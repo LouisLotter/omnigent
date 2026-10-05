@@ -2249,7 +2249,11 @@ async def test_operator_passthrough_reaches_spawned_agent(
             sys.executable,
             "-c",
             "import json, os, pathlib, sys; "
-            "pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(os.environ)))",
+            "observed = {'XAI_API_KEY': os.environ.get('XAI_API_KEY'), "
+            "'unrelated_present': 'UNRELATED_API_KEY' in os.environ, "
+            "'runner_auth_present': any(name in os.environ "
+            f"for name in {sorted(RUNNER_AUTH_SECRET_ENV_VARS)!r})}}; "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(observed))",
             str(captured),
         ]
     )
@@ -2258,10 +2262,10 @@ async def test_operator_passthrough_reaches_spawned_agent(
         await executor._start_process()
         assert executor._proc is not None
         assert await asyncio.wait_for(executor._proc.wait(), timeout=10) == 0
-        env = json.loads(captured.read_text())
-        assert env["XAI_API_KEY"] == "canary-xai"
-        assert "UNRELATED_API_KEY" not in env
-        assert RUNNER_AUTH_SECRET_ENV_VARS.isdisjoint(env)
+        observed = json.loads(captured.read_text())
+        assert observed["XAI_API_KEY"] == "canary-xai"
+        assert not observed["unrelated_present"]
+        assert not observed["runner_auth_present"]
     finally:
         await executor.close()
 
