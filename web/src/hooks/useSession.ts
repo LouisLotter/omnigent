@@ -11,7 +11,13 @@
 // Reading it from the single-fetch snapshot instead means the rail
 // gets the user's actual level for any conversation they navigate to.
 
-import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  CancelledError,
+  type FetchQueryOptions,
+  type QueryClient,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -69,6 +75,36 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   };
 }
 
+/** Join replacement snapshots when invalidation silently cancels an awaited refetch. */
+export async function fetchSessionSnapshot(
+  client: QueryClient,
+  options: FetchQueryOptions<Session>,
+): Promise<Session> {
+  let result = client.fetchQuery(options);
+  const cache = client.getQueryCache();
+  const query = cache.find<Session>({ queryKey: options.queryKey, exact: true });
+  let pending = query?.promise;
+  for (;;) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- each iteration joins the replacement fetch
+      return await result;
+    } catch (error) {
+      const replacement = query?.promise;
+      if (
+        !(error instanceof CancelledError) ||
+        !error.silent ||
+        !replacement ||
+        replacement === pending ||
+        cache.find({ queryKey: options.queryKey, exact: true }) !== query
+      ) {
+        throw error;
+      }
+      pending = replacement;
+      result = replacement;
+    }
+  }
+}
+
 /**
  * Resolve the top-level root of a session's spawn tree by walking the
  * ``parentSessionId`` chain upward.
@@ -107,7 +143,7 @@ export function useRootSessionId(
         // Each hop's request URL is the previous hop's parentSessionId,
         // so the chain is inherently serial.
         // oxlint-disable-next-line no-await-in-loop
-        const session = await queryClient.fetchQuery({
+        const session = await fetchSessionSnapshot(queryClient, {
           queryKey: ["session", hopId],
           queryFn: () => getSessionSlim(hopId),
           staleTime: Infinity,
@@ -181,7 +217,7 @@ export async function prefetchSessionHostChain(
     const hopId: string = id;
     // Each hop's id comes from the previous snapshot, so the chain is serial.
     // oxlint-disable-next-line no-await-in-loop
-    const session: Session = await queryClient.fetchQuery({
+    const session: Session = await fetchSessionSnapshot(queryClient, {
       queryKey: ["session", hopId],
       queryFn: () => getSessionSlim(hopId),
       staleTime: Infinity,
