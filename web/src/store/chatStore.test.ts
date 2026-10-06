@@ -1230,22 +1230,26 @@ describe("chatStore — switchTo", () => {
 
     it("does not follow another fetch after non-silent cancellation", async () => {
       const held = await holdSnapshots();
+      const fetchQuery = vi.spyOn(client, "fetchQuery");
+      onTestFinished(() => fetchQuery.mockRestore());
       void held.observer.refetch();
       const loading = useChatStore.getState().switchTo(id);
-      await vi.waitFor(() => expect(held.responses).toHaveLength(1));
-      const cancellation = client.cancelQueries(
-        { queryKey: held.queryKey, exact: true },
-        { silent: false },
-      );
+      await vi.waitFor(() => {
+        expect(held.responses).toHaveLength(1);
+        expect(fetchQuery).toHaveBeenCalledWith(
+          expect.objectContaining({ queryKey: held.queryKey }),
+        );
+      });
+      const cancellation = client.cancelQueries({ queryKey: held.queryKey, exact: true });
       // Start another fetch before cancellation reaches the joining loader.
-      void held.observer.refetch();
+      const replacement = held.observer.refetch();
       await cancellation;
       await vi.waitFor(() => expect(held.responses).toHaveLength(2));
       held.responses.forEach((resolve) => resolve());
-      await loading;
+      await Promise.all([loading, replacement]);
       const state = useChatStore.getState();
       expect(state.conversationLoadError).toBeInstanceOf(CancelledError);
-      expect(state.conversationLoadError).toMatchObject({ silent: false });
+      expect((state.conversationLoadError as CancelledError).silent).toBeFalsy();
       expect(state.loadingConversation).toBe(false);
       expect(client.getQueryState(held.queryKey)).toBeDefined();
       expect(held.responses).toHaveLength(2);
