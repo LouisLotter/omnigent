@@ -1131,6 +1131,7 @@ describe("chatStore — switchTo", () => {
       fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
         const response = defaultFetchHandler(input, init);
         if (String(input).split("?")[0] !== `/v1/sessions/${id}`) return response;
+        // Held responses retain the status captured here.
         const snapshot = { ...(await response.json()), status };
         return new Promise<Response>((resolve) => {
           responses.push((override) => resolve(override ?? mockResponse(snapshot)));
@@ -1221,9 +1222,37 @@ describe("chatStore — switchTo", () => {
       client.removeQueries({ queryKey: held.queryKey, exact: true });
       held.responses.forEach((resolve) => resolve());
       await loading;
+      // Removal must terminate this load rather than recreate the query.
       expect(useChatStore.getState().conversationLoadError).toBeInstanceOf(CancelledError);
       expect(client.getQueryState(held.queryKey)).toBeUndefined();
       expect(held.responses).toHaveLength(1);
+    });
+
+    it("does not follow another fetch after non-silent cancellation", async () => {
+      const held = await holdSnapshots();
+      const fetchQuery = vi.spyOn(client, "fetchQuery");
+      onTestFinished(() => fetchQuery.mockRestore());
+      void held.observer.refetch();
+      const loading = useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => {
+        expect(held.responses).toHaveLength(1);
+        expect(fetchQuery).toHaveBeenCalledWith(
+          expect.objectContaining({ queryKey: held.queryKey }),
+        );
+      });
+      const cancellation = client.cancelQueries({ queryKey: held.queryKey, exact: true });
+      // Start another fetch before cancellation reaches the joining loader.
+      const replacement = held.observer.refetch();
+      await cancellation;
+      await vi.waitFor(() => expect(held.responses).toHaveLength(2));
+      held.responses.forEach((resolve) => resolve());
+      await Promise.all([loading, replacement]);
+      const state = useChatStore.getState();
+      expect(state.conversationLoadError).toBeInstanceOf(CancelledError);
+      expect((state.conversationLoadError as CancelledError).silent).toBeFalsy();
+      expect(state.loadingConversation).toBe(false);
+      expect(client.getQueryState(held.queryKey)).toBeDefined();
+      expect(held.responses).toHaveLength(2);
     });
 
     it("reports a real error from the replacement without retrying it", async () => {
