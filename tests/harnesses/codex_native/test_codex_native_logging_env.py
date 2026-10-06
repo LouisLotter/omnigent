@@ -131,7 +131,8 @@ async def test_app_server_start_respects_logging_opt_in_and_operator_passthrough
         )
     assert spawn_env == expected
     if operator_passthrough:
-        assert spawn_env["RUST_LOG"] == host_filter
+        forwarded_filter = spawn_env.get("RUST_LOG")
+        assert forwarded_filter == host_filter
     elif not enabled:
         assert "RUST_LOG" not in spawn_env
     assert server.env == original_env
