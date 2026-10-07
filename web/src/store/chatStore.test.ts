@@ -1130,7 +1130,11 @@ describe("chatStore — switchTo", () => {
       });
       fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
         const response = defaultFetchHandler(input, init);
-        if (String(input).split("?")[0] !== `/v1/sessions/${id}`) return response;
+        if (
+          (init?.method ?? "GET") !== "GET" ||
+          String(input).split("?")[0] !== `/v1/sessions/${id}`
+        )
+          return response;
         // Held responses retain the status captured here.
         const snapshot = { ...(await response.json()), status };
         return new Promise<Response>((resolve) => {
@@ -1189,6 +1193,34 @@ describe("chatStore — switchTo", () => {
         await held.finishLoading(loading);
       },
     );
+
+    it("applies an effort pick after its session lookup is replaced", async () => {
+      seedSession(id);
+      sessionLabels.set(id, { "omnigent.wrapper": "codex-native-ui" });
+      await useChatStore.getState().switchTo(id);
+      const held = await holdSnapshots();
+      void client.invalidateQueries({ queryKey: held.queryKey, exact: true });
+      await vi.waitFor(() => expect(held.responses).toHaveLength(1));
+      const picking = useChatStore
+        .getState()
+        .setEffort("high")
+        .catch((error) => error);
+      held.emit("running");
+      await vi.waitFor(() => expect(held.responses.length).toBeGreaterThanOrEqual(2));
+      held.emit("idle");
+      await vi.waitFor(() => expect(held.responses.length).toBeGreaterThanOrEqual(3));
+      held.responses.forEach((resolve) => resolve());
+
+      expect(await picking).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/v1/sessions/${id}`,
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ reasoning_effort: "high" }),
+        }),
+      );
+      expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+    });
 
     it("loads fresh history when replacements pause offline", async () => {
       const held = await holdSnapshots();
