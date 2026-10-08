@@ -105,8 +105,9 @@ def clean_agent_env(
         ``os_env.sandbox.env_passthrough``. This is the documented escape hatch
         for an agent that authenticates from a variable outside its own family.
     :param source: Environment to filter. Defaults to ``os.environ``; injectable
-        for tests. Its own ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also
-        allowed, subject to the deny rules.
+        for tests. Its ``IS_SANDBOX`` marker controls the Git credential grant;
+        its ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names are also allowed, subject
+        to the deny rules.
     :returns: A filtered copy without runner-auth secrets; desktop-session
         variables require ``extra_allowed``.
     """
