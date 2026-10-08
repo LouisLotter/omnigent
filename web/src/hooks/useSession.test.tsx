@@ -141,6 +141,7 @@ describe("fetchSessionSnapshot", () => {
             finishOld = done;
           }),
       )
+      // Settle the replacement before the cancelled caller resumes.
       .mockResolvedValue(session(id));
     const options = { queryKey, queryFn: () => getSessionSlim(id), staleTime: 0 };
     const owner = client.fetchQuery(options).catch(() => undefined);
@@ -318,6 +319,7 @@ describe("prefetchSessionHostChain", () => {
     const queryKey = ["session", id];
     const hostless = routed(id, null, null);
     client.setQueryData(queryKey, hostless);
+    // Mark the cache stale so the walk joins the in-flight refetch.
     await client.invalidateQueries({ queryKey, refetchType: "none" });
     let finishOld!: (value: Session) => void;
     getSessionSlimMock
