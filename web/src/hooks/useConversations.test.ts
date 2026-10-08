@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
@@ -1762,6 +1763,11 @@ describe("overlapping pin writes", () => {
     "refuses an unpin while a reorder is saving, then the reorder %s",
     async (_outcome, response, expected) => {
       const { result, state, respond } = setup("3000");
+      const toasts: string[] = [];
+      const onToast = (e: Event) => {
+        toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+      };
+      window.addEventListener("omnigent:toast", onToast);
 
       act(() => result.current.reorder.mutate([{ id: "conv_c", pinnedAt: 999 }]));
       act(() => result.current.toggle.mutate({ id: "conv_c", pinned: false }));
@@ -1771,6 +1777,10 @@ describe("overlapping pin writes", () => {
       await waitFor(() => expect(result.current.reorder.isSuccess).toBe(true));
       expect(fetchMock).toHaveBeenCalledOnce();
       expect(state()).toEqual({ list: expected, pinned: expected });
+      // The refusal explains itself once; it isn't also reported as a failed unpin.
+      expect(toasts).toContain("Still saving your pins. Try again in a moment.");
+      expect(toasts).not.toContain("Couldn't unpin the session.");
+      window.removeEventListener("omnigent:toast", onToast);
     },
   );
 
@@ -1799,11 +1809,16 @@ describe("overlapping pin writes", () => {
 
 describe("useTogglePinnedConversation failure rollback", () => {
   it.each([
-    ["unpin", "3000", false],
-    ["pin", undefined, true],
+    ["unpin", "3000", false, "Couldn't unpin the session."],
+    ["pin", undefined, true, "Couldn't pin the session."],
   ] as const)(
     "a failed %s rolls back only the pin key, keeping labels changed meanwhile",
-    async (_action, pinValue, pinned) => {
+    async (_action, pinValue, pinned, message) => {
+      const toasts: string[] = [];
+      const onToast = (e: Event) => {
+        toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+      };
+      window.addEventListener("omnigent:toast", onToast);
       let rejectPatch!: (r: Response) => void;
       fetchMock.mockImplementationOnce(
         () =>
@@ -1860,6 +1875,9 @@ describe("useTogglePinnedConversation failure rollback", () => {
           .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
           ?.conversations.map((c) => c.id) ?? [];
       expect(pinnedIds).toEqual(pinValue === undefined ? [] : ["conv_x"]);
+      // The row snapped back, so the user is told the write didn't save.
+      expect(toasts).toEqual([message]);
+      window.removeEventListener("omnigent:toast", onToast);
     },
   );
 });
@@ -3363,6 +3381,32 @@ describe("useDeleteProject", () => {
 });
 
 describe("undoArchiveConversations optimistic restore", () => {
+  it("restores owned rows to Mine without inserting them into Shared", async () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
+    try {
+      const queryClient = new QueryClient();
+      const mineKey = ["conversations", "", false, null, "mine"];
+      const sharedKey = ["conversations", "", false, null, "shared"];
+      queryClient.setQueryData(mineKey, infinitePage([]));
+      queryClient.setQueryData(sharedKey, infinitePage([]));
+      fetchMock.mockResolvedValueOnce(
+        mockResponse(conversation({ id: "conv_owned", archived: false })),
+      );
+
+      await undoArchiveConversations(queryClient, [
+        conversation({ id: "conv_owned", owner: "local", archived: true }),
+      ]);
+
+      const mine = queryClient.getQueryData<ConversationsInfiniteData>(mineKey);
+      const shared = queryClient.getQueryData<ConversationsInfiniteData>(sharedKey);
+      expect(mine?.pages[0].data.map((row) => row.id)).toEqual(["conv_owned"]);
+      expect(mine?.pages[0].data[0].archived).toBe(false);
+      expect(shared?.pages[0].data).toEqual([]);
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
   it("re-injects evicted rows into cached lists before the unarchive PATCH settles", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     // A refetch already evicted the archived row from the sidebar list, so the
