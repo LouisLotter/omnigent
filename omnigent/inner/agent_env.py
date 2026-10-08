@@ -11,6 +11,7 @@ harness added is filtered by construction rather than by remembering.
 The model is not "no credentials ever". It is:
 
     shared safe base  +  this harness's own config/provider families
+                      +  the Git credential-helper pair in managed sandboxes
                       +  exact names the host owner forwarded through
                          ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
                       +  whatever the spec declared in
@@ -32,6 +33,9 @@ from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR, RUNNER_AUTH_SECRE
 DESKTOP_SESSION_ENV_VARS: frozenset[str] = frozenset(
     {"DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"}
 )
+
+# The managed host image's Git credential helper reads these exact names.
+SANDBOX_GIT_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset({"GIT_TOKEN", "GIT_USERNAME"})
 
 # Categories every POSIX CLI needs regardless of vendor: where the user's
 # config lives, how to reach the network, how to format output, where to put
@@ -115,6 +119,8 @@ def clean_agent_env(
     }
     extra = set(extra_allowed)
     exact = BASE_ALLOW_EXACT | set(allow_exact) | extra | operator_names
+    if (env_source.get("IS_SANDBOX") or "").strip() == "1":
+        exact |= SANDBOX_GIT_CREDENTIAL_ENV_VARS
     denied = set(deny_exact) | RUNNER_AUTH_SECRET_ENV_VARS | (DESKTOP_SESSION_ENV_VARS - extra)
     return {
         key: value
