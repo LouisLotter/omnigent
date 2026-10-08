@@ -183,14 +183,6 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
-def test_real_builders_pass_ssh_auth_sock(monkeypatch):
-    """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
-    sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
-    monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
-    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
-        assert build().get("SSH_AUTH_SOCK") == sock, harness
-
-
 @pytest.mark.parametrize("marker", [None, "0", "true", "1", " 1 "])
 def test_real_builders_scope_default_git_credentials(marker, hostile_env, monkeypatch):
     git = {"GIT_TOKEN": "canary-git", "GIT_USERNAME": "git-user"}
@@ -230,6 +222,14 @@ def test_managed_git_credentials_reach_codex(monkeypatch):
     agent_env = _clean_codex_env()
 
     assert {name: agent_env.get(name) for name in git} == git
+
+
+def test_real_builders_pass_ssh_auth_sock(monkeypatch):
+    """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
+    sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
+    monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        assert build().get("SSH_AUTH_SOCK") == sock, harness
 
 
 def test_real_builders_strip_desktop_session(monkeypatch):
