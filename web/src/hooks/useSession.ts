@@ -121,7 +121,7 @@ export async function fetchSessionSnapshot(
  * Drives the Agents rail: the rail renders the whole tree from the
  * top-level session, so when the user is viewing a grandchild the root
  * is two-plus hops up, not just ``parentSessionId``. Each hop reuses
- * the shared ``["session", id]`` snapshot cache (via ``fetchQuery``),
+ * the shared ``["session", id]`` snapshot cache via ``fetchSessionSnapshot``,
  * so walking a tree the user navigated through usually costs zero
  * network requests. A session's parent link is immutable, so the
  * resolved root is cached forever (``staleTime: Infinity``).
