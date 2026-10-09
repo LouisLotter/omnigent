@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -37,6 +39,17 @@ def oidc_server(
     """A dedicated OIDC-mode server wired to a fake IdP."""
     server_tmp = tmp_path_factory.mktemp("e2e_ui_oidc_login")
     yield from spawn_oidc_server(mock_llm_server_url, server_tmp, public_client=request.param)
+
+
+@pytest.fixture
+def provider_errors(oidc_server: OIDCServer) -> Iterator[list[tuple[str, str]]]:
+    """Isolate injected provider responses between browser journeys."""
+    errors = oidc_server.idp.authorization_errors
+    errors.clear()
+    try:
+        yield errors
+    finally:
+        errors.clear()
 
 
 def test_oidc_login_redirects_through_idp_to_authenticated_app(
@@ -91,3 +104,103 @@ def test_oidc_cli_ticket_completes_through_browser(oidc_server: OIDCServer, page
         f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
     )
     assert replay.status == 410
+
+
+def test_oidc_expiry_retries_once_then_signs_in(
+    oidc_server: OIDCServer, provider_errors: list[tuple[str, str]], page: Page
+) -> None:
+    """A provider expiry restarts authorization with fresh state and PKCE."""
+    provider_errors.append(("temporarily_unavailable", "authentication_expired"))
+    authorizations: list[str] = []
+    page.on(
+        "request",
+        lambda request: (
+            authorizations.append(request.url)
+            if urlsplit(request.url).path.endswith("/authorize")
+            else None
+        ),
+    )
+    page.goto(oidc_server.public_url)
+    continue_link = page.locator("#fake-idp-continue")
+    expect(continue_link).to_be_visible(timeout=15_000)
+    assert len(authorizations) == 2
+    first, second = [parse_qs(urlsplit(url).query) for url in authorizations]
+    assert first["state"] != second["state"]
+    assert first["code_challenge"] != second["code_challenge"]
+    continue_link.click()
+    expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
+    assert page.evaluate("async () => (await fetch('/v1/me')).status") == 200
+
+
+def test_oidc_repeated_expiry_offers_manual_restart(
+    oidc_server: OIDCServer,
+    provider_errors: list[tuple[str, str]],
+    page: Page,
+    tmp_path: Path,
+) -> None:
+    """Two expiry responses stop the redirect loop and offer a usable restart."""
+    provider_errors.extend([("temporarily_unavailable", "authentication_expired")] * 2)
+    page.goto(oidc_server.public_url)
+    expect(page.get_by_role("heading", name="Sign-in unsuccessful")).to_be_visible()
+    expect(page.get_by_text("Your sign-in session expired.", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / "oidc-recovery.png"))
+    assert page.evaluate("async () => (await fetch('/v1/me')).status") == 401
+    page.get_by_role("link", name="Sign in again").click()
+    page.locator("#fake-idp-continue").click()
+    expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
+    assert page.evaluate("async () => (await fetch('/v1/me')).status") == 200
+
+
+def test_oidc_provider_denial_recovers_without_retry(
+    oidc_server: OIDCServer, provider_errors: list[tuple[str, str]], page: Page
+) -> None:
+    """Denial shows a static recovery action instead of silently retrying."""
+    provider_errors.append(("access_denied", "private-provider-detail"))
+    page.goto(oidc_server.public_url)
+    expect(page.get_by_role("heading", name="Sign-in unsuccessful")).to_be_visible()
+    expect(
+        page.get_by_text("Sign-in could not be completed at the identity provider.")
+    ).to_be_visible()
+    assert "private-provider-detail" not in page.locator("body").inner_text()
+    page.get_by_role("link", name="Sign in again").click()
+    page.locator("#fake-idp-continue").click()
+    expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
+
+
+def test_oidc_missing_state_recovery_starts_new_browser_login(
+    oidc_server: OIDCServer, page: Page
+) -> None:
+    """A callback without state offers a fresh browser sign-in."""
+    page.goto(
+        f"{oidc_server.public_url}/auth/callback"
+        "?error=temporarily_unavailable&error_description=authentication_expired"
+    )
+    expect(page.get_by_role("heading", name="Sign-in unsuccessful")).to_be_visible()
+    page.get_by_role("link", name="Sign in again").click()
+    page.locator("#fake-idp-continue").click()
+    expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
+
+
+def test_oidc_cli_ticket_survives_expiry_retry(
+    oidc_server: OIDCServer, provider_errors: list[tuple[str, str]], page: Page
+) -> None:
+    """Browser expiry recovery preserves the single-use CLI login ticket."""
+    provider_errors.append(("temporarily_unavailable", "authentication_expired"))
+    ticket_response = page.request.post(f"{oidc_server.base_url}/auth/cli-login")
+    assert ticket_response.status == 200
+    ticket = ticket_response.json()
+    page.goto(f"{oidc_server.public_url}{ticket['login_url']}")
+    page.locator("#fake-idp-continue").click()
+    expect(page.get_by_role("heading", name="Login successful")).to_be_visible()
+    poll = page.request.get(
+        f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
+    )
+    assert poll.status == 200
+    assert poll.json()["user_id"] == oidc_server.idp.email
+    assert poll.json()["token"]
+    assert (
+        page.request.get(
+            f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
+        ).status
+        == 410
+    )
