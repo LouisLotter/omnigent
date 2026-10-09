@@ -302,8 +302,10 @@ def create_auth_router(
     @router.get("/login")
     async def login(request: Request) -> Response:
         """Start OIDC sign-in with PKCE and a short-lived signed state cookie."""
+        # Sanitize before signing so callbacks cannot become open redirects.
         return_to = _sanitize_return_to(request.query_params.get("return_to"))
         base_path = getattr(request.app.state, "base_path", "")
+        # Keep a default destination within a deployment's public prefix.
         if base_path and return_to == "/":
             return_to = f"{base_path}/"
         ticket = request.query_params.get("ticket")
@@ -318,11 +320,16 @@ def create_auth_router(
                 status_code=400,
                 content={"error": "A native sign-in cannot also carry a CLI ticket"},
             )
+        # Carry invites in signed state, not unverified callback parameters.
+        invite = request.query_params.get("invite") if _invites_enabled else None
+        # OIDC Core 3.1.2.1's prompt=login/max_age=0 demands fresh auth for consent.
+        # GitHub OAuth has no id_token/auth_time to verify that demand.
+        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
         return login_response(
             return_to,
             ticket=ticket,
-            invite=request.query_params.get("invite") if _invites_enabled else None,
-            reauth=request.query_params.get("reauth") == "1" and config.provider_type != "github",
+            invite=invite,
+            reauth=reauth,
             native=native,
         )
 
@@ -333,13 +340,26 @@ def create_auth_router(
         login_url: str | None = None,
         clear_state: bool = False,
     ) -> HTMLResponse:
+        """Offer browser recovery without restoring unverified sign-in context.
+
+        :param request: Request carrying the deployment's public base path.
+        :param message: Static explanation of the sign-in failure.
+        :param login_url: Same-origin restart URL built from verified context,
+            or ``None`` for a new browser sign-in with app retry guidance.
+        :param clear_state: Discard only an unusable or completed state cookie.
+        :returns: An uncached recovery page that preserves any session cookie.
+        """
+        app_guidance = ""
         if login_url is None:
             base_path = getattr(request.app.state, "base_path", "")
             login_url = f"{base_path}/auth/login"
+            app_guidance = (
+                "<p>If you started from the Omnigent app, return to it and try again.</p>"
+            )
         response = HTMLResponse(
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
             "<title>Sign-in unsuccessful</title></head><body>"
-            f"<h1>Sign-in unsuccessful</h1><p>{message}</p>"
+            f"<h1>Sign-in unsuccessful</h1><p>{escape(message)}</p>{app_guidance}"
             f'<p><a href="{escape(login_url, quote=True)}">Sign in again</a></p>'
             "</body></html>",
             status_code=400,
@@ -370,6 +390,12 @@ def create_auth_router(
         code = request.query_params.get("code")
         state = request.query_params.get("state")
         error = request.query_params.get("error")
+
+        def unverified_failure(reason: str, *, clear_state: bool = False) -> HTMLResponse:
+            """Log a fixed validation category without callback values."""
+            _logger.info("OIDC provider callback could not be verified: %s", reason)
+            return sign_in_failure(request, clear_state=clear_state)
+
         if not state or (not code and error is None):
             early_native = _native_from_state(_verified_state(request, state))
             if early_native is not None:
@@ -379,7 +405,7 @@ def create_auth_router(
                     "Sign-in was cancelled or declined at the identity provider.",
                 )
             if error is not None:
-                return sign_in_failure(request)
+                return unverified_failure("missing_state")
             return JSONResponse(
                 status_code=400,
                 content={"error": "Missing code or state parameter"},
@@ -389,7 +415,7 @@ def create_auth_router(
         state_cookie = request.cookies.get(_state_cookie)
         if not state_cookie:
             if error is not None:
-                return sign_in_failure(request)
+                return unverified_failure("missing_cookie")
             return JSONResponse(
                 status_code=400,
                 content={"error": "Missing auth state cookie"},
@@ -399,7 +425,7 @@ def create_auth_router(
             state_payload = jwt.decode(state_cookie, config.cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             if error is not None:
-                return sign_in_failure(request, clear_state=True)
+                return unverified_failure("invalid_or_expired_cookie", clear_state=True)
             return JSONResponse(
                 status_code=400,
                 content={"error": "Invalid or expired auth state"},
@@ -408,7 +434,7 @@ def create_auth_router(
         if state != state_payload.get("state"):
             if error is not None:
                 # The cookie may belong to another tab's active sign-in.
-                return sign_in_failure(request)
+                return unverified_failure("state_mismatch")
             return JSONResponse(
                 status_code=400,
                 content={"error": "State mismatch (possible CSRF)"},
@@ -434,10 +460,13 @@ def create_auth_router(
                 error == "temporarily_unavailable"
                 and request.query_params.get("error_description") == "authentication_expired"
             )
-            _logger.warning(
-                "OIDC sign-in failed: %s",
-                "authentication_expired" if expired else "provider_error",
-            )
+            if error == "access_denied":
+                _logger.info("OIDC sign-in cancelled at the identity provider")
+            else:
+                _logger.warning(
+                    "OIDC sign-in failed: %s",
+                    "authentication_expired" if expired else "provider_error",
+                )
             return_to = _sanitize_return_to(state_payload.get("return_to"))
             ticket = state_payload.get("ticket")
             invite = state_payload.get("invite") if _invites_enabled else None

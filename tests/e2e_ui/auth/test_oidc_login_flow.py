@@ -168,7 +168,7 @@ def test_oidc_provider_denial_recovers_without_retry(
 
 
 def test_oidc_missing_state_recovery_starts_new_browser_login(
-    oidc_server: OIDCServer, page: Page
+    oidc_server: OIDCServer, page: Page, tmp_path: Path
 ) -> None:
     """A callback without state offers a fresh browser sign-in."""
     page.goto(
@@ -176,6 +176,10 @@ def test_oidc_missing_state_recovery_starts_new_browser_login(
         "?error=temporarily_unavailable&error_description=authentication_expired"
     )
     expect(page.get_by_role("heading", name="Sign-in unsuccessful")).to_be_visible()
+    expect(
+        page.get_by_text("If you started from the Omnigent app, return to it and try again.")
+    ).to_be_visible()
+    page.screenshot(path=str(tmp_path / "oidc-unverified-recovery.png"))
     page.get_by_role("link", name="Sign in again").click()
     page.locator("#fake-idp-continue").click()
     expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)

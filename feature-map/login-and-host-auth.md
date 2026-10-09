@@ -99,6 +99,9 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   not live IdP timeout tests. State, cookie, base-path and native error controls
   are in `tests/server/test_oidc_recovery.py` and
   `tests/server/integration/test_oidc_native_login.py`.
+  `tests/e2e_ui/base_path/test_oidc_recovery.py` drives missing-state recovery,
+  one expiry retry and repeated expiry through the real server's base-path
+  middleware, provider callback and authenticated SPA.
 - **Isolated CLI loop:** use [cli-setup-verify](../.claude/skills/cli-setup-verify/SKILL.md),
   which drives the real `omnigent` binary in a PTY with a throwaway config and
   data directory, for sign-in prompts and host commands.
@@ -158,6 +161,8 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   older callbacks need manual restart. Missing or mismatched state preserves
   another tab's pending login. Code-only callbacks retain their existing state
   mismatch error. Verified native errors return immediately to the app.
+  Unverifiable native state cannot restore the app's redirect binding: the
+  generic page advises retrying from the app, and its link starts browser login.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one
