@@ -95,6 +95,15 @@ class _OidcLogin:
             path=cookie.path,
         )
 
+    def set_cookie_condition(self, kind: str) -> None:
+        """Set the cookie side of a callback-validation case."""
+        if kind == "missing_cookie":
+            self.client.cookies.clear()
+        elif kind == "signature":
+            self.replace_state(self.state(), b"different-test-only-signing-key")
+        elif kind == "expired":
+            self.replace_state({**self.state(), "exp": int(time.time()) - 30})
+
     def expired(self, state: str, **extra: str) -> httpx.Response:
         return self.client.get(
             f"{self.prefix}/callback",
@@ -271,10 +280,7 @@ def test_invalid_expired_or_mismatched_state_cannot_retry(
     oidc_login: _OidcLogin, kind: str
 ) -> None:
     _, original = oidc_login.login()
-    if kind == "signature":
-        oidc_login.replace_state(original, b"different-test-only-signing-key")
-    elif kind == "expired":
-        oidc_login.replace_state({**original, "exp": int(time.time()) - 30})
+    oidc_login.set_cookie_condition(kind)
     response = oidc_login.expired(
         "another-state" if kind == "mismatch" else original["state"],
         code="private-code",
@@ -323,12 +329,7 @@ def test_invalid_code_callbacks_keep_json_rejection(
     oidc_login: _OidcLogin, kind: str, message: str
 ) -> None:
     _, original = oidc_login.login()
-    if kind == "missing_cookie":
-        oidc_login.client.cookies.clear()
-    elif kind == "signature":
-        oidc_login.replace_state(original, b"different-test-only-signing-key")
-    elif kind == "expired":
-        oidc_login.replace_state({**original, "exp": int(time.time()) - 30})
+    oidc_login.set_cookie_condition(kind)
     params = {"code": "test-code"}
     if kind != "missing_state":
         params["state"] = "another-state" if kind == "mismatch" else original["state"]
@@ -673,12 +674,7 @@ def test_unverified_native_error_guides_app_retry_without_leaking_context(
         code_challenge=derive_code_challenge("v" * 64),
         code_challenge_method="S256",
     )
-    if kind == "missing_cookie":
-        oidc_login.client.cookies.clear()
-    elif kind == "signature":
-        oidc_login.replace_state(original, b"different-test-only-signing-key")
-    elif kind == "expired":
-        oidc_login.replace_state({**original, "exp": int(time.time()) - 30})
+    oidc_login.set_cookie_condition(kind)
     params = {
         "error": "access_denied",
         "error_description": "private-description",

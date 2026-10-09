@@ -84,8 +84,16 @@ def test_oidc_login_redirects_through_idp_to_authenticated_app(
     expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
 
 
-def test_oidc_cli_ticket_completes_through_browser(oidc_server: OIDCServer, page: Page) -> None:
-    """The CLI's browser-ticket flow authenticates against either provider profile."""
+@pytest.mark.parametrize("expired", [False, True], ids=["normal", "expired"])
+def test_oidc_cli_ticket_completes_through_browser(
+    oidc_server: OIDCServer,
+    provider_errors: list[tuple[str, str]],
+    page: Page,
+    expired: bool,
+) -> None:
+    """The CLI ticket authenticates once, including recovery from provider expiry."""
+    if expired:
+        provider_errors.append(("temporarily_unavailable", "authentication_expired"))
     response = page.request.post(f"{oidc_server.base_url}/auth/cli-login")
     assert response.status == 200
     ticket = response.json()
@@ -183,28 +191,3 @@ def test_oidc_missing_state_recovery_starts_new_browser_login(
     page.get_by_role("link", name="Sign in again").click()
     page.locator("#fake-idp-continue").click()
     expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
-
-
-def test_oidc_cli_ticket_survives_expiry_retry(
-    oidc_server: OIDCServer, provider_errors: list[tuple[str, str]], page: Page
-) -> None:
-    """Browser expiry recovery preserves the single-use CLI login ticket."""
-    provider_errors.append(("temporarily_unavailable", "authentication_expired"))
-    ticket_response = page.request.post(f"{oidc_server.base_url}/auth/cli-login")
-    assert ticket_response.status == 200
-    ticket = ticket_response.json()
-    page.goto(f"{oidc_server.public_url}{ticket['login_url']}")
-    page.locator("#fake-idp-continue").click()
-    expect(page.get_by_role("heading", name="Login successful")).to_be_visible()
-    poll = page.request.get(
-        f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
-    )
-    assert poll.status == 200
-    assert poll.json()["user_id"] == oidc_server.idp.email
-    assert poll.json()["token"]
-    assert (
-        page.request.get(
-            f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
-        ).status
-        == 410
-    )
