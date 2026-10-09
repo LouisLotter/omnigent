@@ -41,7 +41,7 @@ def oidc_server(
     yield from spawn_oidc_server(mock_llm_server_url, server_tmp, public_client=request.param)
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def provider_errors(oidc_server: OIDCServer) -> Iterator[list[tuple[str, str]]]:
     """Isolate injected provider responses between browser journeys."""
     errors = oidc_server.idp.authorization_errors
@@ -140,39 +140,46 @@ def test_oidc_expiry_retries_once_then_signs_in(
     assert page.evaluate("async () => (await fetch('/v1/me')).status") == 200
 
 
-def test_oidc_repeated_expiry_offers_manual_restart(
+@pytest.mark.parametrize(
+    ("injected_errors", "message"),
+    [
+        pytest.param(
+            (("temporarily_unavailable", "authentication_expired"),) * 2,
+            "Your sign-in session expired.",
+            id="repeated-expiry",
+        ),
+        pytest.param(
+            (("access_denied", "private-provider-detail"),),
+            "Sign-in could not be completed at the identity provider.",
+            id="provider-denial",
+        ),
+    ],
+)
+def test_oidc_provider_error_offers_manual_restart(
     oidc_server: OIDCServer,
     provider_errors: list[tuple[str, str]],
     page: Page,
     tmp_path: Path,
+    injected_errors: tuple[tuple[str, str], ...],
+    message: str,
 ) -> None:
-    """Two expiry responses stop the redirect loop and offer a usable restart."""
-    provider_errors.extend([("temporarily_unavailable", "authentication_expired")] * 2)
+    """Repeated expiry or denial offers a safe, usable manual restart."""
+    provider_errors.extend(injected_errors)
     page.goto(oidc_server.public_url)
     expect(page.get_by_role("heading", name="Sign-in unsuccessful")).to_be_visible()
-    expect(page.get_by_text("Your sign-in session expired.", exact=True)).to_be_visible()
+    expect(page.get_by_text(message, exact=True)).to_be_visible()
+    assert provider_errors == []
+    body = page.locator("body").inner_text()
+    for _, description in injected_errors:
+        assert description not in body
     page.screenshot(path=str(tmp_path / "oidc-recovery.png"))
     assert page.evaluate("async () => (await fetch('/v1/me')).status") == 401
-    page.get_by_role("link", name="Sign in again").click()
+    restart = page.get_by_role("link", name="Sign in again")
+    expect(restart).to_be_visible()
+    restart.click()
     page.locator("#fake-idp-continue").click()
     expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
     assert page.evaluate("async () => (await fetch('/v1/me')).status") == 200
-
-
-def test_oidc_provider_denial_recovers_without_retry(
-    oidc_server: OIDCServer, provider_errors: list[tuple[str, str]], page: Page
-) -> None:
-    """Denial shows a static recovery action instead of silently retrying."""
-    provider_errors.append(("access_denied", "private-provider-detail"))
-    page.goto(oidc_server.public_url)
-    expect(page.get_by_role("heading", name="Sign-in unsuccessful")).to_be_visible()
-    expect(
-        page.get_by_text("Sign-in could not be completed at the identity provider.")
-    ).to_be_visible()
-    assert "private-provider-detail" not in page.locator("body").inner_text()
-    page.get_by_role("link", name="Sign in again").click()
-    page.locator("#fake-idp-continue").click()
-    expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
 
 
 def test_oidc_missing_state_recovery_starts_new_browser_login(

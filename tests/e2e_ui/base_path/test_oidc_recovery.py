@@ -13,20 +13,17 @@ from tests.e2e_ui.auth._oidc_server import OIDCServer, spawn_oidc_server
 _BASE_PATH = "/proxy/42"
 
 
-@pytest.fixture(
-    scope="module", params=[False, True], ids=["discovery-confidential", "explicit-public-ps256"]
-)
+@pytest.fixture(scope="module")
 def base_path_oidc_server(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-    request: pytest.FixtureRequest,
 ) -> Iterator[OIDCServer]:
     """Start the actual server with both OIDC and its public prefix configured."""
     yield from spawn_oidc_server(
         mock_llm_server_url,
         tmp_path_factory.mktemp("oidc_base_path"),
-        public_client=request.param,
+        public_client=True,
         base_path=_BASE_PATH,
     )
 

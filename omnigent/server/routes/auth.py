@@ -301,7 +301,12 @@ def create_auth_router(
 
     @router.get("/login")
     async def login(request: Request) -> Response:
-        """Start OIDC sign-in with PKCE and a short-lived signed state cookie."""
+        """Start OIDC sign-in with PKCE and a short-lived signed state cookie.
+
+        :param request: The incoming FastAPI request with optional sign-in context.
+        :returns: A 302 redirect to the IdP, or 400 JSON for invalid native
+            parameters or a native sign-in combined with a CLI ticket.
+        """
         # Sanitize before signing so callbacks cannot become open redirects.
         return_to = _sanitize_return_to(request.query_params.get("return_to"))
         base_path = getattr(request.app.state, "base_path", "")
@@ -379,11 +384,11 @@ def create_auth_router(
         authorization code for tokens, extracts the user's email,
         mints a session cookie, and redirects to the app.
 
-        :param request: The incoming FastAPI request containing
-            ``code`` and ``state`` query parameters plus the
-            ``__Host-ap_auth_state`` cookie.
-        :returns: 302 redirect to the app with session cookie set,
-            or 400/403 on validation failure.
+        :param request: The incoming FastAPI request with code/state or provider
+            error parameters and the signed state cookie.
+        :returns: A browser redirect with a session cookie, native app redirect,
+            or CLI success HTML. Provider expiry may redirect once to the IdP;
+            failures return recovery HTML or 400/403 JSON.
         """
         from fastapi.responses import JSONResponse
 
@@ -659,9 +664,7 @@ def create_auth_router(
                     _logger.exception("cli-login: refresh grant issuance failed")
             # Return a simple HTML page — the CLI is polling
             # /auth/cli-poll and will pick up the token.
-            import html as _html
-
-            safe_email = _html.escape(email)
+            safe_email = escape(email)
             html = (
                 "<html><body style='font-family:system-ui;text-align:center;"
                 "padding:60px'>"
