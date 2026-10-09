@@ -428,8 +428,10 @@ def test_missing_code_without_error_remains_invalid(oidc_login: _OidcLogin) -> N
 
 def test_success_after_retry_uses_fresh_verifier_and_real_jwt(oidc_login: _OidcLogin) -> None:
     _, original = oidc_login.login(return_to="/sessions/test")
-    oidc_login.expired(original["state"])
+    retry = oidc_login.expired(original["state"])
+    assert retry.status_code == 302
     retried = oidc_login.state()
+    assert retried["state"] != original["state"]
     response = oidc_login.finish(retried["state"])
     assert response.status_code == 302
     assert response.headers["location"] == "/sessions/test"
@@ -491,8 +493,10 @@ def test_empty_error_with_code_does_not_exchange_or_mint_session(oidc_login: _Oi
 def test_cli_ticket_survives_retry_and_is_single_use(oidc_login: _OidcLogin) -> None:
     ticket = oidc_login.client.post(f"{oidc_login.prefix}/cli-login").json()["ticket"]
     _, original = oidc_login.login(ticket=ticket)
-    oidc_login.expired(original["state"])
+    retry = oidc_login.expired(original["state"])
+    assert retry.status_code == 302
     retried = oidc_login.state()
+    assert retried["state"] != original["state"]
     assert retried["ticket"] == ticket
     assert (
         oidc_login.client.get(
