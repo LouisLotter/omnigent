@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.server.oidc import derive_code_challenge, generate_code_verifier
 from tests.e2e_ui.auth._oidc_server import OIDCServer, spawn_oidc_server
 
 
@@ -91,26 +92,35 @@ def test_oidc_cli_ticket_completes_through_browser(
     page: Page,
     expired: bool,
 ) -> None:
-    """The CLI ticket authenticates once, including recovery from provider expiry."""
+    """CLI tickets retain PKCE and explicit consent after provider-error recovery."""
     if expired:
         provider_errors.append(("temporarily_unavailable", "authentication_expired"))
-    response = page.request.post(f"{oidc_server.base_url}/auth/cli-login")
+    verifier = generate_code_verifier()
+    response = page.request.post(
+        f"{oidc_server.base_url}/auth/cli-login",
+        data={"code_challenge": derive_code_challenge(verifier), "code_challenge_method": "S256"},
+    )
     assert response.status == 200
     ticket = response.json()
+    poll_url = f"{oidc_server.base_url}/auth/cli-poll"
+    poll_args = {
+        "params": {"ticket": ticket["ticket"]},
+        "headers": {"X-Omnigent-Code-Verifier": verifier},
+    }
     page.goto(f"{oidc_server.public_url}{ticket['login_url']}")
     continue_link = page.locator("#fake-idp-continue")
     expect(continue_link).to_be_visible(timeout=15_000)
     continue_link.click()
-    expect(page.get_by_role("heading", name="Login successful")).to_be_visible(timeout=15_000)
-    poll = page.request.get(
-        f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
-    )
+    expect(page.get_by_role("heading", name="Authorize sign-in")).to_be_visible(timeout=15_000)
+    expect(page.get_by_text(ticket["user_code"])).to_be_visible()
+    assert page.request.get(poll_url, **poll_args).status == 202
+    page.get_by_role("button", name="Approve").click()
+    expect(page.get_by_role("heading", name="Approved")).to_be_visible(timeout=15_000)
+    poll = page.request.get(poll_url, **poll_args)
     assert poll.status == 200
     assert poll.json()["user_id"] == oidc_server.idp.email
     assert poll.json()["token"]
-    replay = page.request.get(
-        f"{oidc_server.base_url}/auth/cli-poll", params={"ticket": ticket["ticket"]}
-    )
+    replay = page.request.get(poll_url, **poll_args)
     assert replay.status == 410
 
 
