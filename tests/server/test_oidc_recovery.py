@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from omnigent.server.admin_list import AdminList
 from omnigent.server.app import BasePathMiddleware
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig, derive_code_challenge
+from omnigent.server.oidc import OIDCConfig, derive_code_challenge, generate_code_verifier
 from omnigent.server.routes.auth import create_auth_router
 
 _SECRET = b"oidc-recovery-test-only-secret-32"
@@ -81,6 +81,23 @@ class _OidcLogin:
         response = self.client.get(f"{self.prefix}/login", params=params)
         assert response.status_code == 302
         return (response, self.state())
+
+    def cli_ticket(self) -> tuple[str, dict]:
+        """Create a PKCE-bound ticket and its matching poll arguments."""
+        verifier = generate_code_verifier()
+        response = self.client.post(
+            f"{self.prefix}/cli-login",
+            json={
+                "code_challenge": derive_code_challenge(verifier),
+                "code_challenge_method": "S256",
+            },
+        )
+        assert response.status_code == 200
+        ticket = response.json()["ticket"]
+        return ticket, {
+            "params": {"ticket": ticket},
+            "headers": {"X-Omnigent-Code-Verifier": verifier},
+        }
 
     def state(self) -> dict:
         return jwt.decode(self.client.cookies.get(self.cookie), _SECRET, algorithms=["HS256"])
@@ -492,35 +509,34 @@ def test_empty_error_with_code_does_not_exchange_or_mint_session(oidc_login: _Oi
 
 
 def test_cli_ticket_survives_retry_and_is_single_use(oidc_login: _OidcLogin) -> None:
-    ticket = oidc_login.client.post(f"{oidc_login.prefix}/cli-login").json()["ticket"]
+    ticket, poll_args = oidc_login.cli_ticket()
     _, original = oidc_login.login(ticket=ticket)
     retry = oidc_login.expired(original["state"])
     assert retry.status_code == 302
     retried = oidc_login.state()
     assert retried["state"] != original["state"]
     assert retried["ticket"] == ticket
-    assert (
-        oidc_login.client.get(
-            f"{oidc_login.prefix}/cli-poll", params={"ticket": ticket}
-        ).status_code
-        == 202
-    )
+    assert retried["reauth_at"] >= original["reauth_at"]
+    assert oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args).status_code == 202
+    oidc_login.claims["auth_time"] = int(time.time())
     response = oidc_login.finish(retried["state"])
-    assert response.status_code == 200
-    assert "Login successful" in response.text
-    poll = oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", params={"ticket": ticket})
+    assert response.status_code == 302
+    assert response.headers["location"] == f"{oidc_login.prefix}/cli-consent?ticket={ticket}"
+    assert oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args).status_code == 202
+    approved = oidc_login.client.post(
+        f"{oidc_login.prefix}/cli-approve",
+        data={"ticket": ticket},
+        headers={"Origin": str(oidc_login.client.base_url).rstrip("/")},
+    )
+    assert approved.status_code == 200
+    poll = oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args)
     assert poll.status_code == 200
     assert poll.json()["user_id"] == "user@example.test"
-    assert (
-        oidc_login.client.get(
-            f"{oidc_login.prefix}/cli-poll", params={"ticket": ticket}
-        ).status_code
-        == 410
-    )
+    assert oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args).status_code == 410
 
 
 def test_manual_recovery_preserves_cli_ticket_and_destination(oidc_login: _OidcLogin) -> None:
-    ticket = oidc_login.client.post(f"{oidc_login.prefix}/cli-login").json()["ticket"]
+    ticket, poll_args = oidc_login.cli_ticket()
     _, original = oidc_login.login(ticket=ticket, return_to="/sessions/test")
     oidc_login.expired(original["state"])
     response = oidc_login.expired(oidc_login.state()["state"])
@@ -530,7 +546,11 @@ def test_manual_recovery_preserves_cli_ticket_and_destination(oidc_login: _OidcL
     fresh = oidc_login.state()
     assert "oidc_retry" not in fresh
     assert fresh["return_to"] == "/sessions/test"
-    assert oidc_login.finish(fresh["state"]).status_code == 200
+    oidc_login.claims["auth_time"] = int(time.time())
+    response = oidc_login.finish(fresh["state"])
+    assert response.status_code == 302
+    assert response.headers["location"] == f"{oidc_login.prefix}/cli-consent?ticket={ticket}"
+    assert oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args).status_code == 202
 
 
 def test_reauth_requirement_survives_retry(oidc_login: _OidcLogin) -> None:
@@ -575,7 +595,7 @@ def test_manual_recovery_keeps_forced_reauthentication(oidc_login: _OidcLogin) -
 def test_expired_cli_ticket_is_not_revived_by_manual_recovery(
     oidc_login: _OidcLogin, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ticket = oidc_login.client.post(f"{oidc_login.prefix}/cli-login").json()["ticket"]
+    ticket, poll_args = oidc_login.cli_ticket()
     _, original = oidc_login.login(ticket=ticket)
     oidc_login.expired(original["state"])
     response = oidc_login.expired(oidc_login.state()["state"])
@@ -583,19 +603,15 @@ def test_expired_cli_ticket_is_not_revived_by_manual_recovery(
     expired_at = time.time() + 301
     with monkeypatch.context() as clock:
         clock.setattr("omnigent.server.routes.auth.time.time", lambda: expired_at)
-        response = oidc_login.client.get(
-            f"{oidc_login.prefix}/cli-poll", params={"ticket": ticket}
-        )
+        response = oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args)
     assert response.status_code == 410
     assert oidc_login.client.get(link).status_code == 302
     assert oidc_login.state()["ticket"] == ticket
-    assert oidc_login.finish(oidc_login.state()["state"]).status_code == 302
-    assert (
-        oidc_login.client.get(
-            f"{oidc_login.prefix}/cli-poll", params={"ticket": ticket}
-        ).status_code
-        == 410
-    )
+    oidc_login.claims["auth_time"] = int(time.time())
+    response = oidc_login.finish(oidc_login.state()["state"])
+    assert response.status_code == 302
+    assert response.headers["location"] == "/"
+    assert oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args).status_code == 410
 
 
 def test_subpath_retry_and_recovery_stay_under_mount(oidc_login: _OidcLogin) -> None:

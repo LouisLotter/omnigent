@@ -279,7 +279,7 @@ def create_auth_router(
         native: dict[str, str] | None = None,
         retry: bool = False,
     ) -> RedirectResponse:
-        """Start a fresh authorization request with a signed retry bound."""
+        """Start an authorization request carrying signed sign-in context."""
         state = secrets.token_urlsafe(32)
         code_verifier = generate_code_verifier()
         code_challenge = derive_code_challenge(code_verifier)
