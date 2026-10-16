@@ -45,6 +45,7 @@ from omnigent.inner.model_egress import (
 )
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.ambient import claude_managed_gateway
 from omnigent.onboarding.databricks_config import (
@@ -359,7 +360,16 @@ def _configure_brokered_codex_with_ucode(
     spec: AgentSpec,
     provider: ProviderEntry,
 ) -> None:
-    """Bind the supported Databricks Codex route to signer-only authority."""
+    """Bind the supported Databricks Codex route to signer-only authority.
+
+    A spec without an active sandbox runs on the platform sandbox, and one
+    without a ``model_egress`` grant gets the provider's single model route.
+    """
+    import dataclasses
+
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
     profile = provider.profile
     if os.environ.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"):
         raise OmnigentError(
@@ -368,15 +378,20 @@ def _configure_brokered_codex_with_ucode(
         )
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     if sandbox is None or sandbox.type == "none":
-        raise OmnigentError(
-            "signer-backed Codex requires an active os_env sandbox",
-            code=ErrorCode.INVALID_INPUT,
+        platform_sandbox = _default_sandbox_for_platform()
+        sandbox = (
+            dataclasses.replace(sandbox, type=platform_sandbox.type)
+            if sandbox is not None
+            else platform_sandbox
         )
-    if not spec.model_egress:
-        raise OmnigentError(
-            "signer-backed Codex requires an explicit model_egress grant",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        if spec.os_env is None:
+            # Worker only: a spec without os_env has no OS tools to contain.
+            env["HARNESS_CODEX_OS_ENV"] = json.dumps(
+                dataclasses.asdict(OSEnvSpec(sandbox=sandbox))
+            )
+        else:
+            # In place, so the session's OS tools share the worker's sandbox.
+            spec.os_env.sandbox = sandbox
     if sandbox.egress_rules:
         raise OmnigentError(
             "signer-backed Codex does not support os_env.sandbox.egress_rules; "
@@ -399,13 +414,17 @@ def _configure_brokered_codex_with_ucode(
         )
     assert agent_state is not None
     try:
-        registered_model_provider_binding(
+        binding = registered_model_provider_binding(
             binding_id=UCODE_SIGNER_BINDING_ID,
             trusted_session_endpoint=endpoint,
             trusted_host=state.workspace_host,
         )
     except ValueError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    # No grant means the provider's own route, the most the signer ever signs.
+    model_egress = spec.model_egress or [
+        f"{route.method} {route.host}{route.path}" for route in binding.maximum_routes
+    ]
     if "HARNESS_CODEX_MODEL" not in env:
         env["HARNESS_CODEX_MODEL"] = agent_state.model or _resolve_catalog_default_model(
             "databricks",
@@ -416,7 +435,7 @@ def _configure_brokered_codex_with_ucode(
     env["HARNESS_CODEX_SIGNER_ENDPOINT"] = endpoint
     env["HARNESS_CODEX_GATEWAY_HOST"] = state.workspace_host
     env["HARNESS_CODEX_DATABRICKS_PROFILE"] = profile
-    env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(spec.model_egress)
+    env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(model_egress)
 
 
 def _inject_ucode_agent_state(
@@ -1216,7 +1235,7 @@ def _resolve_provider_for_build(
         # Global ApiKeyAuth — threaded by the builder's global-auth branch.
         return None
     model = _resolve_spec_model(spec)
-    if model is not None and model.startswith(("databricks-", "databricks/")):
+    if model is not None and is_databricks_model_id(model):
         # The model name itself signals Databricks intent (no pinned profile).
         return _legacy_databricks_provider(None, harness_type=harness_type, for_launch=for_launch)
     effective = effective_config_with_detected(explicit_config)
@@ -1355,7 +1374,7 @@ def _build_claude_sdk_spawn_env(
     # 3. Global config ~/.omnigent/config.yaml auth: — only when spec has
     #    no auth at all (same guard as openai-agents to prevent global defaults
     #    from silently overriding YAML-declared legacy profiles).
-    # 4. Auto-Databricks: databricks-* model prefix triggers Databricks routing.
+    # 4. Auto-Databricks: a Databricks model id triggers Databricks routing.
     provider = _resolve_provider_for_build(spec, harness_type="claude-sdk", for_launch=True)
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="claude-sdk")
@@ -1377,10 +1396,10 @@ def _build_claude_sdk_spawn_env(
                 env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] = auth_from_spec.base_url
                 env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] = _key_cmd
         # Enable the gateway for an ApiKeyAuth ``base_url`` (a custom endpoint) or
-        # a ``databricks-`` model; without the flag the executor ignores the base
+        # a Databricks model; without the flag the executor ignores the base
         # URL and falls through to api.anthropic.com.
         if (isinstance(auth_from_spec, ApiKeyAuth) and bool(auth_from_spec.base_url)) or (
-            model is not None and model.startswith(("databricks-", "databricks/"))
+            model is not None and is_databricks_model_id(model)
         ):
             env["HARNESS_CLAUDE_SDK_GATEWAY"] = "true"
     _add_claude_sdk_skills_env(env, spec, workdir)
@@ -1417,6 +1436,9 @@ def _build_claude_sdk_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+    # Explicitly clear inherited presets for agents that have not opted in.
+    preset = spec.executor.config.get("system_prompt_preset")
+    env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
     return env
 
 
@@ -1552,7 +1574,9 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<dir>/``.
+        from ``<bundle>/skills/<dir>/`` and ``<bundle>/.pi/skills/<dir>/``,
+        extensions from ``<bundle>/.pi/extensions``, and a bundle-root
+        context file (``AGENTS.md`` et al.).
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -2133,8 +2157,8 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         # Legacy path: executor.config["profile"] (deprecated — use executor.auth instead).
         # DEPRECATED: config["profile"] will be removed once all specs migrate to auth:.
         profile = spec.executor.config.get("profile")
-        if not profile and model and model.startswith(("databricks-", "databricks/")):
-            # databricks- / databricks/ prefix: route to Databricks (avoiding the
+        if not profile and model and is_databricks_model_id(model):
+            # A Databricks model id: route to Databricks (avoiding the
             # OPENAI_API_KEY short-circuit) via the SDK's DEFAULT profile. The
             # ambient DATABRICKS_CONFIG_PROFILE env var is deliberately NOT
             # consulted — credentials are controlled by the spec or by
@@ -2555,27 +2579,13 @@ def _build_copilot_spawn_env(
 
 
 def _serialize_os_env(value: OSEnvSpec | None) -> str | None:
-    """
-    Encode an :class:`OSEnvSpec` for the wrap's env-var input.
-
-    JSON-encodes :func:`dataclasses.asdict` of the OSEnvSpec so
-    the wrap can :func:`json.loads` it back on the harness side
-    (per the per-spawn env-var pattern from §Step 5a). When
-    *value* is ``None`` (no os_env declared on the spec), this
-    returns ``None`` and ``_build_claude_sdk_spawn_env`` omits
-    the env var entirely — the wrap then falls back to its
-    enable-natives-by-default rule.
-
-    :param value: ``spec.os_env`` — an :class:`OSEnvSpec`
-        instance or ``None``.
-    :returns: JSON string encoding the OSEnvSpec, or ``None``
-        when *value* is ``None``.
-    """
-    import dataclasses
+    """Encode an OS environment for harness subprocesses."""
 
     if value is None:
         return None
-    return json.dumps(dataclasses.asdict(value))
+    from omnigent.inner.os_env_serialization import encode_os_env_spec
+
+    return json.dumps(encode_os_env_spec(value))
 
 
 def _serialize_retry_policy(value: RetryPolicy | None) -> str | None:

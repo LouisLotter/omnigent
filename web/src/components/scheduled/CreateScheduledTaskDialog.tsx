@@ -475,7 +475,7 @@ export function CreateScheduledTaskDialog({
                 // Match the sibling <Select> fields (Frequency / host): full
                 // width, bordered, h-8, normal foreground text — not the compact
                 // muted ghost styling the composer footer uses.
-                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
+                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
                 triggerLabelClassName="max-w-none text-ui"
               />
             </div>
@@ -583,7 +583,7 @@ export function CreateScheduledTaskDialog({
             <p className="text-sm text-muted-foreground">
               {sandboxMode
                 ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
-                : "Leave unset to run on your connected host when the task fires."}
+                : "Leave unset to run on your connected host when the automation fires."}
             </p>
           </div>
 
@@ -653,7 +653,7 @@ export function CreateScheduledTaskDialog({
             data-testid="create-scheduled-task-submit"
             componentId="tasks.scheduled.save"
           >
-            {isEdit ? "Save changes" : "Create task"}
+            {isEdit ? "Save changes" : "Create automation"}
           </Button>
         </DialogFooter>
       </DialogContent>
