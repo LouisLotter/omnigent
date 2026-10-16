@@ -608,7 +608,9 @@ def test_expired_cli_ticket_is_not_revived_by_manual_recovery(
     assert oidc_login.client.get(link).status_code == 302
     assert oidc_login.state()["ticket"] == ticket
     oidc_login.claims["auth_time"] = int(time.time())
-    assert oidc_login.finish(oidc_login.state()["state"]).status_code == 302
+    response = oidc_login.finish(oidc_login.state()["state"])
+    assert response.status_code == 302
+    assert response.headers["location"] == "/"
     assert oidc_login.client.get(f"{oidc_login.prefix}/cli-poll", **poll_args).status_code == 410
 
 
