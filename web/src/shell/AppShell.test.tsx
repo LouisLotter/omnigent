@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
@@ -15,6 +16,7 @@ import { useCallback, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
+  Link,
   MemoryRouter,
   Route,
   Routes,
@@ -179,9 +181,7 @@ vi.mock("./FilesPanel", () => ({
   ),
 }));
 vi.mock("./FileViewer", () => ({
-  // frameless=true → the inline desktop viewer (always open when rendered).
-  // frameless=false/absent → the mobile push-panel (open prop controls visibility).
-  // Use different testids so tests can target the one they care about.
+  // One frameless viewer moves between desktop and mobile layouts.
   FileViewer: ({
     open,
     path,
@@ -303,6 +303,8 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -361,6 +363,15 @@ function ForkDialogProbe() {
         onClick={() => fork.openForkDialog({ upToResponseId: "resp_probe" })}
       >
         fork-from-here
+      </button>
+      <button
+        type="button"
+        data-testid="fork-probe-recover-workspace"
+        onClick={() =>
+          fork.openForkDialog({ sourceSessionId: "conv_abc", workspaceRecovery: true })
+        }
+      >
+        recover-workspace
       </button>
       <button
         type="button"
@@ -547,7 +558,7 @@ function renderShell(
               Settings button and the sidebar's Back row, both of which live in
               components mocked out here. */}
       <Route
-        path="settings"
+        path="settings/*"
         element={
           <>
             <div>settings</div>
@@ -712,6 +723,7 @@ beforeEach(() => {
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
+    sandboxStatus: null,
   });
 });
 
@@ -1173,6 +1185,44 @@ describe("AppShell header", () => {
     fireEvent.click(screen.getByTestId("nav-session"));
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("holds startup while the session's managed sandbox is still launching", () => {
+    // Provisioning outlasts the cold-boot grace, and the server reports a
+    // session with no runner yet as reachable, so only the launch status
+    // keeps the terminal from offering Resume.
+    runnerHealthState.runnerOnline = true;
+    mockConversations([
+      {
+        id: "conv_sandbox",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000) - 600,
+      },
+    ]);
+    useChatStore.setState({ sandboxStatus: { stage: "provisioning" } });
+
+    renderShell("/c/conv_sandbox");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("releases startup once the managed sandbox launch fails", () => {
+    // A failed launch never brings a terminal; its failure band owns the view.
+    runnerHealthState.runnerOnline = true;
+    mockConversations([
+      {
+        id: "conv_sandbox_failed",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000) - 600,
+      },
+    ]);
+    useChatStore.setState({ sandboxStatus: { stage: "failed", error: "quota exceeded" } });
+
+    renderShell("/c/conv_sandbox_failed");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
 
   it("does not hold startup for a fresh chat-first session with an online runner", () => {
@@ -1918,15 +1968,23 @@ describe("Workspace rail maximize", () => {
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
-  it("pins the sidebar open on /settings so the Back row is reachable", () => {
-    // The settings nav replaces the session list INSIDE the sidebar, and its
-    // Back row is the only way off the page. Collapsed, that row is clipped and
-    // inert — the user is stranded with no visible exit. Entering /settings must
-    // therefore force the sidebar open.
+  it.each([
+    ["desktop", "/settings", true],
+    ["desktop", "/settings/import", true],
+    ["mobile", "/settings", true],
+    ["mobile", "/settings/import", false],
+    ["mobile", "/settings/harnesses/codex", false],
+  ] as const)("opens the appropriate settings surface on %s at %s", (viewport, path, open) => {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)" ? viewport === "desktop" : false,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
-    renderShell("/settings");
+    renderShell(path);
 
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
   });
 
   it("refuses to collapse the sidebar while on /settings", () => {
@@ -2653,6 +2711,49 @@ describe("Extension pages own the header", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("restores each Canvas card's saved Workspace choice", async () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_first", permission_level: null },
+      { id: "conv_second", permission_level: null },
+    ]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider info={serverInfo({ features: { canvas: true } })}>
+        {shellTree(
+          qc,
+          "/canvas/c/conv_first",
+          <Route
+            path="canvas/c/:conversationId"
+            element={
+              <>
+                <Link to="/canvas/c/conv_first">First card</Link>
+                <Link to="/canvas/c/conv_second">Second card</Link>
+              </>
+            }
+          />,
+        )}
+      </CapabilitiesProvider>,
+    );
+    const board = await screen.findByText("canvas board");
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Second card" }));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    fireEvent.click(screen.getByRole("link", { name: "First card" }));
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByText("canvas board")).toBe(board);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    fireEvent.click(screen.getByRole("link", { name: "Second card" }));
+    fireEvent.click(screen.getByRole("link", { name: "First card" }));
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+  });
+
   it("focuses the tab strip without replacing its selected soft tab", async () => {
     writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
@@ -2782,6 +2883,28 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
+  });
+
+  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+    writeSessionWorkspaceState("conv_compact_workspace", {
+      open: true,
+      rightRailTab: "changes",
+      openFiles: ["README.md"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_compact_workspace", permission_level: null }]);
+    renderShell("/c/conv_compact_workspace");
+    const selected = screen.getByRole("tab", { name: /changes/i });
+    Object.defineProperty(selected, "checkVisibility", { value: () => false });
+
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+
+    await waitFor(() =>
+      expect(screen.getByRole("toolbar", { name: "Workspace tabs" })).toHaveFocus(),
+    );
   });
 
   it("mounts an expandable pending card for a temporary session", () => {
@@ -3383,11 +3506,8 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md");
 
-    // Viewer must be open and pointing at the file from the URL.
-    // file-viewer = mobile push-panel (md:hidden); file-viewer-inline = desktop inline.
-    // Failure: the conversationId effect did not read searchParams.get("file")
-    // and call setSelectedFilePath with it.
-    const pushPanel = screen.getByTestId("file-viewer");
+    const pushPanel = screen.getByTestId("file-viewer-inline");
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
   });
@@ -3474,8 +3594,7 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1");
 
-    // Scope to mobile push-panel to avoid ambiguity with the inline frameless viewer.
-    const pushPanel = screen.getByTestId("file-viewer");
+    const pushPanel = screen.getByTestId("file-viewer-inline");
     expect(pushPanel).toHaveAttribute("data-state", "open");
 
     fireEvent.click(within(pushPanel).getByRole("button", { name: /file-viewer: close/i }));
@@ -3943,6 +4062,104 @@ describe("Mobile session menu", () => {
 });
 
 describe("AppShell clone/fork action", () => {
+  it.each([false, true])(
+    "resolves a scoped recovery source's own restrictions under a blocked parent (child blocked=%s)",
+    (childBlocked) => {
+      const parent = sessionSnapshot({
+        id: "conv_parent",
+        labels: { "omnigent.host_type": "managed" },
+      });
+      const child = sessionSnapshot({
+        id: "conv_side_child",
+        workspace: "/missing/child",
+        hostId: "host_a",
+        labels: childBlocked ? { "omnigent.host_type": "managed" } : {},
+      });
+      mockConversations([{ id: "conv_parent", permission_level: 4 }]);
+      useSessionMock.mockImplementation((sessionId) => ({
+        session: sessionId === child.id ? child : sessionId === parent.id ? parent : null,
+        isLoading: false,
+        error: null,
+      }));
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+      } as ReturnType<typeof useHosts>);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        sessionShellTree(
+          client,
+          "/c/conv_parent",
+          <ConversationScopeContext.Provider value="conv_side_child">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>,
+        ),
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+
+      expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+      if (childBlocked) {
+        expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+          "Forking this sandbox session is not supported yet.",
+        );
+        expect(screen.queryByTestId("workspace-path-input")).not.toBeInTheDocument();
+        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+      } else {
+        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
+      }
+      expect(forkSessionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("opens workspace recovery and resets it before a later normal fork", async () => {
+    const source = sessionSnapshot({
+      id: "conv_abc",
+      title: "Missing checkout",
+      workspace: "/missing/repo",
+      hostId: "host_a",
+    });
+    mockConversations([
+      { id: "conv_abc", permission_level: 4, host_id: "host_a", workspace: "/missing/repo" },
+    ]);
+    useSessionMock.mockReturnValue({ session: source, isLoading: false, error: null });
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+    } as ReturnType<typeof useHosts>);
+
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByTestId("fork-probe-recover-workspace"));
+    expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+    expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+    expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
+    expect(forkSessionMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+    expect(screen.getByRole("heading", { name: /Fork from this response/ })).toBeVisible();
+    expect(screen.queryByText(/Files from the missing workspace/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-advanced-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("/missing/repo"),
+    );
+  });
+
+  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+    mockConversations([{ id: "conv_managed", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_managed",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_managed");
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
+
   it("exposes canFork to a read-only collaborator on a top-level session", () => {
     // level 1 = read. A collaborator who can only view the shared session
     // must still be able to fork it into their own copy. The header/menu
@@ -5083,6 +5300,28 @@ describe("AppShell design-mode submission", () => {
         message: test.queued ? "Queued for agent." : "Sent to agent.",
       }),
     );
+  });
+
+  it("queues behind a first message still held for startup, even with always-steer", () => {
+    // The status can read idle during startup while the first message waits locally.
+    localStorage.setItem("omnigent:always-steer", "true");
+    Object.assign(chat, {
+      status: "idle",
+      sessionStatus: "idle",
+      pendingUserMessages: [
+        {
+          tempId: "pend_held",
+          content: [{ type: "input_text", text: "first" }],
+          initialDraft: { text: "first", files: [] },
+          createdAtS: 0,
+        },
+      ],
+    });
+    renderShell("/c/conv_design");
+    submitInstruction();
+
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("reads a changed always-steer preference at submission without remounting", () => {

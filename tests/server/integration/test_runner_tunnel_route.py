@@ -37,6 +37,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.server import tunnel_handshake
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
@@ -1107,6 +1108,23 @@ async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
     assert registry.get(_RUNNER_ID) is None
     with contextlib.suppress(asyncio.TimeoutError):
         await communicator.wait(timeout=budget(1.0))
+
+
+async def test_ws_tunnel_closes_silent_peer_within_handshake_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accepted peer that never sends hello is closed with retryable 1013."""
+    monkeypatch.setattr(tunnel_handshake, "HELLO_TIMEOUT_S", 0.2)
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        close = await communicator.receive_output(timeout=budget(5.0))
+        assert close == {"type": "websocket.close", "code": 1013, "reason": "hello timeout"}
+        assert route_app.registry.get(_RUNNER_ID) is None
+        await asyncio.wait_for(communicator.future, budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
 
 
 @pytest.mark.parametrize("end", ["disconnect", "non_hello"])
@@ -2182,6 +2200,14 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert timeouts[0]["app_silence_timeout_s"] == 0.02
     assert timeouts[0]["last_received_frame_age_s"] >= 0
     assert timeouts[0]["last_app_pong_received_age_s"] is None
+    # A silent peer is an expected, self-recovering outage, not a warning.
+    assert timeouts[0]["silence_source"] == "peer"
+    assert timeouts[0]["error_category"] == "runner"
+    assert timeouts[0]["error_impact"] == "transient"
+    [timeout_record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_ping_timeout"
+    ]
+    assert timeout_record.levelno == logging.INFO
     ends = _tunnel_end_events(caplog)
     assert len(ends) == 1
     assert ends[0]["phase"] == "disconnected"

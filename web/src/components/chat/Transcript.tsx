@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent } from "@/lib/systemMessage";
+import { isTerminalCommandInput } from "@/lib/blocks";
 import {
   type Bubble,
   type BubbleCache,
@@ -24,7 +25,8 @@ import {
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
-import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { DbcertBanner } from "@/components/DbcertBanner";
 import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
@@ -171,8 +173,8 @@ function TranscriptImpl({
     const ids = new Set<string>();
     for (const block of blocks) {
       if (
-        block.type === "user_message" &&
-        !isSystemUserContent(block.content) &&
+        ((block.type === "user_message" && !isSystemUserContent(block.content)) ||
+          isTerminalCommandInput(block)) &&
         block.ctx.itemId !== null
       ) {
         ids.add(block.ctx.itemId);
@@ -432,8 +434,11 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs warning, a sibling of Conversation. */}
-        <StreamBudgetBanner />
+        {/* Too-many-tabs and expired-dbcert warnings, siblings of Conversation. */}
+        <FloatingBannerStack>
+          <StreamBudgetBanner />
+          <DbcertBanner conversationId={conversationId} hostId={hostId} />
+        </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
         {!isMobileViewport && (
           <TurnRail

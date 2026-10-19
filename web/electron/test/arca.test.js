@@ -8,7 +8,10 @@ const {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
+  readArcaStatus,
   resolveArcaPath,
+  runArcaExtend,
+  runDbcertRefresh,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
@@ -20,11 +23,168 @@ function fakeConnectChild() {
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.killed = false;
-  child.kill = () => {
+  child.signals = [];
+  child.kill = (signal) => {
     child.killed = true;
+    child.signals.push(signal);
   };
   return child;
 }
+
+function commandDeps(outputs) {
+  const calls = [];
+  return {
+    calls,
+    resolveArcaPath: () => "/bin/arca",
+    spawn: (_path, args) => {
+      calls.push(args);
+      const child = fakeConnectChild();
+      const output = outputs.shift();
+      queueMicrotask(() => {
+        child.stdout.emit("data", output?.stdout ?? "");
+        child.stderr.emit("data", output?.stderr ?? "");
+        child.emit("close", output?.code ?? 0);
+      });
+      return child;
+    },
+  };
+}
+
+describe("arca extend command", () => {
+  const running = '{"status":"running","instance":{"shutdown_time":"2026-10-06T01:00:00Z"}}';
+  it("finds status after many brace-containing CLI notices", async () => {
+    const notices = Array.from({ length: 24 }, (_, index) => `notice {${index}}`).join("\n");
+    const deps = commandDeps([{ stdout: `${notices}\n${running}` }]);
+    assert.equal((await readArcaStatus(deps)).state, "running");
+  });
+  it("rejects a JSON error object even when status exits zero", async () => {
+    const result = await readArcaStatus(commandDeps([{ stdout: '{"error":"failed"}' }]));
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Unexpected arca status output/);
+  });
+  it("checks a running instance first and reports the updated shutdown time", async () => {
+    const updated = '{"status":"running","instance":{"shutdown_time":"2026-10-07T01:00:00Z"}}';
+    const deps = commandDeps([{ stdout: running }, { stdout: "Extended" }, { stdout: updated }]);
+    assert.deepEqual(await runArcaExtend("overnight", deps), {
+      ok: true,
+      shutdownAt: Date.UTC(2026, 9, 7, 1),
+    });
+    assert.deepEqual(deps.calls, [
+      ["status", "--json"],
+      ["extend", "overnight"],
+      ["status", "--json"],
+    ]);
+  });
+
+  it("does not invoke extend when status is stopped or lacks an instance", async () => {
+    await Promise.all(
+      ["stopped", "running"].map(async (status) => {
+        const deps = commandDeps([{ stdout: JSON.stringify({ status, instance: null }) }]);
+        assert.equal((await runArcaExtend("workweek", deps)).ok, false);
+        assert.deepEqual(deps.calls, [["status", "--json"]]);
+      }),
+    );
+  });
+
+  it("rejects every mode outside overnight and workweek before spawning", async () => {
+    const deps = commandDeps([]);
+    assert.equal((await runArcaExtend("default", deps)).ok, false);
+    assert.equal((await runArcaExtend(["overnight"], deps)).ok, false);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("times out a stuck status check", async () => {
+    const child = fakeConnectChild();
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await readArcaStatus({
+        resolveArcaPath: () => "/bin/arca",
+        spawn: () => child,
+        timeoutMs: 5,
+        killGraceMs: 5,
+      });
+      assert.equal(result.errorKind, "timeout");
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it("times out a stuck extend after the status precheck", async () => {
+    const child = fakeConnectChild();
+    const deps = commandDeps([{ stdout: running }]);
+    const firstSpawn = deps.spawn;
+    deps.spawn = (path, args) => (args[0] === "extend" ? child : firstSpawn(path, args));
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await runArcaExtend("overnight", { ...deps, timeoutMs: 5, killGraceMs: 5 });
+      assert.equal(result.errorKind, "timeout");
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it("classifies failed extend commands", async () => {
+    await Promise.all(
+      [
+        ["No running Arca instance", "no-instance"],
+        ["Runtime limit reached", "runtime-limit"],
+        ["certificate expired; run arca login", "arca-auth"],
+        ["unexpected failure", "unknown"],
+      ].map(async ([stderr, errorKind]) => {
+        const deps = commandDeps([{ stdout: running }, { code: 1, stderr }]);
+        const result = await runArcaExtend("overnight", deps);
+        assert.equal(result.errorKind, errorKind);
+        assert.deepEqual(deps.calls, [
+          ["status", "--json"],
+          ["extend", "overnight"],
+        ]);
+      }),
+    );
+  });
+});
+
+describe("dbcert refresh", () => {
+  const dbcertDeps = (outputs) => ({
+    ...commandDeps(outputs),
+    resolveDbcertPath: () => "/bin/dbcert",
+  });
+
+  it("forces a new certificate and names Omnigent as the caller", async () => {
+    const deps = dbcertDeps([{ stdout: "All credentials successfully written" }]);
+    assert.deepEqual(await runDbcertRefresh(deps), { ok: true });
+    assert.deepEqual(deps.calls, [["--force", "--caller-name", "omnigent"]]);
+  });
+
+  it("reports the last line dbcert printed when it fails", async () => {
+    const deps = dbcertDeps([{ code: 1, stderr: "Opening browser\nlogin was canceled\n" }]);
+    assert.deepEqual(await runDbcertRefresh(deps), { ok: false, error: "login was canceled" });
+  });
+
+  it("reports a missing dbcert without spawning", async () => {
+    const deps = { ...dbcertDeps([]), resolveDbcertPath: () => null };
+    assert.match((await runDbcertRefresh(deps)).error, /not found/);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("ends an abandoned sign-in", async () => {
+    const child = fakeConnectChild();
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await runDbcertRefresh({
+        resolveDbcertPath: () => "/bin/dbcert",
+        spawn: () => child,
+        timeoutMs: 5,
+        killGraceMs: 5,
+      });
+      assert.deepEqual(result, { ok: false, error: "The dbcert sign-in timed out." });
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+});
 
 describe("arca binary resolution", () => {
   it("prefers PATH, then falls back to well-known locations", () => {
