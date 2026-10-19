@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -48,6 +49,42 @@ def _noop_policy_arg() -> str:
         "utf-8"
     )
     return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+@pytest.mark.parametrize("grant_field", ["write_roots", "write_files"])
+@pytest.mark.parametrize("grant_parent", [False, True])
+def test_exec_launcher_rejects_writable_launcher_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, grant_field: str, grant_parent: bool
+) -> None:
+    launcher_dir = tmp_path / "launchers"
+    launcher_dir.mkdir()
+    monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(launcher_dir))
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type="linux_bwrap")
+    setattr(policy, grant_field, [tmp_path if grant_parent else launcher_dir])
+
+    with pytest.raises(ValueError, match="Grant a dedicated scratch directory"):
+        create_exec_launcher(sys.executable, policy)
+    assert list(launcher_dir.iterdir()) == []
+
+
+def test_exec_launcher_accepts_dedicated_scratch_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launcher_dir = tmp_path / "launchers"
+    launcher_dir.mkdir()
+    scratch = launcher_dir / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(launcher_dir))
+    policy = dataclasses.replace(
+        _noop_policy(), active=True, backend_type="linux_bwrap", write_roots=[scratch]
+    )
+
+    path = pathlib.Path(create_exec_launcher(sys.executable, policy, cwd=str(scratch)))
+    try:
+        assert path.parent == launcher_dir
+        assert path.stat().st_mode & 0o777 == 0o700
+    finally:
+        path.unlink()
 
 
 def test_run_launcher_emits_logger_checkpoints(caplog) -> None:
@@ -140,6 +177,28 @@ def test_exec_launcher_wrapper_subprocess_emits_markers_to_stderr() -> None:
     )
     assert "[omnigent-sandbox] activated; spawning target=" in result.stderr, result.stderr
     assert "[omnigent-sandbox] target exited rc=0" in result.stderr, result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher script")
+def test_exec_launcher_ignores_workspace_modules(tmp_path: pathlib.Path) -> None:
+    """Modules in the spawner's cwd never replace the launcher's own imports."""
+    for name in ("logging", "json", "base64"):
+        (tmp_path / f"{name}.py").write_text(f"raise ImportError('{name} loaded from the cwd')\n")
+    wrapper_path = create_exec_launcher(sys.executable, _noop_policy())
+    try:
+        result = subprocess.run(
+            [wrapper_path, "-c", "print('target ran')"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "target ran"
 
 
 def test_run_launcher_wraps_target_with_strace_when_env_set(monkeypatch, caplog) -> None:
