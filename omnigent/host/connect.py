@@ -674,6 +674,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # ssh-agent auth, so git-over-SSH and SSH-cert-authenticated tooling
         # fail with "dial unix: missing address".
         "SSH_AUTH_SOCK",
+        # The host's credential broker socket (omnigent.host.credential_broker):
+        # a path like SSH_AUTH_SOCK, which gh's wrapper asks for a GitHub token.
+        "OMNIGENT_HOST_BROKER_SOCKET",
         # The user's URL-opener command (e.g. a remote-dev helper that forwards
         # URLs and OAuth callbacks to the laptop). A command name, not a secret.
         # Without it, CLI logins in the agent fall back to a local browser.
@@ -5317,26 +5320,14 @@ def _serve_host_until_exit(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    # Executor-agnostic GitHub setup: point git at the server's credential
-    # broker and attribute commits to the owner. Best-effort; the host runs in
+    # Executor-agnostic GitHub setup: serve the owner's GitHub token to git and
+    # gh from this process's credential broker and attribute commits to the
+    # owner. Best-effort and a no-op outside a managed sandbox; the host runs in
     # every executor and holds the launch token, so no launcher needs to inject
     # anything GitHub-specific.
-    from omnigent.git_credential_github import (
-        configure_host_gh,
-        configure_host_git,
-        start_host_gh_refresh,
-    )
+    from omnigent.git_credential_github import configure_host_git
 
     configure_host_git(server_url, identity.host_id)
-    # gh CLI ignores git's credential.helper for its own API calls, so also
-    # materialize the owner's brokered token into gh's hosts.yml, then keep it
-    # fresh: git re-fetches per op via the broker, but gh reads a static
-    # hosts.yml, so a background thread re-writes it before the GitHub token
-    # expires (~8h). All three are no-ops outside a managed sandbox; the refresher
-    # runs regardless of the startup write (its ticks re-fetch, so a transient
-    # broker blip at startup can't strand a connected owner for the whole session).
-    configure_host_gh(server_url, identity.host_id)
-    start_host_gh_refresh(server_url, identity.host_id)
 
     # Executor-agnostic Databricks setup: when the owner has linked a workspace,
     # materialize their per-user token as a ``~/.databrickscfg`` profile so the

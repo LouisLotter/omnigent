@@ -405,6 +405,16 @@ RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
 # are sourced after that reset, so this puts the venv back in front.
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
 
+# gh wrapper ahead of /usr/local/bin/gh: hands gh the session owner's GitHub
+# token from the host's credential broker as GH_TOKEN, so no token is written to
+# gh's hosts.yml (omnigent/host/credential_broker.py). Without a broker it runs
+# gh unchanged. /opt/venv/bin stays first on PATH, also in login shells.
+RUN printf '%s\n' '#!/opt/venv/bin/python -I' \
+      'from omnigent.host.credential_broker import gh_main' \
+      'gh_main()' > /opt/venv/bin/gh \
+ && chmod 0755 /opt/venv/bin/gh \
+ && /opt/venv/bin/gh --version >/dev/null
+
 # Optional extra harness CLIs, off by default: space-separated harness names
 # with optional @version pins, or npm:<pkg-spec> — see install-harness-cli.sh
 # and deploy/docker/README.md. Kept at the end of the stage so script churn
