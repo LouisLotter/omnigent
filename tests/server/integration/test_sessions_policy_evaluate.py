@@ -928,6 +928,53 @@ async def test_tool_call_ask_repost_from_a_departed_client_leaves_the_verdict(
     assert listening.json()["result"] == "POLICY_ACTION_ALLOW"
 
 
+_COUNTED_ASKS: list[str] = []
+
+
+def _counted_ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
+    """ASK for Bash, recording each evaluation."""
+    _COUNTED_ASKS.append(str(event.get("type")))
+    return _ask_for_bash(event)
+
+
+async def test_tool_call_ask_repost_after_its_answer_is_not_evaluated_again(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-post whose answer was lost gets that answer without a second evaluation.
+
+    Evaluating again would apply the policy's writes twice, and an approval
+    that changes the policy's verdict to allow would skip the remembered one.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._counted_ask_for_bash")
+    _COUNTED_ASKS.clear()
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session_id}/policies/evaluate"
+    body = {
+        **_tool_call_request("Bash"),
+        "_omnigent_elicitation_id": "elicit_evaluate_" + "8" * 32,
+    }
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    first = asyncio.create_task(client.post(path, json=body))
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept"},
+    )
+    assert verdict.status_code == 202, verdict.text
+    assert (await asyncio.wait_for(first, timeout=5)).json()["result"] == "POLICY_ACTION_ALLOW"
+    evaluations = len(_COUNTED_ASKS)
+
+    repost = await asyncio.wait_for(client.post(path, json=body), timeout=5)
+
+    assert repost.status_code == 200, repost.text
+    assert repost.json()["result"] == "POLICY_ACTION_ALLOW"
+    assert len(_COUNTED_ASKS) == evaluations, "the re-post must not be evaluated again"
+
+
 async def test_tool_call_ask_returns_deny_on_decline(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

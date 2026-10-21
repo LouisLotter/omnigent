@@ -719,6 +719,40 @@ def _prune_harness_elicitation_deadlines(now: float) -> None:
             _harness_elicitation_deadlines.pop(elicitation_id, None)
 
 
+def ask_request_fingerprint(phase: Phase, data: object) -> str:
+    """
+    Digest the whole request an ASK gate answers, not its truncated preview.
+
+    :param phase: The gated phase, e.g. :attr:`Phase.TOOL_CALL`.
+    :param data: The request's event data, e.g. a tool call's name and arguments.
+    :returns: A sha256 hex digest.
+    """
+    canonical = json.dumps(
+        {"phase": phase.value, "data": data}, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def answered_ask_verdict(
+    session_id: str, elicitation_id: str, phase: Phase, data: object
+) -> _AnsweredHarnessElicitation | None:
+    """
+    Return the outcome a re-posted question already reached, before anything evaluates it.
+
+    Evaluating it again would apply the policy's writes a second time, and an
+    approval can change the policy's answer from ask to allow.
+
+    :param session_id: Session asking, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The question's stable id.
+    :param phase: The gated phase.
+    :param data: The request's event data.
+    :returns: The remembered outcome, or ``None``.
+    """
+    return _answered_harness_elicitation(
+        session_id, elicitation_id, ask_request_fingerprint(phase, data)
+    )
+
+
 def _answered_harness_elicitation(
     session_id: str, elicitation_id: str, request_fingerprint: str
 ) -> _AnsweredHarnessElicitation | None:
@@ -2709,7 +2743,7 @@ async def _hold_native_ask_gate_impl(
     # this ASK in the native terminal before parking on the web verdict.
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
-    fingerprint = _harness_elicitation_request_fingerprint(params)
+    fingerprint = ask_request_fingerprint(phase, data)
     answered = _answered_harness_elicitation(session_id, elicitation_id, fingerprint)
     if answered is not None:
         # A re-post of a question already answered (its reply was lost): hand
@@ -2749,10 +2783,6 @@ async def _hold_native_ask_gate_impl(
             policy_name=result.deciding_policy,
         )
     approved = verdict is not None and verdict.action == "accept"
-    if verdict is not None:
-        _remember_answered_harness_elicitation(
-            session_id, elicitation_id, fingerprint, approved=approved, declined_reason=None
-        )
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
         # land only on approve.
@@ -2761,6 +2791,11 @@ async def _hold_native_ask_gate_impl(
         if result.state_updates:
             with contextlib.suppress(ConversationNotFoundError):
                 engine.apply_state_updates(result.state_updates)
+    if verdict is not None:
+        # Remembered only once its writes landed, so a re-post never skips them.
+        _remember_answered_harness_elicitation(
+            session_id, elicitation_id, fingerprint, approved=approved, declined_reason=None
+        )
     return approved
 
 

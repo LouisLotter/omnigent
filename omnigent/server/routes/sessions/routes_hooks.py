@@ -96,6 +96,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
+    answered_ask_verdict,
 )
 from omnigent.server.schemas import (
     ElicitationRequestParams,
@@ -837,6 +838,22 @@ def register_hooks_routes(
             if answered is not None:
                 return answered
             hook_elicitation_id = mcp_approval_id
+        if hook_elicitation_id is not None and not is_read_only:
+            answered = answered_ask_verdict(session_id, hook_elicitation_id, phase, data)
+            if answered is not None:
+                # A re-post whose earlier answer was lost: the same verdict, with
+                # nothing evaluated or written again.
+                return Response(
+                    content=json.dumps(
+                        {"result": "POLICY_ACTION_ALLOW"}
+                        if answered.approved
+                        else {
+                            "result": "POLICY_ACTION_DENY",
+                            "reason": answered.declined_reason or "Approval was not granted.",
+                        }
+                    ),
+                    media_type="application/json",
+                )
         raw_event_context = event.get("context")
         if raw_event_context is not None and not isinstance(raw_event_context, dict):
             raise OmnigentError(

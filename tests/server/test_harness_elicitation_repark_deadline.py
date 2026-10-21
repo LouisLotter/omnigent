@@ -193,3 +193,59 @@ async def test_repost_of_an_answered_question_reuses_its_outcome_without_reapply
     assert await asyncio.wait_for(ask(), timeout=2.0) is True
     assert applied == [{"approved": "1"}, ["checkpoint"]], "writes applied once"
     assert popups == [eid]
+
+
+@pytest.mark.asyncio
+async def test_remembered_outcome_matches_the_whole_request_and_only_after_its_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different command reusing the id asks again; a failed write is never remembered."""
+    monkeypatch.setattr(
+        orchestration, "_spawn_native_approval_popup_forward", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(orchestration, "resolve_ask_timeout", lambda engine, result: 5.0)
+
+    def fail(_updates: object) -> None:
+        raise RuntimeError("state write failed")
+
+    engine = SimpleNamespace(apply_label_writes=lambda labels: None, apply_state_updates=fail)
+    result = SimpleNamespace(
+        reason="Approve?", deciding_policy="ask-bash", set_labels=None, state_updates=["x"]
+    )
+    eid = "elicit_evaluate_77777777777777777777777777777777"
+    long_prefix = "echo " + "a" * 2000
+    data = {"name": "Bash", "arguments": {"command": long_prefix + " one"}}
+
+    task = asyncio.create_task(
+        S._hold_native_ask_gate(
+            _Request(),  # type: ignore[arg-type]
+            session_id="conv_repark",
+            phase=Phase.TOOL_CALL,
+            data=data,
+            engine=engine,  # type: ignore[arg-type]
+            result=result,  # type: ignore[arg-type]
+            conversation_store=None,  # type: ignore[arg-type]
+            elicitation_id=eid,
+        )
+    )
+    while eid not in _elicitation_registry._harness_elicitation_registry:
+        await asyncio.sleep(0)
+    _elicitation_registry._harness_elicitation_registry[eid].set_result(
+        ElicitationResult(action="accept")
+    )
+    with pytest.raises(RuntimeError, match="state write failed"):
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert orchestration.answered_ask_verdict("conv_repark", eid, Phase.TOOL_CALL, data) is None
+
+    orchestration._remember_answered_harness_elicitation(
+        "conv_repark",
+        eid,
+        orchestration.ask_request_fingerprint(Phase.TOOL_CALL, data),
+        approved=True,
+        declined_reason=None,
+    )
+    other = {"name": "Bash", "arguments": {"command": long_prefix + " two"}}
+    assert orchestration.answered_ask_verdict("conv_repark", eid, Phase.TOOL_CALL, data)
+    assert orchestration.answered_ask_verdict("conv_repark", eid, Phase.TOOL_CALL, other) is None
+    assert orchestration.answered_ask_verdict("conv_other", eid, Phase.TOOL_CALL, data) is None
