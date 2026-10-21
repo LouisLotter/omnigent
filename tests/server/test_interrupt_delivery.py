@@ -196,3 +196,31 @@ async def test_message_during_the_first_forward_keeps_the_stop_from_being_redeli
 
     assert scheduled is False
     assert interrupts == []
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_stop_leaves_a_newer_stops_redelivery_alone(
+    interrupts: list[httpx.Request],
+) -> None:
+    """Stop A, then a message, then Stop B: A failing later must not cancel B."""
+    registry = TunnelRegistry()
+    stop_a = interrupt_delivery.input_generation(_SESSION)
+    interrupt_delivery.note_new_input(_SESSION)
+    await _schedule(registry, None)  # Stop B, at the newer generation
+
+    superseded = interrupt_delivery.deliver_interrupt_after_reconnect(
+        _SESSION,
+        runner_id=_RUNNER,
+        after_generation=None,
+        tunnel_registry=registry,
+        runner_router=None,
+        queued_pending_ids=[],
+        wait_s=2.0,
+        stop_generation=stop_a,
+    )
+
+    assert superseded is False
+    assert interrupt_delivery.has_pending_interrupt(_SESSION), "Stop B must stay pending"
+    registry.register(_RUNNER, _NoopWS(), _hello())
+    await _settled()
+    assert len(interrupts) == 1

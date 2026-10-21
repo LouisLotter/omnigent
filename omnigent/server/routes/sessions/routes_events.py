@@ -1570,7 +1570,12 @@ def register_events_routes(
             )
             interrupt_delivered = False
             interrupt_lost = runner_client is None
-            if runner_client is not None:
+            superseded = not codex_child and input_generation(session_id) != stop_generation
+            if superseded:
+                # A message sent while this Stop looked up its runner started a
+                # newer turn, which an older Stop must not interrupt.
+                interrupt_lost = False
+            elif runner_client is not None:
                 try:
                     interrupt_resp = await runner_client.post(
                         f"/v1/sessions/{target_session_id}/events",
@@ -1585,7 +1590,9 @@ def register_events_routes(
                         "Interrupt forward failed for %r",
                         session_id,
                     )
-            interrupt_delivery = "delivered" if interrupt_delivered else "failed"
+            interrupt_delivery = (
+                "delivered" if interrupt_delivered else "superseded" if superseded else "failed"
+            )
             if not interrupt_delivered:
                 if codex_child:
                     raise OmnigentError(
@@ -1626,7 +1633,8 @@ def register_events_routes(
                 # No runner holds this session, so there is nothing to deliver to.
                 return {"queued": False}
             # "pending": the runner was unreachable, and the Stop is sent again
-            # when it reconnects; "failed": the runner refused it.
+            # when it reconnects; "failed": the runner refused it; "superseded":
+            # a newer message arrived first, so it was not sent.
             return {"queued": False, "delivery": interrupt_delivery}
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.

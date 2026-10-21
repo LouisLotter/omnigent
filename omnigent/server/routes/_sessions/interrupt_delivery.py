@@ -103,9 +103,10 @@ def deliver_interrupt_after_reconnect(
         Stop. A newer message means the Stop is not redelivered.
     :returns: ``False`` when a newer message already superseded the Stop.
     """
-    cancel_pending_interrupt(session_id)
     if input_generation(session_id) != stop_generation:
+        # Superseded: it must not replace a newer Stop's redelivery either.
         return False
+    cancel_pending_interrupt(session_id)
     task = asyncio.create_task(
         _deliver_after_reconnect(
             session_id,

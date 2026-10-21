@@ -10635,6 +10635,42 @@ async def test_stop_on_a_silent_runner_tunnel_is_reported_and_sent_after_reconne
         await fake_runner.aclose()
 
 
+async def test_stop_superseded_by_a_message_during_its_lookup_is_not_sent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that arrives while Stop looks up its runner keeps its turn running."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import interrupt_delivery
+
+    posted: list[httpx.Request] = []
+    runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: posted.append(request) or httpx.Response(204)
+        ),
+        base_url="http://runner",
+    )
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+
+    async def lookup_while_a_message_arrives(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        interrupt_delivery.note_new_input(session_id)
+        return runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", lookup_while_a_message_arrives)
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+        )
+    finally:
+        await runner.aclose()
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False, "delivery": "superseded"}
+    assert posted == []
+    assert not interrupt_delivery.has_pending_interrupt(session_id)
+
+
 @pytest.mark.parametrize(
     "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
 )
