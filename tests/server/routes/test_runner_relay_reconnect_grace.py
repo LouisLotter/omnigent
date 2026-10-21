@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import os
+import subprocess
+import sys
+from collections.abc import AsyncIterator, Callable, Iterator
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from omnigent.runtime import session_stream
-from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes._sessions import common, orchestration
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import start_session_stream_collector
 
@@ -340,3 +344,71 @@ async def test_an_unrecovered_stream_still_exhausts_its_grace(
         orchestration._session_status_cache.pop(session_id, None)
         orchestration._session_active_response_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.fixture
+def set_grace_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str | None], None]]:
+    """Set or clear the grace override, with a fresh resolver cache."""
+
+    def _set(value: str | None) -> None:
+        if value is None:
+            monkeypatch.delenv(common.RUNNER_DISCONNECT_GRACE_ENV_VAR, raising=False)
+        else:
+            monkeypatch.setenv(common.RUNNER_DISCONNECT_GRACE_ENV_VAR, value)
+        common.resolve_runner_disconnect_grace_s.cache_clear()
+
+    yield _set
+    common.resolve_runner_disconnect_grace_s.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(None, float(RUNNER_LIVENESS_TTL_S), id="unset-is-the-liveness-lease"),
+        pytest.param(" ", float(RUNNER_LIVENESS_TTL_S), id="blank"),
+        pytest.param("150", 150.0, id="extended"),
+        pytest.param(str(RUNNER_LIVENESS_TTL_S), float(RUNNER_LIVENESS_TTL_S), id="lease"),
+        pytest.param("3600", 3600.0, id="ceiling"),
+    ],
+)
+def test_runner_disconnect_grace_setting(
+    set_grace_env: Callable[[str | None], None], raw: str | None, expected: float
+) -> None:
+    set_grace_env(raw)
+    assert common.resolve_runner_disconnect_grace_s() == expected
+
+
+@pytest.mark.parametrize("raw", ["60", "0", "-1", "3601", "soon", "nan", "inf"])
+def test_invalid_runner_disconnect_grace_falls_back_with_one_warning(
+    set_grace_env: Callable[[str | None], None],
+    raw: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    set_grace_env(raw)
+    with caplog.at_level("WARNING", logger=common._logger.name):
+        assert common.resolve_runner_disconnect_grace_s() == float(RUNNER_LIVENESS_TTL_S)
+        assert common.resolve_runner_disconnect_grace_s() == float(RUNNER_LIVENESS_TTL_S)
+    [record] = caplog.records
+    assert common.RUNNER_DISCONNECT_GRACE_ENV_VAR in record.getMessage()
+    assert repr(raw) in record.getMessage()
+
+
+def test_server_started_with_the_grace_setting_applies_it_everywhere() -> None:
+    """The relay, the disconnect timer and the Stop markers all read the setting."""
+    probe = (
+        "from omnigent.server.routes import sessions\n"
+        "from omnigent.server.routes._sessions import common, orchestration\n"
+        "print(orchestration.RUNNER_DISCONNECT_GRACE_S, sessions.RUNNER_DISCONNECT_GRACE_S,"
+        " common._intentional_stop_sessions._backing.ttl)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env={**os.environ, common.RUNNER_DISCONNECT_GRACE_ENV_VAR: "150"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    relay, timer, stop_marker_ttl = map(float, result.stdout.split())
+    assert relay == timer == 150.0
+    assert stop_marker_ttl == RUNNER_LIVENESS_TTL_S + 150.0

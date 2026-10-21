@@ -240,6 +240,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_terminal_pending_cache,
     get_caps,
     get_server_runner_router,
+    resolve_runner_disconnect_grace_s,
     session_stream,
     set_server_runner_router,
 )
@@ -396,7 +397,6 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
-    RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
@@ -8021,10 +8021,10 @@ async def _dispatch_session_event_to_runner_impl(
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
 
-# Sized to the runner liveness lease so the relay give-up, the disconnect
-# timer, and the liveness-driven sidebar agree on when a dropped runner is
-# gone; a crash is reported separately by the daemon and never waits this out.
-RUNNER_DISCONNECT_GRACE_S: float = float(RUNNER_LIVENESS_TTL_S)
+# How long the relay and the disconnect timer wait for a dropped runner to
+# reconnect; see ``resolve_runner_disconnect_grace_s``. A crash is reported
+# separately by the daemon and never waits this out.
+RUNNER_DISCONNECT_GRACE_S: float = resolve_runner_disconnect_grace_s()
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
 # Version marker for the bounded relay recovery event contract. Keep this on
