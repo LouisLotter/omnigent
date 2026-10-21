@@ -113,6 +113,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _RUNNER_SESSION_INIT_TIMEOUT_S,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -923,7 +924,9 @@ def register_core_routes(
                         exc_info=True,
                     )
             try:
-                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+                await _rc.post(
+                    "/v1/sessions", json=init_body, timeout=_RUNNER_SESSION_INIT_TIMEOUT_S
+                )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
@@ -2790,7 +2793,7 @@ def register_core_routes(
                                 conv,
                                 server_version=VERSION,
                             ),
-                            timeout=10.0,
+                            timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                         )
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST

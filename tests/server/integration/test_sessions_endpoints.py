@@ -5338,7 +5338,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert len(runner_client.posts) == 1
     init_post = runner_client.posts[0]
     assert init_post["url"] == "/v1/sessions"
-    assert init_post["timeout"] == 10.0
+    assert init_post["timeout"] == sessions_module._RUNNER_SESSION_INIT_TIMEOUT_S
     assert init_post["json"]["session_id"] == sid
     assert init_post["json"]["agent_id"] == agent["id"]
     assert init_post["json"]["sub_agent_name"] is None
