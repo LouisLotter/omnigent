@@ -293,8 +293,8 @@ def test_an_extended_runner_grace_keeps_a_turn_through_a_longer_outage(
     _send_user_message(client, session_id)
     _poll_until(lambda: _gate_pending(mock), timeout=60, what="the turn to reach the model")
 
-    # Ten seconds past the 40 s budget, so the outage crosses upstream's grace.
-    outage_s = _drop_runner_then_pause(topology, _PAUSE_S + 10)
+    # Fifteen seconds past the 40 s budget, so the outage clearly crosses upstream's grace.
+    outage_s = _drop_runner_then_pause(topology, _PAUSE_S + 15)
     assert RUNNER_LIVENESS_TTL_S < outage_s < _RUNNER_GRACE_S
 
     release_mock_gate(mock)
