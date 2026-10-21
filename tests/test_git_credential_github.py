@@ -65,7 +65,7 @@ def test_store_and_erase_are_noops(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _HELPER_KEY = "credential.https://github.com.helper"
-_LEGACY_CLEANUP = ("--unset-all", _HELPER_KEY, r"omnigent\.git_credential_github .*--host-token")
+_LEGACY_CLEANUP = ("removed leftovers",)
 
 
 @pytest.fixture
@@ -89,7 +89,7 @@ _FAKE_BROKER = object()
 def _record_git_config(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(h, "_git_config", lambda *args: calls.append(args))
-    monkeypatch.setattr(h, "_remove_legacy_gh_token", lambda: None)
+    monkeypatch.setattr(h, "_remove_leftover_credentials", lambda: calls.append(_LEGACY_CLEANUP))
     return calls
 
 
@@ -243,35 +243,91 @@ def test_host_integrations_are_noops_outside_sandbox(
     assert (tmp_path / "gh" / "hosts.yml").read_text() == hosts
 
 
-def test_remove_leftover_credentials_drops_only_the_launch_token_helper(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # Real git, against an isolated global config: an earlier host's helper
-    # that baked the launch token goes; other helpers stay.
-    gitconfig = tmp_path / "gitconfig"
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
-    legacy = (
-        "!python3 -m omnigent.git_credential_github --server http://srv "
-        "--host-id host1 --host-token old-launch-token"
-    )
-    for value in ("", legacy, "!other-helper"):
-        subprocess.run(
-            ["git", "config", "--global", "--add", _HELPER_KEY, value], check=True, timeout=30
-        )
+_LEGACY_HELPER = (
+    "!python3 -m omnigent.git_credential_github --server http://srv "
+    "--host-id host1 --host-token old-launch-token"
+)
 
-    h._remove_leftover_credentials()
 
-    remaining = subprocess.run(
-        ["git", "config", "--global", "--get-all", _HELPER_KEY],
-        check=True,
+def _git_file(config: Path, *args: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "config", "--file", str(config), *args],
         capture_output=True,
         text=True,
         timeout=30,
-    ).stdout.splitlines()
-    assert remaining == ["", "!other-helper"]
-    assert "old-launch-token" not in gitconfig.read_text()
+    )
+    return result.stdout.splitlines()
+
+
+@pytest.fixture
+def git_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A HOME for real git, with the default global config locations."""
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
+    return home
+
+
+def test_remove_leftover_credentials_drops_only_the_launch_token_helper(git_home: Path) -> None:
+    # Real git. An earlier host's helper that baked the launch token goes from
+    # both global files git reads (it wrote the XDG one when ~/.gitconfig was
+    # absent); other helpers and settings stay.
+    home_config = git_home / ".gitconfig"
+    xdg_config = git_home / ".config" / "git" / "config"
+    for value in ("", _LEGACY_HELPER, "!other-helper"):
+        _git_file(home_config, "--add", _HELPER_KEY, value)
+    _git_file(xdg_config, "--add", _HELPER_KEY, _LEGACY_HELPER)
+    _git_file(xdg_config, "core.editor", "vi")
+
+    h._remove_leftover_credentials()
+
+    assert _git_file(home_config, "--get-all", _HELPER_KEY) == ["", "!other-helper"]
+    assert _git_file(xdg_config, "--get-all", _HELPER_KEY) == []
+    assert _git_file(xdg_config, "core.editor") == ["vi"]
+    for config in (home_config, xdg_config):
+        assert "old-launch-token" not in config.read_text()
+
+
+@pytest.mark.parametrize("stale", [True, False], ids=["stale-lock", "live-lock"])
+def test_remove_leftover_credentials_clears_a_stale_config_lock(
+    git_home: Path, caplog: pytest.LogCaptureFixture, stale: bool
+) -> None:
+    # A writer killed mid-write leaves ~/.gitconfig.lock holding the config it
+    # was writing, and git refuses every later write while it exists. A lock
+    # older than a writer can hold one is removed; a fresh one is left to its
+    # writer and the leftover is reported, not silently kept.
+    home_config = git_home / ".gitconfig"
+    _git_file(home_config, "--add", _HELPER_KEY, _LEGACY_HELPER)
+    lock = home_config.with_name(".gitconfig.lock")
+    lock.write_text(home_config.read_text())
+    if stale:
+        os.utime(lock, (0, 0))
+
+    h._remove_leftover_credentials()
+
+    assert lock.exists() is not stale
+    assert ("old-launch-token" in home_config.read_text()) is not stale
+    assert ("Could not remove the old launch-token git helper" in caplog.text) is not stale
+
+
+def test_remove_leftover_credentials_honours_git_config_global(
+    monkeypatch: pytest.MonkeyPatch, git_home: Path, tmp_path: Path
+) -> None:
+    override = tmp_path / "override.gitconfig"
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(override))
+    _git_file(override, "--add", _HELPER_KEY, _LEGACY_HELPER)
+    untouched = git_home / ".gitconfig"
+    _git_file(untouched, "--add", _HELPER_KEY, _LEGACY_HELPER)
+
+    h._remove_leftover_credentials()
+
+    assert _git_file(override, "--get-all", _HELPER_KEY) == []
+    # git does not read ~/.gitconfig while GIT_CONFIG_GLOBAL is set.
+    assert _git_file(untouched, "--get-all", _HELPER_KEY) == [_LEGACY_HELPER]
 
 
 _OLD_TOKEN = "ghu_old-owner-token"

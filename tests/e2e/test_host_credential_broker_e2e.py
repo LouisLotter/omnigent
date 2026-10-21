@@ -116,13 +116,24 @@ def _git(*args: str, env: dict[str, str], cwd: Path | None = None) -> str:
 
 
 def _seed_leftovers(home: Path) -> None:
-    """What an earlier host wrote: the launch-token helper and gh's token."""
+    """What earlier hosts wrote: the launch-token helper and gh's token.
+
+    The helper is in both global git files (the XDG one is used while
+    ``~/.gitconfig`` is absent) and in the lock a writer killed mid-write left.
+    """
     legacy_helper = (
         "!python3 -m omnigent.git_credential_github --server http://old "
         f"--host-id {_HOST_ID} --host-token {_OLD_LAUNCH_TOKEN}"
     )
+    gitconfig = home / ".gitconfig"
     for value in ("", legacy_helper):
-        _git("config", "--file", str(home / ".gitconfig"), "--add", _HELPER_KEY, value, env={})
+        _git("config", "--file", str(gitconfig), "--add", _HELPER_KEY, value, env={})
+    xdg_gitconfig = home / ".config" / "git" / "config"
+    xdg_gitconfig.parent.mkdir(parents=True)
+    _git("config", "--file", str(xdg_gitconfig), "--add", _HELPER_KEY, legacy_helper, env={})
+    lock = home / ".gitconfig.lock"
+    lock.write_text(gitconfig.read_text())
+    os.utime(lock, (0, 0))
     gh_dir = home / ".config" / "gh"
     gh_dir.mkdir(parents=True)
     # As gh's multi-account migration leaves the old writer's entry.

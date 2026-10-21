@@ -36,11 +36,13 @@ import argparse
 import contextlib
 import logging
 import os
+import re
 import shlex
 import socketserver
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -57,6 +59,10 @@ _TIMEOUT_S = 15.0
 _HELPER_KEY = "credential.https://github.com.helper"
 # GitHub App user access tokens, which the host-credentials endpoint vends.
 _GITHUB_APP_TOKEN_PREFIX = "ghu_"
+# git holds a config lock only while it writes; an older one has no live writer.
+_STALE_LOCK_S = 60.0
+# Matches the helper earlier hosts wrote with the launch token in its argv.
+_LEGACY_HELPER = r"omnigent\.git_credential_github .*--host-token"
 
 
 def _in_sandbox() -> bool:
@@ -218,10 +224,12 @@ def _strip_github_app_tokens(entry: dict) -> bool:
 def _remove_legacy_gh_token() -> None:
     """Drop the GitHub token earlier hosts wrote into gh's ``hosts.yml``.
 
-    Omnigent vends GitHub App user tokens (``ghu_``), which gh's own logins
-    never hold (``gho_``, ``ghp_``, ``github_pat_``), so those are the ones
-    removed. An entry left with no token and no account goes too; other
-    accounts and hosts are kept. Temporary ``.hosts.*.yml`` files from the old
+    Omnigent vends GitHub App user tokens (``ghu_``), while gh's own logins
+    hold ``gho_``, ``ghp_`` or ``github_pat_`` tokens. The old writer left no
+    other mark, so in a managed sandbox every ``ghu_`` token for github.com is
+    treated as its leftover and removed, including one a user stored in gh by
+    hand. An entry left with no token and no account goes too; other accounts
+    and hosts are kept. Temporary ``.hosts.*.yml`` files from the old
     writer's interrupted writes are removed. The rewrite is atomic and 0600.
     """
     config_dir = _gh_config_dir()
@@ -256,13 +264,69 @@ def _remove_legacy_gh_token() -> None:
                 os.unlink(tmp)
 
 
+def _global_git_configs() -> list[Path]:
+    """The global git config files git reads: ``$GIT_CONFIG_GLOBAL``, or both defaults."""
+    override = (os.environ.get("GIT_CONFIG_GLOBAL") or "").strip()
+    if override:
+        return [Path(override)]
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return [Path.home() / ".gitconfig", Path(xdg_config) / "git" / "config"]
+
+
+def _legacy_helpers(config: Path) -> list[str]:
+    """The launch-token helpers in *config*; empty when there are none or git fails."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        result = subprocess.run(
+            ["git", "config", "--file", str(config), "--get-all", _HELPER_KEY],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_S,
+        )
+        return [line for line in result.stdout.splitlines() if re.search(_LEGACY_HELPER, line)]
+    return []
+
+
+def _remove_legacy_git_helper() -> None:
+    """Remove the launch-token helper earlier hosts wrote into the global git config.
+
+    Cleans every global file git reads, keeping other entries. A lock file
+    older than :data:`_STALE_LOCK_S` was left by a writer that died mid-write:
+    it may hold the old configuration and blocks every later write, so it goes.
+    """
+    for config in _global_git_configs():
+        with contextlib.suppress(OSError):
+            lock = config.with_name(f"{config.name}.lock")
+            if time.time() - lock.stat().st_mtime > _STALE_LOCK_S:
+                lock.unlink()
+        if not config.is_file() or not _legacy_helpers(config):
+            continue
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "--file",
+                    str(config),
+                    "--unset-all",
+                    _HELPER_KEY,
+                    _LEGACY_HELPER,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=_TIMEOUT_S,
+            )
+        if _legacy_helpers(config):
+            _logger.warning("Could not remove the old launch-token git helper from %s", config)
+
+
 def _remove_leftover_credentials() -> None:
     """Remove tokens that earlier hosts wrote to disk.
 
     The launch token baked into a github.com helper in the global git config,
     and the GitHub token in gh's ``hosts.yml``.
     """
-    _git_config("--unset-all", _HELPER_KEY, r"omnigent\.git_credential_github .*--host-token")
+    _remove_legacy_git_helper()
     _remove_legacy_gh_token()
 
 
