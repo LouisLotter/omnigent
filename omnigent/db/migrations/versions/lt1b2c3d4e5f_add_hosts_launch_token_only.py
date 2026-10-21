@@ -60,8 +60,9 @@ def upgrade() -> None:
             batch_op.add_column(
                 sa.Column(_COLUMN, sa.Boolean(), nullable=False, server_default=sa.false())
             )
-    # CockroachDB publishes a new column only at commit.
-    _commit(bind)
+    if bind.dialect.name == "cockroachdb":
+        # CockroachDB publishes a new column only at commit.
+        _commit(bind)
     hosts = sa.table(
         _TABLE,
         sa.column("workspace_id", sa.BigInteger()),
