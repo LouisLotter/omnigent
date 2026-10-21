@@ -66,6 +66,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostQuiesceFrame,
+    HostQuiesceResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -8033,6 +8035,61 @@ def test_run_host_process_exits_with_token_refused_code(
     assert excinfo.value.code == HOST_TOKEN_REFUSED_EXIT_CODE
     assert HOST_TOKEN_REFUSED_EXIT_CODE not in (0, HOST_FATAL_EXIT_CODE, 143)
     assert "refused this host's launch token" in capsys.readouterr().err
+
+
+async def test_quiesce_reports_live_runners_launches_and_host_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``host.quiesce`` lists what a stop would cut off, tracked on the host's side.
+
+    An install whose request was dispatched still counts until its work ends,
+    even after the tunnel that asked for it has gone.
+    """
+    host = _make_host_process()
+    alive = SimpleNamespace(proc=SimpleNamespace(poll=lambda: None))
+    exited = SimpleNamespace(proc=SimpleNamespace(poll=lambda: 0))
+    host._runners.update({"runner-live": alive, "runner-done": exited})  # type: ignore[dict-item]
+    host._pending_runner_launches["runner-next"] = {asyncio.get_running_loop().create_future()}
+    started, release = threading.Event(), threading.Event()
+
+    def blocking_install(frame: HostInstallHarnessFrame) -> HostInstallHarnessResultFrame:
+        started.set()
+        release.wait(10)
+        return HostInstallHarnessResultFrame(request_id=frame.request_id, status="failed")
+
+    monkeypatch.setattr(host, "_handle_install_harness", blocking_install)
+
+    class _GoneWs:
+        async def send(self, data: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    install = encode_host_frame(HostInstallHarnessFrame(request_id="install", harness="codex"))
+    task = asyncio.create_task(host._run_frame_handler(_GoneWs(), install))  # type: ignore[arg-type]
+    assert await asyncio.to_thread(started.wait, 5)
+
+    report = await host._handle_quiesce(HostQuiesceFrame(request_id="q1"))
+    assert report == HostQuiesceResultFrame(
+        request_id="q1", runners=["runner-live"], launching=1, operations=["install_harness"]
+    )
+    release.set()
+    await asyncio.wait_for(task, 5)
+    host._pending_runner_launches.clear()
+    host._runners.clear()
+    report = await host._handle_quiesce(HostQuiesceFrame(request_id="q2"))
+    assert report == HostQuiesceResultFrame(request_id="q2")
+
+
+async def test_read_only_host_requests_are_not_host_operations() -> None:
+    """Reads are safe to cut off, so ``host.quiesce`` does not count them."""
+    host = _make_host_process()
+    with host._track_host_operation(HostStatFrame(request_id="s", path="~")):
+        report = await host._handle_quiesce(HostQuiesceFrame(request_id="q"))
+    assert report.operations == []
+    with host._track_host_operation(
+        HostStoreSecretFrame(request_id="w", harness="codex", kind="api_key")
+    ):
+        report = await host._handle_quiesce(HostQuiesceFrame(request_id="q"))
+    assert report.operations == ["store_secret"]
 
 
 async def test_launch_harness_probe_runs_off_the_event_loop(

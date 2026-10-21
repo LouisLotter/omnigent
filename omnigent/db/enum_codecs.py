@@ -3,7 +3,7 @@
 Several low-cardinality closed-set columns (``conversations.kind``,
 ``conversation_items.type``/``status``, ``comments.status``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
-``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
+``hosts.status``, ``hosts.lifecycle``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
 ``scheduled_task_runs.status``) are stored as
 integer codes rather
@@ -96,6 +96,11 @@ DEVICE_GRANT_STATUS: dict[str, int] = {
 HOST_STATUS: dict[str, int] = {
     "online": 1,
     "offline": 2,
+}
+
+# ``NULL`` is the default lifecycle: a laptop, or a sandbox owned by one session.
+HOST_LIFECYCLE: dict[str, int] = {
+    "persistent": 1,
 }
 
 AGENT_KIND: dict[str, int] = {
@@ -288,6 +293,16 @@ def encode_host_status(name: str) -> int:
 def decode_host_status(code: int) -> str:
     """Decode a ``hosts.status`` int code to its name."""
     return _decode(HOST_STATUS, code, field="hosts.status")
+
+
+def encode_host_lifecycle(name: str) -> int:
+    """Encode a ``hosts.lifecycle`` name to its int code."""
+    return _encode(HOST_LIFECYCLE, name, field="hosts.lifecycle")
+
+
+def decode_host_lifecycle(code: int) -> str:
+    """Decode a ``hosts.lifecycle`` int code to its name."""
+    return _decode(HOST_LIFECYCLE, code, field="hosts.lifecycle")
 
 
 def encode_agent_kind(name: str) -> int:

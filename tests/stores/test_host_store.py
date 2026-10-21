@@ -1866,3 +1866,121 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+# ── Persistent managed hosts ───────────────────────────────────────────
+
+
+def _persistent(host_store: HostStore, *, name: str = "Work computer") -> Host:
+    return host_store.create_persistent_host(
+        host_id=uuid.uuid4().hex, name=name, user_id="alice@example.com", provider="cloud"
+    )
+
+
+def _armed_persistent(host_store: HostStore, token: str) -> Host:
+    pending = _persistent(host_store)
+    attached = host_store.attach_persistent_sandbox(pending.host_id, sandbox_id="sb-1")
+    assert attached is not None
+    armed = host_store.rearm_managed_host(
+        pending.host_id,
+        sandbox_id="sb-1",
+        expected_updated_at=attached.updated_at,
+        token=token,
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert armed is not None
+    return armed
+
+
+def test_persistent_host_pending_row_has_no_sandbox_or_token(host_store: HostStore) -> None:
+    """The pending row is persistent, offline and holds neither a sandbox nor a credential."""
+    pending = _persistent(host_store)
+    stored = host_store.get_host(pending.host_id)
+    assert stored is not None
+    assert (stored.lifecycle, stored.status, stored.sandbox_provider) == (
+        "persistent",
+        "offline",
+        "cloud",
+    )
+    assert stored.sandbox_id is None and stored.token_expires_at is None
+    assert host_store.list_hosts("alice@example.com") == [stored]
+
+
+def test_persistent_host_name_is_unique_per_owner_including_tombstones(
+    host_store: HostStore,
+) -> None:
+    """A second host with the same display name is a clean ``ValueError``, even after deletion."""
+    first = _persistent(host_store)
+    with pytest.raises(ValueError, match="already exists"):
+        _persistent(host_store)
+    host_store.attach_persistent_sandbox(first.host_id, sandbox_id="sb-1")
+    host_store.delete_host(first.host_id)  # a tombstone awaiting sandbox removal
+    with pytest.raises(ValueError, match="already exists"):
+        _persistent(host_store)
+    assert _persistent(host_store, name="Other computer").name == "Other computer"
+
+
+def test_attach_persistent_sandbox_only_once_and_never_after_deletion(
+    host_store: HostStore,
+) -> None:
+    """A sandbox attaches to a live pending row once; a deleted row refuses it."""
+    pending = _persistent(host_store)
+    attached = host_store.attach_persistent_sandbox(pending.host_id, sandbox_id="sb-1")
+    assert attached is not None and attached.sandbox_id == "sb-1"
+    assert host_store.attach_persistent_sandbox(pending.host_id, sandbox_id="sb-2") is None
+    other = _persistent(host_store, name="Gone computer")
+    host_store.delete_host(other.host_id)
+    assert host_store.attach_persistent_sandbox(other.host_id, sandbox_id="sb-3") is None
+
+
+def test_start_failure_is_recorded_truncated_and_cleared(host_store: HostStore) -> None:
+    """A failed start's reason is kept on the row until a start succeeds."""
+    pending = _persistent(host_store)
+    host_store.record_start_failure(pending.host_id, "x" * 600)
+    failed = host_store.get_host(pending.host_id)
+    assert failed is not None and failed.start_failure == "x" * 512
+    host_store.record_start_failure(pending.host_id, None)
+    cleared = host_store.get_host(pending.host_id)
+    assert cleared is not None and cleared.start_failure is None
+
+
+@pytest.mark.parametrize("stopped", [True, False])
+def test_sleep_revokes_the_token_until_its_outcome_is_known(
+    host_store: HostStore, stopped: bool
+) -> None:
+    """The recorded sleep refuses the token; a stop expires it, a refusal restores it exactly."""
+    host = _armed_persistent(host_store, "launch-token")
+    assert host_store.resolve_launch_token(host.host_id, "launch-token") is not None
+    assert host_store.begin_host_sleep(host.host_id, operation_id="op-1")
+    assert not host_store.begin_host_sleep(host.host_id, operation_id="op-2")
+    assert host_store.resolve_launch_token(host.host_id, "launch-token") is None
+    assert host_store.list_pending_host_sleeps() == [(host.host_id, "op-1")]
+    host_store.end_host_sleep(host.host_id, operation_id="op-other", stopped=stopped)
+    assert host_store.list_pending_host_sleeps() == [(host.host_id, "op-1")]
+    host_store.end_host_sleep(host.host_id, operation_id="op-1", stopped=stopped)
+    after = host_store.get_host(host.host_id)
+    assert after is not None and after.sleep_operation_id is None
+    resolved = host_store.resolve_launch_token(host.host_id, "launch-token")
+    if stopped:
+        assert resolved is None and after.status == "offline"
+    else:
+        assert resolved is not None and after.token_expires_at == host.token_expires_at
+
+
+def test_deleted_persistent_hosts_are_listed_for_removal(host_store: HostStore) -> None:
+    """Only the owner's tombstoned persistent hosts with a sandbox are listed."""
+    kept = _armed_persistent(host_store, "token-kept")
+    deleted = host_store.create_persistent_host(
+        host_id=uuid.uuid4().hex,
+        name="Old computer",
+        user_id="alice@example.com",
+        provider="cloud",
+    )
+    host_store.attach_persistent_sandbox(deleted.host_id, sandbox_id="sb-old")
+    host_store.delete_host(deleted.host_id)
+    never_provisioned = _persistent(host_store, name="Never started")
+    host_store.delete_host(never_provisioned.host_id)
+    listed = host_store.list_deleted_persistent_hosts("alice@example.com")
+    assert [host.host_id for host in listed] == [deleted.host_id]
+    assert kept.host_id not in {host.host_id for host in listed}
+    assert host_store.list_deleted_persistent_hosts("bob@example.com") == []

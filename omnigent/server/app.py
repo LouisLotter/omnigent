@@ -192,6 +192,9 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    # Providers whose hosts are persistent computers created through
+    # ``POST /v1/hosts``; never offered for a new session's sandbox.
+    persistent_host_providers: list[str] = []
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -3077,6 +3080,9 @@ def create_app(
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+        persistent_host_providers = (
+            list(sandbox_config.persistent_providers()) if sandbox_config is not None else []
+        )
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3154,6 +3160,7 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "persistent_host_providers": persistent_host_providers,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -4187,7 +4194,7 @@ def create_app(
         from omnigent.server.routes.persistent_hosts import create_persistent_hosts_router
 
         app.include_router(
-            create_persistent_hosts_router(host_store, auth_provider=auth_provider),
+            create_persistent_hosts_router(host_store, host_registry, auth_provider=auth_provider),
             prefix="/v1",
             tags=["hosts"],
         )

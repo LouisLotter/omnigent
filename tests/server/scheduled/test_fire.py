@@ -28,6 +28,7 @@ import pytest
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
@@ -238,6 +239,8 @@ class _FakeHost:
     sandbox_provider: str | None = None
     # A dormant managed host still has its provider, even without a sandbox id.
     sandbox_id: str | None = None
+    # "persistent" for a long-lived computer automations may pin.
+    lifecycle: str | None = None
 
 
 class _FakeSandboxConfig:
@@ -1655,6 +1658,67 @@ async def test_legacy_pinned_sandbox_fails_before_host_rpc(
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "existing_sandbox_not_allowed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["fire", "run_now"])
+@pytest.mark.parametrize("admits", [True, False])
+async def test_pinned_persistent_host_is_made_ready_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch, trigger: str, admits: bool
+) -> None:
+    """A fire or run now pinned to a persistent computer wakes it first.
+
+    When the computer refuses new work, the run is recorded as failed with the
+    provider's reason instead of being dispatched.
+    """
+    from omnigent.server import persistent_hosts
+
+    host = _FakeHost(
+        "host_1",
+        "alice@example.com",
+        sandbox_provider="cloud",
+        sandbox_id="sb-1",
+        lifecycle="persistent",
+    )
+    readiness: list[dict[str, Any]] = []
+
+    async def ensure_host_ready(host_id: str, **kwargs: Any) -> None:
+        readiness.append({"host_id": host_id, **kwargs})
+        if not admits:
+            raise OmnigentError(
+                "computer is not accepting new work: not saved",
+                code=ErrorCode.HOST_NOT_ADMITTING,
+            )
+
+    monkeypatch.setattr(persistent_hosts, "ensure_host_ready", ensure_host_ready)
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", AsyncMock(return_value="/root"))
+    # No pinned workspace: resolving the default one authorizes the pinned host first.
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=host.user_id, workspace=None)})
+    dispatched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        dispatched.append(conv)
+
+    deps = _deps(
+        store,
+        host_store=FakeHostStore({host.host_id: host}),
+        host_registry=FakeHostRegistry(online={host.host_id}),
+    )
+    if trigger == "fire":
+        await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    else:
+        await build_run_now(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    assert readiness and readiness[0]["host_id"] == "host_1"
+    assert readiness[0]["operation"] == "scheduled_fire"
+    if admits:
+        assert len(dispatched) == 1
+    else:
+        assert dispatched == []
+        assert store.runs[0]["status"] == "failed"
+        assert store.runs[0]["error_code"] == "host_not_admitting"
+        assert "not saved" in str(store.runs[0]["error"])
 
 
 @pytest.mark.asyncio

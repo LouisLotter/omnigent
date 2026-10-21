@@ -3,10 +3,12 @@
 A managed host normally belongs to one session. A provider entry whose
 :class:`~omnigent.server.managed_hosts.ManagedSandboxConfig` carries a
 :class:`~omnigent.server.managed_hosts.PersistentHostPolicy` creates hosts that
-behave like a laptop instead: they are created without a session, survive
-session deletion, appear in host pickers (asleep or awake), accept pinned
-automations, and are exempt from the offline reaper. Their compute sleeps when
-idle and wakes when work needs it.
+behave like a laptop instead: they are created without a session
+(``POST /v1/hosts``), survive session deletion, appear in host pickers, accept
+pinned automations, and are exempt from the offline reaper. Their compute
+sleeps when idle and wakes when work needs it. The host row's ``lifecycle``
+column records the policy, so a configuration change never turns a persistent
+host back into a disposable one.
 
 This module owns that lifecycle on one replica:
 
@@ -14,21 +16,24 @@ This module owns that lifecycle on one replica:
   :func:`ensure_host_ready`. It waits out a sleep in progress, wakes an asleep
   host once per host (a wake shared by every waiter, so a cancelled waiter never
   stops a wake another needs), re-checks authorization after the wait, and
-  checks the provider's admission report.
+  admits the work only while the provider reports the host admitting. A
+  provider report that cannot be refreshed is never cached and never treated
+  as a refusal; readiness asks again until its deadline.
 * **Admission handles.** Admitting an operation gives the current task a handle
   for that host, released when the task finishes. The check and the grant run
-  with no await between them, so they are atomic with the sleep fence. Nested
-  calls in a task that holds a handle (and tasks it starts) are part of the
-  admitted operation and never wait on the fence.
+  with no await between them, so they are atomic with the sleep fence.
 * **The fenced sleep.** :func:`sleep_if_idle` closes admission under the host's
-  lifecycle lock (the lock its wakes take), waits for admitted operations to
-  finish (abandoning if they do not), asks the host for live runners, records
-  the operation and expires the launch token, and only then calls the
-  provider's ``suspend``. Host shutdown ends every runner, so nothing admitted
-  is cut off by a sleep. An unknown outcome, including a cancelled call or a
-  server restart, keeps admission closed until the same operation reports it.
-* **Repair, not re-arm.** A host whose sandbox still runs is never re-armed or
-  restarted: its process reconnects with its current token.
+  lifecycle lock (the lock its wakes take), waits for admitted operations and
+  host requests to finish, asks the host through ``host.quiesce`` whether any
+  runner or host operation is live, records the operation (which revokes the
+  launch token), and only then calls the provider's ``suspend``. An unknown
+  outcome keeps admission closed until the same operation reports it.
+* **Repair, not re-arm.** A live host process is never re-armed or restarted,
+  because host shutdown ends its runners: it reconnects with its current token.
+  When the provider reports a typed status, Omnigent re-arms and starts a host
+  only after the provider grants a start claim, never on a status report alone.
+
+Fence and admission state live in this process, which suits one server replica.
 """
 
 from __future__ import annotations
@@ -41,27 +46,44 @@ import logging
 import secrets
 import time
 import uuid
+import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import click
+
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.onboarding.sandboxes.types import AdmissionReport, SuspendResult
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.types import (
+    ADMISSION_NEEDS_SIGN_IN,
+    AdmissionReport,
+    StartClaim,
+    SuspendResult,
+)
 from omnigent.server.managed_hosts import (
-    MANAGED_HOST_ONLINE_TIMEOUT_S,
     _launcher_for_teardown,
     _resume_locks,
     _start_sandbox_host,
-    _wait_for_host_online,
+    _terminate_sandbox_best_effort,
+    managed_host_name,
+    terminate_managed_host,
 )
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
     from omnigent.server.host_registry import HostConnection, HostRegistry
-    from omnigent.server.managed_hosts import ManagedSandboxDeployment, PersistentHostPolicy
+    from omnigent.server.managed_hosts import (
+        ManagedSandboxConfig,
+        ManagedSandboxDeployment,
+        PersistentHostPolicy,
+    )
     from omnigent.stores.host_store import Host, HostStore
 
 _logger = logging.getLogger(__name__)
+
+PERSISTENT = "persistent"
 
 # How long a host operation outside readiness (e.g. a runner launch) waits for
 # a sleep in progress before giving up.
@@ -69,8 +91,16 @@ ADMISSION_WAIT_S = 120.0
 # How long the fence waits for admitted operations to finish before it abandons
 # the sleep. Never a reason to proceed: only finished operations are.
 FENCE_DRAIN_S = 60.0
-_LIST_RUNNERS_TIMEOUT_S = 10.0
+# A start whose reply was lost is presumed undelivered after this long in
+# ``start_claimed``, and the next claim supersedes it.
+START_REDELIVERY_S = 15.0
+_QUIESCE_TIMEOUT_S = 10.0
+_STATUS_POLL_S = 2.0
+_UNKNOWN_RETRY_S = 1.0
 _POLL_S = 0.2
+
+WakeProgress = Callable[[str, "str | None"], None]
+"""Observer of a wake's progress: ``(stage, error)``, using the session launch stages."""
 
 _host_store: HostStore | None = None
 _host_registry: HostRegistry | None = None
@@ -91,8 +121,11 @@ class _HostLifecycle:
     unknown_suspend_operation: str | None = None
     handles: dict[str, str] = field(default_factory=dict)
     report: AdmissionReport | None = None
+    # Unix time of the provider reply behind ``report``.
     report_at: float = 0.0
     wake_task: asyncio.Task[None] | None = None
+    wake_stage: str | None = None
+    observers: set[WakeProgress] = field(default_factory=set)
     idle_since: float | None = None
     # The sleep-intent write in flight, kept so a cancelled fence can learn its result.
     pending_intent: asyncio.Future[bool] | None = None
@@ -104,9 +137,25 @@ class _HostLifecycle:
         """Operations currently admitted on the host."""
         return list(self.handles.values())
 
+    def waking(self) -> bool:
+        """Whether a wake or first start is in flight on this replica."""
+        return self.wake_task is not None and not self.wake_task.done()
+
+    def publish(self, stage: str, error: str | None = None) -> None:
+        """Report a wake stage to every observer waiting on this host."""
+        self.wake_stage = stage
+        for observer in list(self.observers):
+            try:
+                observer(stage, error)
+            except Exception:  # noqa: BLE001 — progress reporting never breaks a wake.
+                _logger.warning("wake progress observer failed", exc_info=True)
+
 
 # custom-lint: disable-next=workspace-scoped-cache -- host_id state; one per persistent host
 _states: dict[str, _HostLifecycle] = {}
+# Every connection a request was sent on, superseded ones included, by host and identity.
+# custom-lint: disable-next=workspace-scoped-cache -- host_id key; weak values die with the tunnel
+_connections: dict[str, weakref.WeakValueDictionary[int, HostConnection]] = {}
 
 
 def configure(
@@ -130,47 +179,107 @@ def enabled() -> bool:
         _host_store is not None
         and _host_registry is not None
         and _deployment is not None
-        and any(config.persistent is not None for config in _deployment.offered())
+        and bool(_deployment.persistent_providers())
     )
-
-
-def policy_for(host: Host) -> PersistentHostPolicy | None:
-    """Return the persistent policy governing *host*, or ``None`` for other hosts."""
-    if _deployment is None or host.sandbox_provider is None:
-        return None
-    config = _deployment.for_provider(host.sandbox_provider)
-    return config.persistent if config is not None else None
 
 
 def is_persistent_host(host: Host) -> bool:
     """Whether *host* is a persistent managed host."""
-    return policy_for(host) is not None
+    return host.lifecycle == PERSISTENT
+
+
+def _entry_for(host: Host) -> ManagedSandboxConfig | None:
+    """The provider entry governing a persistent host, if it is still configured."""
+    if _deployment is None or host.sandbox_provider is None:
+        return None
+    entry = _deployment.for_provider(host.sandbox_provider)
+    return entry if entry is not None and entry.persistent is not None else None
+
+
+def policy_for(host: Host) -> PersistentHostPolicy | None:
+    """Return the persistent policy governing *host*, or ``None`` for other hosts."""
+    if not is_persistent_host(host):
+        return None
+    entry = _entry_for(host)
+    return entry.persistent if entry is not None else None
 
 
 def _state(host_id: str) -> _HostLifecycle:
     return _states.setdefault(host_id, _HostLifecycle())
 
 
+def _lifecycle_lock(host_id: str) -> asyncio.Lock:
+    """The per-host lock every wake and sleep of *host_id* takes."""
+    return _resume_locks.setdefault(host_id, asyncio.Lock())
+
+
 def forget(host_id: str) -> None:
-    """Drop lifecycle state for a deleted host."""
-    _states.pop(host_id, None)
+    """Drop lifecycle state for a deleted host, cancelling its wake."""
+    _connections.pop(host_id, None)
+    state = _states.pop(host_id, None)
+    if state is not None and state.wake_task is not None:
+        state.wake_task.cancel()
 
 
-def lifecycle_status(host: Host, *, online: bool) -> str | None:
-    """Picker state for a persistent host: ``awake``, ``asleep`` or ``sleeping``."""
+def manage_url(host: Host) -> str | None:
+    """The provider's setup page for *host*, from the policy's ``manage_url`` template."""
+    policy = policy_for(host)
+    template = policy.manage_url if policy is not None else None
+    if template is None:
+        return None
+    if "{sandbox_id}" in template and host.sandbox_id is None:
+        return None
+    return template.replace("{host_id}", host.host_id).replace(
+        "{sandbox_id}", host.sandbox_id or ""
+    )
+
+
+def persistent_status(host: Host, *, online: bool) -> dict[str, Any] | None:
+    """Picker state for a persistent host, or ``None`` for other hosts.
+
+    :param host: The host row.
+    :param online: Whether the host is live (online with a fresh heartbeat).
+    :returns: ``state`` (``awake``, ``asleep``, ``waking``, ``sleeping`` or
+        ``failed``), ``wake_stage``, ``failure``, the last ``admission`` report,
+        ``manage_url`` and ``provider``.
+    """
     if not is_persistent_host(host):
         return None
     state = _states.get(host.host_id)
-    if state is not None and not state.admitting.is_set():
-        return "sleeping"
-    return "awake" if online else "asleep"
+    failure: str | None = None
+    if state is not None and state.waking():
+        status = "waking"
+    elif state is not None and not state.admitting.is_set():
+        status = "sleeping"
+    elif online:
+        status = "awake"
+    elif host.start_failure is not None or host.sandbox_id is None:
+        status = "failed"
+        failure = host.start_failure or "Setup did not finish. Start it again."
+    else:
+        status = "asleep"
+    report = state.report if state is not None else None
+    return {
+        "state": status,
+        "wake_stage": state.wake_stage if state is not None and status == "waking" else None,
+        "failure": failure,
+        "admission": (
+            {"admitting": report.admitting, "reason": report.reason, "message": report.message}
+            if report is not None
+            else None
+        ),
+        "manage_url": manage_url(host),
+        "provider": host.sandbox_provider,
+    }
 
 
-async def _persistent_host(host_id: str) -> Host | None:
+async def _persistent_host(host_id: str, host: Host | None = None) -> Host | None:
+    """The persistent host *host_id*, reusing *host* when the caller already loaded it."""
     if not enabled():
         return None
-    assert _host_store is not None
-    host = await asyncio.to_thread(_host_store.get_host, host_id)
+    if host is None:
+        assert _host_store is not None
+        host = await asyncio.to_thread(_host_store.get_host, host_id)
     return host if host is not None and is_persistent_host(host) else None
 
 
@@ -179,10 +288,16 @@ def _unavailable(message: str) -> OmnigentError:
 
 
 def _not_admitting(host: Host, report: AdmissionReport) -> OmnigentError:
-    return OmnigentError(
-        f"{host.name} is not accepting new work: {report.reason or 'no reason given'}",
-        code=ErrorCode.HOST_NOT_ADMITTING,
-    )
+    detail = report.message or report.reason or "no reason given"
+    if report.reason == ADMISSION_NEEDS_SIGN_IN:
+        link = manage_url(host)
+        where = f" at {link}" if link else ""
+        message = f"{host.name} needs you to sign in{where} before it can take new work"
+        if report.message:
+            message = f"{message}: {report.message}"
+    else:
+        message = f"{host.name} is not accepting new work: {detail}"
+    return OmnigentError(message, code=ErrorCode.HOST_NOT_ADMITTING)
 
 
 def _owns(host_id: str, state: _HostLifecycle) -> bool:
@@ -191,7 +306,7 @@ def _owns(host_id: str, state: _HostLifecycle) -> bool:
     return handle is not None and handle in state.handles
 
 
-def _grant(host_id: str, state: _HostLifecycle, operation: str) -> None:
+def _grant(host_id: str, state: _HostLifecycle, operation: str, *, renews_idle: bool) -> None:
     """Admit *operation* for the current task until the task finishes.
 
     Callers check admission with no await between that check and this call,
@@ -200,7 +315,8 @@ def _grant(host_id: str, state: _HostLifecycle, operation: str) -> None:
     handle = secrets.token_hex(8)
     state.handles[handle] = operation
     _held.set({**(_held.get() or {}), host_id: handle})
-    state.idle_since = None
+    if renews_idle:
+        state.idle_since = None
     task = asyncio.current_task()
     if task is not None:
         task.add_done_callback(lambda _task: state.handles.pop(handle, None))
@@ -213,6 +329,9 @@ async def ensure_host_ready(
     timeout_s: float,
     owner: str | None = None,
     wake: bool = True,
+    host: Host | None = None,
+    progress: WakeProgress | None = None,
+    renews_idle: bool = True,
 ) -> None:
     """Make a persistent host ready for one new operation, within a deadline.
 
@@ -223,25 +342,65 @@ async def ensure_host_ready(
     provider reports the host admitting.
 
     :param host_id: Host the operation targets.
-    :param operation: What the work is, e.g. ``"message"``, for logs.
+    :param operation: What the work is, e.g. ``"message"``, for logs and the fence.
     :param timeout_s: Deadline for the whole wait, in seconds.
     :param owner: Caller the host must still belong to, or ``None`` to skip.
     :param wake: ``False`` refuses instead of waking an asleep host.
+    :param host: The host row when the caller already loaded it.
+    :param progress: Observer told the wake's stages, then ``"ready"`` or
+        ``"failed"`` when this call waited on a wake.
+    :param renews_idle: ``False`` for reads, which never keep a host awake.
     :raises OmnigentError: ``HOST_NOT_ADMITTING`` with the provider's reason;
-        ``RUNNER_UNAVAILABLE`` when the host cannot be made ready in time;
-        ``NOT_FOUND`` when the host was deleted during the wait.
+        ``RUNNER_UNAVAILABLE`` when the host cannot be made ready in time,
+        including "computer status unknown"; ``NOT_FOUND`` when the host was
+        deleted during the wait; ``FORBIDDEN`` when it changed owner.
     """
-    host = await _persistent_host(host_id)
-    if host is None:
+    found = await _persistent_host(host_id, host)
+    if found is None:
         return
     assert _host_store is not None and _host_registry is not None
     state = _state(host_id)
     if _owns(host_id, state):
-        # Part of an admitted operation; this task holds its own handle, so the
+        # Part of an admitted operation; this task takes its own handle, so the
         # operation stays admitted until this task finishes too.
-        _grant(host_id, state, operation)
+        _grant(host_id, state, operation, renews_idle=renews_idle)
         return
     deadline = time.monotonic() + timeout_s
+    observed: list[str] = []
+
+    def observe(stage: str, error: str | None) -> None:
+        observed.append(stage)
+        if progress is not None:
+            progress(stage, error)
+
+    state.observers.add(observe)
+    try:
+        await _until_admitted(
+            found, state, operation, deadline, timeout_s, wake, owner, renews_idle
+        )
+    except OmnigentError as exc:
+        if observed and progress is not None:
+            progress("failed", str(exc))
+        raise
+    finally:
+        state.observers.discard(observe)
+    if observed and progress is not None:
+        progress("ready", None)
+
+
+async def _until_admitted(
+    host: Host,
+    state: _HostLifecycle,
+    operation: str,
+    deadline: float,
+    timeout_s: float,
+    wake: bool,
+    owner: str | None,
+    renews_idle: bool,
+) -> None:
+    """The readiness loop: wait, wake, re-authorize and admit."""
+    assert _host_store is not None and _host_registry is not None
+    host_id = host.host_id
     while True:
         await _wait_admitting(state, host, deadline)
         # Re-check authorization after every wait: the host may have been
@@ -254,16 +413,22 @@ async def ensure_host_ready(
         host = current
         if _host_registry.get(host_id) is not None:
             report = await _admission(host, state)
+            if report is None:
+                # Unknown is never a refusal: ask again while the work waits.
+                if time.monotonic() >= deadline:
+                    raise _unavailable(f"{host.name}: computer status unknown; try again shortly")
+                await asyncio.sleep(min(_UNKNOWN_RETRY_S, max(deadline - time.monotonic(), 0)))
+                continue
             if not report.admitting:
                 raise _not_admitting(host, report)
             # No await from here to the grant: a sleep that closed admission
             # while this task awaited is seen, and the loop waits for it.
             if state.admitting.is_set() and _host_registry.get(host_id) is not None:
-                _grant(host_id, state, operation)
+                _grant(host_id, state, operation, renews_idle=renews_idle)
                 return
             continue
         if not wake:
-            raise _unavailable(f"{host.name} went to sleep; send the request again to wake it")
+            raise _unavailable(f"{host.name} is asleep; send the request again to wake it")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _unavailable(f"{host.name} did not become ready within {timeout_s:.0f}s")
@@ -284,6 +449,20 @@ async def ensure_host_ready(
             raise _unavailable(f"{host.name} could not wake: {detail}") from exc
 
 
+def session_progress(session_id: str) -> WakeProgress:
+    """Report a wake to a session's existing launch-progress surface.
+
+    :param session_id: The session whose request waits on the wake.
+    :returns: An observer for :func:`ensure_host_ready`'s ``progress``.
+    """
+    from omnigent.server.routes._sessions.helpers import _publish_sandbox_status
+
+    def publish(stage: str, error: str | None) -> None:
+        _publish_sandbox_status(session_id, stage, error)
+
+    return publish
+
+
 async def admit_host_work(host_id: str, operation: str) -> None:
     """Admission gate for host operations such as runner launches and installs.
 
@@ -296,11 +475,9 @@ async def admit_host_work(host_id: str, operation: str) -> None:
     host = await _persistent_host(host_id)
     if host is None:
         return
-    state = _state(host_id)
-    if _owns(host_id, state):
-        _grant(host_id, state, operation)
-        return
-    await ensure_host_ready(host_id, operation=operation, timeout_s=ADMISSION_WAIT_S, wake=False)
+    await ensure_host_ready(
+        host_id, operation=operation, timeout_s=ADMISSION_WAIT_S, wake=False, host=host
+    )
 
 
 async def wake_if_persistent(host_id: str) -> bool:
@@ -310,15 +487,15 @@ async def wake_if_persistent(host_id: str) -> bool:
     takes the same single-flight, repair-not-re-arm path.
 
     :returns: ``False`` when the host is not persistent (nothing was done).
+    :raises OmnigentError: When the wake fails; never ``SandboxGoneError``, so
+        no caller can answer it by provisioning a blank sandbox.
     """
     host = await _persistent_host(host_id)
     if host is None:
         return False
-    assert _host_registry is not None
-    state = _state(host_id)
-    await _wait_admitting(state, host, time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S)
-    if _host_registry.get(host_id) is None:
-        await asyncio.shield(_wake_task(host_id, state))
+    entry = _entry_for(host)
+    timeout_s = entry.host_online_timeout_s if entry is not None else ADMISSION_WAIT_S
+    await ensure_host_ready(host_id, operation="wake", timeout_s=timeout_s, host=host)
     return True
 
 
@@ -340,79 +517,383 @@ async def _wait_admitting(state: _HostLifecycle, host: Host, deadline: float) ->
             await asyncio.wait_for(state.admitting.wait(), remaining)
 
 
-async def _admission(host: Host, state: _HostLifecycle) -> AdmissionReport:
-    """The provider's admission report, at most the policy's maximum age old."""
+def _launcher(host: Host) -> SandboxHostLauncher | None:
+    return _launcher_for_teardown(host, _deployment)
+
+
+async def _admission(host: Host, state: _HostLifecycle) -> AdmissionReport | None:
+    """The provider's admission report, at most the policy's maximum age old.
+
+    :returns: The report, or ``None`` when the provider could not answer. An
+        unanswered refresh is never cached, so the next call asks again.
+    """
     policy = policy_for(host)
-    launcher = _launcher_for_teardown(host, _deployment)
+    launcher = _launcher(host)
     if policy is None or launcher is None or not launcher.capabilities.admission:
         return AdmissionReport(admitting=True)
-    now = time.monotonic()
-    if state.report is not None and now - state.report_at <= policy.admission_max_age_s:
+    if state.report is not None and time.time() - state.report_at <= policy.admission_max_age_s:
         return state.report
-    assert host.sandbox_id is not None
+    try:
+        return await _fresh_report(host, launcher, state)
+    except SandboxGoneError:
+        raise _unavailable(f"{host.name} no longer exists on {host.sandbox_provider}") from None
+
+
+async def _fresh_report(
+    host: Host, launcher: SandboxHostLauncher, state: _HostLifecycle
+) -> AdmissionReport | None:
+    """Ask the provider for a new report; ``None`` when it cannot answer."""
+    if host.sandbox_id is None:
+        return None
     try:
         report = await asyncio.to_thread(launcher.admission, host.sandbox_id)
-    except Exception:  # noqa: BLE001 — an unrefreshable report counts as not admitting.
+    except SandboxGoneError:
+        raise
+    except Exception:  # noqa: BLE001 — an unanswered refresh is "unknown", never a refusal.
         _logger.warning("admission report for host %s failed", host.host_id, exc_info=True)
-        report = AdmissionReport(admitting=False, reason="computer status unknown")
-    state.report, state.report_at = report, now
+        return None
+    if report is None:
+        return None
+    state.report = report
+    state.report_at = report.observed_at if report.observed_at is not None else time.time()
     return report
 
 
-def _wake_task(host_id: str, state: _HostLifecycle) -> asyncio.Task[None]:
+def _wake_task(
+    host_id: str, state: _HostLifecycle, *, provision: bool = False
+) -> asyncio.Task[None]:
     """The host's in-flight wake, started if none is running."""
-    if state.wake_task is None or state.wake_task.done():
-        state.wake_task = asyncio.create_task(_wake(host_id, state), name=f"wake-host-{host_id}")
+    if not state.waking():
+        state.wake_stage = None
+        state.wake_task = asyncio.create_task(
+            _wake(host_id, state, provision=provision), name=f"wake-host-{host_id}"
+        )
+        state.wake_task.add_done_callback(_log_wake_failure)
+    assert state.wake_task is not None
     return state.wake_task
 
 
-async def _wake(host_id: str, state: _HostLifecycle) -> None:
-    """Wake one persistent host under its lifecycle lock."""
+def _log_wake_failure(task: asyncio.Task[None]) -> None:
+    """Retrieve a wake's failure, which its waiters report and a first start records."""
+    if not task.cancelled() and task.exception() is not None:
+        _logger.info("%s failed: %s", task.get_name(), task.exception())
+
+
+def start_host_now(host_id: str) -> asyncio.Task[None]:
+    """Start or retry a persistent host's start in the background ("Start again").
+
+    Provisions its sandbox first when it has none.
+
+    :returns: The shared wake task, which callers may await.
+    """
+    return _wake_task(host_id, _state(host_id), provision=True)
+
+
+async def _wake(host_id: str, state: _HostLifecycle, *, provision: bool) -> None:
+    """Wake one persistent host under its lifecycle lock.
+
+    :param provision: Provision a sandbox for a host that has none (its first
+        start, or "Start again" after a failed one). Failures of such a start
+        are recorded on the host, so it shows as failed with the reason.
+    """
     assert _host_store is not None and _host_registry is not None
-    async with _resume_locks.setdefault(host_id, asyncio.Lock()):
+    async with _lifecycle_lock(host_id):
         if _host_registry.get(host_id) is not None:
             return
         host = await asyncio.to_thread(_host_store.get_host, host_id)
-        if host is None or host.sandbox_id is None:
+        if host is None:
             raise _unavailable(f"host {host_id} no longer exists")
-        launcher = _launcher_for_teardown(host, _deployment)
-        entry = _deployment.for_provider(host.sandbox_provider) if _deployment else None
-        if launcher is None or entry is None or entry.persistent is None:
+        entry = _entry_for(host)
+        launcher = _launcher(host)
+        if entry is None or launcher is None:
             raise _unavailable(f"{host.name}'s provider is no longer configured")
-        sandbox_id = host.sandbox_id
-        if await asyncio.to_thread(launcher.is_running, sandbox_id):
-            # Repair, not re-arm: stopping or re-arming a live host ends its
-            # runners, so wait for it to reconnect with its current token.
-            _logger.info("Host %s sandbox is running; waiting for it to reconnect", host_id)
-            await _wait_for_host_online(_host_store, host_id)
-            return
-        _logger.info("Waking persistent host %s (sandbox %s)", host_id, sandbox_id)
-        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=None)
-        await asyncio.to_thread(launcher.resume, sandbox_id)
-        token = secrets.token_urlsafe(32)
-        armed = await asyncio.to_thread(
-            _host_store.rearm_managed_host,
-            host_id,
-            sandbox_id=sandbox_id,
-            expected_updated_at=host.updated_at,
-            token=token,
-            token_expires_at=now_epoch() + entry.token_ttl_s,
+        if host.sandbox_id is None and not provision:
+            raise _unavailable(
+                f"{host.name} is not set up: {host.start_failure or 'its setup did not finish'}. "
+                "Start it again."
+            )
+        try:
+            if host.sandbox_id is None:
+                attached = await _provision(host, launcher, state)
+                if attached is None:
+                    return
+                host = attached
+            await _bring_up(host, launcher, entry, state)
+        except SandboxGoneError:
+            failure = (
+                f"{host.name} no longer exists on {host.sandbox_provider}. "
+                "Delete it and add a new computer."
+            )
+            await asyncio.to_thread(_host_store.record_start_failure, host_id, failure)
+            raise _unavailable(failure) from None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not provision:
+                raise
+            failure = _failure_message(exc)
+            await asyncio.to_thread(_host_store.record_start_failure, host_id, failure)
+            raise _unavailable(f"{host.name} could not start: {failure}") from exc
+        if host.start_failure is not None:
+            await asyncio.to_thread(_host_store.record_start_failure, host_id, None)
+
+
+def _failure_message(exc: BaseException) -> str:
+    if isinstance(exc, click.ClickException):
+        return exc.message
+    detail = getattr(exc, "detail", None)
+    return str(detail) if detail else str(exc) or type(exc).__name__
+
+
+async def _provision(
+    host: Host, launcher: SandboxHostLauncher, state: _HostLifecycle
+) -> Host | None:
+    """Provision the sandbox for a pending persistent host.
+
+    :returns: The host with its sandbox recorded, or ``None`` when the host
+        was deleted meanwhile (its new sandbox is then removed).
+    """
+    assert _host_store is not None
+    state.publish("provisioning")
+    await asyncio.to_thread(launcher.prepare_for_launch, agent_name=None)
+    await asyncio.to_thread(launcher.prepare)
+    sandbox_id = await asyncio.to_thread(launcher.provision, managed_host_name(host.host_id))
+    attached = await asyncio.to_thread(
+        _host_store.attach_persistent_sandbox, host.host_id, sandbox_id=sandbox_id
+    )
+    if attached is None:
+        # Deleted during provisioning: removing the new sandbox completes that deletion.
+        await _terminate_sandbox_best_effort(
+            launcher, sandbox_id, host_id=host.host_id, provider=launcher.provider
         )
-        if armed is None:
-            raise _unavailable(f"{host.name} changed while waking; try again")
-        # A new generation starts with a fresh admission report.
-        state.report = None
+    return attached
+
+
+async def _online(host_id: str) -> bool:
+    assert _host_store is not None and _host_registry is not None
+    if _host_registry.get(host_id) is not None:
+        return True
+    return await asyncio.to_thread(_host_store.is_online, host_id)
+
+
+async def _await_online(host_id: str, deadline: float, *, at_most_s: float | None = None) -> bool:
+    """Poll until the host is online, the deadline passes or *at_most_s* elapses."""
+    end = deadline if at_most_s is None else min(deadline, time.monotonic() + at_most_s)
+    while True:
+        if await _online(host_id):
+            return True
+        if time.monotonic() >= end:
+            return False
+        await asyncio.sleep(min(_POLL_S * 2.5, max(end - time.monotonic(), 0)))
+
+
+async def _bring_up(
+    host: Host,
+    launcher: SandboxHostLauncher,
+    entry: ManagedSandboxConfig,
+    state: _HostLifecycle,
+) -> None:
+    """Bring a persistent host online, within the provider's online wait."""
+    timeout_s = entry.host_online_timeout_s
+    deadline = time.monotonic() + timeout_s
+    if launcher.capabilities.admission:
+        await _bring_up_typed(host, launcher, entry, state, deadline)
+    else:
+        await _bring_up_untyped(host, launcher, entry, state, deadline)
+    # A new generation starts with a fresh admission report.
+    state.report = None
+
+
+async def _bring_up_untyped(
+    host: Host,
+    launcher: SandboxHostLauncher,
+    entry: ManagedSandboxConfig,
+    state: _HostLifecycle,
+    deadline: float,
+) -> None:
+    """Wake through ``is_running`` for a provider without a typed status.
+
+    A running sandbox is repaired, never re-armed: its host reconnects with
+    its current token. Only a stopped sandbox is resumed and started anew.
+    """
+    assert host.sandbox_id is not None
+    if await asyncio.to_thread(launcher.is_running, host.sandbox_id):
+        _logger.info("Host %s sandbox is running; waiting for it to reconnect", host.host_id)
+        state.publish("connecting")
+        if not await _await_online(host.host_id, deadline):
+            raise _unavailable(f"{host.name} is running but did not reconnect")
+        return
+    state.publish("provisioning")
+    await _call_launcher(host, launcher.resume, host.sandbox_id)
+    await _arm_and_start(host, launcher, entry, state, attempt=None)
+    if not await _await_online(host.host_id, deadline):
+        raise _unavailable(
+            f"{host.name} did not come online within {entry.host_online_timeout_s:g}s"
+        )
+
+
+async def _bring_up_typed(
+    host: Host,
+    launcher: SandboxHostLauncher,
+    entry: ManagedSandboxConfig,
+    state: _HostLifecycle,
+    deadline: float,
+) -> None:
+    """Wake by the provider's typed status, re-arming only through a granted claim.
+
+    ``host_running`` and ``stopping`` are waited out; ``stopped`` is resumed;
+    ``started_no_host``, ``start_claimed`` and ``host_refused`` are claimed,
+    re-armed and started. A claim refused because a host process took over
+    means its host reconnects on its own.
+    """
+    assert host.sandbox_id is not None
+    # Statuses in which our own recent start is still on its way to the host.
+    # Without claims a superseded start cannot be told apart, so both count.
+    pending: tuple[str, ...] = (
+        ("start_claimed",)
+        if launcher.capabilities.start_claims
+        else ("start_claimed", "started_no_host")
+    )
+    claim_operation = uuid.uuid4().hex
+    started_at: float | None = None
+    start_delivered = False
+    while True:
+        if await _online(host.host_id):
+            return
+        if time.monotonic() >= deadline:
+            raise _unavailable(
+                f"{host.name} did not come online within {entry.host_online_timeout_s:g}s"
+            )
+        report = await _fresh_report(host, launcher, state)
+        status = report.status if report is not None else None
+        if status is None or status in ("host_running", "stopping"):
+            # Unknown, a live host reconnecting, or a stop in progress: wait.
+            await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S)
+            continue
+        if status == "stopped":
+            state.publish("provisioning")
+            await _call_launcher(host, launcher.resume, host.sandbox_id)
+            await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S)
+            continue
+        if status in pending and started_at is not None:
+            if start_delivered or time.monotonic() - started_at < START_REDELIVERY_S:
+                # Our attempt holds the sandbox; its host takes the parameters soon.
+                await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S)
+                continue
+        claim = await _claim_start(host, launcher, claim_operation, deadline)
+        # The answer is recorded under this operation; the next claim is a new one.
+        claim_operation = uuid.uuid4().hex
+        if not claim.granted:
+            _logger.info(
+                "Start claim for host %s refused (status %s); not re-arming",
+                host.host_id,
+                claim.status,
+            )
+            await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S)
+            continue
+        current = await asyncio.to_thread(_require_host, host.host_id)
+        start_delivered = await _arm_and_start(
+            current, launcher, entry, state, attempt=claim.attempt
+        )
+        started_at = time.monotonic()
+
+
+def _require_host(host_id: str) -> Host:
+    assert _host_store is not None
+    host = _host_store.get_host(host_id)
+    if host is None:
+        raise _unavailable(f"host {host_id} was removed while waking")
+    return host
+
+
+async def _call_launcher(host: Host, method: Callable[..., Any], *args: Any) -> None:
+    """Call a launcher step whose refusal is final and whose lost reply is retried.
+
+    :raises OmnigentError: With the provider's readable message on a refusal.
+    """
+    try:
+        await asyncio.to_thread(method, *args)
+    except click.ClickException as exc:
+        raise _unavailable(f"{host.name} could not wake: {exc.message}") from exc
+    except SandboxGoneError:
+        raise
+    except Exception:  # noqa: BLE001 — a lost reply: the status loop finds out.
+        _logger.warning("launcher call for host %s failed", host.host_id, exc_info=True)
+
+
+async def _claim_start(
+    host: Host, launcher: SandboxHostLauncher, operation_id: str, deadline: float
+) -> StartClaim:
+    """Claim a start attempt, repeating a lost reply with the same operation id."""
+    assert host.sandbox_id is not None
+    if not launcher.capabilities.start_claims:
+        return StartClaim(granted=True)
+    while True:
+        try:
+            return await asyncio.to_thread(
+                launcher.claim_start, host.sandbox_id, operation_id=operation_id
+            )
+        except click.ClickException as exc:
+            raise _unavailable(f"{host.name} could not start: {exc.message}") from exc
+        except SandboxGoneError:
+            raise
+        except Exception:  # noqa: BLE001 — a lost reply; the same operation returns its outcome.
+            _logger.warning("start claim for host %s failed", host.host_id, exc_info=True)
+        if time.monotonic() >= deadline:
+            raise _unavailable(f"{host.name}: computer status unknown; try again shortly")
+        await asyncio.sleep(min(_UNKNOWN_RETRY_S, max(deadline - time.monotonic(), 0)))
+
+
+async def _arm_and_start(
+    host: Host,
+    launcher: SandboxHostLauncher,
+    entry: ManagedSandboxConfig,
+    state: _HostLifecycle,
+    *,
+    attempt: int | None,
+) -> bool:
+    """Arm a fresh launch token and start the host for one attempt.
+
+    :returns: ``True`` when the provider confirmed the start, ``False`` when
+        its reply was lost.
+    :raises OmnigentError: When the host changed meanwhile or the provider
+        refused the start.
+    """
+    assert _host_store is not None and host.sandbox_id is not None
+    token = secrets.token_urlsafe(32)
+    armed = await asyncio.to_thread(
+        _host_store.rearm_managed_host,
+        host.host_id,
+        sandbox_id=host.sandbox_id,
+        expected_updated_at=host.updated_at,
+        token=token,
+        token_expires_at=now_epoch() + entry.token_ttl_s,
+    )
+    if armed is None:
+        raise _unavailable(f"{host.name} changed while waking; try again")
+    state.publish("starting")
+    try:
         await _start_sandbox_host(
             launcher,
-            sandbox_id,
+            host.sandbox_id,
             token=token,
-            host_id=host_id,
+            host_id=host.host_id,
             host_name=host.name,
             server_url=entry.server_url,
             repos=(),
             host_config=entry.host_config,
+            start_attempt=attempt,
         )
-        await _wait_for_host_online(_host_store, host_id)
+        delivered = True
+    except click.ClickException as exc:
+        raise _unavailable(f"{host.name} could not start: {exc.message}") from exc
+    except SandboxGoneError:
+        raise
+    except Exception:  # noqa: BLE001 — a lost reply; the status shows whether it arrived.
+        _logger.warning("start_host for host %s failed", host.host_id, exc_info=True)
+        delivered = False
+    state.publish("connecting")
+    return delivered
 
 
 def guard_host_request(conn: HostConnection) -> None:
@@ -424,56 +905,83 @@ def guard_host_request(conn: HostConnection) -> None:
 
     :raises ConnectionError: When the host is going to sleep.
     """
+    _connections.setdefault(conn.host_id, weakref.WeakValueDictionary())[id(conn)] = conn
     state = _states.get(conn.host_id)
     if state is not None and not state.admitting.is_set() and not _owns(conn.host_id, state):
         raise ConnectionError(f"host {conn.host_id!r} is going to sleep")
 
 
 def _pending_requests(conn: HostConnection) -> int:
-    """Server-to-host requests awaiting the host's reply, of every kind."""
-    return sum(
-        len(getattr(conn, item.name))
-        for item in dataclasses.fields(conn)
-        if item.name.startswith(("pending_", "inflight_"))
-        and item.name != "pending_runner_lists"
-        and isinstance(getattr(conn, item.name), dict)
+    """Server-to-host requests awaiting a reply, on this and superseded connections."""
+    total = 0
+    known = _connections.get(conn.host_id, {})
+    for connection in {**known, id(conn): conn}.values():
+        total += sum(
+            len(getattr(connection, item.name))
+            for item in dataclasses.fields(connection)
+            if item.name.startswith(("pending_", "inflight_"))
+            and item.name != "pending_quiesce"
+            and isinstance(getattr(connection, item.name), dict)
+        )
+    return total
+
+
+@dataclass(frozen=True)
+class QuiesceReport:
+    """What a host reports as live: runners, runner launches and host operations."""
+
+    runners: list[str]
+    launching: int
+    operations: list[str]
+
+
+async def quiesce_host(conn: HostConnection) -> QuiesceReport | None:
+    """Ask a connected host whether any runner or host operation is live.
+
+    :returns: The host's report, or ``None`` when it cannot answer (an older
+        host, a timeout or a dropped connection).
+    """
+    from omnigent.host.frames import (
+        CAP_QUIESCE,
+        HostQuiesceFrame,
+        HostQuiesceResultFrame,
+        encode_host_frame,
     )
 
-
-async def list_host_runners(conn: HostConnection) -> dict[str, Any] | None:
-    """Ask a connected host for its live and launching runners.
-
-    :returns: ``{"runners": [...], "launching": n}``, or ``None`` when the host
-        cannot answer (older host, timeout or dropped connection).
-    """
-    from omnigent.host.frames import CAP_LIST_RUNNERS, HostListRunnersFrame, encode_host_frame
-
     assert _host_registry is not None
-    if CAP_LIST_RUNNERS not in conn.hello.capabilities:
+    if CAP_QUIESCE not in conn.hello.capabilities:
         return None
     request_id = secrets.token_hex(8)
-    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-    conn.pending_runner_lists[request_id] = future
+    future: asyncio.Future[HostQuiesceResultFrame] = asyncio.get_running_loop().create_future()
+    conn.pending_quiesce[request_id] = future
     try:
         # The fence's own question bypasses the send guard it has just closed.
         if _host_registry.get(conn.host_id) is not conn:
             return None
-        conn.enqueue(encode_host_frame(HostListRunnersFrame(request_id)))
-        return await asyncio.wait_for(future, _LIST_RUNNERS_TIMEOUT_S)
+        conn.enqueue(encode_host_frame(HostQuiesceFrame(request_id)))
+        result = await asyncio.wait_for(future, _QUIESCE_TIMEOUT_S)
     except (ConnectionError, TimeoutError):
         return None
     finally:
-        conn.pending_runner_lists.pop(request_id, None)
+        conn.pending_quiesce.pop(request_id, None)
+    return QuiesceReport(
+        runners=list(result.runners),
+        launching=result.launching,
+        operations=list(result.operations),
+    )
 
 
 def _busy_reason(
-    state: _HostLifecycle, conn: HostConnection, runners: dict[str, Any] | None
+    state: _HostLifecycle, conn: HostConnection, report: QuiesceReport | None
 ) -> str | None:
     """Why the host must not sleep now, or ``None`` when it is quiescent."""
-    if runners is None:
-        return "host cannot list its runners"
-    if runners["runners"] or runners["launching"]:
-        return f"runners {runners['runners']}, launching {runners['launching']}"
+    if report is None:
+        return "host cannot report quiescence"
+    if report.runners or report.launching or report.operations:
+        return (
+            f"runners {report.runners}, launching {report.launching}, "
+            f"host operations {report.operations}"
+        )
     pending = _pending_requests(conn)
     if pending:
         return f"{pending} host request(s) in flight"
@@ -503,13 +1011,12 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
     if host is None or host.sandbox_id is None:
         return "abandoned"
     assert _host_store is not None and _host_registry is not None
-    launcher = _launcher_for_teardown(host, _deployment)
-    entry = _deployment.for_provider(host.sandbox_provider) if _deployment else None
-    if launcher is None or entry is None or not launcher.capabilities.suspend:
+    launcher = _launcher(host)
+    if launcher is None or not launcher.capabilities.suspend:
         return "abandoned"
     state = _state(host_id)
     outcome = "abandoned"
-    async with _resume_locks.setdefault(host_id, asyncio.Lock()):
+    async with _lifecycle_lock(host_id):
         operation_id = state.unknown_suspend_operation
         if only_operation is not None and operation_id != only_operation:
             return outcome
@@ -527,7 +1034,7 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                     if time.monotonic() >= deadline:
                         return outcome
                     await asyncio.sleep(_POLL_S)
-                if _busy_reason(state, conn, await list_host_runners(conn)) is not None:
+                if _busy_reason(state, conn, await quiesce_host(conn)) is not None:
                     return outcome
                 operation_id = uuid.uuid4().hex
                 # From the intent write on, the outcome is unknown until learned,
@@ -535,7 +1042,7 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                 outcome = "unknown"
                 state.unknown_suspend_operation = operation_id
                 state.closed_reason = "going to sleep (outcome unknown)"
-                # Persist before the effect: the operation, and the token's revocation.
+                # Persist before the effect: the operation, which revokes the token.
                 state.pending_intent = asyncio.ensure_future(
                     asyncio.to_thread(
                         _host_store.begin_host_sleep, host_id, operation_id=operation_id
@@ -567,7 +1074,6 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                     host_id,
                     operation_id=operation_id,
                     stopped=result.outcome == "stopped",
-                    token_expires_at=now_epoch() + entry.token_ttl_s,
                 )
                 if result.outcome == "stopped":
                     _host_registry.deregister(host_id)
@@ -598,6 +1104,74 @@ async def recover_pending_sleeps() -> list[str]:
         state.closed_reason = "going to sleep (outcome unknown)"
         recovered.append(host_id)
     return recovered
+
+
+async def create_host(*, owner: str, name: str, provider: str | None) -> Host:
+    """Create a persistent host and start it in the background.
+
+    The pending row is written before the provider provisions anything; the
+    first start then provisions, arms and starts the host. A failure leaves
+    the host ``failed`` with its reason, never deleted.
+
+    :param owner: The caller, e.g. ``"alice@example.com"``.
+    :param name: Caller-chosen display name, e.g. ``"Work computer"``.
+    :param provider: A persistent provider, or ``None`` for the first one.
+    :returns: The pending host.
+    :raises OmnigentError: ``INVALID_INPUT`` when no such provider exists;
+        ``CONFLICT`` when the name is taken.
+    """
+    assert _host_store is not None
+    offered = _deployment.persistent_providers() if _deployment is not None else ()
+    if not offered or (provider is not None and provider not in offered):
+        raise OmnigentError(
+            f"no persistent host provider {provider!r} is configured"
+            if provider is not None
+            else "no persistent host provider is configured",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        host = await asyncio.to_thread(
+            _host_store.create_persistent_host,
+            host_id=uuid.uuid4().hex,
+            name=name,
+            user_id=owner,
+            provider=provider or offered[0],
+        )
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+    start_host_now(host.host_id)
+    return host
+
+
+async def delete_host(host: Host) -> None:
+    """Delete a persistent host: tombstone it, then ask the provider to remove it.
+
+    ``terminate`` means removal for a persistent host and is called only here,
+    after account deletion, and by the reaper's retry of a tombstone.
+    """
+    assert _host_store is not None
+    forget(host.host_id)
+    await terminate_managed_host(host, _host_store, _deployment)
+
+
+async def remove_deleted_account_hosts(user_id: str) -> None:
+    """Remove the sandboxes of a deleted account's persistent hosts.
+
+    Called after the account deletion commits; a failure is retried by the reaper.
+    """
+    if not enabled():
+        return
+    assert _host_store is not None
+    for host in await asyncio.to_thread(_host_store.list_deleted_persistent_hosts, user_id):
+        forget(host.host_id)
+        await terminate_managed_host(host, _host_store, _deployment)
+
+
+def _token_expiring(host: Host, policy: PersistentHostPolicy) -> bool:
+    return (
+        host.token_expires_at is not None
+        and host.token_expires_at - now_epoch() <= policy.token_refresh_margin_s
+    )
 
 
 class PersistentHostIdleMonitor:
@@ -637,7 +1211,11 @@ class PersistentHostIdleMonitor:
                 _logger.exception("persistent host idle sweep failed")
 
     async def sweep_once(self) -> dict[str, str]:
-        """Check every connected persistent host once; returns each host's state."""
+        """Check every connected persistent host once; returns each host's state.
+
+        A host sleeps once it has been quiescent for the policy's idle window,
+        or at its first quiescent moment when its launch token is near expiry.
+        """
         assert _host_store is not None and _host_registry is not None
         outcomes: dict[str, str] = {}
         for host_id, state in list(_states.items()):
@@ -652,7 +1230,7 @@ class PersistentHostIdleMonitor:
             if host is None or conn is None or policy is None or host_id in outcomes:
                 continue
             state = _state(host_id)
-            busy = _busy_reason(state, conn, await list_host_runners(conn))
+            busy = _busy_reason(state, conn, await quiesce_host(conn))
             if busy is not None:
                 state.idle_since = None
                 outcomes[host_id] = f"busy: {busy}"
@@ -660,7 +1238,7 @@ class PersistentHostIdleMonitor:
             now = time.monotonic()
             if state.idle_since is None:
                 state.idle_since = now
-            if now - state.idle_since >= policy.idle_sleep_s:
+            if _token_expiring(host, policy) or now - state.idle_since >= policy.idle_sleep_s:
                 outcomes[host_id] = await sleep_if_idle(host_id)
             else:
                 outcomes[host_id] = f"idle for {now - state.idle_since:.0f}s"

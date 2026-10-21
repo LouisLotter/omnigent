@@ -99,7 +99,11 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
-from omnigent.server.persistent_hosts import ensure_host_ready, is_persistent_host
+from omnigent.server.persistent_hosts import (
+    ensure_host_ready,
+    is_persistent_host,
+    session_progress,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -1365,6 +1369,13 @@ def register_events_routes(
                 absent here but the host is live on another replica.
             """
             _app_state = request.app.state
+            if wake_conv.host_id is not None:
+                await ensure_host_ready(
+                    wake_conv.host_id,
+                    operation="compact",
+                    timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+                    progress=session_progress(session_id),
+                )
             if wake_conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
                 session_id=session_id,
                 conv=wake_conv,
@@ -2390,6 +2401,7 @@ def register_events_routes(
                 conv.host_id,
                 operation="message",
                 timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+                progress=session_progress(session_id),
             )
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
             session_id=session_id,

@@ -4565,6 +4565,35 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PersistentHostCreate": {
+        "description": "Body of `POST /v1/hosts`.",
+        "properties": {
+          "name": {
+            "description": "Display name shown in host pickers, e.g. `\"Work computer\"`.",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A configured persistent provider, or `None` for the first.",
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PersistentHostCreate",
+        "type": "object"
+      },
       "PluginAsset": {
         "properties": {
           "id": {
@@ -5748,6 +5777,14 @@
           "needs_setup": {
             "title": "Needs Setup",
             "type": "boolean"
+          },
+          "persistent_host_providers": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Persistent Host Providers",
+            "type": "array"
           },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
@@ -10853,9 +10890,94 @@
         "tags": [
           "hosts"
         ]
+      },
+      "post": {
+        "description": "Create a persistent host for the caller; its first start runs in the background.\n\n**Returns:** The new host, `waking` while it starts.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when no such persistent provider is configured; 409 when the caller already has a host with the name.",
+        "operationId": "create_persistent_host_v1_hosts_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersistentHostCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Persistent Host V1 Hosts Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Persistent Host",
+        "tags": [
+          "hosts"
+        ]
       }
     },
     "/v1/hosts/{host_id}": {
+      "delete": {
+        "description": "Delete a persistent host and ask its provider to remove the sandbox.\n\nThe host is removed from Omnigent first; a provider removal that fails\nis retried by the managed-sandbox reaper.",
+        "operationId": "delete_persistent_host_v1_hosts__host_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Persistent Host V1 Hosts  Host Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Persistent Host",
+        "tags": [
+          "hosts"
+        ]
+      },
       "get": {
         "description": "Get details for a single host.\n\n**Returns:** Host details dict \u2014 the `list_hosts` fields (including `gateway_inference`, `None` when unreported) plus `runners`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
@@ -11761,6 +11883,51 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/start": {
+      "post": {
+        "description": "Start a persistent host again, e.g. after its first start failed.\n\n**Returns:** The host, `waking` while it starts.",
+        "operationId": "start_persistent_host_v1_hosts__host_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Persistent Host V1 Hosts  Host Id  Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Persistent Host",
         "tags": [
           "hosts"
         ]

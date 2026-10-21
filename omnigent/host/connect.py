@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,8 +91,6 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
-    HostListRunnersFrame,
-    HostListRunnersResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
@@ -103,6 +101,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostQuiesceFrame,
+    HostQuiesceResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -500,6 +500,19 @@ _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
+
+# Host operations that change the machine, by request frame. ``host.quiesce``
+# reports them while in flight so a sandbox stop never cuts one off; runner
+# launches are reported separately.
+_MUTATING_HOST_OPERATIONS: dict[type, str] = {
+    HostStopRunnerFrame: "stop_runner",
+    HostCreateDirFrame: "create_dir",
+    HostInstallHarnessFrame: "install_harness",
+    HostStoreSecretFrame: "store_secret",
+    HostCreateWorktreeFrame: "create_worktree",
+    HostRemoveWorktreeFrame: "remove_worktree",
+    HostFsWriteFrame: "fs_write",
+}
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -1344,6 +1357,9 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
+        # Mutating host operations in flight by kind, reported by host.quiesce.
+        # Counted by frame task, which outlives a dropped tunnel's request.
+        self._host_operations: Counter[str] = Counter()
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -2479,23 +2495,37 @@ class HostProcess:
             status=status,
         )
 
-    async def _handle_list_runners(
-        self, frame: HostListRunnersFrame
-    ) -> HostListRunnersResultFrame:
-        """Report runners whose process is alive and launches still in flight.
+    async def _handle_quiesce(self, frame: HostQuiesceFrame) -> HostQuiesceResultFrame:
+        """Report live runners, runner launches and mutating host operations.
 
-        The managed-host sleep fence asks this before suspending the sandbox,
-        because stopping the host ends every runner on it.
+        The persistent-host sleep fence asks this before the sandbox stops,
+        because stopping the host ends every runner and operation on it.
         """
         live = []
         for runner_id, handle in list(self._runners.items()):
             if await asyncio.to_thread(handle.proc.poll) is None:
                 live.append(runner_id)
-        return HostListRunnersResultFrame(
+        return HostQuiesceResultFrame(
             request_id=frame.request_id,
             runners=live,
             launching=len(self._pending_runner_launches),
+            operations=sorted(self._host_operations.elements()),
         )
+
+    @contextlib.contextmanager
+    def _track_host_operation(self, frame: object) -> Iterator[None]:
+        """Count a mutating host operation for ``host.quiesce`` until it finishes."""
+        kind = _MUTATING_HOST_OPERATIONS.get(type(frame))
+        if kind is None:
+            yield
+            return
+        self._host_operations[kind] += 1
+        try:
+            yield
+        finally:
+            self._host_operations[kind] -= 1
+            if self._host_operations[kind] <= 0:
+                del self._host_operations[kind]
 
     async def _watch_runner(self, runner_id: str) -> None:
         """Watch a spawned runner and report an unexpected exit.
@@ -5031,7 +5061,7 @@ class HostProcess:
             carrier = {}
         raw_kind = carrier.get("kind")
         kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
-        with telemetry.consume_frame_span(kind, carrier):
+        with telemetry.consume_frame_span(kind, carrier), self._track_host_operation(frame):
             await self._dispatch_host_frame(ws, frame)
 
     async def _dispatch_host_frame(
@@ -5071,8 +5101,8 @@ class HostProcess:
             await self._send_text(ws, encode_host_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
-        elif isinstance(frame, HostListRunnersFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_list_runners(frame)))
+        elif isinstance(frame, HostQuiesceFrame):
+            await self._send_text(ws, encode_host_frame(await self._handle_quiesce(frame)))
         elif isinstance(frame, HostStatFrame):
             await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):

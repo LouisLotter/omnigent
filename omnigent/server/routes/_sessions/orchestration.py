@@ -4709,12 +4709,14 @@ async def ensure_runner_connected(
 
     if conv.host_id is not None:
         from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
-        from omnigent.server.persistent_hosts import ensure_host_ready
+        from omnigent.server.persistent_hosts import ensure_host_ready, session_progress
 
+        # A persistent host may be asleep or going to sleep: hold, wake, admit.
         await ensure_host_ready(
             conv.host_id,
             operation="resource_access",
             timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+            progress=session_progress(session_id),
         )
 
     # Fast path: a live runner tunnel is already reachable.

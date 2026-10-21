@@ -196,6 +196,7 @@ def _host(
     status: str = "offline",
     terminating_sandbox_id: str | None = None,
     deleted_at: int | None = None,
+    lifecycle: str | None = None,
 ) -> Host:
     return Host(
         host_id=host_id,
@@ -208,6 +209,7 @@ def _host(
         sandbox_id=sandbox_id,
         terminating_sandbox_id=terminating_sandbox_id,
         deleted_at=deleted_at,
+        lifecycle=lifecycle,
     )
 
 
@@ -672,3 +674,40 @@ async def test_identity_and_termination_run_off_event_loop_thread() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.identity_threads == modal.termination_threads
     assert modal.identity_threads[0] != event_loop_thread
+
+
+async def test_sweep_retries_only_deleted_persistent_hosts() -> None:
+    """An asleep persistent host is offline by design; only a deleted one's removal is retried."""
+    now = 4_000_000
+    cloud = _RecordingLauncher("cloud")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_asleep",
+                    provider="cloud",
+                    sandbox_id="sb-asleep",
+                    updated_at=now - 90 * _DAY_S,
+                    lifecycle="persistent",
+                ),
+                _host(
+                    "host_deleted",
+                    provider="cloud",
+                    sandbox_id="sb-deleted",
+                    updated_at=now - 2 * _DAY_S,
+                    deleted_at=now - _DAY_S,
+                    lifecycle="persistent",
+                ),
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([cloud]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert cloud.terminated == ["sb-deleted"]
+    assert hosts.hosts[7]["host_asleep"].sandbox_id == "sb-asleep"
+    assert hosts.detached == []

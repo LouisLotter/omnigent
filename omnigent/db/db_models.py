@@ -1314,9 +1314,16 @@ class SqlHost(OmnigentBase):
         active host generation and awaiting successful provider termination.
         A fresh generation may be registered in ``sandbox_id`` while this
         cleanup remains pending.
+    :param lifecycle: Int code of the host's lifecycle (see
+        ``omnigent.db.enum_codecs.HOST_LIFECYCLE``): ``persistent`` for a
+        managed host that outlives sessions and sleeps when idle. ``NULL`` for
+        laptops and for sandboxes owned by one session.
     :param sleep_operation_id: Operation id of a persistent host's sleep whose
         outcome is not yet known. Written before the provider is asked to stop
         the sandbox; admission stays closed until the outcome is recorded.
+    :param start_failure: Person-readable reason a persistent host's last
+        start failed, e.g. ``"provider refused: capacity"``. ``NULL`` once a
+        start succeeds.
     :param deleted_at: Logical deletion timestamp for a managed host whose
         provider sandbox cleanup is still pending. The row is physically
         removed after every recorded sandbox id terminates successfully.
@@ -1355,7 +1362,9 @@ class SqlHost(OmnigentBase):
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    lifecycle: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     sleep_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    start_failure: Mapped[str | None] = mapped_column(String(512), nullable=True)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)

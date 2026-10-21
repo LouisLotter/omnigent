@@ -254,8 +254,8 @@ class ManagedSandboxReaper:
         from omnigent.server.persistent_hosts import is_persistent_host
 
         if host.deleted_at is None and is_persistent_host(host):
-            # An asleep persistent host is offline by design, not abandoned.
-            return host.terminating_sandbox_id is not None
+            # Offline by design while asleep: only a deleted one's removal is retried.
+            return False
         return host.sandbox_provider is not None and (
             (
                 host.deleted_at is not None

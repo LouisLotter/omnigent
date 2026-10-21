@@ -76,23 +76,30 @@ _MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
 _MAX_MANAGED_KEEPALIVE_INTERVAL_S: float = 3600.0
 
 
-def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
+def resolve_managed_keepalive_interval_s(
+    provider: str | None = None, *, configured_s: float | None = None
+) -> float:
     """
     How often the server refreshes a live managed sandbox's liveness, in seconds.
 
     Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
     pushes an absolute deadline forward under a short window; every other
-    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
-    overrides both when set (advanced/experimental — the operator-facing knob is
-    ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
-    Resolved live from the env on each call (no snapshot), so the server loop
-    cadence and the ``agent_sandbox`` window floor cannot disagree.
+    provider uses the cheaper 600s default. A provider entry's own setting
+    (*configured_s*) replaces that default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    overrides all of them when set (advanced/experimental — the operator-facing
+    knob is ``keep_warm_s``), floored at a small minimum so a typo cannot spin
+    the loop. Resolved live from the env on each call (no snapshot), so the
+    server loop cadence and the ``agent_sandbox`` window floor cannot disagree.
+
+    :param provider: Provider short name, e.g. ``"modal"``.
+    :param configured_s: The provider entry's keep-alive interval, or ``None``.
     """
-    default = (
-        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
-        if provider == "agent_sandbox"
-        else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
-    )
+    if configured_s is not None:
+        default = configured_s
+    elif provider == "agent_sandbox":
+        default = _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
+    else:
+        default = _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
     raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
     if not raw:
         return default
@@ -522,6 +529,7 @@ class SandboxLifecycle(ABC):
             ),
             suspend=self._is_capability_overridden("suspend"),
             admission=self._is_capability_overridden("admission"),
+            start_claims=self._is_capability_overridden("claim_start"),
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
@@ -715,30 +723,56 @@ class SandboxLifecycle(ABC):
         """
         Stop a quiescent sandbox, keeping its volume, so a persistent host can sleep.
 
-        Optional capability, called only by the managed-host sleep fence after
-        Omnigent has closed the host's admission and the host reported no live
-        runner. Repeating a call with the same *operation_id* must report the
-        recorded outcome rather than act again.
+        Optional capability, called only by the persistent-host sleep fence
+        after Omnigent has closed the host's admission, the host reported no
+        live runner or host operation, and its launch token was revoked.
+        Repeating a call with the same *operation_id* must report the recorded
+        outcome rather than act again.
 
         :param sandbox_id: The sandbox to stop, e.g. ``"sb-a1b2c3"``.
         :param operation_id: Idempotency key for this sleep attempt.
-        :returns: ``refused``, ``stopped`` or ``unknown``.
+        :returns: ``refused`` (nothing stopped), ``stopped`` or ``unknown``.
         :raises SandboxCapabilityError: When the provider cannot suspend.
         """
         raise self._capability_error("suspend a sandbox")
 
-    def admission(self, sandbox_id: str) -> _sandbox_types.AdmissionReport:
+    def admission(self, sandbox_id: str) -> _sandbox_types.AdmissionReport | None:
         """
-        Report whether the sandbox currently admits new work.
+        Report whether the sandbox admits new work, with its typed status.
 
-        Optional capability: providers without one always admit. A provider that
-        cannot determine the state answers not admitting, with the reason.
+        Optional capability for persistent hosts. Omnigent refuses new work
+        only on an explicit refusal; ``None`` (or an exception) means the
+        provider could not answer, which Omnigent never caches and asks again
+        within its readiness deadline.
 
         :param sandbox_id: The sandbox to inspect, e.g. ``"sb-a1b2c3"``.
-        :returns: The provider's current admission report.
+        :returns: The provider's admission report, or ``None`` when unknown.
+        :raises SandboxGoneError: When the sandbox definitively no longer exists.
         """
         del sandbox_id
-        return _sandbox_types.AdmissionReport(admitting=True)
+        return None
+
+    def claim_start(self, sandbox_id: str, *, operation_id: str) -> _sandbox_types.StartClaim:
+        """
+        Claim a new host start attempt, the fence before any re-arm.
+
+        Optional capability for persistent hosts whose provider supervises the
+        host process. The provider grants a claim only while no host process
+        holds the sandbox (``started_no_host``, ``start_claimed`` or
+        ``host_refused``), records attempt N+1 and returns it; a later claim
+        supersedes it. Omnigent re-arms the host and calls ``start_host`` with
+        ``start_attempt=`` only after a granted claim, so a launcher that
+        implements this must accept that keyword on ``start_host`` and refuse a
+        start whose attempt is no longer current. Repeating a call with the same
+        *operation_id* returns the recorded outcome.
+
+        :param sandbox_id: The sandbox to start a host in, e.g. ``"sb-a1b2c3"``.
+        :param operation_id: Idempotency key for this claim.
+        :returns: The claim, granted or refused with the current status.
+        :raises SandboxCapabilityError: When the provider has no start claims.
+        :raises SandboxGoneError: When the sandbox definitively no longer exists.
+        """
+        raise self._capability_error("claim a host start")
 
     def _capability_error(self, action: str) -> SandboxCapabilityError:
         """

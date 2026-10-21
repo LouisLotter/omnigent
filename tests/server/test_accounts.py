@@ -43,6 +43,7 @@ from omnigent.server.auth import (
     create_auth_provider,
     resolve_auth_source,
 )
+from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.passwords import (
     InvalidPasswordError,
     hash_password,
@@ -956,6 +957,7 @@ def _build_accounts_app(
     monkeypatch: pytest.MonkeyPatch,
     *,
     init_admin_password: str | None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> Iterator[TestClient]:
     """Build a production-shaped accounts-mode app + TestClient.
 
@@ -969,6 +971,7 @@ def _build_accounts_app(
     :param init_admin_password: When set, bootstrap creates the admin
         with it (admin exists, no setup pending). When ``None``, no
         admin is created and ``/v1/info`` reports ``needs_setup``.
+    :param sandbox_config: Managed sandbox providers, or ``None`` for none.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
@@ -1046,6 +1049,7 @@ def _build_accounts_app(
         host_store=host_store,
         auth_provider=auth_provider,
         account_store=account_store,
+        sandbox_config=sandbox_config,
     )
     with TestClient(app) as client:
         yield client
@@ -1718,6 +1722,60 @@ def test_delete_user_revokes_durable_authority(accounts_app: TestClient, tmp_pat
     assert hosts.list_hosts("alice") == []
     # The still-signed cookie no longer authenticates.
     assert alice.get("/auth/me").status_code == 401
+
+
+def test_delete_user_removes_their_persistent_hosts_after_the_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deleted account's computers are tombstoned, then removed through their provider.
+
+    Persistent hosts outlive sessions, so nothing else would ever ask the
+    provider to remove them; a failed removal stays a tombstone the reaper retries.
+    """
+    import uuid
+
+    from omnigent.server import persistent_hosts
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, PersistentHostPolicy
+    from omnigent.stores.host_store import HostStore
+    from tests.server.persistent_host_fakes import FakeComputer
+
+    computer = FakeComputer()
+    deployment = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://localhost:8000",
+            launcher_factory=lambda: computer,
+            token_ttl_s=3600,
+            provider=computer.provider,
+            persistent=PersistentHostPolicy(),
+        )
+    )
+    built = _build_accounts_app(
+        tmp_path, monkeypatch, init_admin_password="admin-pw-12345", sandbox_config=deployment
+    )
+    app = next(built)
+    try:
+        admin = _login(app, "admin", "admin-pw-12345")
+        invite = admin.post("/auth/invite", json={}).json()["token"]
+        registered = TestClient(app.app).post(
+            "/auth/register",
+            json={"invite": invite, "username": "alice", "password": "alice-pw-1234"},
+        )
+        assert registered.status_code == 200, registered.text
+        hosts = HostStore(f"sqlite:///{tmp_path}/test.db")
+        computer_row = hosts.create_persistent_host(
+            host_id=uuid.uuid4().hex, name="Work computer", user_id="alice", provider="fakepersist"
+        )
+        hosts.attach_persistent_sandbox(computer_row.host_id, sandbox_id="sb-alice")
+
+        resp = admin.delete("/auth/users/alice")
+
+        assert resp.status_code == 204, resp.text
+        assert computer.events == ["terminate"]
+        assert hosts.get_host(computer_row.host_id) is None
+        assert hosts.list_deleted_persistent_hosts("alice") == []
+    finally:
+        built.close()
+        persistent_hosts.configure(None, None, None)
 
 
 def test_change_own_password_round_trip(accounts_app: TestClient) -> None:

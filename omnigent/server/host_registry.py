@@ -44,6 +44,7 @@ from omnigent.host.frames import (
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
+    HostQuiesceResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
 )
@@ -440,7 +441,7 @@ class HostConnection:
     pending_runner_status: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
-    pending_runner_lists: dict[str, asyncio.Future[dict[str, Any]]] = field(
+    pending_quiesce: dict[str, asyncio.Future[HostQuiesceResultFrame]] = field(
         default_factory=dict,
     )
     pending_stats: dict[str, asyncio.Future[dict[str, Any]]] = field(

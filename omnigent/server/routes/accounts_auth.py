@@ -792,6 +792,14 @@ def create_accounts_auth_router(
             for task_id in owned_task_ids:
                 scheduler.remove(task_id)
         auth_provider.revoke_user_sessions(user_id)
+        from omnigent.server import persistent_hosts
+
+        try:
+            # Persistent hosts outlive sessions, so their removal follows the commit.
+            await persistent_hosts.remove_deleted_account_hosts(user_id)
+        except Exception:
+            # The tombstones stay; the managed-sandbox reaper retries the removal.
+            _logger.exception("Removing deleted account %s's persistent hosts failed", user_id)
         return Response(status_code=204)
 
     @router.post("/users/{user_id}/reset")

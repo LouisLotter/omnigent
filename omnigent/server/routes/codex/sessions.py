@@ -22,6 +22,8 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+from omnigent.server.persistent_hosts import ensure_host_ready, session_progress
 from omnigent.server.routes._auth_helpers import get_user_id as _get_user_id
 from omnigent.server.routes._auth_helpers import require_access as _require_access
 from omnigent.server.routes.sessions import (
@@ -407,6 +409,14 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
+    if event.get("type") != "goal_get" and conv.host_id is not None:
+        # A goal change is new work: a persistent host must be awake and admitting.
+        await ensure_host_ready(
+            conv.host_id,
+            operation="codex_goal",
+            timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+            progress=session_progress(session_id),
+        )
     runner_result = await _forward_session_change_to_runner(
         session_id,
         runner_router,
