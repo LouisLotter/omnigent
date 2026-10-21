@@ -2062,6 +2062,280 @@ async def test_local_single_user_server_never_reowns_a_managed_host(db_uri: str)
     assert host is not None and host.user_id == "alice@example.com"
 
 
+# ── A launch-token tunnel never outlives its token ──────────
+
+
+def _supersede_launch_token(store: HostStore, change: str) -> None:
+    """End ``tunnel-token-old`` as ``_HOST_ID``'s launch token by *change*.
+
+    ``re-arm`` and ``replacement`` arm ``tunnel-token-new`` in its place.
+    """
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    if change == "re-arm":
+        assert store.rearm_managed_host(
+            _HOST_ID,
+            sandbox_id="sb-tunnel-1",
+            expected_updated_at=host.updated_at,
+            token="tunnel-token-new",
+            token_expires_at=now_epoch() + 3600,
+        )
+    elif change == "replacement":
+        assert store.replace_managed_host_sandbox(
+            host_id=_HOST_ID,
+            user_id="alice@example.com",
+            token="tunnel-token-new",
+            provider="modal",
+            sandbox_id="sb-tunnel-2",
+            token_expires_at=now_epoch() + 3600,
+        )
+    elif change == "revocation":
+        store.revoke_launch_token(_HOST_ID)
+    elif change == "sleep":
+        assert store.begin_host_sleep(_HOST_ID, operation_id="sleep-op")
+    else:
+        assert store.delete_host(_HOST_ID) is not None
+
+
+async def _connect_managed(app: FastAPI, token: str) -> ApplicationCommunicator:
+    """Open an accepted host tunnel to ``_HOST_ID`` that presents launch *token*."""
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await communicator.send_input({"type": "websocket.connect"})
+    assert (await communicator.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    return communicator
+
+
+async def _sole_refusal(communicator: ApplicationCommunicator) -> HostConnectionErrorFrame:
+    """Return the server's refusal, asserting it is the only frame the tunnel carried."""
+    sent = await communicator.receive_output(timeout=budget(2.0))
+    assert sent["type"] == "websocket.send", sent
+    refusal = decode_host_frame(sent["text"])
+    assert isinstance(refusal, HostConnectionErrorFrame), refusal
+    closed = await communicator.receive_output(timeout=budget(1.0))
+    assert (closed["type"], closed["code"]) == ("websocket.close", 4009)
+    return refusal
+
+
+@pytest.mark.parametrize(
+    ("change", "newer_tunnel"),
+    [
+        ("re-arm", "connected"),
+        ("re-arm", "disconnected"),
+        ("re-arm", None),
+        ("replacement", "connected"),
+        ("replacement", "disconnected"),
+        ("replacement", None),
+        ("revocation", None),
+        ("deletion", None),
+        ("sleep", None),
+    ],
+)
+async def test_delayed_handshake_with_a_superseded_token_never_registers(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, change: str, newer_tunnel: str | None
+) -> None:
+    """An old token's handshake stalled after its store check loses to whatever ended the token.
+
+    It never replaces the new token's tunnel, never registers after that tunnel
+    has gone, and the server sends it nothing but the refusal.
+    """
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-old")
+    stored, release = threading.Event(), threading.Event()
+    upsert_on_connect = store.upsert_on_connect
+
+    def stall_old_token_after_store(*args: object, **kwargs: object) -> object:
+        host = upsert_on_connect(*args, **kwargs)
+        if kwargs.get("managed_token") == "tunnel-token-old":
+            stored.set()
+            release.wait(budget(5.0))
+        return host
+
+    monkeypatch.setattr(store, "upsert_on_connect", stall_old_token_after_store)
+    try:
+        old = await _connect_managed(app, "tunnel-token-old")
+        await old.send_input({"type": "websocket.receive", "text": _make_hello(_MANAGED_NAME)})
+        assert await asyncio.to_thread(stored.wait, budget(5.0))
+        _supersede_launch_token(store, change)
+        if newer_tunnel is not None:
+            newer = await _connect_managed(app, "tunnel-token-new")
+            await _send_hello_and_wait(newer, registry, name=_MANAGED_NAME)
+            if newer_tunnel == "disconnected":
+                await newer.send_input({"type": "websocket.disconnect", "code": 1000})
+                await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), budget(2.0))
+        current = registry.get(_HOST_ID)
+    finally:
+        release.set()
+
+    refusal = await _sole_refusal(old)
+    await old.wait(timeout=budget(2.0))
+    assert await old.receive_nothing()
+
+    assert (refusal.stage, refusal.retryable) == ("registry", True)
+    assert "replaced or revoked" in refusal.error
+    assert registry.get(_HOST_ID) is current
+    host = store.get_host(_HOST_ID)
+    if newer_tunnel != "connected":
+        assert current is None
+        assert host is None or host.status == "offline"
+        return
+    assert current is not None and current.retirement_reason is None
+    assert host is not None and host.status == "online"
+    registry.send_text(current, "frame-for-the-current-host")
+    sent = await newer.receive_output(timeout=budget(2.0))
+    assert (sent["type"], sent["text"]) == ("websocket.send", "frame-for-the-current-host")
+    await newer.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_refused_old_token_never_marks_offline_the_host_a_new_token_is_registering(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old token's tunnel, refused after it registered, leaves the new token's host online."""
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-old")
+    stored = {"tunnel-token-old": threading.Event(), "tunnel-token-new": threading.Event()}
+    released = {"tunnel-token-old": threading.Event(), "tunnel-token-new": threading.Event()}
+    upsert_on_connect = store.upsert_on_connect
+
+    def stall_each_token_after_store(*args: object, **kwargs: object) -> object:
+        host = upsert_on_connect(*args, **kwargs)
+        token = str(kwargs.get("managed_token"))
+        stored[token].set()
+        released[token].wait(budget(5.0))
+        return host
+
+    monkeypatch.setattr(store, "upsert_on_connect", stall_each_token_after_store)
+    try:
+        old = await _connect_managed(app, "tunnel-token-old")
+        await old.send_input({"type": "websocket.receive", "text": _make_hello(_MANAGED_NAME)})
+        assert await asyncio.to_thread(stored["tunnel-token-old"].wait, budget(5.0))
+        _supersede_launch_token(store, "replacement")
+        newer = await _connect_managed(app, "tunnel-token-new")
+        await newer.send_input({"type": "websocket.receive", "text": _make_hello(_MANAGED_NAME)})
+        assert await asyncio.to_thread(stored["tunnel-token-new"].wait, budget(5.0))
+        released["tunnel-token-old"].set()
+        refusal = await _sole_refusal(old)
+        await old.wait(timeout=budget(2.0))
+    finally:
+        for event in released.values():
+            event.set()
+
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), budget(2.0))
+    assert (refusal.stage, refusal.retryable) == ("registry", True)
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "online"
+    await newer.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("credential", ["launch token", "bearer"])
+async def test_delayed_handshake_with_a_current_credential_still_registers(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, credential: str
+) -> None:
+    """A handshake overtaken by another tunnel of its host still registers, newest wins.
+
+    Covers a managed host reconnecting with its current token and a laptop
+    reconnecting with its owner's bearer.
+    """
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    name = _MANAGED_NAME if credential == "launch token" else "alices-laptop"
+    if credential == "launch token":
+        _register_managed(store, host_id=_HOST_ID, token="tunnel-token-current")
+
+    async def dial() -> ApplicationCommunicator:
+        if credential == "launch token":
+            return await _connect_managed(app, "tunnel-token-current")
+        return await _connect_route(app, _TUNNEL_PATH)
+
+    stored, release = threading.Event(), threading.Event()
+    upsert_on_connect = store.upsert_on_connect
+
+    def stall_first_handshake_after_store(*args: object, **kwargs: object) -> object:
+        host = upsert_on_connect(*args, **kwargs)
+        if not stored.is_set():
+            stored.set()
+            release.wait(budget(5.0))
+        return host
+
+    monkeypatch.setattr(store, "upsert_on_connect", stall_first_handshake_after_store)
+    try:
+        delayed = await dial()
+        hello = _make_hello(name, connection_id="delayed")
+        await delayed.send_input({"type": "websocket.receive", "text": hello})
+        assert await asyncio.to_thread(stored.wait, budget(5.0))
+        overtaking = await dial()
+        await _send_hello_and_wait(overtaking, registry, name=name, connection_id="overtaking")
+        overtaken = registry.get(_HOST_ID)
+    finally:
+        release.set()
+
+    async def wait_for_delayed() -> None:
+        while (conn := registry.get(_HOST_ID)) is None or conn.hello.connection_id != "delayed":
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_delayed(), budget(2.0))
+    assert overtaken is not None and overtaken.retirement_reason == "replaced"
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "online"
+    for communicator in (delayed, overtaking):
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("change", ["replacement", "revocation", "deletion"])
+async def test_launch_token_tunnel_ends_at_its_next_heartbeat_once_its_token_is_ended(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """A connected host whose token the server replaced, revoked or deleted is cut off."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-old")
+    old = await _connect_managed(app, "tunnel-token-old")
+    await _send_hello_and_wait(old, registry, name=_MANAGED_NAME)
+
+    _supersede_launch_token(store, change)
+    refusal = await _registration_refusal(old)
+
+    assert (refusal.stage, refusal.retryable) == ("connected", True)
+    assert "replaced or revoked" in refusal.error
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), budget(2.0))
+    host = store.get_host(_HOST_ID)
+    assert host is None or host.status == "offline"
+    if change == "replacement":
+        newer = await _connect_managed(app, "tunnel-token-new")
+        await _send_hello_and_wait(newer, registry, name=_MANAGED_NAME)
+        await newer.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("state", ["expired", "sleeping"])
+async def test_launch_token_tunnel_outlives_token_expiry_and_a_pending_sleep(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """Only a new arming, revocation or deletion ends a connected host's tunnel."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-current")
+    communicator = await _connect_managed(app, "tunnel-token-current")
+    await _send_hello_and_wait(communicator, registry, name=_MANAGED_NAME)
+    connection = registry.get(_HOST_ID)
+
+    if state == "sleeping":
+        assert store.begin_host_sleep(_HOST_ID, operation_id="sleep-op")
+    values = {"updated_at": 1} | (
+        {"token_expires_at": now_epoch() - 1} if state == "expired" else {}
+    )
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(update(SqlHost).where(SqlHost.host_id == _HOST_ID).values(**values))
+        session.commit()
+
+    await _wait_updated_at_at_least(store, _HOST_ID, now_epoch() - 5)
+    assert registry.get(_HOST_ID) is connection
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
 class _FakeSenderWebSocket:
     """Minimal ``send_text`` stand-in for ``_sender_loop`` unit tests.
 
