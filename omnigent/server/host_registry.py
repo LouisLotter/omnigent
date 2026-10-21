@@ -221,9 +221,14 @@ def _hold_unanswered_operations(conn: HostConnection) -> None:
             if future.done() or request_id in conn.inflight_unanswered:
                 continue
             conn.inflight_unanswered[request_id] = now
-            loop.call_later(
-                UNANSWERED_OPERATION_HOLD_S, conn.inflight_unanswered.pop, request_id, None
-            )
+            # The callback holds the connection itself, so a fence that tracks
+            # connections weakly keeps seeing the hold until it expires.
+            loop.call_later(UNANSWERED_OPERATION_HOLD_S, _release_unanswered, conn, request_id)
+
+
+def _release_unanswered(conn: HostConnection, request_id: str) -> None:
+    """End one unanswered operation's hold."""
+    conn.inflight_unanswered.pop(request_id, None)
 
 
 def _fail_pending_futures(

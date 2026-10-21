@@ -684,3 +684,21 @@ async def test_closed_connection_answers_every_waiting_request_with_its_outcome(
         assert getattr(conn, name) == {}
     # A host-changing request may still be running there: it keeps counting.
     assert set(conn.inflight_unanswered) == {"req_1"}
+
+
+async def test_unanswered_operation_hold_outlives_other_references_to_its_connection() -> None:
+    """A fence that tracks connections weakly keeps seeing the hold until it expires."""
+    import gc
+    import weakref
+
+    registry = HostRegistry()
+    old = registry.register("host_hold", FakeWebSocket(), _make_hello(), owner="bob")
+    old.pending_installs["req_install"] = asyncio.get_running_loop().create_future()
+    registry.register("host_hold", FakeWebSocket(), _make_hello(), owner="bob")
+    retired = weakref.ref(old)
+    del old
+    gc.collect()
+
+    held = retired()
+    assert held is not None, "the retired connection was collected with its hold"
+    assert set(held.inflight_unanswered) == {"req_install"}
