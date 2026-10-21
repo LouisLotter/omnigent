@@ -7981,10 +7981,16 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param delivery: ``"accepted"`` when the runner took the message;
+        ``"duplicate"`` when it had already accepted it, so nothing new runs;
+        ``"unknown"`` when it may have taken it but its answer was lost, so a
+        client must not resend it (a resend with the same stable id is
+        de-duplicated while the pending entry is kept).
     """
 
     item_id: str | None
     pending_id: str | None
+    delivery: Literal["accepted", "duplicate", "unknown"] = "accepted"
 
 
 def _extract_persistent_item_from_sse(

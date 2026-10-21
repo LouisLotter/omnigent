@@ -806,6 +806,142 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+class _LostAcceptanceRunner:
+    """
+    Runner fake that de-duplicates like the real one and can lose its answers.
+
+    ``lose_answers`` forwards are accepted (run) and then answered with a read
+    timeout, as when the runner took a message and its reply was lost on a
+    half-open tunnel. ``refuse_next`` forwards never reach it.
+    """
+
+    def __init__(self) -> None:
+        from omnigent.runner.message_acceptance import AcceptedMessages
+
+        self.accepted = AcceptedMessages()
+        self.runs: list[str] = []
+        self.lose_answers = 0
+        self.refuse_next = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/events"):
+            return httpx.Response(202, json={})
+        if self.refuse_next:
+            self.refuse_next -= 1
+            raise httpx.ConnectError("runner offline", request=request)
+        body = json.loads(request.content)
+        if self.accepted.seen("conv", body):
+            return httpx.Response(202, json={"status": "duplicate"})
+        self.accepted.remember("conv", body)
+        self.runs.append(body["content"][0]["text"])
+        if self.lose_answers:
+            self.lose_answers -= 1
+            raise httpx.ReadTimeout("answer lost", request=request)
+        return httpx.Response(202, json={"status": "accepted"})
+
+
+async def test_native_message_whose_acceptance_is_lost_runs_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message the runner took, whose answer was lost, runs once across retries.
+
+    The first answer is "delivery unknown, do not resend" instead of 502, and
+    the pending entry is kept, so a retry with the same stable id is answered
+    from it. A retry after the mirror drained the entry reaches the runner,
+    which answers it as a duplicate. A send that never reached the runner is
+    still a 502 whose retry runs.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    pending_inputs.reset_for_tests()
+    runner_fake = _LostAcceptanceRunner()
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+
+    def message(text: str, stable_id: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+                "stable_id": stable_id,
+            },
+        }
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_fake), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "claude-code-native-ui",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events = f"/v1/sessions/{session_id}/events"
+        try:
+            lost = message("append one line", "1" * 32)
+            runner_fake.lose_answers = 1
+            first = await client.post(events, json=lost)
+            assert first.status_code == 202, first.text
+            assert first.json()["delivery"] == "unknown"
+            assert pending_inputs.snapshot_for(session_id), "the entry must be kept"
+
+            retry = await client.post(events, json=lost)
+            assert retry.status_code == 202, retry.text
+            assert retry.json()["delivery"] == "duplicate"
+            assert retry.json()["pending_id"] == first.json()["pending_id"]
+
+            mirrored = await client.post(
+                events,
+                json={
+                    "type": "external_conversation_item",
+                    "data": {"item_type": "message", "item_data": lost["data"]},
+                },
+            )
+            assert mirrored.status_code == 202, mirrored.text
+            assert not pending_inputs.snapshot_for(session_id)
+            late_retry = await client.post(events, json=lost)
+            assert late_retry.status_code == 202, late_retry.text
+            assert late_retry.json()["delivery"] == "duplicate"
+            assert "pending_id" not in late_retry.json()
+            assert not pending_inputs.snapshot_for(session_id)
+            assert runner_fake.runs == ["append one line"]
+
+            never_sent = message("second message", "2" * 32)
+            runner_fake.refuse_next = 1
+            refused = await client.post(events, json=never_sent)
+            assert refused.status_code == 502, refused.text
+            assert not pending_inputs.snapshot_for(session_id)
+            resent = await client.post(events, json=never_sent)
+            assert resent.status_code == 202, resent.text
+            assert "delivery" not in resent.json()
+            assert runner_fake.runs == ["append one line", "second message"]
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
 async def test_native_user_item_respects_background_title_header_opt_out(
     client: httpx.AsyncClient,
     app: Any,

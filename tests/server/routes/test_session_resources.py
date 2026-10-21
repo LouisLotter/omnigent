@@ -22,6 +22,7 @@ from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner.transports.ws_tunnel.transport import TunnelRequestNotSentError
 from omnigent.runtime import (
     _globals,
     session_stream,
@@ -872,27 +873,36 @@ async def test_claude_native_message_surfaces_runner_sse_failure(
 
 
 @pytest.mark.asyncio
-async def test_claude_native_message_tunnel_close_mid_forward_returns_502(
+@pytest.mark.parametrize(
+    ("drop", "status", "delivery"),
+    [
+        # The tunnel closed after the frame was queued: the runner may have it.
+        (ConnectionError("tunnel closed before request completed"), 202, "unknown"),
+        # The tunnel closed before the frame was queued: it never left.
+        (TunnelRequestNotSentError("runner tunnel was replaced"), 502, None),
+    ],
+)
+async def test_claude_native_message_tunnel_close_mid_forward_reports_its_outcome(
     client: httpx.AsyncClient,
+    drop: ConnectionError,
+    status: int,
+    delivery: str | None,
 ) -> None:
     """
-    A WS-tunnel drop between terminal ensure and message forward is a 502.
+    A WS-tunnel drop between terminal ensure and message forward has a known outcome.
 
-    WSTunnelTransport raises bare ``ConnectionError`` — not an
-    ``httpx.HTTPError`` — when the runner tunnel closes mid-request.
-    Before this fix the exception escaped the forward's
-    ``except httpx.HTTPError`` clause to the global catch-all and the
-    client saw an opaque 500 ``internal_error``; it must map to the
-    same 502 as any other transport failure on the forward leg.
+    ``WSTunnelTransport`` raises a bare ``ConnectionError`` — not an
+    ``httpx.HTTPError`` — when the runner tunnel closes mid-request, which must
+    not escape to the catch-all as an opaque 500. A drop after the request
+    left is "delivery unknown, do not resend"; one before it left is a 502
+    whose retry is safe.
     """
     fake_runner = _FakeRunnerClient(
         payload={},
         exc_paths={
             # Ensure (terminals POST) succeeds via the default payload;
             # only the message-forward leg drops the tunnel.
-            "/v1/sessions/64a784c3aa907d1774f44313546947c6/events": ConnectionError(
-                "tunnel closed before request completed"
-            ),
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/events": drop,
         },
     )
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
@@ -909,10 +919,11 @@ async def test_claude_native_message_tunnel_close_mid_forward_returns_502(
         },
     )
 
-    # 502 is the designed transport-failure mapping; a 500 here means
-    # the bare ConnectionError escaped to the catch-all again.
-    assert resp.status_code == 502, resp.text
-    assert resp.json()["detail"] == "Claude terminal message delivery failed"
+    assert resp.status_code == status, resp.text
+    if delivery is None:
+        assert resp.json()["detail"] == "Claude terminal message delivery failed"
+    else:
+        assert resp.json()["delivery"] == delivery
     # Ensure ran (and passed) before the forward leg hit the drop.
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),

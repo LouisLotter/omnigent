@@ -105,6 +105,7 @@ from omnigent.runner.subagent_routing import (
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import runner_request_may_have_been_delivered
 from omnigent.runtime import (
     disconnect_outcome,
     get_policy_store,
@@ -6210,6 +6211,10 @@ def _build_native_terminal_message_event(
     return event
 
 
+class _NativeMessageDeliveryUnknownError(Exception):
+    """The runner may have taken a native message, but its answer was lost."""
+
+
 async def _forward_native_terminal_message(
     runner_client: httpx.AsyncClient,
     session_id: str,
@@ -6220,7 +6225,7 @@ async def _forward_native_terminal_message(
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
-) -> None:
+) -> Literal["accepted", "duplicate"]:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
 
@@ -6245,9 +6250,12 @@ async def _forward_native_terminal_message(
         ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
-    :returns: None.
+    :returns: ``"duplicate"`` when the runner had already accepted this
+        message, else ``"accepted"``.
     :raises HTTPException: 502 when the runner or harness rejects
-        the injection request.
+        the injection request, or the request never reached the runner.
+    :raises _NativeMessageDeliveryUnknownError: When the request may have
+        reached the runner but no answer came back.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(
@@ -6324,6 +6332,8 @@ async def _forward_native_terminal_message(
             exc_info=True,
             extra={"session_id": session_id},
         )
+        if runner_request_may_have_been_delivered(exc):
+            raise _NativeMessageDeliveryUnknownError(str(exc)) from exc
         raise HTTPException(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed",
@@ -6371,6 +6381,23 @@ async def _forward_native_terminal_message(
             input_delivery,
         ),
     )
+    return "duplicate" if _runner_reported_duplicate(resp) else "accepted"
+
+
+def _runner_reported_duplicate(resp: httpx.Response) -> bool:
+    """
+    Return whether the runner answered that it had already accepted this message.
+
+    :param resp: The runner's answer to a forwarded message.
+    :returns: ``True`` for the runner's duplicate-message answer.
+    """
+    from omnigent.runner.message_acceptance import DUPLICATE_MESSAGE_STATUS
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("status") == DUPLICATE_MESSAGE_STATUS
 
 
 async def _persist_session_event(
@@ -7902,7 +7929,9 @@ async def _dispatch_session_event_to_runner_impl(
                         session_id, repeated_pending_id
                     ),
                 )
-                return _SessionEventDispatchResult(item_id=None, pending_id=repeated_pending_id)
+                return _SessionEventDispatchResult(
+                    item_id=None, pending_id=repeated_pending_id, delivery="duplicate"
+                )
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8043,10 +8072,11 @@ async def _dispatch_session_event_to_runner_impl(
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
         forwarded = False
+        delivery: Literal["accepted", "duplicate", "unknown"] = "accepted"
         try:
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
-            await _forward_native_terminal_message(
+            delivery = await _forward_native_terminal_message(
                 runner_client,
                 session_id,
                 conv,
@@ -8071,6 +8101,21 @@ async def _dispatch_session_event_to_runner_impl(
                 attributes=input_attributes(input_delivery),
                 outcome="forward_accepted",
             )
+        except _NativeMessageDeliveryUnknownError as exc:
+            # The runner may be running it. Keep the pending entry, so a resend
+            # with the same stable id is answered from it instead of run twice;
+            # the transcript mirror drains it, or a later mirror reports it as
+            # undelivered.
+            forwarded = True
+            delivery = "unknown"
+            log_input_event(
+                _logger,
+                "native_input_forward_finished",
+                session_id=session_id,
+                attributes=input_attributes(input_delivery),
+                outcome="delivery_unknown",
+                exception_type=type(exc.__cause__ or exc).__name__,
+            )
         except BaseException as exc:
             log_input_event(
                 _logger,
@@ -8084,6 +8129,10 @@ async def _dispatch_session_event_to_runner_impl(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        if delivery == "duplicate" and pending_id is not None:
+            # The runner already took this message; its mirror drains the first entry.
+            pending_inputs.resolve(session_id, pending_id)
+            pending_id = None
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
@@ -8116,7 +8165,7 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id, delivery=delivery)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,

@@ -3103,6 +3103,10 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if dispatch.delivery != "accepted":
+            # "unknown": the runner may be running it, so the client must not
+            # resend it; "duplicate": it was already accepted and nothing new runs.
+            response["delivery"] = dispatch.delivery
         return response
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
