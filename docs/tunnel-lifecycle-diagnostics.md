@@ -44,6 +44,18 @@ and requested `4003 / ping timeout`. The host handles application pings in
 `HostProcess._handle_raw_message`; protocol keepalives run separately inside
 the WebSocket library.
 
+The host and runner apply the same rule in the other direction. A tunnel that
+delivers no message for `OMNIGENT_TUNNEL_SILENCE_TIMEOUT_S` (45 seconds by
+default; `0` disables it), then none during one more 1-second read, is aborted
+and redialed. The disconnect rows carry `disconnect_reason = silence_timeout`
+and `error_type = TunnelSilenceTimeoutError`. This catches a path that keeps
+answering protocol pings while dropping data, which the protocol keepalive
+cannot see. The server's application ping keeps a healthy tunnel inside the
+deadline, and the extra read lets messages queued while the process was paused
+arrive first. A server that cannot send for that long, for example because its
+event loop stalls or one very large message crawls over a slow link, now also
+loses the tunnel; the protocol keepalive alone allowed about 120 seconds.
+
 Both ends use the heartbeat/send timing fields below. Server pings retain
 local enqueue timing without changing their wire payload. All host application
 sends, including pongs and request replies, pass through the same timing

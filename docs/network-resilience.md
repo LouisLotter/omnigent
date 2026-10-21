@@ -15,7 +15,7 @@ instead of Codex's automatic reviewer.
 | Outage | The user sees | Never |
 | --- | --- | --- |
 | Blip under ~5 s | Nothing, or a brief "Reconnecting…" | A failed turn, an approval denied or lost, a lost or duplicated action, a wrong status |
-| Within the reconnect grace (`RUNNER_DISCONNECT_GRACE_S`, 90 s) | "Reconnecting…", and the turn still shown running when it is | A red error over a turn that is still running on the host |
+| Within the reconnect grace (`RUNNER_DISCONNECT_GRACE_S`: 90 s, extended with `OMNIGENT_RUNNER_DISCONNECT_GRACE_S`) | "Reconnecting…", and the turn still shown running when it is | A red error over a turn that is still running on the host |
 | Past the grace | "Host offline since …", then the true state and one action that fixes it once reachable | A spinner forever, a status that disagrees with the harness, an error with no action |
 | The harness loses its model | A visible retrying state, then success or a retryable error | A silent stall, or a terminal error without Retry |
 | The user acts during an outage | The action applied exactly once when reachable, or refused at once with the input kept | Silently dropped or applied twice |

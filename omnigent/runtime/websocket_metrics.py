@@ -11,6 +11,7 @@ from opentelemetry.util.types import Attributes
 from websockets.exceptions import ConnectionClosed
 
 from omnigent.runtime.telemetry import telemetry_enabled
+from omnigent.util.tunnel_silence import TunnelSilenceTimeoutError
 
 _logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ DisconnectReason = Literal[
     "protocol_error",
     "server_rehome",
     "server_restart",
+    "silence_timeout",
     "suspend_resume",
     "transport_error",
     "unknown",
@@ -125,6 +127,8 @@ def classify_disconnect_reason(
         return "local_shutdown"
     if resumed_from_suspend:
         return "suspend_resume"
+    if isinstance(error, TunnelSilenceTimeoutError):
+        return "silence_timeout"
 
     code = websocket_close_code(error)
     close_reason = websocket_close_reason(error) or ""

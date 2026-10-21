@@ -6,12 +6,16 @@ import asyncio
 import contextlib
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.client import ClientConnection, connect
 
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.proxy import (
@@ -23,6 +27,14 @@ from tests.e2e.resilience.lab.proxy import (
     tag_matches,
 )
 from tests.e2e.resilience.lab.tls import TlsInterceptor
+from tests.e2e.resilience.lab.websocket_frames import (
+    OP_BINARY,
+    OP_PING,
+    OP_PONG,
+    OP_TEXT,
+    FrameSplitter,
+    encode_frame,
+)
 
 _TUNNEL = b"GET /v1/runners/r1/tunnel HTTP/1.1\r\nHost: x\r\n\r\n"
 _HTTP = b"POST /v1/sessions/conv_1/events HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -377,3 +389,239 @@ def test_flap_reset_leaves_listener_refusal_working(loop_thread: LoopThread) -> 
     flap.clear()
     with proxy.refuse(), pytest.raises(ConnectionRefusedError):
         socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+
+
+@dataclass
+class _WebSocketUpstream:
+    """A real WebSocket server that echoes and records what reaches it."""
+
+    port: int
+    received: list[str]
+    connections: list[ServerConnection]
+    closed: threading.Event
+
+
+async def _start_websocket_upstream(ping_interval: float | None) -> _WebSocketUpstream:
+    received: list[str] = []
+    connections: list[ServerConnection] = []
+    closed = threading.Event()
+
+    async def _handle(ws: ServerConnection) -> None:
+        connections.append(ws)
+        try:
+            async for message in ws:
+                received.append(str(message))
+                await ws.send(f"echo: {message}")
+        except ConnectionClosed:
+            pass
+        finally:
+            closed.set()
+
+    server = await serve(
+        _handle,
+        "127.0.0.1",
+        0,
+        ping_interval=ping_interval,
+        ping_timeout=None if ping_interval is None else ping_interval * 3,
+    )
+    return _WebSocketUpstream(
+        int(server.sockets[0].getsockname()[1]), received, connections, closed
+    )
+
+
+def _websocket_client(proxy: FaultProxy) -> ClientConnection:
+    return connect(
+        f"ws://127.0.0.1:{proxy.port}/v1/runners/r1/tunnel",
+        open_timeout=5,
+        close_timeout=_HOLD_S,
+    )
+
+
+def _proxy_to(loop: LoopThread, port: int) -> FaultProxy:
+    proxy = FaultProxy(
+        "host", ("127.0.0.1", port), loop=loop, events=EventLog(), classify=host_link
+    )
+    proxy.start()
+    return proxy
+
+
+def test_ping_only_answers_pings_and_drops_data_both_ways(loop_thread: LoopThread) -> None:
+    upstream = loop_thread.run(_start_websocket_upstream(ping_interval=None))
+    proxy = _proxy_to(loop_thread, upstream.port)
+    with _websocket_client(proxy) as client:
+        client.send("before")
+        assert client.recv(timeout=2) == "echo: before"
+        [conn] = proxy.connections({"runner.tunnel"})
+        assert conn.last_s2c_message_age_s is not None
+
+        assert proxy.ping_only({"runner.tunnel"}) == 1
+        # The server side sees the tunnel drop at once.
+        assert upstream.closed.wait(timeout=2)
+        client.send("after")
+        with pytest.raises(TimeoutError):
+            client.recv(timeout=_HOLD_S)
+        assert upstream.received == ["before"]
+        # The client's keepalive is still satisfied.
+        assert client.ping().wait(timeout=2)
+        [conn] = proxy.connections({"runner.tunnel"})
+        assert (conn.ping_only, conn.pings_answered) == ("abort", 1)
+
+        # A new connection passes, as through a path that dropped the old one.
+        with _websocket_client(proxy) as fresh:
+            fresh.send("fresh")
+            assert fresh.recv(timeout=2) == "echo: fresh"
+    _wait(lambda: not proxy.connections())
+    [gave_up] = [
+        event
+        for event in proxy._events.events(kind="disconnect")
+        if event.fields["reason"] == "client_gave_up"
+    ]
+    assert gave_up.fields["tag"] == "runner.tunnel"
+
+
+def test_ping_only_hold_keeps_the_server_side_open_with_its_pings_answered(
+    loop_thread: LoopThread,
+) -> None:
+    upstream = loop_thread.run(_start_websocket_upstream(ping_interval=0.1))
+    proxy = _proxy_to(loop_thread, upstream.port)
+    with _websocket_client(proxy) as client:
+        client.send("before")
+        assert client.recv(timeout=2) == "echo: before"
+        assert proxy.ping_only(server_leg="hold") == 1
+        loop_thread.run(upstream.connections[0].send("from the server"))
+        client.send("from the client")
+        with pytest.raises(TimeoutError):
+            client.recv(timeout=_HOLD_S * 2)
+        # Several of the server's keepalive timeouts passed without a close.
+        assert not upstream.closed.is_set()
+        assert upstream.received == ["before"]
+    # Once the client gives up, the held server side is released.
+    assert upstream.closed.wait(timeout=2)
+
+
+def test_ping_only_skips_connections_that_are_not_websockets(loop_thread: LoopThread) -> None:
+    upstream = _upstream(loop_thread, "upgrade")
+    proxy = _proxy(loop_thread, upstream)
+    with contextlib.closing(_connect(proxy, _TUNNEL)) as raw_upgrade:
+        assert _recv(raw_upgrade).startswith(b"HTTP/1.1 101")
+        assert proxy.ping_only() == 0
+        raw_upgrade.sendall(b"not a frame")
+        assert _recv(raw_upgrade) == b"echo:not a frame"
+
+
+_UPGRADE_HEAD = (
+    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+)
+
+
+def _split_feed(splitter: FrameSplitter, stream: bytes, cuts: list[int]) -> tuple[bytes, list]:
+    passthrough, frames = b"", []
+    for start, end in zip([0, *cuts], [*cuts, len(stream)], strict=True):
+        chunk_passthrough, chunk_frames = splitter.feed(stream[start:end])
+        passthrough += chunk_passthrough
+        frames.extend(chunk_frames)
+    return passthrough, frames
+
+
+def test_frame_splitter_yields_whole_frames_from_any_chunking() -> None:
+    ping = encode_frame(OP_PING, b"keepalive", masked=True)
+    big = encode_frame(OP_TEXT, b"x" * 70_000, masked=False)
+    medium = encode_frame(OP_BINARY, b"y" * 300, masked=True)
+    stream = _UPGRADE_HEAD + ping + big + medium
+    splitter = FrameSplitter(response_head=True)
+    passthrough, frames = _split_feed(splitter, stream, list(range(7, len(stream), 7)))
+    assert passthrough == _UPGRADE_HEAD
+    assert splitter.websocket
+    assert [frame.raw for frame in frames] == [ping, big, medium]
+    assert [frame.opcode for frame in frames] == [OP_PING, OP_TEXT, OP_BINARY]
+    # Control payloads are unmasked; data payloads are never read.
+    assert [frame.payload for frame in frames] == [b"keepalive", b"", b""]
+
+
+def test_frame_splitter_finds_a_head_cut_anywhere() -> None:
+    data = encode_frame(OP_TEXT, b"after the head", masked=False)
+    for cut in range(1, len(_UPGRADE_HEAD) + 1):
+        splitter = FrameSplitter(response_head=True)
+        passthrough, frames = _split_feed(splitter, _UPGRADE_HEAD + data, [cut])
+        assert passthrough == _UPGRADE_HEAD, cut
+        assert [frame.raw for frame in frames] == [data], cut
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n",
+        _UPGRADE_HEAD.replace(b"\r\n\r\n", b"\r\nX-Padding: " + b"p" * 17_000 + b"\r\n\r\n"),
+    ],
+    ids=["plain-response", "other-upgrade", "oversized-upgrade"],
+)
+def test_frame_splitter_passes_other_responses_through(head: bytes) -> None:
+    body = b"\x81\x7fnot a frame"
+    for cuts in ([], [5, len(head) + 2], [16_385]):
+        splitter = FrameSplitter(response_head=True)
+        passthrough, frames = _split_feed(splitter, head + body, cuts)
+        assert (passthrough, frames) == (head + body, []), cuts
+        assert not splitter.websocket, cuts
+
+
+def _start_scripted_upstream(loop: LoopThread, reply: list[bytes], received: list[bytes]) -> int:
+    """Answer the first request with *reply*, one write per piece, then record the rest."""
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        for piece in reply:
+            writer.write(piece)
+            await writer.drain()
+            await asyncio.sleep(0.05)
+        while data := await reader.read(65536):
+            received.append(data)
+        writer.close()
+
+    async def _start() -> int:
+        server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+        return int(server.sockets[0].getsockname()[1])
+
+    return loop.run(_start())
+
+
+def _recv_exactly(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = _recv(sock)
+        assert chunk, f"connection ended after {data!r}"
+        data += chunk
+    return data
+
+
+@pytest.mark.parametrize(
+    "cut", [10, _UPGRADE_HEAD.index(b"Upgrade")], ids=["in-status-line", "in-headers"]
+)
+def test_ping_only_catches_a_websocket_however_its_handshake_is_segmented(
+    loop_thread: LoopThread, cut: int
+) -> None:
+    received: list[bytes] = []
+    hello = encode_frame(OP_TEXT, b"hello", masked=False)
+    port = _start_scripted_upstream(
+        loop_thread, [_UPGRADE_HEAD[:cut], _UPGRADE_HEAD[cut:] + hello], received
+    )
+    proxy = _proxy_to(loop_thread, port)
+    with contextlib.closing(_connect(proxy, b"GET /v1/hosts/h1/tunnel HTTP/1.1\r\n")) as sock:
+        time.sleep(0.05)
+        sock.sendall(b"Host: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        assert _recv_exactly(sock, len(_UPGRADE_HEAD + hello)) == _UPGRADE_HEAD + hello
+        assert proxy.ping_only({"host.tunnel"}) == 1
+        sock.sendall(encode_frame(OP_TEXT, b"dropped", masked=True))
+        sock.sendall(encode_frame(OP_PING, b"are you there", masked=True))
+        assert _recv(sock) == encode_frame(OP_PONG, b"are you there", masked=False)
+    assert received == []
+
+
+def test_response_head_cut_short_still_reaches_the_client(loop_thread: LoopThread) -> None:
+    partial = b"HTTP/1.1 200 OK\r\nContent-Ty"
+    port = _start_scripted_upstream(loop_thread, [partial], [])
+    proxy = _proxy_to(loop_thread, port)
+    with contextlib.closing(_connect(proxy, _HTTP.replace(b"POST", b"GET"))) as sock:
+        sock.shutdown(socket.SHUT_WR)
+        assert _recv_exactly(sock, len(partial)) == partial
+        assert _recv(sock) == b""

@@ -30,6 +30,11 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     uvicorn_tunnel_kwargs,
 )
+from omnigent.util.tunnel_silence import (
+    SERVER_APP_PING_INTERVAL_S,
+    TUNNEL_SILENCE_GRACE_S,
+    TUNNEL_SILENCE_TIMEOUT_S,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,6 +78,22 @@ def test_keepalive_not_stricter_than_app_level_budget() -> None:
             "would drop a busy-but-healthy tunnel with 1011 before the app-level "
             "keepalive fires (issue #1116)."
         )
+
+
+def test_silence_deadline_outlasts_the_server_ping_and_beats_its_liveness_budget() -> None:
+    """The client silence deadline must never fire on a healthy tunnel.
+
+    The server sends an application ping every ``PING_INTERVAL_S`` on both
+    tunnels; the deadline keeps half an interval of margin above it, and the
+    client notices a dead path before the server's own app-level budget does.
+    """
+    from omnigent.server.routes import host_tunnel, runner_tunnel
+
+    for module in (runner_tunnel, host_tunnel):
+        assert module.PING_INTERVAL_S == SERVER_APP_PING_INTERVAL_S, module.__name__
+        assert TUNNEL_SILENCE_TIMEOUT_S >= 1.5 * module.PING_INTERVAL_S, module.__name__
+        app_level_dead_after_s = module.PING_INTERVAL_S * module.PING_MISS_THRESHOLD
+        assert app_level_dead_after_s > TUNNEL_SILENCE_TIMEOUT_S + TUNNEL_SILENCE_GRACE_S
 
 
 def test_uvicorn_tunnel_kwargs_name_real_uvicorn_options() -> None:

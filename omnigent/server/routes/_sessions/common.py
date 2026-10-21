@@ -8,8 +8,10 @@ so a single instance is imported by reference across the package.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import math
+import os
 import re
 import time
 import weakref
@@ -650,11 +652,56 @@ _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCach
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
+RUNNER_DISCONNECT_GRACE_ENV_VAR = "OMNIGENT_RUNNER_DISCONNECT_GRACE_S"
+# Ceiling for the override: a runner that never returns must still be reconciled.
+_MAX_RUNNER_DISCONNECT_GRACE_S = 3600.0
+
+
+@functools.cache
+def resolve_runner_disconnect_grace_s() -> float:
+    """Seconds the server waits for a dropped runner to reconnect (env override or default).
+
+    Defaults to the runner liveness lease (:data:`RUNNER_LIVENESS_TTL_S`), so the
+    relay give-up, the disconnect timer and the liveness-driven sidebar agree.
+    Deployments whose runners can be paused while their tunnel drops, for
+    example during a sandbox checkpoint, extend it through
+    :data:`RUNNER_DISCONNECT_GRACE_ENV_VAR`. A value that is not a number between
+    the lease and :data:`_MAX_RUNNER_DISCONNECT_GRACE_S` is ignored with a warning,
+    so a typo cannot stop the server from starting.
+
+    Cached, so the warning is logged once; tests call ``cache_clear()``.
+
+    :returns: The grace in seconds, e.g. ``90.0``.
+    """
+    default = float(RUNNER_LIVENESS_TTL_S)
+    raw = os.environ.get(RUNNER_DISCONNECT_GRACE_ENV_VAR)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    # Also rejects the "nan" and "inf" that ``float()`` accepts.
+    if not default <= value <= _MAX_RUNNER_DISCONNECT_GRACE_S:
+        _logger.warning(
+            "%s must be a number of seconds between %gs and %gs, got %r; using %gs",
+            RUNNER_DISCONNECT_GRACE_ENV_VAR,
+            default,
+            _MAX_RUNNER_DISCONNECT_GRACE_S,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
 # Markers belong to one runner and expire after teardown plus disconnect grace.
 # Do not evict live markers under load: each one suppresses an expected drop.
 _intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.TTLCache(
-        maxsize=math.inf, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
+        maxsize=math.inf,
+        ttl=RUNNER_LIVENESS_TTL_S + resolve_runner_disconnect_grace_s(),
+        timer=lambda: time.monotonic(),
     )
 )
 
@@ -1063,6 +1110,7 @@ def get_server_host_registry() -> HostRegistry | None:
 
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
+    "RUNNER_DISCONNECT_GRACE_ENV_VAR",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
@@ -1256,6 +1304,7 @@ __all__ = [
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
+    "resolve_runner_disconnect_grace_s",
     "set_server_host_registry",
     "set_server_runner_router",
 ]

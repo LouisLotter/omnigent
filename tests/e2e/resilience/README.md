@@ -116,6 +116,7 @@ lab's isolated home. That noise is local, and CI does not have it.
 | `proxy.recycle(lifetime_s, tags)` | Close connections older than a lifetime, like an ingress recycling streams. |
 | `proxy.sever_held(after_s, tags)` | Answer `504` to a request still waiting for a response after `after_s`, like a front-door request cap. |
 | `proxy.flap(up_s=, down_s=, mode=)` | Alternate outages with healthy periods. |
+| `proxy.ping_only(tags, server_leg=)` | Leave live WebSocket connections half-open with false liveness: the proxy answers the client's pings and drops every other frame both ways until the client gives up. The server side is reset (`abort`) or held with its pings answered (`hold`). New connections pass. |
 | `lab.restart_server(downtime_s=, graceful=)` / `with lab.server_down()` | Deploy (SIGTERM) or crash (SIGKILL) the server. |
 | `with lab.sleep_host()` | Freeze every host-side process (daemon, runners, tmux, Claude) and blackhole their links. |
 | `lab.kill_runner()` | SIGKILL the runner processes. |
