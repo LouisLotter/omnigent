@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Iterator
 
@@ -243,3 +244,70 @@ async def test_a_result_after_the_person_acted_changes_nothing(
     _append(store, session_id, _output("call_1"))
     await settle_late_tool_result(session_id, store)
     assert _last_task_error_from_labels(_labels(store, session_id)) is None
+
+
+async def _record_unknown_outcome(store: SqlAlchemyConversationStore, session_id: str) -> str:
+    (effect_id,) = _append(store, session_id, _user("append a line"), _call("call_1", "Bash"))[1:]
+    _session_status_cache[session_id] = "running"
+    answer = _init_answer(continuation_blocked=True)
+    assert await keep_interrupted_outcome(session_id, answer, store, runner_id="runner_new")
+    return effect_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["unreadable", "another call's result", "incomplete scan"])
+async def test_no_positive_evidence_keeps_the_outcome_unknown(
+    store: SqlAlchemyConversationStore,
+    session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    """Only the recorded call's own result, found in a complete scan, settles the record."""
+    from omnigent.server import interrupted_work
+
+    await _record_unknown_outcome(store, session_id)
+    if evidence == "another call's result":
+        _append(store, session_id, _output("call_other"))
+    else:
+        _append(store, session_id, _output("call_1"))
+    if evidence == "unreadable":
+
+        def unreadable(*_args: object, **_kwargs: object) -> object:
+            raise OSError("database is locked")
+
+        monkeypatch.setattr(store, "list_items", unreadable)
+    elif evidence == "incomplete scan":
+        _append(store, session_id, _call("call_2", "Read"), _output("call_2"))
+        monkeypatch.setattr(interrupted_work, "_TOOL_CALL_LOOKBACK_ITEMS", 2)
+
+    await settle_late_tool_result(session_id, store)
+
+    monkeypatch.undo()
+    error = _last_task_error_from_labels(_labels(store, session_id))
+    assert error is not None and error["code"] == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+
+
+@pytest.mark.asyncio
+async def test_a_record_cleared_during_settlement_is_not_resurrected(
+    store: SqlAlchemyConversationStore, session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The person's message clears the record while the settlement reads the transcript."""
+    from omnigent.server import interrupted_work
+    from omnigent.server.routes._sessions.helpers import _persist_session_status_error_labels
+
+    await _record_unknown_outcome(store, session_id)
+    _append(store, session_id, _output("call_1"))
+    scan = interrupted_work._scan_current_turn
+
+    def scan_while_the_person_acts(
+        conversation_store: SqlAlchemyConversationStore, sid: str
+    ) -> object:
+        asyncio.run(_persist_session_status_error_labels(sid, None, conversation_store))
+        return scan(conversation_store, sid)
+
+    monkeypatch.setattr(interrupted_work, "_scan_current_turn", scan_while_the_person_acts)
+    _session_status_cache[session_id] = "idle"
+    await settle_late_tool_result(session_id, store)
+
+    assert _last_task_error_from_labels(_labels(store, session_id)) is None
+    assert _session_status_cache[session_id] == "idle"

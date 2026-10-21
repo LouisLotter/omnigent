@@ -69,6 +69,30 @@ class _RetryOnceMaker:
                 raise DBAPIError("commit", {}, _CommitSerializationFailure(), False)
 
 
+def test_set_labels_if_writes_only_while_the_expected_labels_hold(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A conditional write never overwrites a label another writer changed or cleared."""
+    conversation = conversation_store.create_conversation()
+    conversation_store.set_labels(conversation.id, {"state": "unknown", "item": "call_a"})
+
+    assert not conversation_store.set_labels_if(
+        conversation.id, {"state": "known"}, {"state": "unknown", "item": "call_b"}
+    )
+    assert conversation_store.set_labels_if(
+        conversation.id, {"state": "known"}, {"state": "unknown", "item": "call_a"}
+    )
+    # A cleared label reads as "": an older writer expecting the old value is refused.
+    conversation_store.set_labels(conversation.id, {"state": ""})
+    assert not conversation_store.set_labels_if(
+        conversation.id, {"state": "unknown"}, {"state": "known"}
+    )
+    # An absent label matches "".
+    assert conversation_store.set_labels_if(conversation.id, {"fresh": "yes"}, {"absent": ""})
+    labels = conversation_store.get_conversation(conversation.id).labels  # type: ignore[union-attr]
+    assert (labels["state"], labels["item"], labels["fresh"]) == ("", "call_a", "yes")
+
+
 def test_fork_drops_import_provenance_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -99,9 +99,7 @@ def _unanswered_tool_call(
 ) -> tuple[str, str] | None:
     """Blocking body of :func:`unanswered_tool_call`."""
     try:
-        page = conversation_store.list_items(
-            session_id, limit=_TOOL_CALL_LOOKBACK_ITEMS, order="desc"
-        )
+        return _scan_current_turn(conversation_store, session_id)[1]
     except Exception:  # noqa: BLE001 — naming the tool is best effort
         _logger.warning(
             "Could not read the transcript of session %s",
@@ -110,6 +108,18 @@ def _unanswered_tool_call(
             extra={"session_id": session_id},
         )
         return None
+
+
+def _scan_current_turn(
+    conversation_store: ConversationStore, session_id: str
+) -> tuple[bool, tuple[str, str] | None]:
+    """
+    Find the current turn's latest tool call without a result, raising on read errors.
+
+    :returns: Whether the scan reached the turn's start, and the call as
+        ``(item_id, tool_name)`` or ``None``.
+    """
+    page = conversation_store.list_items(session_id, limit=_TOOL_CALL_LOOKBACK_ITEMS, order="desc")
     answered: set[str] = set()
     for item in page.data:
         data = item.data
@@ -117,10 +127,44 @@ def _unanswered_tool_call(
             answered.add(getattr(data, "call_id", ""))
         elif item.type == "function_call":
             if getattr(data, "call_id", None) not in answered:
-                return item.id, str(getattr(data, "name", "") or "a tool")
+                return True, (item.id, str(getattr(data, "name", "") or "a tool"))
         elif item.type == "message" and getattr(data, "role", None) == "user":
+            return True, None
+    return not page.has_more, None
+
+
+def _answered_call(
+    conversation_store: ConversationStore, session_id: str, item_id: str
+) -> str | None:
+    """
+    Return the tool of the recorded call *item_id* if its result is in the transcript.
+
+    Positive evidence only: ``None`` when the call or its result is not found,
+    or the transcript cannot be read.
+    """
+    try:
+        call = conversation_store.get_item(session_id, item_id)
+        call_id = getattr(getattr(call, "data", None), "call_id", None)
+        if call is None or call.type != "function_call" or not call_id:
             return None
-    return None
+        after = item_id
+        while True:
+            page = conversation_store.list_items(
+                session_id, limit=100, after=after, order="asc", type="function_call_output"
+            )
+            if any(getattr(item.data, "call_id", None) == call_id for item in page.data):
+                return str(getattr(call.data, "name", "") or "a tool")
+            if not page.has_more or not page.data:
+                return None
+            after = page.data[-1].id
+    except Exception:  # noqa: BLE001 — without evidence the outcome stays unknown
+        _logger.warning(
+            "Could not look for the result of session %s's interrupted call",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return None
 
 
 def interrupted_outcome_error(tool: tuple[str, str] | None) -> ErrorDetail:
@@ -272,7 +316,10 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
     call a dead runner left unanswered. The outcome is then known, but the turn
     was still not continued, so the failure stays until the person acts. A
     record that another call is still without a result names that call instead.
-    A settled record never goes back to unknown.
+    Only the recorded call's result, found in the transcript, settles it; the
+    write is conditional on the record being unchanged, so a record the person
+    cleared, or another settlement changed, is never overwritten and a settled
+    record never goes back to unknown.
 
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :param conversation_store: Store for the transcript and failure labels.
@@ -282,8 +329,8 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
         _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY,
     )
     from omnigent.server.routes._sessions.helpers import (
-        _persist_session_status_error_labels,
         _publish_status,
+        _session_status_error_label_updates,
     )
 
     def recorded_call() -> tuple[str, str | None] | None:
@@ -302,18 +349,50 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
     if recorded is None:
         return
     item_id, owner_runner_id = recorded
-    unanswered = await unanswered_tool_call(conversation_store, session_id)
-    if unanswered is not None and unanswered[0] == item_id:
+    tool_name = await asyncio.to_thread(_answered_call, conversation_store, session_id, item_id)
+    if tool_name is None:
         return
-    if unanswered is not None:
-        error = interrupted_outcome_error(unanswered)
-    else:
-        call = await asyncio.to_thread(conversation_store.get_item, session_id, item_id)
-        error = interrupted_outcome_known_error(
-            str(getattr(getattr(call, "data", None), "name", "") or "a tool")
+    try:
+        complete, unanswered = await asyncio.to_thread(
+            _scan_current_turn, conversation_store, session_id
         )
-    # Recheck: the person's message may have cleared the record meanwhile.
-    if await asyncio.to_thread(recorded_call) != recorded:
+    except Exception:  # noqa: BLE001 — without a complete scan the outcome stays unknown
+        _logger.warning(
+            "Could not read the transcript of session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if not complete or (unanswered is not None and unanswered[0] == item_id):
+        return
+    error = (
+        interrupted_outcome_error(unanswered)
+        if unanswered is not None
+        else interrupted_outcome_known_error(tool_name)
+    )
+    updates = _session_status_error_label_updates(
+        error,
+        owner_runner_id=owner_runner_id,
+        item_id=unanswered[0] if unanswered is not None else item_id,
+    )
+    expected = {
+        LAST_TASK_ERROR_CODE_LABEL_KEY: INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+        _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: item_id,
+    }
+    try:
+        written = await asyncio.to_thread(
+            conversation_store.set_labels_if, session_id, updates, expected
+        )
+    except Exception:  # noqa: BLE001 — the record stays unknown
+        _logger.warning(
+            "Could not settle the interrupted outcome of session %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if not written:
         return
     _logger.info(
         "Session %s: the interrupted call's result arrived; its outcome is known",
@@ -321,10 +400,3 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
         extra={"session_id": session_id},
     )
     _publish_status(session_id, "failed", error, failure_origin="interrupted_call_answered")
-    await _persist_session_status_error_labels(
-        session_id,
-        error,
-        conversation_store,
-        owner_runner_id=owner_runner_id,
-        item_id=unanswered[0] if unanswered is not None else item_id,
-    )

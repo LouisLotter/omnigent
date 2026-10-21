@@ -2723,6 +2723,42 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
+    def set_labels_if(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        expected: dict[str, str],
+    ) -> bool:
+        """
+        Upsert labels only while other labels still hold the expected values.
+
+        Locks the conversation row, then compares and writes in one
+        transaction. See the abstract method for the parameters.
+
+        :returns: ``True`` when the labels matched and *updates* were written.
+        """
+        stamp = now_epoch()
+        stable_updates = dict(updates)
+        stable_expected = dict(expected)
+
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            rows = session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(list(stable_expected)),
+                )
+            ).all()
+            current = {row.key: row.value for row in rows}
+            if any(current.get(key, "") != value for key, value in stable_expected.items()):
+                return False
+            if stable_updates:
+                _upsert_labels(session, conversation_id, stable_updates, stamp)
+            return True
+
+        return run_write_transaction(self._conv_session_immediate, "set_labels_if", write)
+
     def delete_label(
         self,
         conversation_id: str,

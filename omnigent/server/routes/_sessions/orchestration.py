@@ -3288,6 +3288,8 @@ async def _persist_external_conversation_item_unlocked(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
+        # Its first post may have ended before settling the interrupted outcome.
+        await _settle_if_late_result(session_id, conv, persisted, conversation_store)
         return persisted.id
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
@@ -3361,12 +3363,22 @@ async def _persist_external_conversation_item_unlocked(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
     await record_claude_subagent_return(session_id, persisted, conversation_store)
+    await _settle_if_late_result(session_id, conv, persisted, conversation_store)
+    return persisted.id
+
+
+async def _settle_if_late_result(
+    session_id: str,
+    conv: Conversation,
+    persisted: ConversationItem,
+    conversation_store: ConversationStore,
+) -> None:
+    """Settle an interrupted, unknown outcome that this tool result may answer."""
     if (
         persisted.type == "function_call_output"
         and conv.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == INTERRUPTED_OUTCOME_UNKNOWN_CODE
     ):
         await settle_late_tool_result(session_id, conversation_store)
-    return persisted.id
 
 
 def _new_external_conversation_item(
@@ -3461,10 +3473,8 @@ async def _persist_external_conversation_items(
         if not persisted.deduplicated:
             _publish_persisted_external_item(session_id, body, persisted)
         await record_claude_subagent_return(session_id, persisted, conversation_store)
-    if any(
-        persisted.type == "function_call_output" and not persisted.deduplicated
-        for persisted in persisted_items
-    ):
+    # Duplicates count too: their first post may have ended before settling.
+    if any(persisted.type == "function_call_output" for persisted in persisted_items):
         await settle_late_tool_result(session_id, conversation_store)
     if error is not None:
         raise error

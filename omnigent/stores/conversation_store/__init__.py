@@ -1165,6 +1165,30 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_labels_if(
+        self,
+        conversation_id: str,
+        updates: dict[str, str],
+        expected: dict[str, str],
+    ) -> bool:
+        """
+        Upsert labels only while other labels still hold the expected values.
+
+        The comparison and the write are one transaction, so a concurrent
+        writer that changed an expected label makes this call a no-op
+        instead of being overwritten.
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc123"``.
+        :param updates: Mapping from label key to new value, as for
+            :meth:`set_labels`.
+        :param expected: Mapping from label key to the value it must hold;
+            ``""`` also matches an absent label, e.g.
+            ``{"omnigent.last_task_error_code": "interrupted_outcome_unknown"}``.
+        :returns: ``True`` when the labels matched and *updates* were written.
+        """
+        ...
+
+    @abstractmethod
     def delete_label(
         self,
         conversation_id: str,
