@@ -15,9 +15,10 @@ bearer by design; nothing in the row tells them apart. Such rows stay unmarked
 and keep the bearer path until their next server-managed arming sets the
 marker. The upgrade logs how many there are.
 
-Deployment: additive, with a server default so older application code keeps
-writing valid rows. Roll back by downgrading this revision; upgrading again
-re-runs the backfill.
+The backfill walks the primary key in bounded pages and commits each full page,
+so a retried upgrade resumes safely. Deployment: additive, with a server
+default so older application code keeps writing valid rows. Roll back by
+downgrading this revision; upgrading again re-runs the backfill.
 """
 
 from __future__ import annotations
@@ -33,26 +34,36 @@ down_revision: str | None = "mm1a2b3c4d5e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+_TABLE = "hosts"
 _COLUMN = "launch_token_only"
 _BATCH_SIZE = 500
-_logger = logging.getLogger(__name__)
+# Alembic loads revision files under generated module names; name the logger explicitly.
+_logger = logging.getLogger("omnigent.db.migrations.hosts_launch_token_only")
+
+
+def _commit(bind: sa.Connection) -> None:
+    """Commit the work so far and continue in a new transaction."""
+    if bind.dialect.name == "cockroachdb":
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+    else:
+        with op.get_context().autocommit_block():
+            pass
 
 
 def upgrade() -> None:
     """Add the marker, mark armed rows and report the rows left unclassified."""
     bind = op.get_bind()
     # MySQL commits DDL, so a retried upgrade may find the column already added.
-    if _COLUMN not in {column["name"] for column in sa.inspect(bind).get_columns("hosts")}:
-        with op.batch_alter_table("hosts") as batch_op:
+    if _COLUMN not in {column["name"] for column in sa.inspect(bind).get_columns(_TABLE)}:
+        with op.batch_alter_table(_TABLE) as batch_op:
             batch_op.add_column(
                 sa.Column(_COLUMN, sa.Boolean(), nullable=False, server_default=sa.false())
             )
-    if bind.dialect.name == "cockroachdb":
-        # CRDB publishes a new column only at commit.
-        bind.commit()
-        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+    # CockroachDB publishes a new column only at commit.
+    _commit(bind)
     hosts = sa.table(
-        "hosts",
+        _TABLE,
         sa.column("workspace_id", sa.BigInteger()),
         sa.column("host_id"),
         sa.column("token_hash", sa.String(64)),
@@ -60,32 +71,46 @@ def upgrade() -> None:
         sa.column("deleted_at", sa.BigInteger()),
         sa.column(_COLUMN, sa.Boolean()),
     )
-    marked = 0
+    marked = unclassified = 0
+    cursor: tuple[int, bytes | str] | None = None
     while True:
-        armed = bind.execute(
-            sa.select(hosts.c.workspace_id, hosts.c.host_id)
-            .where(hosts.c.token_hash.is_not(None), hosts.c[_COLUMN] == sa.false())
-            .limit(_BATCH_SIZE)
-        ).all()
-        if not armed:
+        query = sa.select(
+            hosts.c.workspace_id,
+            hosts.c.host_id,
+            hosts.c.token_hash.is_not(None).label("armed"),
+            sa.and_(hosts.c.sandbox_provider.is_not(None), hosts.c.deleted_at.is_(None)).label(
+                "live_sandbox"
+            ),
+            hosts.c[_COLUMN],
+        ).order_by(hosts.c.workspace_id, hosts.c.host_id)
+        if cursor is not None:
+            if bind.dialect.name == "mysql":
+                # MySQL treats tuple inequalities as filters over a full index scan.
+                query = query.where(
+                    sa.or_(
+                        hosts.c.workspace_id > cursor[0],
+                        sa.and_(hosts.c.workspace_id == cursor[0], hosts.c.host_id > cursor[1]),
+                    )
+                )
+            else:
+                query = query.where(sa.tuple_(hosts.c.workspace_id, hosts.c.host_id) > cursor)
+        rows = bind.execute(query.limit(_BATCH_SIZE)).all()
+        if not rows:
             break
-        for workspace_id, host_id in armed:
-            bind.execute(
-                hosts.update()
-                .where(hosts.c.workspace_id == workspace_id, hosts.c.host_id == host_id)
-                .values({_COLUMN: True})
-            )
-        marked += len(armed)
-    unclassified = bind.execute(
-        sa.select(sa.func.count())
-        .select_from(hosts)
-        .where(
-            hosts.c.sandbox_provider.is_not(None),
-            hosts.c.token_hash.is_(None),
-            hosts.c.deleted_at.is_(None),
-            hosts.c[_COLUMN] == sa.false(),
-        )
-    ).scalar_one()
+        for workspace_id, host_id, armed, live_sandbox, already_marked in rows:
+            if armed and not already_marked:
+                bind.execute(
+                    hosts.update()
+                    .where(hosts.c.workspace_id == workspace_id, hosts.c.host_id == host_id)
+                    .values({_COLUMN: True})
+                )
+                marked += 1
+            elif not armed and live_sandbox and not already_marked:
+                unclassified += 1
+        last_id = rows[-1].host_id
+        cursor = (rows[-1].workspace_id, last_id if isinstance(last_id, str) else bytes(last_id))
+        if len(rows) == _BATCH_SIZE:
+            _commit(bind)
     _logger.info("Marked %d armed managed hosts as launch-token-only", marked)
     if unclassified:
         _logger.warning(
@@ -97,5 +122,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Remove the marker."""
-    with op.batch_alter_table("hosts") as batch_op:
+    with op.batch_alter_table(_TABLE) as batch_op:
         batch_op.drop_column(_COLUMN)

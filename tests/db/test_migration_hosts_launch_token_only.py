@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib import import_module
-from pathlib import Path
-from types import ModuleType
 
 import pytest
 import sqlalchemy as sa
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
+from alembic import command
 
-from omnigent.db.utils import clear_engine_cache, get_or_create_engine, now_epoch
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
+from omnigent.db.utils import _build_alembic_config, get_or_create_engine, now_epoch
 from omnigent.stores.host_store import HostRegistrationRefusedError, HostStore
 
+_PREVIOUS = "mm1a2b3c4d5e"
+_REVISION = "lt1b2c3d4e5f"
+_MIGRATION = "omnigent.db.migrations.versions.lt1b2c3d4e5f_add_hosts_launch_token_only"
+_LOGGER = "omnigent.db.migrations.hosts_launch_token_only"
 _OWNER = "alice@example.com"
 _ARMED = "a1a1a1a1a1a14a1a8a1a1a1a1a1a1a1a"
 _CLEARED = "b2b2b2b2b2b24b2b8b2b2b2b2b2b2b2b"
@@ -24,22 +27,28 @@ _LAPTOP = "d4d4d4d4d4d44d4d8d4d4d4d4d4d4d4d"
 _DELETED = "e5e5e5e5e5e54e5e8e5e5e5e5e5e5e5e"
 
 
-@pytest.fixture
-def migration() -> ModuleType:
-    return import_module(
-        "omnigent.db.migrations.versions.lt1b2c3d4e5f_add_hosts_launch_token_only"
-    )
+def _migrate(engine: sa.Engine, revision: str, *, downgrade: bool = False) -> None:
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.connect() as connection:
+        if engine.dialect.name == "cockroachdb":
+            _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        (command.downgrade if downgrade else command.upgrade)(config, revision)
+        connection.commit()
 
 
-@pytest.fixture
-def db_uri(tmp_path: Path) -> Iterator[str]:
-    """A SQLite database at head; each test moves it back across the migration."""
-    uri = f"sqlite:///{tmp_path / 'hosts.db'}"
-    get_or_create_engine(uri)
+@contextmanager
+def _migration_log(caplog: pytest.LogCaptureFixture) -> Iterator[None]:
+    """Capture the migration's report; Alembic's logging setup replaces root handlers."""
+    logger = logging.getLogger(_LOGGER)
+    level = logger.level
+    logger.addHandler(caplog.handler)
+    logger.setLevel(logging.INFO)
     try:
-        yield uri
+        yield
     finally:
-        clear_engine_cache()
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(level)
 
 
 def _register(store: HostStore, host_id: str, *, token: str = "launch-token") -> None:
@@ -54,8 +63,21 @@ def _register(store: HostStore, host_id: str, *, token: str = "launch-token") ->
     )
 
 
-def _seed_hosts(store: HostStore) -> None:
-    """One host of each kind the backfill must tell apart."""
+def _marked(engine: sa.Engine) -> dict[str, bool]:
+    with engine.connect() as connection:
+        rows = connection.execute(sa.text("SELECT host_id, launch_token_only FROM hosts")).all()
+    return {bytes(host_id).hex(): bool(marked) for host_id, marked in rows}
+
+
+def _columns(engine: sa.Engine) -> set[str]:
+    return {column["name"] for column in sa.inspect(engine).get_columns("hosts")}
+
+
+def test_upgrade_marks_only_armed_hosts_and_reports_the_rest(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine = get_or_create_engine(db_uri)
+    store = HostStore(db_uri)
     _register(store, _ARMED)
     _register(store, _CLEARED)
     store.revoke_launch_token(_CLEARED)
@@ -65,46 +87,13 @@ def _seed_hosts(store: HostStore) -> None:
     store.upsert_on_connect(_LAPTOP, "alices-laptop", _OWNER)
     _register(store, _DELETED)
     assert store.delete_host(_DELETED) is not None
+    _migrate(engine, _PREVIOUS, downgrade=True)
+    assert "launch_token_only" not in _columns(engine)
 
+    with _migration_log(caplog):
+        _migrate(engine, _REVISION)
 
-def _migrate(uri: str, migration: ModuleType, *steps: str) -> None:
-    """Run *steps* (``"downgrade"``, ``"upgrade"`` or raw SQL) on one connection.
-
-    One connection, because SQLite checks ``ADD COLUMN`` against a connection's
-    cached schema, which another connection's DDL can leave stale.
-    """
-    with get_or_create_engine(uri).begin() as connection:
-        with Operations.context(MigrationContext.configure(connection)):
-            for step in steps:
-                if step in {"downgrade", "upgrade"}:
-                    getattr(migration, step)()
-                else:
-                    connection.execute(sa.text(step))
-
-
-def _marked(uri: str) -> dict[str, bool]:
-    with get_or_create_engine(uri).connect() as connection:
-        rows = connection.execute(sa.text("SELECT host_id, launch_token_only FROM hosts")).all()
-    return {bytes(host_id).hex(): bool(marked) for host_id, marked in rows}
-
-
-def _columns(uri: str) -> set[str]:
-    return {
-        column["name"] for column in sa.inspect(get_or_create_engine(uri)).get_columns("hosts")
-    }
-
-
-def test_upgrade_marks_only_armed_hosts_and_reports_the_rest(
-    db_uri: str, migration: ModuleType, caplog: pytest.LogCaptureFixture
-) -> None:
-    _seed_hosts(HostStore(db_uri))
-    _migrate(db_uri, migration, "downgrade")
-    assert "launch_token_only" not in _columns(db_uri)
-
-    with caplog.at_level(logging.INFO, logger=migration.__name__):
-        _migrate(db_uri, migration, "upgrade")
-
-    assert _marked(db_uri) == {
+    assert _marked(engine) == {
         _ARMED: True,
         _CLEARED: False,
         _SELF_REGISTERING: False,
@@ -116,33 +105,75 @@ def test_upgrade_marks_only_armed_hosts_and_reports_the_rest(
     assert "2 sandbox hosts hold no launch token" in caplog.text
 
 
-def test_upgrade_resumes_after_the_column_was_committed(
-    db_uri: str, migration: ModuleType
-) -> None:
-    """MySQL commits DDL, so a retried upgrade can find the column already added."""
-    _register(HostStore(db_uri), _ARMED)
-    _migrate(
-        db_uri,
-        migration,
-        "downgrade",
-        "ALTER TABLE hosts ADD COLUMN launch_token_only BOOLEAN NOT NULL DEFAULT 0",
-        "upgrade",
+def test_backfill_commits_bounded_pages_and_resumes_after_an_interruption(db_uri: str) -> None:
+    batch_size = import_module(_MIGRATION)._BATCH_SIZE
+    engine = get_or_create_engine(db_uri)
+    _migrate(engine, _PREVIOUS, downgrade=True)
+    hosts = sa.table(
+        "hosts",
+        sa.column("workspace_id", sa.BigInteger()),
+        sa.column("host_id", sa.LargeBinary()),
+        sa.column("user_id", sa.String()),
+        sa.column("name", sa.String()),
+        sa.column("status", sa.SmallInteger()),
+        sa.column("created_at", sa.Integer()),
+        sa.column("updated_at", sa.Integer()),
+        sa.column("token_hash", sa.String()),
+        sa.column("sandbox_provider", sa.String()),
     )
+    count = 2 * batch_size + 1
+    with engine.begin() as connection:
+        connection.execute(
+            hosts.insert(),
+            [
+                {
+                    "workspace_id": 0,
+                    "host_id": index.to_bytes(16, "big"),
+                    "user_id": _OWNER,
+                    "name": f"managed-{index}",
+                    "status": 2,
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "token_hash": "0" * 64,
+                    "sandbox_provider": "modal",
+                }
+                for index in range(1, count + 1)
+            ],
+        )
+    updates = 0
 
-    assert _marked(db_uri) == {_ARMED: True}
+    def fail_second_page(conn, cursor, statement, parameters, context, executemany):
+        nonlocal updates
+        if statement.startswith("UPDATE hosts SET launch_token_only"):
+            updates += 1
+            if updates == batch_size + 1:
+                raise RuntimeError("interrupted second page")
+
+    sa.event.listen(engine, "before_cursor_execute", fail_second_page)
+    try:
+        with pytest.raises(RuntimeError, match="interrupted second page"):
+            _migrate(engine, _REVISION)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", fail_second_page)
+    # The column and the first page were committed before the interruption.
+    assert sum(_marked(engine).values()) == batch_size
+
+    _migrate(engine, _REVISION)
+
+    assert _marked(engine) == {f"{index:032x}": True for index in range(1, count + 1)}
 
 
 @pytest.mark.parametrize("arming", ["replace", "rearm"])
-def test_arming_a_migrated_legacy_host_closes_the_bearer_path(
-    db_uri: str, migration: ModuleType, arming: str
-) -> None:
+def test_arming_a_migrated_legacy_host_closes_the_bearer_path(db_uri: str, arming: str) -> None:
     """A legacy managed host keeps the bearer path only until the server arms it again."""
+    engine = get_or_create_engine(db_uri)
     store = HostStore(db_uri)
     _register(store, _CLEARED, token="old-token")
     store.revoke_launch_token(_CLEARED)
-    _migrate(db_uri, migration, "downgrade", "upgrade")
+    _migrate(engine, _PREVIOUS, downgrade=True)
+    _migrate(engine, _REVISION)
     name = f"managed-{_CLEARED[:8]}"
-    assert _marked(db_uri) == {_CLEARED: False}
+    assert _marked(engine) == {_CLEARED: False}
     # The documented residual: unclassified, it still registers with the bearer.
     store.upsert_on_connect(_CLEARED, name, _OWNER)
     store.set_offline(_CLEARED)
