@@ -274,29 +274,43 @@ def test_remove_leftover_credentials_drops_only_the_launch_token_helper(
     assert "old-launch-token" not in gitconfig.read_text()
 
 
-_LEGACY_GITHUB = {"oauth_token": "ghu_old", "user": "octo", "git_protocol": "https"}
+_OLD_TOKEN = "ghu_old-owner-token"
+# What the old writer left, before and after gh's multi-account migration.
+_LEGACY_FLAT = {"oauth_token": _OLD_TOKEN, "user": "octo", "git_protocol": "https"}
+_LEGACY_MIGRATED = {**_LEGACY_FLAT, "users": {"octo": {"oauth_token": _OLD_TOKEN}}}
+# gh's own logins: a flat (pre-migration) login, and accounts the old writer
+# merged its token into.
+_OWN_FLAT = {"oauth_token": "gho_own", "user": "alice", "git_protocol": "ssh"}
+_OWN_ACCOUNTS = {"users": {"alice": {"oauth_token": "gho_own"}, "bob": {}}, "user": "alice"}
 _ENTERPRISE = {"oauth_token": "enterprise-tok", "user": "alice"}
-_GH_LOGIN = {
-    "users": {"octo": {"oauth_token": "gho_own"}},
-    "oauth_token": "gho_own",
-    "user": "octo",
-    "git_protocol": "https",
-}
 
 
 @pytest.mark.parametrize(
     ("before", "after"),
     [
-        ({"github.com": _LEGACY_GITHUB}, None),
+        ({"github.com": _LEGACY_FLAT}, None),
+        ({"github.com": _LEGACY_MIGRATED}, None),
         (
-            {"github.com": _LEGACY_GITHUB, "github.mycompany.com": _ENTERPRISE},
+            {"github.com": _LEGACY_MIGRATED, "github.mycompany.com": _ENTERPRISE},
             {"github.mycompany.com": _ENTERPRISE},
         ),
-        # gh's own login records accounts under `users`; it is the user's, kept.
-        ({"github.com": _GH_LOGIN}, {"github.com": _GH_LOGIN}),
+        (
+            {"github.com": {**_OWN_ACCOUNTS, "oauth_token": _OLD_TOKEN, "git_protocol": "https"}},
+            {"github.com": {**_OWN_ACCOUNTS, "git_protocol": "https"}},
+        ),
+        ({"github.com": _OWN_FLAT}, {"github.com": _OWN_FLAT}),
+        ({"github.com": _OWN_ACCOUNTS}, {"github.com": _OWN_ACCOUNTS}),
         ({"github.mycompany.com": _ENTERPRISE}, {"github.mycompany.com": _ENTERPRISE}),
     ],
-    ids=["legacy-only", "legacy-and-enterprise", "gh-own-login", "no-github-entry"],
+    ids=[
+        "legacy-flat",
+        "legacy-migrated-by-gh",
+        "legacy-and-enterprise",
+        "legacy-merged-into-own-accounts",
+        "own-flat-login",
+        "own-accounts",
+        "no-github-entry",
+    ],
 )
 def test_remove_legacy_gh_token(
     monkeypatch: pytest.MonkeyPatch,
@@ -309,7 +323,7 @@ def test_remove_legacy_gh_token(
     hosts_path = gh_dir / "hosts.yml"
     hosts_path.write_text(yaml.safe_dump(before))
     # An interrupted earlier write left a temporary sibling holding a token.
-    (gh_dir / ".hosts.abc123.yml").write_text(yaml.safe_dump({"github.com": _LEGACY_GITHUB}))
+    (gh_dir / ".hosts.abc123.yml").write_text(yaml.safe_dump({"github.com": _LEGACY_FLAT}))
     monkeypatch.setenv("GH_CONFIG_DIR", str(gh_dir))
 
     h._remove_legacy_gh_token()
@@ -317,9 +331,10 @@ def test_remove_legacy_gh_token(
     assert not (gh_dir / ".hosts.abc123.yml").exists()
     if after is None:
         assert not hosts_path.exists()
-    else:
-        assert yaml.safe_load(hosts_path.read_text()) == after
-    if after is not None and after != before:
+        return
+    assert yaml.safe_load(hosts_path.read_text()) == after
+    assert _OLD_TOKEN not in hosts_path.read_text()
+    if after != before:
         assert hosts_path.stat().st_mode & 0o777 == 0o600
 
 

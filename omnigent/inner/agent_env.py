@@ -24,6 +24,7 @@ import os
 from collections.abc import Iterable, Mapping
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent.host.credential_broker import SOCKET_ENV_VAR
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 
 # Desktop access requires an explicit grant outside the sandbox.
@@ -69,6 +70,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # running and to hold the key. Shared here because every harness runs
         # git, not just the one whose bug surfaced it.
         "SSH_AUTH_SOCK",
+        # The managed host's credential broker socket, which gh's wrapper asks
+        # for a GitHub token. A path like SSH_AUTH_SOCK; the launch token stays out.
+        SOCKET_ENV_VAR,
         # The user's URL-opener command, so an agent's CLI logins open URLs the
         # way the user configured (e.g. forwarded to a laptop from a remote box).
         "BROWSER",

@@ -55,6 +55,8 @@ _logger = logging.getLogger(__name__)
 
 _TIMEOUT_S = 15.0
 _HELPER_KEY = "credential.https://github.com.helper"
+# GitHub App user access tokens, which the host-credentials endpoint vends.
+_GITHUB_APP_TOKEN_PREFIX = "ghu_"
 
 
 def _in_sandbox() -> bool:
@@ -183,14 +185,44 @@ def _gh_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "gh"
 
 
-def _remove_legacy_gh_token() -> None:
-    """Drop the github.com token earlier hosts wrote into gh's ``hosts.yml``.
+def _is_github_app_token(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(_GITHUB_APP_TOKEN_PREFIX)
 
-    Those hosts wrote ``oauth_token`` / ``user`` / ``git_protocol`` for
-    github.com; gh's own login also records the account under ``users``, so an
-    entry with a token and no ``users`` map came from them. Their interrupted
-    writes left ``.hosts.*.yml`` temporary files, removed too. Other hosts and
-    accounts are kept; the rewrite is atomic and 0600.
+
+def _strip_github_app_tokens(entry: dict) -> bool:
+    """Remove GitHub App user tokens from gh's github.com entry, in place.
+
+    Earlier hosts wrote the owner's token at the entry's top level; gh's
+    multi-account migration copies it under ``users``. Accounts left empty are
+    dropped.
+
+    :returns: Whether anything was removed.
+    """
+    removed = False
+    if _is_github_app_token(entry.get("oauth_token")):
+        del entry["oauth_token"]
+        removed = True
+    users = entry.get("users")
+    if isinstance(users, dict):
+        for login, account in list(users.items()):
+            if isinstance(account, dict) and _is_github_app_token(account.get("oauth_token")):
+                del account["oauth_token"]
+                removed = True
+                if not account:
+                    del users[login]
+        if not users:
+            del entry["users"]
+    return removed
+
+
+def _remove_legacy_gh_token() -> None:
+    """Drop the GitHub token earlier hosts wrote into gh's ``hosts.yml``.
+
+    Omnigent vends GitHub App user tokens (``ghu_``), which gh's own logins
+    never hold (``gho_``, ``ghp_``, ``github_pat_``), so those are the ones
+    removed. An entry left with no token and no account goes too; other
+    accounts and hosts are kept. Temporary ``.hosts.*.yml`` files from the old
+    writer's interrupted writes are removed. The rewrite is atomic and 0600.
     """
     config_dir = _gh_config_dir()
     for leftover in config_dir.glob(".hosts.*.yml"):
@@ -204,9 +236,10 @@ def _remove_legacy_gh_token() -> None:
     if not isinstance(hosts, dict):
         return
     entry = hosts.get("github.com")
-    if not isinstance(entry, dict) or "oauth_token" not in entry or "users" in entry:
+    if not isinstance(entry, dict) or not _strip_github_app_tokens(entry):
         return
-    del hosts["github.com"]
+    if "oauth_token" not in entry and "users" not in entry:
+        del hosts["github.com"]
     if not hosts:
         with contextlib.suppress(OSError):
             hosts_path.unlink()

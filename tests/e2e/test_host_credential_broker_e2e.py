@@ -24,8 +24,10 @@ import pytest
 import yaml
 
 from omnigent.git_credential_github import configure_host_git
+from omnigent.host.connect import _build_runner_env
 from omnigent.host.credential_broker import SOCKET_ENV_VAR
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+from omnigent.inner.agent_env import clean_agent_env
 from tests.e2e._fake_github_https import FakeGitHub, make_bare_repo
 
 pytestmark = pytest.mark.posix_only
@@ -123,7 +125,13 @@ def _seed_leftovers(home: Path) -> None:
         _git("config", "--file", str(home / ".gitconfig"), "--add", _HELPER_KEY, value, env={})
     gh_dir = home / ".config" / "gh"
     gh_dir.mkdir(parents=True)
-    legacy = {"oauth_token": _OLD_GITHUB_TOKEN, "user": "octo", "git_protocol": "https"}
+    # As gh's multi-account migration leaves the old writer's entry.
+    legacy = {
+        "oauth_token": _OLD_GITHUB_TOKEN,
+        "user": "octo",
+        "git_protocol": "https",
+        "users": {"octo": {"oauth_token": _OLD_GITHUB_TOKEN}},
+    }
     (gh_dir / "hosts.yml").write_text(yaml.safe_dump({"github.com": legacy, **_ENTERPRISE}))
 
 
@@ -202,26 +210,38 @@ def test_git_and_gh_use_the_broker_and_leave_no_token_on_disk(
                 timeout=_TIMEOUT_S,
             ).stdout.strip()
             assert owner_email == ("owner@example.test" if scenario == "linked" else "")
-            # What a runner passes on to the agent: no launch token, the image's
-            # shared GIT_TOKEN, and the broker's socket path when there is one.
-            agent_env = {
-                "PATH": os.pathsep.join([str(wrapper_bin), str(real_bin), os.environ["PATH"]]),
-                "HOME": str(home),
-                "GIT_CONFIG_SYSTEM": str(system_config),
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_TOKEN": _SHARED_TOKEN,
-                "GIT_TRACE": str(trace),
-                "GIT_SSL_NO_VERIFY": "1",  # the stand-in's self-signed certificate
-                "https_proxy": github.proxy_url,
-                "no_proxy": "127.0.0.1,localhost",
-                **{
-                    f"GIT_{role}_{field}": value
-                    for role in ("AUTHOR", "COMMITTER")
-                    for field, value in (("NAME", "agent"), ("EMAIL", "agent@example.test"))
-                },
-            }
-            if os.environ.get(SOCKET_ENV_VAR):
-                agent_env[SOCKET_ENV_VAR] = os.environ[SOCKET_ENV_VAR]
+            # The agent's environment through the real filters: host to runner,
+            # then runner to agent CLI. The launch token must not survive them.
+            runner_env = _build_runner_env(
+                os.environ,
+                server_url=endpoint.url,
+                runner_id="runner_e2e",
+                binding_token="binding-e2e",
+                workspace=str(home),
+                parent_pid=os.getpid(),
+            )
+            agent_env = clean_agent_env(source=runner_env)
+            assert HOST_TOKEN_ENV_VAR not in agent_env
+            assert agent_env.get(SOCKET_ENV_VAR) == os.environ.get(SOCKET_ENV_VAR)
+            # Test plumbing: the image's PATH order and system helper, its
+            # shared token, the github.com stand-in, and git's command trace.
+            agent_env.update(
+                {
+                    "PATH": os.pathsep.join([str(wrapper_bin), str(real_bin), agent_env["PATH"]]),
+                    "GIT_CONFIG_SYSTEM": str(system_config),
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_TOKEN": _SHARED_TOKEN,
+                    "GIT_TRACE": str(trace),
+                    "GIT_SSL_NO_VERIFY": "1",  # the stand-in's self-signed certificate
+                    "https_proxy": github.proxy_url,
+                    "no_proxy": "127.0.0.1,localhost",
+                    **{
+                        f"GIT_{role}_{field}": value
+                        for role in ("AUTHOR", "COMMITTER")
+                        for field, value in (("NAME", "agent"), ("EMAIL", "agent@example.test"))
+                    },
+                }
+            )
             work = home / "work"
             _git("clone", "--", _CLONE_URL, str(work), env=agent_env)
             (work / "change.txt").write_text("agent change\n")

@@ -67,7 +67,6 @@ def test_broker_serves_requests_on_an_owner_only_socket(socket_root: Path) -> No
         reply = broker.request_credential(str(path), {"protocol": "https", "host": "github.com"})
         assert reply == {"username": "x-access-token", "password": "owner-token"}
         assert resolver.requests == [{"protocol": "https", "host": "github.com"}]
-    assert not path.exists()
 
 
 def test_broker_tightens_an_existing_group_readable_root(socket_root: Path) -> None:
@@ -107,21 +106,60 @@ def test_broker_declines_and_keeps_serving(
 def test_restarted_host_recreates_the_socket(socket_root: Path) -> None:
     path = broker.broker_socket_path("host-1")
     first = broker.start_credential_broker(path, _Resolver({"password": "first"}))
-    # A crashed host leaves its socket file behind with nothing listening.
+    # A crashed or closed host leaves its socket file behind with nothing listening.
     first.shutdown()
-    first.socket.close()
-    assert path.exists()
+    first.server_close()
+    assert stat.S_ISSOCK(os.lstat(path).st_mode)
     assert broker.request_credential(str(path), {"host": "github.com"}) == {}
 
     with _serving(path, _Resolver({"password": "second"})):
         assert broker.request_credential(str(path), {"host": "github.com"}) == {
             "password": "second"
         }
-        # The earlier process's cleanup must not remove the new host's socket.
-        first.server_close()
-        assert path.exists()
         assert _mode(path) == 0o600
-    assert not path.exists()
+    assert [entry.name for entry in socket_root.iterdir()] == [path.name]
+
+
+def test_overlapping_hosts_never_remove_each_others_socket(
+    socket_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Host B starts and publishes while host A is between binding and
+    # publishing. Whichever publishes last serves the path, and closing the
+    # other leaves it serving.
+    path = broker.broker_socket_path("host-1")
+    real_replace = os.replace
+    started: list[socketserver.BaseServer] = []
+
+    def replace_after_a_competitor(source: str, target: str) -> None:
+        monkeypatch.setattr(broker.os, "replace", real_replace)
+        started.append(broker.start_credential_broker(path, _Resolver({"password": "b"})))
+        real_replace(source, target)
+
+    monkeypatch.setattr(broker.os, "replace", replace_after_a_competitor)
+    host_a = broker.start_credential_broker(path, _Resolver({"password": "a"}))
+    (host_b,) = started
+    try:
+        assert broker.request_credential(str(path), {"host": "github.com"}) == {"password": "a"}
+        host_b.shutdown()
+        host_b.server_close()
+        assert broker.request_credential(str(path), {"host": "github.com"}) == {"password": "a"}
+    finally:
+        host_a.shutdown()
+        host_a.server_close()
+    # Only the published socket remains; no staging name is left behind.
+    assert [entry.name for entry in socket_root.iterdir()] == [path.name]
+
+
+def test_publish_failure_leaves_no_staging_socket(
+    socket_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(source: str, target: str) -> None:
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(broker.os, "replace", refuse)
+    with pytest.raises(PermissionError):
+        broker.start_credential_broker(broker.broker_socket_path("h"), _Resolver(None))
+    assert list(socket_root.iterdir()) == []
 
 
 def test_socket_path_is_per_host_and_stable(socket_root: Path) -> None:

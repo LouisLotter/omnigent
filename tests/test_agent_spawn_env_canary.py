@@ -201,6 +201,18 @@ def test_real_builders_pass_ssh_auth_sock(monkeypatch):
         assert build().get("SSH_AUTH_SOCK") == sock, harness
 
 
+def test_real_builders_pass_the_host_credential_broker_socket(monkeypatch):
+    """gh's wrapper finds the managed host's broker by this path; the launch token stays out."""
+    sock = "/tmp/omnigent-0/credentials-0123456789abcdef.sock"
+    monkeypatch.setattr(
+        "os.environ", {"OMNIGENT_HOST_BROKER_SOCKET": sock, "OMNIGENT_HOST_TOKEN": "canary-launch"}
+    )
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert env.get("OMNIGENT_HOST_BROKER_SOCKET") == sock, harness
+        assert "OMNIGENT_HOST_TOKEN" not in env, harness
+
+
 def test_real_builders_pass_browser(monkeypatch):
     """The user's URL opener must survive filtering, or CLI logins open the wrong browser."""
     monkeypatch.setattr("os.environ", {"BROWSER": "www-browser"})

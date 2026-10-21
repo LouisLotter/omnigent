@@ -9,7 +9,8 @@ name the socket by absolute path: git's credential helper has it in
 
 The socket is 0600 inside the owner-only harness socket root
 (``/tmp/omnigent-<uid>`` by default), outside the home directory and workspace,
-so snapshots of those never capture it. A restarted host recreates it.
+so snapshots of those never capture it. A restarted host replaces it at the
+same path.
 
 Threat model: this removes the on-disk copies only. Any process running as the
 same user can still ask the broker for a credential while the host runs.
@@ -26,6 +27,7 @@ import hashlib
 import io
 import logging
 import os
+import secrets
 import socket
 import socketserver
 import sys
@@ -101,12 +103,14 @@ class _RequestHandler(socketserver.StreamRequestHandler):
 def start_credential_broker(socket_path: Path, resolve: Resolver) -> socketserver.BaseServer:
     """Serve *resolve* on *socket_path* from a daemon thread.
 
-    Validates the parent as an owner-only directory, replaces any socket left by
-    an earlier host process, and binds the new one with mode 0600.
+    Validates the parent as an owner-only directory, binds the socket under a
+    private name with mode 0600, then renames it over *socket_path*, replacing
+    any socket an earlier or concurrent host process left there in one step.
+    Closing the server leaves the path alone, since a newer host may own it.
 
-    :returns: The running server; ``server_close()`` also removes the socket.
+    :returns: The running server.
     :raises RuntimeError: If the parent directory is not owner-only.
-    :raises OSError: If the socket cannot be bound.
+    :raises OSError: If the socket cannot be bound or published.
     """
     from omnigent.runtime.harnesses.paths import ensure_private_dir
 
@@ -114,28 +118,20 @@ def start_credential_broker(socket_path: Path, resolve: Resolver) -> socketserve
     # A configured root may be nested; only the socket's own directory must be owner-only.
     socket_path.parent.parent.mkdir(parents=True, exist_ok=True)
     ensure_private_dir(socket_path.parent, os.getuid())
-    with contextlib.suppress(FileNotFoundError):
-        socket_path.unlink()
-
-    bound_inode: int | None = None
+    staging = socket_path.with_name(f".{os.getpid()}-{secrets.token_hex(4)}.sock")
 
     class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         daemon_threads = True
 
-        def server_close(self) -> None:
-            super().server_close()
-            # Leave a socket a newer host process has bound at the same path.
-            with contextlib.suppress(OSError):
-                if os.stat(socket_path).st_ino == bound_inode:
-                    socket_path.unlink()
-
-    server = _Server(str(socket_path), _RequestHandler)
+    server = _Server(str(staging), _RequestHandler)
     server.resolve = resolve  # type: ignore[attr-defined]
     try:
-        bound_inode = os.stat(socket_path).st_ino
-        os.chmod(socket_path, 0o600)
+        os.chmod(staging, 0o600)
+        os.replace(staging, socket_path)
     except OSError:
         server.server_close()
+        with contextlib.suppress(OSError):
+            staging.unlink()
         raise
     threading.Thread(
         target=server.serve_forever, name="host-credential-broker", daemon=True
