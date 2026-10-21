@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.git_credential_github import configure_host_git
+from omnigent.host.credential_broker import SOCKET_ENV_VAR
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
 from omnigent.onboarding.sandboxes.kubernetes import (
     KubernetesSandboxLauncher,
@@ -38,7 +40,10 @@ from omnigent.server.managed_hosts import _apply_git_clone_options, parse_sandbo
     ],
 )
 def test_clone_policy_checkout_recovery_and_retained_workspace(
-    tmp_path: Path, policy: dict[str, object], branch: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: dict[str, object],
+    branch: str | None,
 ) -> None:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(
@@ -170,21 +175,27 @@ def test_clone_policy_checkout_recovery_and_retained_workspace(
         assert (checkout / "untracked.txt").read_text() == "keep me\n"
         assert len(requests) == probe_count
 
-        run(
-            sys.executable,
-            "-c",
-            "from omnigent.git_credential_github import configure_host_git; "
-            "import sys; configure_host_git(sys.argv[1], 'host-test')",
-            url,
-        )
-        for token in ["fixture-owner-token", "fixture-rotated-token"]:
-            state["token"] = token
-            credential = run(
-                "git", "credential", "fill", input="protocol=https\nhost=github.com\n\n"
-            )
-            assert f"password={token}" in credential.splitlines()
+        # The host process serves git's helper from its credential broker.
+        with monkeypatch.context() as host_env:
+            for key in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "IS_SANDBOX"):
+                host_env.setenv(key, env[key])
+            host_env.setenv(HOST_TOKEN_ENV_VAR, env[HOST_TOKEN_ENV_VAR])
+            host_env.setenv(SOCKET_ENV_VAR, "")
+            broker = configure_host_git(url, "host-test")
+            assert broker is not None
+            try:
+                for token in ["fixture-owner-token", "fixture-rotated-token"]:
+                    state["token"] = token
+                    credential = run(
+                        "git", "credential", "fill", input="protocol=https\nhost=github.com\n\n"
+                    )
+                    assert f"password={token}" in credential.splitlines()
+            finally:
+                broker.shutdown()
+                broker.server_close()
         assert requests and all(requests)
         assert state["token"] not in (checkout / ".git/config").read_text()
+        assert env[HOST_TOKEN_ENV_VAR] not in Path(env["GIT_CONFIG_GLOBAL"]).read_text()
     finally:
         server.shutdown()
         server.server_close()

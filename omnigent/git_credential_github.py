@@ -1,69 +1,75 @@
-"""Git credential helper that fetches the session's GitHub token from the server.
+"""Git credential helper that gets the owner's GitHub token through the host.
 
 Installed in a managed sandbox as git's ``credential.helper`` for
 ``github.com``. On each HTTPS auth challenge git runs this with ``get`` and the
-request on stdin; the helper calls the server's host-facing credential endpoint
-(:mod:`omnigent.server.routes.host_credentials`, with ``provider=github``) over
-the sandbox's existing authenticated channel and prints back ``username`` /
-``password``.
+request on stdin. The helper asks the host's credential broker
+(:mod:`omnigent.host.credential_broker`) over a local Unix socket; the host
+calls the server's host-facing credential endpoint
+(:mod:`omnigent.server.routes.host_credentials`, with ``provider=github``)
+with the launch token it holds in memory, and the helper prints back
+``username`` / ``password``. The gh CLI asks the same broker through its
+wrapper, :func:`omnigent.host.credential_broker.gh_main`.
 
 Why this shape:
-- For **git**, the **GitHub token is never persisted** in the sandbox — it's
-  fetched fresh per git operation and lives only in this short-lived process's
-  stdout. (The gh CLI has no per-op credential hook, so
-  :func:`configure_host_gh` does materialize the token into gh's ``hosts.yml``
-  at launch — a within-sandbox persistence the threat model below already
-  admits, matching how ``~/.databrickscfg`` is written — and
-  :func:`start_host_gh_refresh` re-writes it on an interval so gh stays fresh
-  across the ~8h token expiry the git broker otherwise handles per-op.)
+- **The host writes neither the launch token nor the GitHub token to disk or
+  into an argv.** ``~/.gitconfig`` names only the socket, by absolute path, and
+  the GitHub token lives only in the helper's stdout or gh's environment.
 - It is **executor-agnostic**: every executor already starts the host with a
   server URL + launch token, so nothing GitHub-specific is injected per
-  executor. The host bakes the endpoint coordinates (server URL, host id, launch
-  token) into the ``credential.helper`` invocation, so the helper works
-  regardless of whether the process running git inherited the runner's env.
+  executor.
 
-The launch token *does* live in the git config (a lesser, host-scoped,
-expiring credential already present in this disposable sandbox); the user's
-GitHub token does not.
-
-Threat model: this removes the GitHub token from disk/env, not the ability of
-in-sandbox code to request one. Any process that can read the launch token (git
-config / argv) can call the endpoint and obtain the owner's full-scope user
-token for its lifetime; teardown stops future fetches but does not revoke an
-already-fetched token. The trust boundary is the sandbox, not this helper.
+Threat model: this removes the tokens from disk, not the ability of in-sandbox
+code to request one. Any same-user process can ask the broker (or read the
+launch token from the host's environment) and obtain the owner's full-scope
+user token for its lifetime; teardown stops future fetches but does not revoke
+an already-fetched token. The trust boundary is the sandbox, not this helper.
 
 Run as: ``git credential.helper`` →
-``python -m omnigent.git_credential_github --server <url> --host-id <id>
---host-token <tok>``.
+``<python> -I -m omnigent.git_credential_github --socket <path>``. The
+workspace-prep init container instead runs :func:`main` in-process with the
+launch token from its environment (``--server/--host-id/--host-token``).
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import logging
 import os
+import re
 import shlex
+import socketserver
 import subprocess
 import sys
 import tempfile
-import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
 import yaml
 
+from omnigent.host import credential_broker
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 
+_logger = logging.getLogger(__name__)
+
 _TIMEOUT_S = 15.0
+_HELPER_KEY = "credential.https://github.com.helper"
+# GitHub App user access tokens, which the host-credentials endpoint vends.
+_GITHUB_APP_TOKEN_PREFIX = "ghu_"
+# git holds a config lock only while it writes; an older one has no live writer.
+_STALE_LOCK_S = 60.0
+# Matches the helper earlier hosts wrote with the launch token in its argv.
+_LEGACY_HELPER = r"omnigent\.git_credential_github .*--host-token"
 
 
 def _in_sandbox() -> bool:
     """Whether we're running inside a managed sandbox (host image sets ``IS_SANDBOX=1``).
 
-    The broker host integrations auto-materialize the owner's credentials into
-    the host's git / gh config. That's only ever wanted in a managed sandbox — a
+    The host integrations rewire git's github.com credential chain and start the
+    credential broker. That's only ever wanted in a managed sandbox — a
     disposable, per-session filesystem. A local ``omnigent host`` shares the
     developer's real ``~/.gitconfig`` / ``~/.config/gh``, so every auto-apply must
     be a no-op there. ``IS_SANDBOX=1`` is baked into the managed host image and
@@ -139,73 +145,42 @@ def _git_config(*args: str) -> None:
 def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
     """Make the per-user broker the sole github.com credential helper.
 
-    Bakes the (lesser, expiring) launch token into the helper invocation so it
-    works regardless of whether the agent's process inherited the env; the GitHub
-    token itself is fetched per-op and never stored. Resets the github.com helper
-    chain first: git accumulates credential helpers across scopes and runs them in
-    parse order (system → global), stopping at the first that returns a full
-    credential. A managed image installs a wider-scope helper that answers
-    github.com from a shared ``$GIT_TOKEN``; parsed before this --global entry it
-    would vend first and silently bypass the per-user broker. An empty value
-    clears the inherited chain for github.com, so only the broker remains.
+    Used by :func:`configure_clone_credentials`. The workspace-prep init
+    container swaps this function, by name, for one that writes a helper reading
+    the launch token from its environment into a temporary git config. The host
+    uses :func:`_install_socket_helper`, which writes no token.
 
-    Idempotent by ``--replace-all``: the workspace-prep init container and the
-    host both wire the broker into the same shared ~/.gitconfig (and the host
-    re-runs on every resume). A plain set can't overwrite the 2+ values that
-    leaves, so without ``--replace-all`` broker entries would pile up.
+    Resets the github.com helper chain first: git accumulates credential helpers
+    across scopes and runs them in parse order (system → global), stopping at the
+    first that returns a full credential. A managed image installs a wider-scope
+    helper that answers github.com from a shared ``$GIT_TOKEN``; parsed before
+    this --global entry it would vend first and silently bypass the per-user
+    broker. An empty value clears the inherited chain for github.com, so only the
+    broker remains. ``--replace-all`` keeps re-runs idempotent.
     """
     helper = (
         "!python3 -m omnigent.git_credential_github "
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
         f"--host-token {shlex.quote(token)}"
     )
-    _git_config("--replace-all", "credential.https://github.com.helper", "")
-    _git_config("--add", "credential.https://github.com.helper", helper)
+    _git_config("--replace-all", _HELPER_KEY, "")
+    _git_config("--add", _HELPER_KEY, helper)
 
 
-def configure_host_git(server_url: str, host_id: str) -> None:
-    """Configure git in a managed sandbox to use the GitHub credential broker.
+def _install_socket_helper(socket_path: Path) -> None:
+    """Make the host's broker socket the sole github.com credential helper.
 
-    Called by ``omnigent host`` at startup — executor-agnostic, since the host
-    runs in every executor and holds ``$OMNIGENT_HOST_TOKEN``. When the owner has
-    GitHub connected (the per-user Connect model), makes the broker the
-    authoritative github.com ``credential.helper`` (fetching the owner's token
-    from the server per git op; never written to disk) and sets the commit author
-    to them. Best-effort: never raises (git may be absent, or GitHub not
-    configured on the server).
-
-    Connected-gated, mirroring :func:`configure_clone_credentials`: a confirmed
-    ``connected: false`` means the owner hasn't linked GitHub (a shared-
-    ``$GIT_TOKEN`` or local deployment). Installing the broker would reset the
-    github.com chain (clearing a shared ``$GIT_TOKEN`` helper) and then decline,
-    breaking in-session git — so that path instead **clears** any broker helper a
-    prior (inconclusive) clone probe may have installed, restoring the ambient
-    helper. Only a connected owner, or an inconclusive probe (``None``,
-    fail-closed like the clone), takes over github.com.
-
-    Sandbox-only (see :func:`_in_sandbox`): a no-op outside a managed sandbox, so
-    a local ``omnigent host`` never rewrites the developer's real ``~/.gitconfig``.
+    Resets the inherited github.com chain as :func:`_install_broker_helper`
+    does. The helper names the interpreter and socket by absolute path, since
+    agent processes may run another ``python3`` and lack the host's
+    environment; ``-I`` keeps a repository's files off the import path.
     """
-    if not _in_sandbox():
-        return
-    token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
-    if not token:
-        return
-    data = _fetch(server_url, host_id, token)
-    if data is not None and not data.get("connected"):
-        # Confirmed not linked: actively clear any broker helper a prior
-        # (inconclusive) clone probe installed. Just returning would leave that
-        # helper — and the chain reset it wrote — in place, stranding in-session
-        # git behind a broker that now declines. Unsetting restores the ambient
-        # shared-``$GIT_TOKEN`` helper.
-        _git_config("--unset-all", "credential.https://github.com.helper")
-        return
-    _install_broker_helper(server_url, host_id, token)
-    owner = str((data or {}).get("owner") or "")
-    if data and data.get("connected") and "@" in owner:
-        _git_config("user.email", owner)
-        login = data.get("login")
-        _git_config("user.name", str(login) if login else owner.split("@", 1)[0])
+    helper = (
+        f"!{shlex.quote(sys.executable)} -I -m omnigent.git_credential_github "
+        f"--socket {shlex.quote(str(socket_path))}"
+    )
+    _git_config("--replace-all", _HELPER_KEY, "")
+    _git_config("--add", _HELPER_KEY, helper)
 
 
 def _gh_config_dir() -> Path:
@@ -216,55 +191,70 @@ def _gh_config_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "gh"
 
 
-def _write_gh_hosts(login: str, token: str) -> bool:
-    """Materialize the owner's ``github.com`` auth into gh's ``hosts.yml``.
+def _is_github_app_token(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(_GITHUB_APP_TOKEN_PREFIX)
 
-    The gh CLI does not consult git's ``credential.helper`` for its own API
-    calls (``gh api`` / ``gh pr`` / ``gh issue``); it reads ``oauth_token`` from
-    ``hosts.yml`` (or ``GH_TOKEN``).
 
-    Writes **only the** ``github.com`` **key, merging** into any existing
-    document so a user's other hosts survive (``hosts.yml`` is a multi-host map —
-    a GitHub Enterprise entry, a second account). This matters because the host's
-    ``GH_CONFIG_DIR`` is not always a throwaway sandbox one: a local ``omnigent
-    host`` resolves it to the real ``~/.config/gh``, where truncating would
-    destroy the developer's config on every refresh. Mirrors the Databricks
-    config writer in :mod:`omnigent.onboarding.setup`, which mutates one section
-    of ``~/.databrickscfg`` and writes the rest back rather than truncating.
+def _strip_github_app_tokens(entry: dict) -> bool:
+    """Remove GitHub App user tokens from gh's github.com entry, in place.
 
-    Written via a fresh ``0600`` temp file + :func:`os.replace`, so the token is
-    never briefly world-readable and a concurrent ``gh`` read never sees a
-    partial file; :func:`yaml.safe_dump` quotes values correctly whatever they
-    contain.
+    Earlier hosts wrote the owner's token at the entry's top level; gh's
+    multi-account migration copies it under ``users``. Accounts left empty are
+    dropped.
 
-    NB deliberately no ``gh auth setup-git``: that would register gh as a git
-    credential helper and compete with the per-user broker, which must stay
-    authoritative for github.com so git ops fetch the token fresh per op.
-
-    :returns: ``True`` when written; ``False`` on any filesystem error.
+    :returns: Whether anything was removed.
     """
-    hosts_path = _gh_config_dir() / "hosts.yml"
-    # Merge into the existing document so other hosts / accounts are preserved. A
-    # missing, unreadable, or non-mapping file is treated as empty (never a
-    # failure) — the worst case is starting a fresh map.
-    hosts: dict = {}
-    with contextlib.suppress(OSError, yaml.YAMLError):
-        loaded = yaml.safe_load(hosts_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            hosts = loaded
-    entry = hosts.get("github.com")
-    if not isinstance(entry, dict):
-        entry = {}
-    entry.update({"oauth_token": token, "user": login, "git_protocol": "https"})
-    hosts["github.com"] = entry
+    removed = False
+    if _is_github_app_token(entry.get("oauth_token")):
+        del entry["oauth_token"]
+        removed = True
+    users = entry.get("users")
+    if isinstance(users, dict):
+        for login, account in list(users.items()):
+            if isinstance(account, dict) and _is_github_app_token(account.get("oauth_token")):
+                del account["oauth_token"]
+                removed = True
+                if not account:
+                    del users[login]
+        if not users:
+            del entry["users"]
+    return removed
 
+
+def _remove_legacy_gh_token() -> None:
+    """Drop the GitHub token earlier hosts wrote into gh's ``hosts.yml``.
+
+    Omnigent vends GitHub App user tokens (``ghu_``), while gh's own logins
+    hold ``gho_``, ``ghp_`` or ``github_pat_`` tokens. The old writer left no
+    other mark, so in a managed sandbox every ``ghu_`` token for github.com is
+    treated as its leftover and removed, including one a user stored in gh by
+    hand. An entry left with no token and no account goes too; other accounts
+    and hosts are kept. Temporary ``.hosts.*.yml`` files from the old
+    writer's interrupted writes are removed. The rewrite is atomic and 0600.
+    """
+    config_dir = _gh_config_dir()
+    for leftover in config_dir.glob(".hosts.*.yml"):
+        with contextlib.suppress(OSError):
+            leftover.unlink()
+    hosts_path = config_dir / "hosts.yml"
+    try:
+        hosts = yaml.safe_load(hosts_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return
+    if not isinstance(hosts, dict):
+        return
+    entry = hosts.get("github.com")
+    if not isinstance(entry, dict) or not _strip_github_app_tokens(entry):
+        return
+    if "oauth_token" not in entry and "users" not in entry:
+        del hosts["github.com"]
+    if not hosts:
+        with contextlib.suppress(OSError):
+            hosts_path.unlink()
+        return
     tmp: str | None = None
     try:
-        hosts_path.parent.mkdir(parents=True, exist_ok=True)
-        # mkstemp creates the file 0600 (owner-only, umask-independent), so the
-        # credential never has a world-readable window; os.replace swaps it in
-        # atomically, so a concurrent gh read never sees a partial file.
-        fd, tmp = tempfile.mkstemp(dir=hosts_path.parent, prefix=".hosts.", suffix=".yml")
+        fd, tmp = tempfile.mkstemp(dir=config_dir, prefix=".hosts.", suffix=".yml")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             yaml.safe_dump(hosts, handle, default_flow_style=False, sort_keys=True)
         os.replace(tmp, hosts_path)
@@ -272,93 +262,149 @@ def _write_gh_hosts(login: str, token: str) -> bool:
         if tmp is not None:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
-        return False
-    return True
 
 
-def configure_host_gh(server_url: str, host_id: str) -> bool:
-    """Authenticate the sandbox's gh CLI as the session owner.
+def _global_git_configs() -> list[Path]:
+    """The global git config files git reads: ``$GIT_CONFIG_GLOBAL``, or both defaults."""
+    override = (os.environ.get("GIT_CONFIG_GLOBAL") or "").strip()
+    if override:
+        return [Path(override)]
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return [Path.home() / ".gitconfig", Path(xdg_config) / "git" / "config"]
 
-    Companion to :func:`configure_host_git` (which wires git's per-op broker):
-    the gh CLI has no per-op credential hook, so — like the Databricks config
-    writer in :mod:`omnigent.onboarding.setup` materializes ``~/.databrickscfg``
-    — the owner's brokered GitHub token is materialized into ``hosts.yml`` at
-    host startup. The token is a short-lived, server-refreshed user token; it is
-    re-fetched on each host launch, so a long-lived session should relaunch to
-    refresh it.
 
-    Best-effort: a no-op when the host token is absent, the broker is
-    unreachable, or the owner hasn't linked GitHub (any ambient gh auth is left
-    untouched). Never raises.
+def _legacy_helpers(config: Path) -> list[str]:
+    """The launch-token helpers in *config*; empty when there are none or git fails."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        result = subprocess.run(
+            ["git", "config", "--file", str(config), "--get-all", _HELPER_KEY],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT_S,
+        )
+        return [line for line in result.stdout.splitlines() if re.search(_LEGACY_HELPER, line)]
+    return []
 
-    :returns: ``True`` when gh was authenticated; ``False`` otherwise.
+
+def _remove_legacy_git_helper() -> None:
+    """Remove the launch-token helper earlier hosts wrote into the global git config.
+
+    Cleans every global file git reads, keeping other entries. A lock file
+    older than :data:`_STALE_LOCK_S` was left by a writer that died mid-write:
+    it may hold the old configuration and blocks every later write, so it goes.
+    """
+    for config in _global_git_configs():
+        with contextlib.suppress(OSError):
+            lock = config.with_name(f"{config.name}.lock")
+            if time.time() - lock.stat().st_mtime > _STALE_LOCK_S:
+                lock.unlink()
+        if not config.is_file() or not _legacy_helpers(config):
+            continue
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "--file",
+                    str(config),
+                    "--unset-all",
+                    _HELPER_KEY,
+                    _LEGACY_HELPER,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=_TIMEOUT_S,
+            )
+        if _legacy_helpers(config):
+            _logger.warning("Could not remove the old launch-token git helper from %s", config)
+
+
+def _remove_leftover_credentials() -> None:
+    """Remove tokens that earlier hosts wrote to disk.
+
+    The launch token baked into a github.com helper in the global git config,
+    and the GitHub token in gh's ``hosts.yml``.
+    """
+    _remove_legacy_git_helper()
+    _remove_legacy_gh_token()
+
+
+def _github_resolver(server_url: str, host_id: str) -> credential_broker.Resolver:
+    """Build the broker's resolver: github.com over https, per request, else decline."""
+
+    def resolve(request: Mapping[str, str]) -> dict[str, str] | None:
+        if request.get("host") != "github.com" or request.get("protocol") != "https":
+            return None
+        token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
+        if not token:
+            return None
+        credential = _fetch_credential(server_url, host_id, token)
+        if credential is None:
+            return None
+        username, password = credential
+        return {"username": username, "password": password}
+
+    return resolve
+
+
+def configure_host_git(server_url: str, host_id: str) -> socketserver.BaseServer | None:
+    """Wire git and gh in a managed sandbox to the host's credential broker.
+
+    Called by ``omnigent host`` at startup — executor-agnostic, since the host
+    runs in every executor and holds ``$OMNIGENT_HOST_TOKEN``. First removes
+    tokens that earlier hosts wrote to disk. When the owner has GitHub
+    connected (the per-user Connect model), starts the broker, exports its
+    socket path for gh's wrapper (:data:`credential_broker.SOCKET_ENV_VAR`),
+    makes the socket the authoritative github.com ``credential.helper``, and
+    sets the commit author to the owner. Best-effort: never raises (git may be
+    absent, or GitHub not configured on the server).
+
+    Connected-gated, mirroring :func:`configure_clone_credentials`: a confirmed
+    ``connected: false`` means the owner hasn't linked GitHub (a shared-
+    ``$GIT_TOKEN`` or local deployment). Taking over github.com would clear a
+    shared ``$GIT_TOKEN`` helper and then decline, breaking in-session git — so
+    that path instead **clears** any broker helper a prior (inconclusive) probe
+    may have installed, restoring the ambient helper, and starts no broker. Only
+    a connected owner, or an inconclusive probe (``None``, fail-closed like the
+    clone), takes over github.com. If the broker cannot start, the helper still
+    names its socket and declines, so git fails closed.
+
+    Sandbox-only (see :func:`_in_sandbox`): a no-op outside a managed sandbox, so
+    a local ``omnigent host`` never rewrites the developer's real ``~/.gitconfig``.
+
+    :returns: The running broker, or ``None`` when none was started.
     """
     if not _in_sandbox():
-        return False
+        return None
+    os.environ.pop(credential_broker.SOCKET_ENV_VAR, None)
     token = (os.environ.get(_HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:
-        return False
+        return None
+    _remove_leftover_credentials()
     data = _fetch(server_url, host_id, token)
-    if not data or not data.get("connected") or not data.get("token"):
-        return False
-    gh_token = str(data["token"])
-    login = str(data.get("login") or data.get("username") or "x-access-token")
-    return _write_gh_hosts(login, gh_token)
-
-
-# How often the background refresher re-materializes gh's hosts.yml, in seconds.
-# NB the name deliberately avoids a TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL segment:
-# the managed-sandbox launcher rejects env-passthrough names that look like a
-# credential (they would land in the Pod spec/etcd), and this is a plain integer.
-_GH_REFRESH_INTERVAL_ENV_VAR: str = "OMNIGENT_GH_REFRESH_INTERVAL_S"
-_GH_REFRESH_DEFAULT_S: int = 1800
-
-
-def _gh_refresh_interval_s() -> int:
-    """Resolve the gh-token refresh interval (env override, else 30 min).
-
-    Non-positive disables the refresher.
-    """
-    raw = (os.environ.get(_GH_REFRESH_INTERVAL_ENV_VAR) or "").strip()
-    if not raw:
-        return _GH_REFRESH_DEFAULT_S
+    if data is not None and not data.get("connected"):
+        # Confirmed not linked: clear any broker helper and the chain reset it
+        # wrote, restoring the ambient shared-``$GIT_TOKEN`` helper.
+        _git_config("--unset-all", _HELPER_KEY)
+        return None
+    socket_path = credential_broker.broker_socket_path(host_id)
+    broker: socketserver.BaseServer | None = None
     try:
-        return int(raw)
-    except ValueError:
-        return _GH_REFRESH_DEFAULT_S
-
-
-def start_host_gh_refresh(server_url: str, host_id: str) -> threading.Thread | None:
-    """Keep the gh CLI's ``hosts.yml`` token fresh over a long-lived host.
-
-    Unlike git (whose per-op broker helper re-fetches the server-refreshed
-    token on every operation), the gh CLI reads a **static** ``hosts.yml``, so
-    the token :func:`configure_host_gh` writes at startup goes stale when the
-    GitHub App user token expires (~8h) and the server rotates it — a
-    long-running session would then hit ``gh api`` 401s. This best-effort daemon
-    thread re-materializes ``hosts.yml`` on an interval well under the token
-    lifetime, so gh stays authenticated for the life of the host. (An
-    agent-sandbox resume already refreshes it by re-running host startup; this
-    covers a session that stays live without ever suspending.)
-
-    :returns: The started daemon thread, or ``None`` when disabled (a
-        non-positive interval, or outside a managed sandbox) — mainly for tests.
-    """
-    if not _in_sandbox():
-        return None
-    interval = _gh_refresh_interval_s()
-    if interval <= 0:
-        return None
-
-    def _loop() -> None:
-        while True:
-            time.sleep(interval)
-            with contextlib.suppress(Exception):
-                configure_host_gh(server_url, host_id)
-
-    thread = threading.Thread(target=_loop, name="gh-token-refresh", daemon=True)
-    thread.start()
-    return thread
+        broker = credential_broker.start_credential_broker(
+            socket_path, _github_resolver(server_url, host_id)
+        )
+    except (OSError, RuntimeError) as exc:
+        _logger.warning("GitHub credential broker did not start at %s: %s", socket_path, exc)
+    else:
+        os.environ[credential_broker.SOCKET_ENV_VAR] = str(socket_path)
+    _install_socket_helper(socket_path)
+    owner = str((data or {}).get("owner") or "")
+    if data and data.get("connected") and "@" in owner:
+        _git_config("user.email", owner)
+        login = data.get("login")
+        _git_config("user.name", str(login) if login else owner.split("@", 1)[0])
+    return broker
 
 
 def configure_clone_credentials(server_url: str, host_id: str) -> bool:
@@ -395,9 +441,12 @@ def configure_clone_credentials(server_url: str, host_id: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--server", required=True)
-    parser.add_argument("--host-id", required=True)
-    parser.add_argument("--host-token", required=True)
+    # The host's broker socket; or the endpoint coordinates for an in-process
+    # caller that holds the launch token itself.
+    parser.add_argument("--socket")
+    parser.add_argument("--server")
+    parser.add_argument("--host-id")
+    parser.add_argument("--host-token")
     # git passes the operation (get/store/erase) as the first positional arg.
     parser.add_argument("operation", nargs="?", default="get")
     args, _ = parser.parse_known_args(argv)
@@ -415,7 +464,15 @@ def main(argv: list[str] | None = None) -> int:
     if request.get("host") != "github.com" or request.get("protocol") != "https":
         return 0
 
-    cred = _fetch_credential(args.server, args.host_id, args.host_token)
+    cred: tuple[str, str] | None = None
+    if args.socket:
+        reply = credential_broker.request_credential(
+            args.socket, {"protocol": "https", "host": "github.com"}
+        )
+        if reply.get("password"):
+            cred = (reply.get("username") or "x-access-token", reply["password"])
+    elif args.server and args.host_id and args.host_token:
+        cred = _fetch_credential(args.server, args.host_id, args.host_token)
     if cred is None:
         return 0  # decline; git tries the next helper / prompts
     username, token = cred

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -78,3 +83,75 @@ def test_extra_cli_rows_match_harness_install_table() -> None:
 
     # goose's default pin mirrors the runtime's minimum supported goose.
     assert f"${{1:-{hi._GOOSE_MIN_VERSION}}}" in script
+
+
+def _gh_wrapper_install_command(dockerfile: Path) -> str:
+    """The image's ``RUN`` that writes the gh wrapper, joined into one shell command."""
+    lines = dockerfile.read_text().splitlines()
+    start = lines.index("RUN printf '%s\\n' '#!/opt/venv/bin/python -I' \\")
+    command = []
+    for line in lines[start:]:
+        command.append(line.removesuffix("\\").strip())
+        if not line.endswith("\\"):
+            break
+    return " ".join(command).removeprefix("RUN ")
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        _ROOT / "deploy/docker/Dockerfile",
+        _ROOT / "deploy/docker/Dockerfile.ubi",
+    ],
+)
+def test_host_images_put_the_gh_broker_wrapper_ahead_of_gh(
+    dockerfile: Path, tmp_path: Path
+) -> None:
+    """The image's ``/opt/venv/bin/gh`` hands gh the broker's GitHub token.
+
+    Runs the Dockerfile's own install command with the venv paths pointed at
+    this interpreter and a scratch directory, then calls the installed wrapper
+    the way an agent's shell would, with a recording ``gh`` after it on PATH.
+    """
+    from omnigent.host import credential_broker
+
+    venv_bin, real_bin = tmp_path / "venv-bin", tmp_path / "usr-local-bin"
+    venv_bin.mkdir()
+    real_bin.mkdir()
+    (real_bin / "gh").write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        'print(json.dumps({"argv": sys.argv[1:], "gh_token": os.environ.get("GH_TOKEN")}))\n'
+    )
+    (real_bin / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join([str(venv_bin), str(real_bin), "/usr/bin", "/bin"]),
+    }
+    env.pop("GH_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+    install = (
+        _gh_wrapper_install_command(dockerfile)
+        .replace("/opt/venv/bin/python", sys.executable)
+        .replace("/opt/venv/bin/gh", str(venv_bin / "gh"))
+    )
+    subprocess.run(["sh", "-c", install], env=env, check=True, timeout=60)
+
+    with tempfile.TemporaryDirectory(prefix="og-gh-", dir="/tmp") as root:
+        socket_path = Path(root) / "run" / "credentials.sock"
+        broker = credential_broker.start_credential_broker(
+            socket_path, lambda request: {"password": "owner-token"}
+        )
+        try:
+            ran = subprocess.run(
+                ["gh", "pr", "view"],
+                env={**env, credential_broker.SOCKET_ENV_VAR: str(socket_path)},
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60,
+            )
+        finally:
+            broker.shutdown()
+            broker.server_close()
+    assert json.loads(ran.stdout) == {"argv": ["pr", "view"], "gh_token": "owner-token"}

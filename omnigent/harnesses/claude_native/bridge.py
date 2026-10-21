@@ -46,7 +46,6 @@ import secrets
 import shlex
 import socket
 import socketserver
-import stat
 import sys
 import tempfile
 import threading
@@ -1396,39 +1395,12 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
+    from omnigent.runtime.harnesses.paths import ensure_private_dir
+
     getuid = getattr(os, "getuid", None)
     my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
-        _ensure_private_dir(ancestor, my_uid)
-
-
-def _ensure_private_dir(path: Path, my_uid: int | None) -> None:
-    """
-    Create ``path`` as a 0o700 directory, or validate an existing one.
-
-    :param path: Directory that must be owner-only, e.g. one bridge ancestor
-        or the harness socket root.
-    :param my_uid: Current uid, or ``None`` where POSIX ownership does not
-        apply (Windows), which skips the owner and mode checks.
-    :raises RuntimeError: If ``path`` exists as a symlink, a non-directory,
-        or a directory owned by another uid.
-    """
-    try:
-        os.mkdir(path, mode=0o700)
-        return
-    except FileExistsError:
-        pass
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode):
-        raise RuntimeError(f"refusing to use {path!s}: is a symlink")
-    if not stat.S_ISDIR(st.st_mode):
-        raise RuntimeError(f"refusing to use {path!s}: not a directory")
-    if my_uid is not None and st.st_uid != my_uid:
-        raise RuntimeError(
-            f"refusing to use {path!s}: owned by uid {st.st_uid}, not current user ({my_uid})"
-        )
-    if my_uid is not None and (st.st_mode & 0o077) != 0:
-        os.chmod(path, 0o700)
+        ensure_private_dir(ancestor, my_uid)
 
 
 def ensure_secure_dir(target: Path) -> None:
@@ -6601,13 +6573,13 @@ def _start_unix_control_server(
     :returns: The bound, listening server and its socket path (mode 0600).
     """
     from omnigent.inner._proc import process_alive
-    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+    from omnigent.runtime.harnesses.paths import ensure_private_dir, resolve_harness_tmp_parent
 
     root = resolve_harness_tmp_parent()
     # A configured root may be nested (``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa``);
     # only the leaf must be owner-only.
     root.parent.mkdir(parents=True, exist_ok=True)
-    _ensure_private_dir(root, os.getuid())
+    ensure_private_dir(root, os.getuid())
     for stale in root.glob(f"{_MCP_SOCKET_PREFIX}*{_MCP_SOCKET_SUFFIX}"):
         try:
             owner = int(stale.name[len(_MCP_SOCKET_PREFIX) : -len(_MCP_SOCKET_SUFFIX)])

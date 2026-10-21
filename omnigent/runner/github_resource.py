@@ -15,11 +15,12 @@ Design notes:
   sandboxed OS-env shell helper. The helper strips secrets from the environment,
   which would break ``gh`` auth; a plain subprocess inherits the runner process
   environment, so ``gh`` authenticates as it normally does — the developer's
-  ``gh`` login in local dev, and in a managed sandbox the per-user ``hosts.yml``
-  that :func:`omnigent.git_credential_github.configure_host_gh` writes from the
-  credential broker at host startup. In a sandbox we additionally scrub
-  ``GH_TOKEN``/``GITHUB_TOKEN`` from ``gh``'s env (gh ranks those *above*
-  ``hosts.yml``), so a stray ambient token — e.g. a gh-MCP env passthrough —
+  ``gh`` login in local dev, and in a managed sandbox the connected owner's
+  token, which the image's ``gh`` wrapper
+  (:func:`omnigent.host.credential_broker.gh_main`) gets from the host's
+  credential broker per call. In a sandbox we additionally scrub
+  ``GH_TOKEN``/``GITHUB_TOKEN`` from ``gh``'s env (the wrapper keeps a token
+  already set), so a stray ambient token — e.g. a gh-MCP env passthrough —
   can't silently make the panel act as a shared identity instead of the
   connected owner. Outside a sandbox the env is inherited untouched.
 - The list and patch are GitHub-computed, never a local ``git diff``, so a stale
@@ -172,11 +173,11 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
             _pr_title_timed_out.set(True)
             return None, "", "title lookup deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
-    # the per-user hosts.yml that configure_host_gh writes — never an ambient
-    # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
-    # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
-    # make the panel act as a shared identity. Outside a sandbox (local dev) the
-    # env is inherited untouched, so the developer's own gh auth still works.
+    # the gh wrapper's broker token — never an ambient GH_TOKEN/GITHUB_TOKEN,
+    # which the wrapper keeps. Scrub them so a stray token in the sandbox/runner
+    # env (e.g. a gh-MCP passthrough) can't silently make the panel act as a
+    # shared identity. Outside a sandbox (local dev) the env is inherited
+    # untouched, so the developer's own gh auth still works.
     #
     # ``token`` deliberately re-adds GH_TOKEN to run this one call as a chosen
     # account (the account selector). It's only ever set outside a sandbox — see
