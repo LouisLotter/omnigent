@@ -19,6 +19,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
     Host,
+    HostRegistrationRefusedError,
     HostStore,
     host_is_live,
 )
@@ -1866,3 +1867,309 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+# ── Launch-token-only managed hosts ─────────────────────────
+
+_MANAGED_ID = "7c1e4d2a9b3f4e5d8a6b0c1d2e3f4a5b"
+_MANAGED_NAME = "managed-7c1e4d2a"
+_LAPTOP_ID = "3f2e1d0c9b8a47968574a3b2c1d0e9f8"
+_OWNER = "alice@example.com"
+_MANAGED_STATES = ["armed", "revoked", "expired", "detached", "pending", "deleted"]
+
+
+def _managed_host_in_state(store: HostStore, state: str) -> None:
+    """Create the managed host ``_MANAGED_ID`` in a token *state*.
+
+    Every state but ``armed`` leaves the host without a usable launch token.
+    """
+    if state == "pending":
+        assert store.reserve_managed_host(
+            host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+        )
+        return
+    armed = store.register_managed_host(
+        host_id=_MANAGED_ID,
+        name=_MANAGED_NAME,
+        user_id=_OWNER,
+        token="managed-token",
+        provider="modal",
+        sandbox_id="sb-managed",
+        token_expires_at=now_epoch() + (-10 if state == "expired" else 3600),
+    )
+    if state == "revoked":
+        store.revoke_launch_token(_MANAGED_ID)
+    elif state == "detached":
+        assert store.detach_stale_managed_sandbox(
+            _MANAGED_ID, sandbox_id="sb-managed", expected_updated_at=armed.updated_at
+        )
+    elif state == "deleted":
+        assert store.delete_host(_MANAGED_ID) is not None
+
+
+@pytest.mark.parametrize("state", _MANAGED_STATES)
+def test_owner_bearer_never_registers_a_managed_host(host_store: HostStore, state: str) -> None:
+    """A same-owner bearer cannot claim, rotate or re-own a managed host in any token state."""
+    _managed_host_in_state(host_store, state)
+    assert host_store.registers_only_with_launch_token(_MANAGED_ID)
+    before = host_store.get_host(_MANAGED_ID)
+
+    with pytest.raises(ValueError) as same_id:
+        host_store.upsert_on_connect(_MANAGED_ID, _MANAGED_NAME, _OWNER)
+    assert state == "deleted" or isinstance(same_id.value, HostRegistrationRefusedError)
+    with pytest.raises(ValueError):
+        host_store.upsert_on_connect(_MANAGED_ID, "elsewhere", "local", allow_host_id_reown=True)
+    with pytest.raises(HostRegistrationRefusedError) as rotation:
+        host_store.upsert_on_connect(_LAPTOP_ID, _MANAGED_NAME, _OWNER)
+    # A deleted host frees its name once cleanup finishes; a managed one never does.
+    assert rotation.value.retryable is (state == "deleted")
+
+    assert host_store.get_host(_LAPTOP_ID) is None
+    assert host_store.get_host(_MANAGED_ID) == before
+    assert host_store.registers_only_with_launch_token(_MANAGED_ID)
+
+
+def test_reown_backstop_refuses_a_managed_host(host_store: HostStore) -> None:
+    """A managed row that appears after the same-id lookup is still never re-owned."""
+    _managed_host_in_state(host_store, "armed")
+    with host_store._session_immediate("test_reown_backstop") as session:
+        with pytest.raises(HostRegistrationRefusedError):
+            host_store._reown_host_id(
+                session,
+                host_id=_MANAGED_ID,
+                name="elsewhere",
+                user_id="local",
+                generation=None,
+                now=now_epoch(),
+            )
+    host = host_store.get_host(_MANAGED_ID)
+    assert host is not None
+    assert (host.user_id, host.name) == (_OWNER, _MANAGED_NAME)
+
+
+def test_laptop_named_like_a_managed_host_gets_a_clean_refusal(host_store: HostStore) -> None:
+    """Names are unique per owner, so the laptop is told to rename; other owners are unaffected."""
+    _managed_host_in_state(host_store, "armed")
+
+    with pytest.raises(HostRegistrationRefusedError) as refusal:
+        host_store.upsert_on_connect(_LAPTOP_ID, _MANAGED_NAME, _OWNER)
+    assert not refusal.value.retryable
+    assert _MANAGED_NAME in str(refusal.value)
+    assert "Rename this host" in str(refusal.value)
+
+    assert host_store.upsert_on_connect(_LAPTOP_ID, "alices-laptop", _OWNER).status == "online"
+    other_owner = "e0d1c2b3a4954687a8b9c0d1e2f3a4b5"
+    assert host_store.upsert_on_connect(other_owner, _MANAGED_NAME, "bob@example.com")
+
+
+@pytest.mark.parametrize("deleted_kind", ["managed", "self-registering"])
+def test_name_of_a_deleted_host_is_refused_until_its_cleanup_finishes(
+    host_store: HostStore, deleted_kind: str
+) -> None:
+    """A tombstone keeps its name; the refusal is retryable and clears once the sandbox is gone."""
+    if deleted_kind == "managed":
+        _managed_host_in_state(host_store, "deleted")
+    else:
+        host_store.reserve_sandbox_host(
+            host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+        )
+        host_store.bind_sandbox(_MANAGED_ID, provider="modal", sandbox_id="sb-managed")
+        assert host_store.delete_host(_MANAGED_ID) is not None
+
+    with pytest.raises(HostRegistrationRefusedError) as refusal:
+        host_store.upsert_on_connect(_LAPTOP_ID, _MANAGED_NAME, _OWNER)
+    assert refusal.value.retryable
+
+    assert host_store.mark_sandbox_terminated(_MANAGED_ID, sandbox_id="sb-managed")
+    laptop = host_store.upsert_on_connect(_LAPTOP_ID, _MANAGED_NAME, _OWNER)
+    assert not laptop.launch_token_only
+
+
+@pytest.mark.parametrize("arming", ["replace", "rearm"])
+def test_server_arming_marks_an_unclassified_sandbox_host(
+    host_store: HostStore, arming: str
+) -> None:
+    """A tokenless provider row keeps the bearer path until the server arms it, then refuses it."""
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="sb-1")
+    assert bound is not None
+    assert not bound.launch_token_only
+    assert not host_store.registers_only_with_launch_token(_RESERVED_HOST_ID)
+    # Unarmed, it registers with its owner's bearer like any self-registering sandbox.
+    host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
+    host_store.set_offline(_RESERVED_HOST_ID)
+    snapshot = host_store.get_host(_RESERVED_HOST_ID)
+    assert snapshot is not None
+
+    if arming == "replace":
+        armed = host_store.replace_managed_host_sandbox(
+            host_id=_RESERVED_HOST_ID,
+            user_id="alice@example.test",
+            token="armed-token",
+            provider="modal",
+            sandbox_id="sb-2",
+            token_expires_at=now_epoch() + 3600,
+        )
+    else:
+        armed = host_store.rearm_managed_host(
+            _RESERVED_HOST_ID,
+            sandbox_id="sb-1",
+            expected_updated_at=snapshot.updated_at,
+            token="armed-token",
+            token_expires_at=now_epoch() + 3600,
+        )
+
+    assert armed is not None
+    assert armed.launch_token_only
+    with pytest.raises(HostRegistrationRefusedError):
+        host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
+    with pytest.raises(HostRegistrationRefusedError):
+        host_store.upsert_on_connect(_LAPTOP_ID, "managed-host", "alice@example.test")
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID, "managed-host", "alice@example.test", managed_token="armed-token"
+    )
+    assert connected.status == "online"
+
+
+def test_refused_arming_leaves_the_host_unmarked(host_store: HostStore) -> None:
+    """The marker is written only by an arming that commits."""
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="sb-1")
+    assert bound is not None
+
+    stale = host_store.rearm_managed_host(
+        _RESERVED_HOST_ID,
+        sandbox_id="sb-1",
+        expected_updated_at=bound.updated_at - 1,
+        token="stale-token",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert stale is None
+    assert host_store.detach_stale_managed_sandbox(
+        _RESERVED_HOST_ID, sandbox_id="sb-1", expected_updated_at=bound.updated_at
+    )
+    with pytest.raises(ValueError, match="pending termination"):
+        host_store.replace_managed_host_sandbox(
+            host_id=_RESERVED_HOST_ID,
+            user_id="alice@example.test",
+            token="refused-token",
+            provider="modal",
+            sandbox_id="sb-1",
+            token_expires_at=now_epoch() + 3600,
+        )
+
+    assert not host_store.registers_only_with_launch_token(_RESERVED_HOST_ID)
+
+
+def test_new_managed_host_is_launch_token_only(host_store: HostStore) -> None:
+    """A managed launch marks its host; laptops and reserved sandboxes stay on the bearer path."""
+    _managed_host_in_state(host_store, "armed")
+    _reserve(host_store)
+    laptop = host_store.upsert_on_connect(_LAPTOP_ID, "alices-laptop", _OWNER)
+
+    managed = host_store.get_host(_MANAGED_ID)
+    assert managed is not None
+    assert managed.launch_token_only
+    assert not laptop.launch_token_only
+    assert not host_store.registers_only_with_launch_token(_LAPTOP_ID)
+    assert not host_store.registers_only_with_launch_token(_RESERVED_HOST_ID)
+    assert not host_store.registers_only_with_launch_token("00000000000000000000000000000000")
+
+
+def test_reserved_managed_host_is_pending_and_launch_token_only(host_store: HostStore) -> None:
+    """The pending row admits only the launch token armed after provisioning."""
+    pending = host_store.reserve_managed_host(
+        host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+    )
+    assert pending is not None
+    assert pending == host_store.get_host(_MANAGED_ID)
+    assert (pending.status, pending.sandbox_provider, pending.sandbox_id) == (
+        "offline",
+        "modal",
+        None,
+    )
+    assert pending.launch_token_only
+    with pytest.raises(HostRegistrationRefusedError):
+        host_store.upsert_on_connect(_MANAGED_ID, _MANAGED_NAME, _OWNER)
+
+    armed = host_store.replace_managed_host_sandbox(
+        host_id=_MANAGED_ID,
+        user_id=_OWNER,
+        token="first-token",
+        provider="modal",
+        sandbox_id="sb-first",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert armed is not None
+    assert armed.created_at == pending.created_at
+    connected = host_store.upsert_on_connect(
+        _MANAGED_ID, _MANAGED_NAME, _OWNER, managed_token="first-token"
+    )
+    assert (connected.status, connected.sandbox_id) == ("online", "sb-first")
+
+
+@pytest.mark.parametrize("holder", ["host id", "name", "deleted name"])
+def test_reserving_a_managed_host_refuses_a_taken_identity(
+    host_store: HostStore, holder: str
+) -> None:
+    if holder == "host id":
+        host_store.upsert_on_connect(_MANAGED_ID, "alices-laptop", _OWNER)
+    elif holder == "name":
+        host_store.upsert_on_connect(_LAPTOP_ID, _MANAGED_NAME, _OWNER)
+    else:
+        host_store.register_managed_host(
+            host_id=_LAPTOP_ID,
+            name=_MANAGED_NAME,
+            user_id=_OWNER,
+            token="old-token",
+            provider="modal",
+            sandbox_id="sb-old",
+            token_expires_at=now_epoch() + 3600,
+        )
+        assert host_store.delete_host(_LAPTOP_ID) is not None
+
+    assert (
+        host_store.reserve_managed_host(
+            host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+        )
+        is None
+    )
+    if holder != "host id":
+        assert host_store.get_host(_MANAGED_ID) is None
+    # Names are per owner: another owner may use the same one.
+    assert host_store.reserve_managed_host(
+        host_id="e0d1c2b3a4954687a8b9c0d1e2f3a4b5",
+        name=_MANAGED_NAME,
+        user_id="bob@example.com",
+        provider="modal",
+    )
+
+
+def test_reserving_a_managed_host_loses_an_insert_race_cleanly(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def lose_insert_race(session_maker, operation_name, callback, **kwargs):
+        if operation_name == "reserve_managed_host":
+            raise IntegrityError(
+                "UNIQUE constraint failed: hosts.workspace_id, hosts.user_id, hosts.name",
+                params={"name": _MANAGED_NAME},
+                orig=Exception("duplicate name"),
+            )
+        return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", lose_insert_race)
+    assert (
+        host_store.reserve_managed_host(
+            host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+        )
+        is None
+    )
+
+
+def test_stale_request_cannot_reserve_a_managed_host(host_store: HostStore) -> None:
+    with account_authority_scope(_OWNER, "revoked-generation"):
+        with pytest.raises(OmnigentError, match="authority has been revoked"):
+            host_store.reserve_managed_host(
+                host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+            )
+    assert not host_store.registers_only_with_launch_token(_MANAGED_ID)

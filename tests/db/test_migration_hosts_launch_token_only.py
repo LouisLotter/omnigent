@@ -14,7 +14,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
 from omnigent.db.utils import clear_engine_cache, get_or_create_engine, now_epoch
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import HostRegistrationRefusedError, HostStore
 
 _OWNER = "alice@example.com"
 _ARMED = "a1a1a1a1a1a14a1a8a1a1a1a1a1a1a1a"
@@ -130,3 +130,50 @@ def test_upgrade_resumes_after_the_column_was_committed(
     )
 
     assert _marked(db_uri) == {_ARMED: True}
+
+
+@pytest.mark.parametrize("arming", ["replace", "rearm"])
+def test_arming_a_migrated_legacy_host_closes_the_bearer_path(
+    db_uri: str, migration: ModuleType, arming: str
+) -> None:
+    """A legacy managed host keeps the bearer path only until the server arms it again."""
+    store = HostStore(db_uri)
+    _register(store, _CLEARED, token="old-token")
+    store.revoke_launch_token(_CLEARED)
+    _migrate(db_uri, migration, "downgrade", "upgrade")
+    name = f"managed-{_CLEARED[:8]}"
+    assert _marked(db_uri) == {_CLEARED: False}
+    # The documented residual: unclassified, it still registers with the bearer.
+    store.upsert_on_connect(_CLEARED, name, _OWNER)
+    store.set_offline(_CLEARED)
+    snapshot = store.get_host(_CLEARED)
+    assert snapshot is not None
+
+    if arming == "replace":
+        armed = store.replace_managed_host_sandbox(
+            host_id=_CLEARED,
+            user_id=_OWNER,
+            token="new-token",
+            provider="modal",
+            sandbox_id="sb-next",
+            token_expires_at=now_epoch() + 3600,
+        )
+    else:
+        armed = store.rearm_managed_host(
+            _CLEARED,
+            sandbox_id=f"sb-{_CLEARED[:8]}",
+            expected_updated_at=snapshot.updated_at,
+            token="new-token",
+            token_expires_at=now_epoch() + 3600,
+        )
+
+    assert armed is not None and armed.launch_token_only
+    with pytest.raises(HostRegistrationRefusedError):
+        store.upsert_on_connect(_CLEARED, name, _OWNER)
+    with pytest.raises(HostRegistrationRefusedError):
+        store.upsert_on_connect(_LAPTOP, name, _OWNER)
+    with pytest.raises(HostRegistrationRefusedError):
+        store.upsert_on_connect(_CLEARED, "elsewhere", "local", allow_host_id_reown=True)
+    assert store.resolve_launch_token(_CLEARED, "old-token") is None
+    connected = store.upsert_on_connect(_CLEARED, name, _OWNER, managed_token="new-token")
+    assert connected.status == "online"

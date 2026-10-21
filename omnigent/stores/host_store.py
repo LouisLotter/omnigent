@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import Engine, or_, select, tuple_, update
+from sqlalchemy import Engine, Select, or_, select, tuple_, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -58,6 +58,24 @@ class _HostOwnershipError(IntegrityError):
     """An ownership refusal, not a retryable insert conflict."""
 
 
+class HostRegistrationRefusedError(ValueError):
+    """A bearer registration refused because a managed or deleted host holds its id or name.
+
+    The message is written for the connecting host's operator.
+
+    :param message: Why the registration was refused and what to do about it.
+    :param retryable: Whether the same registration can succeed later
+        unchanged, e.g. once a deleted host's cleanup frees its name.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+LAUNCH_TOKEN_ONLY_REFUSAL = "This host is server-managed; it registers only with its launch token."
+
+
 @dataclass
 class Host:
     """
@@ -88,6 +106,9 @@ class Host:
         generation may coexist in ``sandbox_id`` while this cleanup retries.
     :param deleted_at: Logical deletion timestamp. A managed host with pending
         provider cleanup keeps an internal tombstone row until cleanup succeeds.
+    :param launch_token_only: ``True`` for a host the server armed or reserved
+        as managed: it registers only with its launch token, never with an
+        owner's bearer, and its id and name cannot be taken over.
     :param configured_harnesses: Per-harness readiness reported in the
         host's last ``host.hello`` frame, e.g.
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
@@ -107,6 +128,7 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
+    launch_token_only: bool = False
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -182,6 +204,7 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        launch_token_only=row.launch_token_only,
     )
 
 
@@ -199,6 +222,44 @@ def hash_host_launch_token(token: str) -> str:
     :returns: Hex SHA-256 digest, e.g. ``"9f86d08..."`` (64 chars).
     """
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _identity_holder(host_id: str, user_id: str, name: str) -> Select[tuple[str]]:
+    """Select a row holding *host_id*, or *name* for *user_id*, deleted hosts included."""
+    return (
+        select(SqlHost.host_id)
+        .where(
+            SqlHost.workspace_id == current_workspace_id(),
+            or_(
+                SqlHost.host_id == host_id,
+                (SqlHost.user_id == user_id) & (SqlHost.name == name),
+            ),
+        )
+        .limit(1)
+    )
+
+
+def _refuse_name_takeover(row: SqlHost) -> None:
+    """Refuse a bearer registration under a name a deleted or managed host holds.
+
+    A deleted host keeps its name until its sandbox cleanup finishes. Rotating a
+    managed host would move it, its sessions and its sandbox to a host id that
+    its launch token never proved.
+
+    :param row: The host row holding the connecting host's ``(user_id, name)``.
+    :raises HostRegistrationRefusedError: When *row* is deleted or managed.
+    """
+    if row.deleted_at is not None:
+        raise HostRegistrationRefusedError(
+            f"The host name {row.name!r} belongs to a deleted host whose cleanup is "
+            "still pending; this host can register once it finishes.",
+            retryable=True,
+        )
+    if row.launch_token_only:
+        raise HostRegistrationRefusedError(
+            f"The host name {row.name!r} belongs to a server-managed host on this "
+            "account. Rename this host (host.name in its config.yaml) and reconnect."
+        )
 
 
 def delete_host_in_session(session: Session, row: SqlHost) -> Host:
@@ -315,6 +376,9 @@ class HostStore:
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
         :returns: The upserted :class:`Host`.
+        :raises HostRegistrationRefusedError: Without *managed_token*, when
+            *host_id* is launch-token-only, or *name* belongs to this owner's
+            launch-token-only or deleted host.
         """
         now = now_epoch()
         harnesses_json = (
@@ -358,6 +422,9 @@ class HostStore:
             if row is not None:
                 if row.deleted_at is not None:
                     raise ValueError("host has been deleted")
+                # Same owner or not, a bearer never registers a managed host.
+                if row.launch_token_only:
+                    raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
                 # W2-class boundary: a different user must not claim another
                 # user's host_id. Raise the same IntegrityError the old UNIQUE
                 # constraint produced so the tunnel handler rejects the hijack.
@@ -395,15 +462,16 @@ class HostStore:
                 if reowned is not None:
                     return reowned
 
+            # Names are unique per owner, deleted hosts included.
             existing_by_name = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.user_id == user_id,
                     SqlHost.name == name,
-                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if existing_by_name is not None:
+                _refuse_name_takeover(existing_by_name)
                 # Same (user_id, name), different host_id: identity rotation.
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
@@ -426,6 +494,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 created_at=now,
                 updated_at=now,
+                launch_token_only=False,
                 configured_harnesses=harnesses_json,
             )
             session.add(row)
@@ -480,6 +549,7 @@ class HostStore:
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
         terminating_sandbox_id = row.terminating_sandbox_id
+        launch_token_only = row.launch_token_only
 
         bound_ids = list(
             session.execute(
@@ -523,6 +593,7 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             terminating_sandbox_id=terminating_sandbox_id,
+            launch_token_only=launch_token_only,
             configured_harnesses=harnesses_json,
         )
         session.add(new_row)
@@ -587,6 +658,8 @@ class HostStore:
         ).scalar_one_or_none()
         if existing is None:
             return None
+        if existing.launch_token_only:
+            raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
         created_at = existing.created_at
         session.execute(
             update(SqlHost)
@@ -901,18 +974,7 @@ class HostStore:
         :returns: ``True`` when either key is taken in this workspace.
         """
         with self._session("select_host_identity_taken") as session:
-            row = session.execute(
-                select(SqlHost.host_id)
-                .where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    or_(
-                        SqlHost.host_id == host_id,
-                        (SqlHost.user_id == user_id) & (SqlHost.name == name),
-                    ),
-                )
-                .limit(1)
-            ).first()
-            return row is not None
+            return session.execute(_identity_holder(host_id, user_id, name)).first() is not None
 
     def reserve_sandbox_host(
         self, *, host_id: str, name: str, user_id: str, provider: str
@@ -956,6 +1018,7 @@ class HostStore:
                     created_at=now,
                     updated_at=now,
                     sandbox_provider=provider,
+                    launch_token_only=False,
                 )
                 session.add(row)
             else:
@@ -1044,9 +1107,9 @@ class HostStore:
         Called by the managed-launch orchestration after the sandbox is
         provisioned and BEFORE the in-sandbox host process starts, so
         the launch token is resolvable by the time the host first dials
-        the tunnel. The row is created ``"offline"``; the tunnel's
-        normal ``upsert_on_connect`` flips it online when the host
-        registers.
+        the tunnel. The row is created ``"offline"`` and launch-token-only;
+        the tunnel's ``upsert_on_connect`` flips it online when the host
+        registers with that token.
 
         :param host_id: Server-generated host identifier, e.g.
             ``"host_a1b2c3d4..."``.
@@ -1081,11 +1144,58 @@ class HostStore:
                 token_expires_at=token_expires_at,
                 sandbox_provider=provider,
                 sandbox_id=sandbox_id,
+                launch_token_only=True,
             )
             session.add(row)
             return _row_to_host(row)
 
         return run_write_transaction(self._session_immediate, "register_managed_host", write)
+
+    def reserve_managed_host(
+        self, *, host_id: str, name: str, user_id: str, provider: str
+    ) -> Host | None:
+        """
+        Create a server-managed host's pending row before its sandbox exists.
+
+        For a create flow that records the host before provisioning. The row is
+        offline, holds no launch token or sandbox, and is launch-token-only from
+        creation, so no owner bearer can register it while it is pending. Arm it
+        with :meth:`replace_managed_host_sandbox` once the sandbox exists.
+
+        :param host_id: Server-generated host identifier, e.g.
+            ``"host_a1b2c3d4..."``.
+        :param name: Display name, unique per owner, e.g. ``"build-box"``.
+        :param user_id: User the managed host acts for, e.g.
+            ``"alice@example.com"``.
+        :param provider: Sandbox provider name, e.g. ``"modal"``.
+        :returns: The pending :class:`Host`, or ``None`` when *host_id*, or
+            *name* for *user_id*, is already taken, deleted hosts included.
+        """
+
+        def write(session: Session) -> Host | None:
+            generation = require_active_account(session, user_id)
+            if session.execute(_identity_holder(host_id, user_id, name)).first() is not None:
+                return None
+            now = now_epoch()
+            row = SqlHost(
+                account_generation=generation,
+                user_id=user_id,
+                name=name,
+                host_id=host_id,
+                status=encode_host_status("offline"),
+                created_at=now,
+                updated_at=now,
+                sandbox_provider=provider,
+                launch_token_only=True,
+            )
+            session.add(row)
+            return _row_to_host(row)
+
+        try:
+            return run_write_transaction(self._lifecycle_session, "reserve_managed_host", write)
+        except IntegrityError:
+            # A concurrent registration took the id or the name after the check.
+            return None
 
     def replace_managed_host_sandbox(
         self,
@@ -1102,6 +1212,7 @@ class HostStore:
         The row lock serializes replacement with :meth:`delete_host`. A missing
         result means full teardown already removed the durable host, so the
         caller must clean up the unregistered sandbox instead of recreating it.
+        Arming makes the host launch-token-only in the same transaction.
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
@@ -1137,6 +1248,7 @@ class HostStore:
             existing.token_expires_at = token_expires_at
             existing.sandbox_provider = provider
             existing.sandbox_id = sandbox_id
+            existing.launch_token_only = True
             existing.updated_at = now
             return _row_to_host(existing)
 
@@ -1155,6 +1267,7 @@ class HostStore:
         heartbeats. Cleanup of a different, older generation does not block the
         active generation. A missing result means the caller's snapshot is no
         longer current and the provider must not be asked to resume that sandbox id.
+        Re-arming makes the host launch-token-only in the same update.
         """
         now = now_epoch()
         with self._lifecycle_session("rearm_managed_host") as session:
@@ -1183,6 +1296,7 @@ class HostStore:
                     .values(
                         token_hash=hash_host_launch_token(token),
                         token_expires_at=token_expires_at,
+                        launch_token_only=True,
                         status=encode_host_status("offline"),
                         updated_at=now,
                     )
@@ -1192,6 +1306,26 @@ class HostStore:
                 return None
             row = session.get(SqlHost, (current_workspace_id(), host_id))
             return _row_to_host(row) if row is not None else None
+
+    def registers_only_with_launch_token(self, host_id: str) -> bool:
+        """
+        Whether only its launch token may register *host_id*.
+
+        Reads the durable marker, never whether a usable token exists, so a
+        managed host whose token was revoked, expired or detached, or that was
+        deleted, still refuses an owner's bearer.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``True`` when the host is marked launch-token-only.
+        """
+        with self._session("select_host_launch_token_only") as session:
+            marked = session.execute(
+                select(SqlHost.launch_token_only).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+            ).scalar_one_or_none()
+        return bool(marked)
 
     def resolve_launch_token(self, host_id: str, token: str) -> Host | None:
         """

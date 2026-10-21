@@ -81,7 +81,11 @@ from omnigent.server.host_registry import (
     RunnerExitReports,
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import (
+    LAUNCH_TOKEN_ONLY_REFUSAL,
+    HostRegistrationRefusedError,
+    HostStore,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -160,7 +164,8 @@ def create_host_tunnel_router(
         sandbox hosts: a connection presenting the managed-host token
         header authenticates via
         :meth:`HostStore.resolve_launch_token` instead of
-        *auth_provider* (sandboxes have no user credentials).
+        *auth_provider* (sandboxes have no user credentials). A host the
+        server manages registers only that way, never with a bearer.
     :param auth_provider: Optional auth provider for user identity.
         When set, the authenticated user is recorded as the host
         owner.
@@ -204,7 +209,8 @@ def create_host_tunnel_router(
         """Accept a host's outbound WebSocket tunnel.
 
         Protocol:
-        1. Authenticate the owner from the handshake (BEFORE accept).
+        1. Authenticate the owner from the handshake (BEFORE accept);
+           refuse a bearer for a launch-token-only host.
         2. Accept the WS upgrade.
         3. Receive the ``host.hello`` frame.
         4. Validate ``frame_protocol_version`` (strict-major).
@@ -313,6 +319,15 @@ def create_host_tunnel_router(
                     ),
                 )
                 return
+
+        # Any owner-level bearer, such as a runner token from another sandbox,
+        # must not replace a managed host's registration. The store re-checks.
+        if managed_token is None and await asyncio.to_thread(
+            host_store.registers_only_with_launch_token, host_id
+        ):
+            _logger.warning("Refusing bearer registration of managed host %s", host_id)
+            await _refuse_upgrade(ws, status=403, reason=LAUNCH_TOKEN_ONLY_REFUSAL)
+            return
 
         await ws.accept()
         conn: HostConnection | None = None
@@ -556,6 +571,13 @@ def create_host_tunnel_router(
             disconnect_error = exc
             ended_by = "handler_cancelled"
             raise
+        except HostRegistrationRefusedError as exc:
+            # An expected refusal, reported to the host's operator, not a server fault.
+            disconnect_error = exc
+            _logger.warning("Refusing host %s registration: %s", host_id, exc)
+            await _send_connection_error(ws, stage=stage, error=str(exc), retryable=exc.retryable)
+            with contextlib.suppress(Exception):
+                await ws.close(code=4009, reason="host registration refused")
         except WebSocketDisconnect as exc:
             disconnect_error = exc
             # Only run disconnect cleanup if we actually registered this
