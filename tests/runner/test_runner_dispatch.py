@@ -10964,8 +10964,20 @@ async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> No
 
 @pytest.mark.parametrize(
     ("pressed_ago_s", "turn_running", "applied"),
-    [(None, True, True), (0.0, True, True), (30.0, True, False), (0.0, False, False)],
-    ids=["first-delivery", "turn-pressed-for", "turn-began-after-the-press", "turn-ended"],
+    [
+        (None, True, True),
+        (30.0, True, True),
+        (58.0, True, False),
+        (90.0, True, False),
+        (0.0, False, False),
+    ],
+    ids=[
+        "first-delivery",
+        "turn-pressed-for",
+        "turn-may-have-begun-after-the-press",
+        "turn-began-after-the-press",
+        "turn-ended",
+    ],
 )
 @pytest.mark.asyncio
 async def test_resent_stop_reaches_only_the_turn_it_was_pressed_for(
@@ -10982,6 +10994,8 @@ async def test_resent_stop_reaches_only_the_turn_it_was_pressed_for(
     if turn_running:
         app.state.begin_turn_slot(conv)
         app.state.active_turns[conv] = turn
+        # The turn has been running for a minute.
+        app.state.turn_started_at[conv] -= 60.0
     event: dict[str, Any] = {"type": "interrupt"}
     if pressed_ago_s is not None:
         event["pressed_ago_s"] = pressed_ago_s

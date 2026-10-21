@@ -5,6 +5,11 @@ the runner reconnects. By then the turn the person pressed Stop for may have
 ended, and another may be running: a queued message's, a woken parent's, or
 one typed into the terminal. A re-sent Stop says how long ago it was pressed,
 and the runner applies it only to a turn that was already running then.
+
+The two sides share no clock: the runner places the press by subtracting that
+duration from its own time, which puts it late by the Stop's transit. A turn
+must therefore have started at least the longest transit before that, the
+server's timeout for the forward, to count.
 """
 
 from __future__ import annotations
@@ -16,6 +21,10 @@ PRESSED_AGO_FIELD = "pressed_ago_s"
 
 # The runner's answer to a re-sent Stop whose turn has ended.
 TURN_ENDED_STATUS = "turn_ended"
+
+# The server gives up on a re-sent Stop's forward after this long, and so
+# bounds its transit.
+RESENT_STOP_TRANSIT_ALLOWANCE_S = 5.0
 
 
 def resent_stop_outlived_its_turn(
@@ -35,8 +44,8 @@ def resent_stop_outlived_its_turn(
     :param turn_started_at: When the latest turn started, on the runner's
         monotonic clock, or ``None`` when none is known.
     :param now: The runner's monotonic time.
-    :returns: ``True`` when no turn runs now, or the running one started after
-        the Stop was pressed.
+    :returns: ``True`` when no turn runs now, or the running one may have
+        started after the Stop was pressed.
     """
     pressed_ago_s = event.get(PRESSED_AGO_FIELD)
     if (
@@ -47,4 +56,4 @@ def resent_stop_outlived_its_turn(
         return False
     if not turn_active or turn_started_at is None:
         return True
-    return turn_started_at > now - pressed_ago_s
+    return turn_started_at > now - pressed_ago_s - RESENT_STOP_TRANSIT_ALLOWANCE_S

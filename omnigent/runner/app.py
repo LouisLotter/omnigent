@@ -1435,6 +1435,7 @@ def create_runner_app(
     app.state.turn_bind_epoch = _turn_bind_epoch
     # When each session's latest turn was bound, on the monotonic clock.
     _turn_started_at: dict[str, float] = {}
+    app.state.turn_started_at = _turn_started_at
     # Epoch at which desync recovery claimed the terminal token; competing sites skip their
     # ``idle`` only if the epoch still matches.
     _desync_terminalized: dict[str, int] = {}
