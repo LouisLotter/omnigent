@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+import socket
+import traceback
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +40,13 @@ from omnigent.stores.credential_store.secret_cipher import (
     cipher_setup_hint,
 )
 from omnigent.stores.credential_store.vault_cipher import CREDENTIAL_VAULT_KEY_ENV_VAR
-from tests.server.fake_key_service import FakeKeyService, b64url, b64url_decode
+from tests.server.fake_key_service import (
+    FakeKeyService,
+    b64url,
+    b64url_decode,
+    derivation_info,
+    seal,
+)
 
 CTX_ALICE = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
 CTX_BOB = {"workspace_id": "0", "user_id": "bob", "provider": "github", "account_id": ""}
@@ -85,6 +94,14 @@ def _replying(status: int, body: bytes) -> HttpSecretCipher:
     )
 
 
+@contextmanager
+def _refusing_url() -> Iterator[str]:
+    """A loopback URL whose port is held but not listening, so connections are refused."""
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        yield f"http://127.0.0.1:{reserved.getsockname()[1]}/v1"
+
+
 # ── the SecretCipher contract ──────────────────────────────────────────────
 
 
@@ -120,7 +137,13 @@ def test_another_records_context_reads_as_not_linked() -> None:
 def test_corrupt_stored_value_reads_as_not_linked_without_a_call() -> None:
     service = _service()
     cipher = _cipher(service)
-    for stored in ("not-a-real-ciphertext!!", "oshttp1:k:0:abc", "oshttp1:k:1:a/b", "osvault:x:y"):
+    for stored in (
+        "not-a-real-ciphertext!!",
+        "oshttp1:k:0:abcd",
+        "oshttp1:k:1:ab/d",
+        "oshttp1:k:1:abcde",
+        "osvault:x:y",
+    ):
         assert cipher.decrypt(stored, context=CTX_ALICE) is None
     assert service.served == []
 
@@ -186,17 +209,13 @@ def test_expired_request_raises(skew_s: int) -> None:
 
 
 def test_unreachable_endpoint_raises() -> None:
-    service = _service()
-    with service.serve() as url:
-        stored = HttpSecretCipher(
-            url, signing_key=SIGNING_KEY, signing_key_id=SIGNING_KEY_ID
-        ).encrypt("ghu_alice", context=CTX_ALICE)
-    # The server is gone, so its port now refuses connections.
-    cipher = HttpSecretCipher(url, signing_key=SIGNING_KEY, signing_key_id=SIGNING_KEY_ID)
-    with pytest.raises(KeyServiceError, match="unreachable for decrypt: ConnectError"):
-        cipher.decrypt(stored, context=CTX_ALICE)
-    with pytest.raises(KeyServiceError, match="unreachable for encrypt"):
-        cipher.encrypt("x", context=CTX_ALICE)
+    stored = _cipher(_service()).encrypt("ghu_alice", context=CTX_ALICE)
+    with _refusing_url() as url:
+        cipher = HttpSecretCipher(url, signing_key=SIGNING_KEY, signing_key_id=SIGNING_KEY_ID)
+        with pytest.raises(KeyServiceError, match="decrypt request failed: ConnectError"):
+            cipher.decrypt(stored, context=CTX_ALICE)
+        with pytest.raises(KeyServiceError, match="encrypt request failed: ConnectError"):
+            cipher.encrypt("x", context=CTX_ALICE)
 
 
 def test_timeout_raises() -> None:
@@ -241,12 +260,47 @@ def test_decrypt_failure_other_than_unusable_raises(status: int, body: bytes) ->
         b'{"key_id":"k","key_version":true,"ciphertext":"AAAA"}',
         b'{"key_id":"k","key_version":"1","ciphertext":"AAAA"}',
         b'{"key_id":"k","key_version":1,"ciphertext":"AA+/"}',
+        b'{"key_id":"k","key_version":1,"ciphertext":"A"}',
+        b'{"key_id":"k","key_version":1,"ciphertext":"AAAAA"}',
         b"not json",
     ],
 )
 def test_malformed_encrypt_reply_raises(body: bytes) -> None:
     with pytest.raises(KeyServiceError, match="malformed encrypt reply"):
         _replying(200, body).encrypt("x", context=CTX_ALICE)
+
+
+def test_redirect_is_not_followed_even_by_a_redirecting_client() -> None:
+    hosts: list[str] = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(307, headers={"Location": "http://elsewhere.test/v1/encrypt"})
+
+    client = httpx.Client(transport=httpx.MockTransport(redirect), follow_redirects=True)
+    cipher = HttpSecretCipher(
+        URL, signing_key=SIGNING_KEY, signing_key_id=SIGNING_KEY_ID, client=client
+    )
+    with pytest.raises(KeyServiceError, match="HTTP 307"):
+        cipher.encrypt("ghu_alice", context=CTX_ALICE)
+    assert hosts == ["key-service.test"]
+
+
+def test_protocol_error_text_is_not_repeated() -> None:
+    """A malformed reply's raw bytes stay out of the error and its traceback."""
+
+    def malformed(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("illegal header line: ghu_reply_canary", request=request)
+
+    cipher = HttpSecretCipher(
+        URL,
+        signing_key=SIGNING_KEY,
+        signing_key_id=SIGNING_KEY_ID,
+        client=httpx.Client(transport=httpx.MockTransport(malformed)),
+    )
+    with pytest.raises(KeyServiceError, match="RemoteProtocolError") as failure:
+        cipher.decrypt(f"oshttp1:{RECORD_KEY_ID}:1:AAAA", context=CTX_ALICE)
+    assert "ghu_reply_canary" not in "".join(traceback.format_exception(failure.value))
 
 
 def test_oversized_plaintext_is_refused() -> None:
@@ -293,9 +347,8 @@ def test_signing_key_rotation_by_key_id() -> None:
 def test_no_plaintext_or_key_in_logs_or_errors(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
     plaintext = "ghu_plaintext_canary_0123"
-    service = _service()
-    errors: list[str] = []
-    with service.serve() as url:
+    failures: list[KeyServiceError] = []
+    with _service().serve() as url:
         cipher = HttpSecretCipher(url, signing_key=SIGNING_KEY, signing_key_id=SIGNING_KEY_ID)
         stored = cipher.encrypt(plaintext, context=CTX_ALICE)
         assert cipher.decrypt(stored, context=CTX_ALICE) == plaintext
@@ -304,12 +357,15 @@ def test_no_plaintext_or_key_in_logs_or_errors(caplog: pytest.LogCaptureFixture)
         refused = HttpSecretCipher(url, signing_key=SIGNING_KEY, signing_key_id="signing-unknown")
         with pytest.raises(KeyServiceError) as refusal:
             refused.encrypt(plaintext, context=CTX_ALICE)
-        errors.append(str(refusal.value))
-    with pytest.raises(KeyServiceError) as unreachable:
-        cipher.decrypt(stored, context=CTX_ALICE)
-    errors.append(str(unreachable.value))
+        failures.append(refusal.value)
+    with _refusing_url() as url:
+        unreachable = HttpSecretCipher(url, signing_key=SIGNING_KEY, signing_key_id=SIGNING_KEY_ID)
+        with pytest.raises(KeyServiceError) as connect_failure:
+            unreachable.decrypt(stored, context=CTX_ALICE)
+        failures.append(connect_failure.value)
     assert caplog.records, "the failure paths above log warnings"
-    for text in [caplog.text, *errors, repr(cipher)]:
+    tracebacks = ["".join(traceback.format_exception(failure)) for failure in failures]
+    for text in [caplog.text, *tracebacks, repr(cipher)]:
         assert plaintext not in text
         assert SIGNING_KEY.decode() not in text
 
@@ -437,8 +493,8 @@ def test_client_requests_match_the_protocol_vectors() -> None:
         client=httpx.Client(transport=httpx.MockTransport(reply)),
         clock=lambda: fixture["timestamp"],
     )
-    plaintext = fixture["seal"]["plaintext"]
-    context = {**fixture["seal"]["context"], "account_id": ""}
+    plaintext = fixture["seals"][0]["plaintext"]
+    context = {**fixture["seals"][0]["context"], "account_id": ""}
     stored = cipher.encrypt(plaintext, context=context)
     assert stored == encrypt["stored_record"]
     assert cipher.decrypt(stored, context=context) == plaintext
@@ -469,3 +525,20 @@ def test_reference_endpoint_matches_the_protocol_vectors() -> None:
             assert body["error"]["code"] == expected["code"], case["name"]
         else:
             assert body == expected["body"], case["name"]
+
+
+def test_seal_vectors_match_the_reference_endpoint() -> None:
+    fixture = _fixture()
+    root_key = b64url_decode(fixture["record_key"]["key_base64url"])
+    for vector in fixture["seals"]:
+        identity = (vector["context"], vector["key_id"], vector["key_version"])
+        assert derivation_info(*identity) == vector["hkdf_info"].encode()
+        sealed = seal(
+            root_key,
+            context=vector["context"],
+            key_id=vector["key_id"],
+            key_version=vector["key_version"],
+            plaintext=vector["plaintext"],
+            iv=b64url_decode(vector["iv_base64url"]),
+        )
+        assert sealed == vector["ciphertext"]

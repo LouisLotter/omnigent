@@ -191,7 +191,8 @@ omnigent-key-service-v1
 The first line keeps these signatures from verifying in any other protocol that
 shares the key. The operation line binds a signature to one route, so an encrypt
 request cannot be replayed as a decrypt. Omnigent sends compact JSON with sorted
-keys; the endpoint verifies the bytes it received, before parsing them.
+keys and non-ASCII characters escaped as `\uXXXX`; the endpoint verifies the
+bytes it received, before parsing them, and never re-serializes to verify.
 
 `context` is the record's identity: an object of string values, `workspace_id`,
 `user_id`, `provider` and, for a named account, `account_id`. Omnigent omits
@@ -261,7 +262,7 @@ Only the explicit `422 unusable` counts as a per-record failure. A store-wide
 fault must never read as "not linked": the user would reconnect, and the new
 ciphertext would overwrite a record that is still readable once the fault is
 fixed. Omnigent's exceptions repeat the status and error code only, never the
-endpoint's message.
+endpoint's message or anything from a malformed reply.
 
 ### Stored form and key rotation
 
@@ -286,15 +287,18 @@ The endpoint chooses the record key, under these rules:
 ### A suggested construction
 
 The test endpoint (`tests/server/fake_key_service.py`) does the following, and
-the fixture's `seal` vector pins it; it can be built from WebCrypto alone:
+the fixture's `seals` vectors pin it, one of them with non-ASCII text; it can be
+built from WebCrypto alone:
 
 - a root key of 32 random bytes per `(key_id, key_version)`;
 - a per-record key from HKDF-SHA256 with an empty salt, 32 bytes long, whose
   `info` is the UTF-8 compact JSON
   `{"context":{…},"key_id":"…","key_version":1,"purpose":"omnigent-credential-record"}`
-  with keys sorted at every level;
-- AES-256-GCM with a random 96-bit IV and no additional data; the ciphertext is
-  base64url, unpadded, of the IV, the encrypted bytes and the tag, in that order.
+  with keys sorted at every level and non-ASCII characters written as UTF-8,
+  not escaped (as JavaScript's `JSON.stringify` writes them);
+- AES-256-GCM with a random 96-bit IV, a 128-bit tag and no additional data; the
+  ciphertext is base64url, unpadded, of the IV, the encrypted bytes and the tag,
+  in that order.
 
 ### Security notes
 

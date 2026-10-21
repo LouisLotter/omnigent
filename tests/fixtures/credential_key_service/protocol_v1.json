@@ -12,6 +12,7 @@
   },
   "timestamp": 1792584000,
   "freshness_window_seconds": 300,
+  "seals_note": "The suggested construction with fixed IVs, so these vectors and the encrypt reply are reproducible; an endpoint draws a random IV for every encryption.",
   "exchanges": [
     {
       "operation": "encrypt",
@@ -57,18 +58,34 @@
       }
     }
   ],
-  "seal": {
-    "note": "The suggested construction, with a fixed IV so the encrypt reply above is reproducible; an endpoint draws a random IV for every encryption.",
-    "context": {
-      "provider": "github",
-      "user_id": "alice@example.com",
-      "workspace_id": "0"
+  "seals": [
+    {
+      "context": {
+        "provider": "github",
+        "user_id": "alice@example.com",
+        "workspace_id": "0"
+      },
+      "key_id": "example-records",
+      "key_version": 1,
+      "plaintext": "{\"access_token\": \"ghu_example\", \"refresh_token\": \"ghr_example\"}",
+      "hkdf_info": "{\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1,\"purpose\":\"omnigent-credential-record\"}",
+      "iv_base64url": "AAECAwQFBgcICQoL",
+      "ciphertext": "AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg"
     },
-    "plaintext": "{\"access_token\": \"ghu_example\", \"refresh_token\": \"ghr_example\"}",
-    "hkdf_info": "{\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1,\"purpose\":\"omnigent-credential-record\"}",
-    "iv_base64url": "AAECAwQFBgcICQoL",
-    "ciphertext": "AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg"
-  },
+    {
+      "context": {
+        "provider": "github",
+        "user_id": "zo\u00eb@example.com",
+        "workspace_id": "0"
+      },
+      "key_id": "example-records",
+      "key_version": 1,
+      "plaintext": "p\u00e4ssw\u00f6rd \u2713",
+      "hkdf_info": "{\"context\":{\"provider\":\"github\",\"user_id\":\"zo\u00eb@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1,\"purpose\":\"omnigent-credential-record\"}",
+      "iv_base64url": "DA0ODxAREhMUFRYX",
+      "ciphertext": "DA0ODxAREhMUFRYXIaWXgYhiyRhixjg5iTBt0xx5rmVSJNq--YsBk7oZ"
+    }
+  ],
   "endpoint_cases": [
     {
       "name": "decrypt at the end of the freshness window",
@@ -279,6 +296,24 @@
       "expect": {
         "status": 400,
         "code": "invalid_request"
+      }
+    },
+    {
+      "name": "non-ASCII context and plaintext",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "ec2307363e884d3e39df341ac571672c3d38093c06fb041e2eb6566cb8de6e21"
+      },
+      "body": "{\"ciphertext\":\"DA0ODxAREhMUFRYXIaWXgYhiyRhixjg5iTBt0xx5rmVSJNq--YsBk7oZ\",\"context\":{\"provider\":\"github\",\"user_id\":\"zo\\u00eb@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 200,
+        "body": {
+          "plaintext": "p\u00e4ssw\u00f6rd \u2713"
+        }
       }
     }
   ]

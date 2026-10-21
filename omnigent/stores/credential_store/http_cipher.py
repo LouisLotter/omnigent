@@ -146,6 +146,11 @@ def _valid_key_version(value: int) -> bool:
     return not isinstance(value, bool) and 1 <= value <= _MAX_KEY_VERSION
 
 
+def _is_base64url(text: str) -> bool:
+    """Unpadded base64url: its alphabet, and a length that whole bytes can have."""
+    return bool(_CIPHERTEXT_RE.fullmatch(text)) and len(text) % 4 != 1
+
+
 def _wrap(key_id: str, key_version: int, ciphertext: str) -> str:
     return f"{_ENVELOPE_PREFIX}:{key_id}:{key_version}:{ciphertext}"
 
@@ -159,7 +164,7 @@ def _unwrap(stored: str) -> tuple[str, int, str] | None:
     if not (
         _KEY_ID_RE.fullmatch(key_id)
         and _KEY_VERSION_RE.fullmatch(version_text)
-        and _CIPHERTEXT_RE.fullmatch(ciphertext)
+        and _is_base64url(ciphertext)
     ):
         return None
     key_version = int(version_text)
@@ -180,10 +185,18 @@ def _sealed_record(body: Any) -> tuple[str, int, str]:
             and isinstance(key_version, int)
             and _valid_key_version(key_version)
             and isinstance(ciphertext, str)
-            and _CIPHERTEXT_RE.fullmatch(ciphertext)
+            and _is_base64url(ciphertext)
         ):
             return key_id, key_version, ciphertext
     raise KeyServiceError("credential key service sent a malformed encrypt reply.")
+
+
+def _transport_failure(exc: httpx.HTTPError) -> str:
+    """Name a transport failure without repeating anything the peer sent."""
+    # Network and timeout errors carry OS text; protocol errors can quote raw reply bytes.
+    if isinstance(exc, (httpx.NetworkError, httpx.TimeoutException)):
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
 
 
 def _error_code(body: Any) -> str | None:
@@ -305,12 +318,16 @@ class HttpSecretCipher:
         }
         try:
             response = self._client.post(
-                f"{self._base_url}/{operation}", content=body, headers=headers
+                f"{self._base_url}/{operation}",
+                content=body,
+                headers=headers,
+                follow_redirects=False,
             )
         except httpx.HTTPError as exc:
+            # Not chained: a protocol error's text can quote the reply, which may hold plaintext.
             raise KeyServiceError(
-                f"credential key service unreachable for {operation}: {type(exc).__name__}"
-            ) from exc
+                f"credential key service {operation} request failed: {_transport_failure(exc)}"
+            ) from None
         try:
             parsed = response.json()
         except ValueError:
