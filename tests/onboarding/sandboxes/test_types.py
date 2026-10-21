@@ -61,6 +61,7 @@ def test_capabilities_defaults() -> None:
     # Off by default so a single-repo provider (and every out-of-tree one) is
     # never handed a multi-repo request; providers opt in explicitly.
     assert caps.multi_repo is False
+    assert caps.checkpoint is False
 
 
 def test_capabilities_custom() -> None:

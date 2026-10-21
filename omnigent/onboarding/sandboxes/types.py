@@ -94,6 +94,10 @@ class SandboxCapabilities:
         handed a multi-repo request; providers opt in explicitly.
     :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
         when creating checkouts. Custom materializers must opt in.
+    :param checkpoint: Provider implements
+        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.checkpoint`,
+        so the server asks it to save a managed sandbox when a turn on that
+        host ends and periodically during a long turn.
     """
 
     cli_bootstrap: bool = False
@@ -110,6 +114,13 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    checkpoint: bool = False
+
+
+CheckpointReason = Literal["turn_completed", "long_turn"]
+"""Why the server asks a provider to save a sandbox: a turn on its host ended
+(``"turn_completed"``), or a turn has run for the policy's ``max_interval_s``
+without a save (``"long_turn"``)."""
 
 
 @dataclass(frozen=True)

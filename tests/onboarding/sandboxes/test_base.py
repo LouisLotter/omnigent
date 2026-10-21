@@ -22,11 +22,12 @@ import yaml
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
+    SandboxCapabilityError,
     SandboxLauncher,
     render_host_config_write_command,
     supervise_host_command,
 )
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import CheckpointReason, RepoWorkspace
 
 _HOST_LAUNCH = "FOO=bar omnigent host --server https://srv"
 
@@ -736,3 +737,19 @@ def test_start_host_without_host_config_runs_cleanup_on_resumable_launcher() -> 
         i for i, cmd in enumerate(launcher.commands) if "omnigent host --server" in cmd
     )
     assert cleanup_index < host_index
+
+
+def test_checkpoint_is_an_optional_capability_derived_from_the_override() -> None:
+    """The base refuses; a launcher that overrides ``checkpoint`` declares it."""
+    plain = _RecordingLauncher()
+    assert plain.capabilities.checkpoint is False
+    with pytest.raises(SandboxCapabilityError, match="checkpoint a sandbox"):
+        plain.checkpoint("sb-1", reason="turn_completed")
+
+    class _CheckpointingLauncher(_RecordingLauncher):
+        def checkpoint(self, sandbox_id: str, *, reason: CheckpointReason) -> str | None:
+            return f"{sandbox_id}:{reason}"
+
+    launcher = _CheckpointingLauncher()
+    assert launcher.capabilities.checkpoint is True
+    assert launcher.checkpoint("sb-1", reason="long_turn") == "sb-1:long_turn"

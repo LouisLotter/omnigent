@@ -286,6 +286,7 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+| `checkpoint` | Implements `checkpoint()` for turn-aligned saves of managed sandboxes |
 
 ## Network policy for harness bridge servers
 

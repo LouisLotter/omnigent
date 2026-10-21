@@ -42,6 +42,7 @@ from omnigent.onboarding.sandboxes.registry import (
     reset_plugin_state_for_tests,
 )
 from omnigent.onboarding.sandboxes.types import (
+    CheckpointReason,
     GitCloneOptions,
     HostContext,
     RepoWorkspace,
@@ -56,6 +57,7 @@ from omnigent.onboarding.sandboxes.types import (
 __all__ = [
     "COMMUNITY_MODULE_PREFIX",
     "DEFAULT_SANDBOX_NAME",
+    "CheckpointReason",
     "DerivedWorkspace",
     "GitCloneOptions",
     "HostContext",
