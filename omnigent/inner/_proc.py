@@ -24,8 +24,10 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 import weakref
+from collections.abc import Callable
 from contextlib import suppress
 from typing import Protocol, TypedDict
 
@@ -133,6 +135,43 @@ def spawn_kwargs() -> SpawnKwargs:
     if IS_POSIX:
         return {"start_new_session": True}
     return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+
+
+_PR_SET_PDEATHSIG = 1
+
+
+def die_with_parent_preexec() -> Callable[[], None] | None:
+    """
+    Return a ``preexec_fn`` that makes the child die with the spawning process.
+
+    A runner killed outright leaves its children running, and a child that
+    keeps working for a dead runner acts with nobody recording it. On Linux the
+    kernel can SIGKILL the child the moment its parent dies. The signal is tied
+    to the spawning thread, so it is only armed when spawning from the main
+    thread, whose end is the process's end.
+
+    :returns: The function to pass as ``preexec_fn``, or ``None`` where the
+        signal is unavailable or would follow a shorter-lived thread.
+    """
+    if not IS_LINUX or threading.current_thread() is not threading.main_thread():
+        return None
+    try:
+        import ctypes
+
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+    # Resolve everything before fork: the child only makes the call.
+    kill_signal = int(signal.SIGKILL)
+    parent_pid = os.getpid()
+
+    def _arm() -> None:
+        prctl(_PR_SET_PDEATHSIG, kill_signal, 0, 0, 0)
+        # The parent may have died between fork and prctl.
+        if os.getppid() != parent_pid:
+            os._exit(1)
+
+    return _arm
 
 
 def remember_process_group(process: _ProcessLike) -> None:

@@ -742,3 +742,53 @@ def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> 
         "MALLOC_ARENA_MAX": "1",
         "MALLOC_TRIM_THRESHOLD_": "65536",
     }
+
+
+_SPAWNS_DOOMED_CHILD = """
+import subprocess, sys
+from omnigent.inner import _proc
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    preexec_fn=_proc.die_with_parent_preexec(),
+)
+print(child.pid, flush=True)
+import time; time.sleep(60)
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+def test_child_armed_with_parent_death_signal_dies_with_a_killed_parent() -> None:
+    """A parent killed outright takes its armed child with it."""
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _SPAWNS_DOOMED_CHILD], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert parent.stdout is not None
+        child_pid = int(parent.stdout.readline())
+        assert psutil.pid_exists(child_pid)
+        parent.kill()
+        parent.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not psutil.pid_exists(child_pid) or (
+                psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the armed child outlived its killed parent")
+    finally:
+        parent.kill()
+
+
+def test_parent_death_signal_is_not_armed_off_the_main_thread() -> None:
+    """A spawning thread can end before the process; the signal must not follow it."""
+    import threading
+
+    armed: list[object] = []
+    worker = threading.Thread(target=lambda: armed.append(_proc.die_with_parent_preexec()))
+    worker.start()
+    worker.join()
+
+    assert armed == [None]
