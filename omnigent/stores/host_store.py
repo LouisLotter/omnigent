@@ -107,6 +107,7 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
+    sleep_operation_id: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -182,6 +183,7 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        sleep_operation_id=row.sleep_operation_id,
     )
 
 
@@ -1431,6 +1433,84 @@ class HostStore:
             if row.sandbox_id is None and row.terminating_sandbox_id is None:
                 session.delete(row)
             return True
+
+    def begin_host_sleep(self, host_id: str, *, operation_id: str) -> bool:
+        """Record a sleep and expire the host's launch token, before any stop.
+
+        Persist-before-effect for the sleep fence: a restart before the outcome
+        is known finds the operation and keeps admission closed. The token
+        digest stays, so the host still registers only by launch token, and an
+        open tunnel is unaffected because tokens are checked at handshake.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param operation_id: Idempotency key the provider's stop is asked with.
+        :returns: ``False`` when the host is gone or another sleep is pending.
+        """
+        expired_at = now_epoch() - 1
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.token_hash.is_not(None),
+                        SqlHost.sleep_operation_id.is_(None),
+                        SqlHost.deleted_at.is_(None),
+                    )
+                    .values(sleep_operation_id=operation_id, token_expires_at=expired_at)
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(self._session_immediate, "begin_host_sleep", write)
+
+    def end_host_sleep(
+        self, host_id: str, *, operation_id: str, stopped: bool, token_expires_at: int
+    ) -> None:
+        """Record a sleep's known outcome.
+
+        A stopped sandbox leaves the host offline with its expired token. A
+        refused sleep restores the same token digest's validity.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param operation_id: The operation recorded by :meth:`begin_host_sleep`.
+        :param stopped: ``True`` when the provider confirmed the stop.
+        :param token_expires_at: Validity restored to the token after a refusal.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> None:
+            values: dict[str, object] = {"sleep_operation_id": None}
+            if stopped:
+                values.update(status=encode_host_status("offline"), updated_at=now)
+            else:
+                values["token_expires_at"] = token_expires_at
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.sleep_operation_id == operation_id,
+                )
+                .values(**values)
+            )
+
+        run_write_transaction(self._session_immediate, "end_host_sleep", write)
+
+    def list_pending_host_sleeps(self) -> list[tuple[str, str]]:
+        """Return ``(host_id, operation_id)`` for every sleep with an unknown outcome."""
+        with self._session("list_pending_host_sleeps") as session:
+            rows = session.execute(
+                select(SqlHost.host_id, SqlHost.sleep_operation_id).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.sleep_operation_id.is_not(None),
+                    SqlHost.deleted_at.is_(None),
+                )
+            ).all()
+        return [(str(row.host_id), str(row.sleep_operation_id)) for row in rows]
 
     def revoke_launch_token(self, host_id: str) -> None:
         """

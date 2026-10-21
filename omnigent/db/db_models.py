@@ -1314,6 +1314,9 @@ class SqlHost(OmnigentBase):
         active host generation and awaiting successful provider termination.
         A fresh generation may be registered in ``sandbox_id`` while this
         cleanup remains pending.
+    :param sleep_operation_id: Operation id of a persistent host's sleep whose
+        outcome is not yet known. Written before the provider is asked to stop
+        the sandbox; admission stays closed until the outcome is recorded.
     :param deleted_at: Logical deletion timestamp for a managed host whose
         provider sandbox cleanup is still pending. The row is physically
         removed after every recorded sandbox id terminates successfully.
@@ -1352,6 +1355,7 @@ class SqlHost(OmnigentBase):
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    sleep_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)

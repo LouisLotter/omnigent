@@ -543,6 +543,8 @@ class HostRegistry:
         ) = None
         # Optional host admission check (persistent managed hosts); may wait or refuse.
         self.admission_gate: Callable[[str, str], Awaitable[None]] | None = None
+        # Optional check on every server-to-host request; raises ConnectionError to refuse.
+        self.send_guard: Callable[[HostConnection], None] | None = None
 
     def register(
         self,
@@ -855,5 +857,7 @@ class HostRegistry:
             current = self._hosts.get((conn.workspace_id, conn.host_id))
             if current is not conn:
                 raise ConnectionError(f"host {conn.host_id!r} connection was replaced")
+        if self.send_guard is not None:
+            self.send_guard(conn)
 
         conn.enqueue(data)

@@ -1928,6 +1928,7 @@ def create_app(
     host_registry.launch_authorizer = _admit_host_launch
     persistent_hosts.configure(host_store, host_registry, sandbox_config)
     host_registry.admission_gate = persistent_hosts.admit_host_work
+    host_registry.send_guard = persistent_hosts.guard_host_request
     persistent_host_monitor = persistent_hosts.PersistentHostIdleMonitor()
     app.state.persistent_host_monitor = persistent_host_monitor
     app.state.agent_store = agent_store
@@ -2341,7 +2342,7 @@ def create_app(
             error_impact=exc.impact.value,
             error_phase=exc.phase.value,
         )
-        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+        if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.HOST_NOT_ADMITTING):
             # A session state, not a fault: the user's machine is asleep or
             # the host disconnected, and clients render it as a reconnect
             # affordance. Through the 5xx arm every poll of an offline
