@@ -8,7 +8,7 @@ import itertools
 import secrets
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -359,6 +359,22 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         _SUBAGENT_STATUS_TYPE,
     }
 )
+
+
+def _records_an_outcome(event_type: object, data: object) -> bool:
+    """
+    Whether an event records an outcome its sender forgets once acknowledged.
+
+    A transcript item, and a turn-end status edge (``idle`` or ``failed``),
+    whose failure detail is persisted.
+    """
+    if event_type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+        return True
+    return (
+        event_type == _EXTERNAL_SESSION_STATUS_TYPE
+        and isinstance(data, Mapping)
+        and data.get("status") in ("idle", "failed")
+    )
 
 
 def _is_batchable_external_item(event: SessionEventInput) -> bool:
@@ -857,7 +873,7 @@ def register_events_routes(
                         session_id, list(run), conversation_store
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
-                if any(event.type == _EXTERNAL_CONVERSATION_ITEM_TYPE for event in body):
+                if any(_records_an_outcome(event.type, event.data) for event in body):
                     await _require_durable(request)
                 return acks
             ack = await _post_event_impl(
@@ -866,15 +882,16 @@ def register_events_routes(
                 body,
                 in_flight=in_flight if body.type == "message" else None,
             )
-            if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+            if _records_an_outcome(body.type, body.data):
                 await _require_durable(request)
             return ack
 
     async def _require_durable(request: Request) -> None:
-        """Answer a recorded transcript item only once it is durable."""
+        """Answer a recorded outcome only once it is durable."""
         if not await commits_durable(durability_barrier(request.app)):
             raise OmnigentError(
-                "The item was recorded, but its durability is not yet confirmed. Send it again.",
+                "The outcome was recorded, but its durability is not yet confirmed. "
+                "Send it again.",
                 code=ErrorCode.DURABILITY_UNCONFIRMED,
             )
 
@@ -893,11 +910,11 @@ def register_events_routes(
             app=app, headers=headers, owner=owner, runner_id=runner_id, batch=batch
         )
         recorded = any(
-            event.get("type") == _EXTERNAL_CONVERSATION_ITEM_TYPE
+            _records_an_outcome(event.get("type"), event.get("data"))
             for event in batch.events[: ack.applied]
         )
         if recorded and not await commits_durable(durability_barrier(app)):
-            # The runner keeps the items and sends them again; their writes are idempotent.
+            # The runner keeps the events and sends them again; item writes are idempotent.
             return EventAckFrame(batch.id, 0, ErrorCode.DURABILITY_UNCONFIRMED, retryable=True)
         return ack
 

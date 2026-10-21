@@ -5676,6 +5676,71 @@ async def test_status_edge_retried_after_a_lost_answer_is_applied_once(
     assert len(forwarded) == 2
 
 
+async def test_turn_end_status_is_acknowledged_only_once_durable(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed edge's sender forgets it once answered, so the answer waits for durability.
+
+    Its retry, under the same Idempotency-Key, is answered once durable and not
+    applied a second time.
+    """
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    answers = [False, True]
+
+    async def barrier() -> bool:
+        return answers.pop(0)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child_id = child_resp.json()["id"]
+        forwarded.clear()
+        app.state.durability_barrier = barrier
+        try:
+
+            async def post_failed() -> httpx.Response:
+                return await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {"status": "failed", "output": "API Error: 500"},
+                    },
+                    headers={"Idempotency-Key": "edge-failed"},
+                )
+
+            unconfirmed = await post_failed()
+            retried = await post_failed()
+        finally:
+            app.state.durability_barrier = None
+
+    assert unconfirmed.status_code == 503, unconfirmed.text
+    assert unconfirmed.json()["error"]["code"] == "durability_unconfirmed"
+    assert retried.status_code == 202, retried.text
+    assert len(forwarded) == 1
+    assert answers == []
+
+
 async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
