@@ -735,14 +735,15 @@ def register_core_routes(
                 runner_id=runner_id,
                 host_registry=host_registry,
                 tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                runner_exit_reports=getattr(request.app.state, "runner_exit_reports", None),
             )
             launch_result = (
                 {"status": "started"}
                 if settled == "started"
                 else {
                     "status": "failed",
-                    "error": "host never received the launch"
-                    if settled == "not_received"
+                    "error": "the runner exited while starting"
+                    if settled == "failed"
                     else (
                         f"host launch timed out after {launch_timeout_s:g}s "
                         f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"

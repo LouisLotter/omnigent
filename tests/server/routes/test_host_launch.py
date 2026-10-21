@@ -378,24 +378,26 @@ class TestResolveLaunchTimeout:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("registered", "has_conn", "status", "expected"),
+    ("registered", "has_conn", "status", "exit_report", "expected"),
     [
-        (True, True, None, "started"),
-        (False, True, "alive", "started"),
-        (False, True, "sign_in_pending", "started"),
-        (False, True, "dead", "failed"),
-        (False, True, "unknown", "not_received"),
-        (False, True, None, "unknown"),
-        (False, False, None, "unknown"),
+        (True, True, None, False, "started"),
+        (False, True, "alive", False, "started"),
+        (False, True, "sign_in_pending", False, "started"),
+        (False, True, "dead", False, "failed"),
+        (False, True, "unknown", True, "failed"),
+        (False, True, "unknown", False, "unknown"),
+        (False, True, None, False, "unknown"),
+        (False, False, None, False, "unknown"),
     ],
     ids=[
         "registered",
         "alive",
         "sign-in",
         "exited",
-        "never-received",
+        "exited-and-reaped",
+        "no-record",
         "no-answer",
-        "host-gone",
+        "host-replaced",
     ],
 )
 async def test_settle_unanswered_launch(
@@ -403,10 +405,18 @@ async def test_settle_unanswered_launch(
     registered: bool,
     has_conn: bool,
     status: str | None,
+    exit_report: bool,
     expected: str,
 ) -> None:
-    """A lost launch result is resolved by registration or the host's runner status."""
+    """A lost launch result is resolved by evidence; a missing host record proves nothing.
+
+    The host forgets a runner once its exit is reaped, and a restarted host
+    remembers none, so "no record" stays unknown unless an exit report shows
+    the runner ran and exited.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server.host_registry import RunnerExitReports
     from omnigent.server.routes._host_launch import settle_unanswered_launch
     from omnigent.server.routes._sessions import helpers
 
@@ -427,13 +437,14 @@ async def test_settle_unanswered_launch(
             async def receive_text(self) -> str:
                 raise AssertionError("not read")
 
-        from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
-
         tunnels.register(
             "runner_1",
             _NoopWS(),
             HelloFrame(runner_version="0", frame_protocol_version=1, harnesses=[], envs=[]),
         )
+    reports = RunnerExitReports()
+    if exit_report:
+        reports.record("runner_1", "runner process exited with code 1", owner=None)
     registry = _FakeHostRegistry(conns={"host_1": object()} if has_conn else {})
 
     settled = await settle_unanswered_launch(
@@ -441,7 +452,7 @@ async def test_settle_unanswered_launch(
         runner_id="runner_1",
         host_registry=registry,  # type: ignore[arg-type]
         tunnel_registry=tunnels,
+        runner_exit_reports=reports,
     )
 
     assert settled == expected
-    assert queried == ([] if registered or not has_conn else ["runner_1"])

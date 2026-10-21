@@ -1167,6 +1167,7 @@ def create_hosts_router(
                 runner_id=runner_id,
                 host_registry=host_registry,
                 tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                runner_exit_reports=getattr(request.app.state, "runner_exit_reports", None),
             )
             if settled == "started":
                 result = {"status": "started"}
@@ -1175,9 +1176,7 @@ def create_hosts_router(
                 raise HTTPException(
                     status_code=502 if settled == "failed" else 504,
                     detail=(
-                        "host never received the launch request"
-                        if settled == "not_received"
-                        else "the runner exited while starting"
+                        "the runner exited while starting"
                         if settled == "failed"
                         else f"host did not respond to launch request within "
                         f"{launch_timeout_s:g}s (raise {LAUNCH_TIMEOUT_ENV_VAR} "

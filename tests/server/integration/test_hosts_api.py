@@ -618,7 +618,7 @@ async def test_launch_runner_happy_path(
 @pytest.mark.parametrize(
     ("runner_status", "expected_status"),
     [("alive", 200), ("unknown", 504), ("dead", 502)],
-    ids=["result-lost-runner-up", "launch-never-received", "runner-exited"],
+    ids=["result-lost-runner-up", "host-has-no-record", "runner-exited"],
 )
 async def test_launch_runner_settles_a_launch_whose_result_was_lost(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
@@ -630,8 +630,8 @@ async def test_launch_runner_settles_a_launch_whose_result_was_lost(
     A launch whose result never arrived is resolved through ``host.runner_status``.
 
     A runner the host started is reported as launching, not as a failure
-    whose rollback would strand it; a launch the host never received fails
-    without claiming a runner.
+    whose rollback would strand it. A host with no record of the runner may
+    have reaped its exit or restarted, so that stays an unanswered launch.
     """
     from omnigent.host.frames import (
         HostLaunchRunnerFrame,
@@ -688,7 +688,9 @@ async def test_launch_runner_settles_a_launch_whose_result_was_lost(
     else:
         assert updated.runner_id is None, "a failed launch must not leave a binding"
         if runner_status == "unknown":
-            assert "never received" in resp.json()["detail"]
+            assert "did not respond" in resp.json()["detail"]
+        else:
+            assert "exited" in resp.json()["detail"]
 
 
 @pytest.mark.parametrize(
