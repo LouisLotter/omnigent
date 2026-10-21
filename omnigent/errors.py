@@ -236,6 +236,9 @@ class ErrorCode:
         indistinguishable from a completed enumeration, so the caller
         silently loses the remaining rows. The caller's remedy is to
         restart the enumeration without the cursor.
+    :cvar DURABILITY_UNCONFIRMED: A write was recorded, but the deployment
+        could not confirm in time that it is durable (HTTP 503). Sending the
+        same idempotent write again is safe and expected.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -258,6 +261,7 @@ class ErrorCode:
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
+    DURABILITY_UNCONFIRMED = "durability_unconfirmed"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -315,6 +319,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    # 503: the write is recorded; its idempotent sender retries until durable.
+    ErrorCode.DURABILITY_UNCONFIRMED: 503,
 }
 
 
@@ -356,6 +362,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # The deployment's own replication has not caught up.
+    ErrorCode.DURABILITY_UNCONFIRMED: ErrorCategory.SERVER,
 }
 
 
@@ -392,6 +400,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.HOST_NOT_ADMITTING: ErrorImpact.TRANSIENT,
     ErrorCode.WRONG_REPLICA: ErrorImpact.TRANSIENT,
     ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
+    ErrorCode.DURABILITY_UNCONFIRMED: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
     ErrorCode.FORBIDDEN: ErrorImpact.BENIGN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorImpact.BENIGN,
@@ -440,6 +449,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.DURABILITY_UNCONFIRMED: ErrorPhase.REQUEST,
 }
 
 

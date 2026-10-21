@@ -87,6 +87,13 @@ async def _read_ack(comm: ApplicationCommunicator) -> EventAckFrame:
     raise AssertionError("server never acknowledged the event batch")
 
 
+def _assert_no_ack_sent(comm: ApplicationCommunicator) -> None:
+    # A timed-out receive would cancel the app, so read only what is queued.
+    while not comm.output_queue.empty():
+        frame = decode_frame(comm.output_queue.get_nowait()["text"])
+        assert not isinstance(frame, EventAckFrame), f"acknowledged before durable: {frame}"
+
+
 async def _close(comm: ApplicationCommunicator) -> None:
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
     with contextlib.suppress(asyncio.TimeoutError):
@@ -156,6 +163,77 @@ async def test_lost_ack_replays_without_duplicate_item(
             if first_open:
                 await _close(first)
 
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items] == ["recovered after restart"]
+
+
+async def test_item_is_acknowledged_only_once_its_write_is_durable(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The runner may forget an item only when the server's write of it is durable.
+
+    Until the deployment's barrier confirms it, no acknowledgement is sent, and
+    an unconfirmed write asks for the batch again. The retry, once durable, is
+    acknowledged without a second item.
+    """
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(session_id, _RUNNER_ID)
+    waiting = asyncio.Event()
+    replicated = asyncio.Event()
+    answers = [False, True]
+
+    async def barrier() -> bool:
+        waiting.set()
+        await replicated.wait()
+        return answers.pop(0)
+
+    app.state.durability_barrier = barrier
+    dispatcher = RunnerEventDispatcher()
+    comm = await _connect(app)
+    posting: asyncio.Task[httpx.Response] | None = None
+    try:
+
+        async def send(text: str) -> None:
+            await comm.send_input({"type": "websocket.receive", "text": text})
+
+        dispatcher.ready(send)
+        async with TunnelEventClient(
+            base_url="http://server",
+            event_dispatcher=dispatcher,
+            transport=httpx.MockTransport(lambda _: httpx.Response(599)),
+        ) as forwarder:
+            posting = asyncio.create_task(
+                forwarder.post(f"/v1/sessions/{session_id}/events", json=_ITEM)
+            )
+            await asyncio.wait_for(waiting.wait(), timeout=budget(3.0))
+            await asyncio.sleep(0.1)
+            _assert_no_ack_sent(comm)
+            replicated.set()
+            unconfirmed = await _read_ack(comm)
+            assert unconfirmed == EventAckFrame(
+                unconfirmed.id, 0, "durability_unconfirmed", retryable=True
+            )
+            dispatcher.acknowledge(unconfirmed)
+            confirmed = await _read_ack(comm)
+            assert confirmed == EventAckFrame(confirmed.id, 1)
+            dispatcher.acknowledge(confirmed)
+            response = await asyncio.wait_for(posting, timeout=budget(3.0))
+            assert response.status_code == 202
+    finally:
+        app.state.durability_barrier = None
+        dispatcher.disconnected()
+        if posting is not None:
+            if not posting.done():
+                posting.cancel()
+            await asyncio.gather(posting, return_exceptions=True)
+        await _close(comm)
+
+    assert answers == []
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     assert [item["content"][0]["text"] for item in items] == ["recovered after restart"]
 

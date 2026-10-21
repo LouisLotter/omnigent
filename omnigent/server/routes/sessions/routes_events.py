@@ -97,6 +97,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.durability import commits_durable, durability_barrier
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 from omnigent.server.persistent_hosts import (
@@ -855,17 +856,51 @@ def register_events_routes(
                         session_id, list(run), conversation_store
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
+                if any(event.type == _EXTERNAL_CONVERSATION_ITEM_TYPE for event in body):
+                    await _require_durable(request)
                 return acks
-            return await _post_event_impl(
+            ack = await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type == "message" else None,
             )
+            if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+                await _require_durable(request)
+            return ack
+
+    async def _require_durable(request: Request) -> None:
+        """Answer a recorded transcript item only once it is durable."""
+        if not await commits_durable(durability_barrier(request.app)):
+            raise OmnigentError(
+                "The item was recorded, but its durability is not yet confirmed. Send it again.",
+                code=ErrorCode.DURABILITY_UNCONFIRMED,
+            )
 
     router.include_router(event_router)
 
     async def ingest_runner_batch(
+        *,
+        app: Any,
+        headers: Headers,
+        owner: str | None,
+        runner_id: str,
+        batch: EventBatchFrame,
+    ) -> EventAckFrame:
+        """Apply bounded, authenticated runner events; acknowledge recorded items once durable."""
+        ack = await _apply_runner_batch(
+            app=app, headers=headers, owner=owner, runner_id=runner_id, batch=batch
+        )
+        recorded = any(
+            event.get("type") == _EXTERNAL_CONVERSATION_ITEM_TYPE
+            for event in batch.events[: ack.applied]
+        )
+        if recorded and not await commits_durable(durability_barrier(app)):
+            # The runner keeps the items and sends them again; their writes are idempotent.
+            return EventAckFrame(batch.id, 0, ErrorCode.DURABILITY_UNCONFIRMED, retryable=True)
+        return ack
+
+    async def _apply_runner_batch(
         *,
         app: Any,
         headers: Headers,
