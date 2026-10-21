@@ -692,6 +692,9 @@ class ManagedSandboxConfig:
     :param default_model_options: Optional, request-scoped provider catalog used
         when no host catalog is available for the selected harness and user.
         Supplies choices without selecting a default or provisioning a host.
+    :param persistent: Lifecycle policy that makes this provider's hosts
+        persistent (see :mod:`omnigent.server.persistent_hosts`), or ``None``
+        for hosts that belong to one session.
     """
 
     server_url: str
@@ -705,6 +708,22 @@ class ManagedSandboxConfig:
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
+    persistent: PersistentHostPolicy | None = None
+
+
+@dataclass(frozen=True)
+class PersistentHostPolicy:
+    """Lifecycle of hosts that outlive sessions and sleep when idle.
+
+    :param idle_sleep_s: Seconds without a live runner or admitted work before
+        the host's sandbox is suspended.
+    :param admission_max_age_s: Oldest provider admission report readiness uses.
+    :param sweep_interval_s: Seconds between idle checks on this replica.
+    """
+
+    idle_sleep_s: float = 300.0
+    admission_max_age_s: float = 60.0
+    sweep_interval_s: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -3529,6 +3548,7 @@ async def launch_managed_host(
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     host_id: str | None = None,
+    persistent: bool = False,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -3573,6 +3593,8 @@ async def launch_managed_host(
     :param host_id: Id to register the host under — a create's
         ``host_id`` — or ``None`` to mint one. A requested id also makes the
         host route by it (see :func:`host_slice_key_enabled`).
+    :param persistent: Create a persistent host. A provider with a persistent
+        lifecycle refuses per-session (ephemeral) launches.
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3580,6 +3602,14 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
+    if (entry.persistent is not None) != persistent:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sandbox provider '{entry.provider}' creates "
+                f"{'persistent hosts only' if entry.persistent else 'per-session hosts only'}"
+            ),
+        )
     launcher = entry.launcher_factory()
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
@@ -4137,6 +4167,11 @@ async def resume_managed_host(
     :raises HTTPException: 502 when the resume or host restart otherwise fails.
     """
     if config is None:
+        return
+    from omnigent.server import persistent_hosts
+
+    # A persistent host wakes through its lifecycle, which never re-arms a live one.
+    if await persistent_hosts.wake_if_persistent(host_id):
         return
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.

@@ -76,6 +76,9 @@ _logger = logging.getLogger(__name__)
 # dispatching the prompt this fire. The session + grant are already persisted, so
 # a timeout leaves an owner-visible session the runner can still pick up later.
 _RUNNER_CONNECT_TIMEOUT_S = 30.0
+# How long a fire waits for a pinned persistent host to wake (its own online wait
+# plus the provider resume).
+_PINNED_HOST_READY_TIMEOUT_S = 240.0
 
 # The path stat'd on the resolved host to derive a fallback workspace for a task
 # that pinned no workspace (research / summaries / chat-only). The runner still
@@ -1097,11 +1100,30 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
             f"connected host {host_id!r} belongs to a different account registration",
             error_code="host_authority_revoked",
         )
-    if host.sandbox_provider is not None:
+    from omnigent.server.persistent_hosts import ensure_host_ready, is_persistent_host
+
+    if host.sandbox_provider is not None and not is_persistent_host(host):
         raise _CannotLaunchScheduledFire(
             "automations cannot use an existing sandbox; select a new sandbox for each run",
             error_code="existing_sandbox_not_allowed",
         )
+    try:
+        # A pinned persistent host is woken for the fire (or run now) and admits it.
+        await ensure_host_ready(
+            host_id,
+            operation="scheduled_fire",
+            timeout_s=_PINNED_HOST_READY_TIMEOUT_S,
+            owner=host.user_id,
+        )
+    except OmnigentError as exc:
+        raise _CannotLaunchScheduledFire(
+            str(exc),
+            error_code=(
+                "host_not_admitting"
+                if exc.code == ErrorCode.HOST_NOT_ADMITTING
+                else "host_wake_failed"
+            ),
+        ) from exc
 
 
 def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:

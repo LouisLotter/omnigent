@@ -251,6 +251,11 @@ class ManagedSandboxReaper:
 
     @staticmethod
     def _is_reap_candidate(host: Host, *, cutoff: int, now: int) -> bool:
+        from omnigent.server.persistent_hosts import is_persistent_host
+
+        if host.deleted_at is None and is_persistent_host(host):
+            # An asleep persistent host is offline by design, not abandoned.
+            return host.terminating_sandbox_id is not None
         return host.sandbox_provider is not None and (
             (
                 host.deleted_at is not None

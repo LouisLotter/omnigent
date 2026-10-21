@@ -61,6 +61,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.persistent_hosts import admit_host_work, lifecycle_status
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -718,6 +719,9 @@ def create_hosts_router(
                     # targets the server creates on demand, not
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
+                    # "awake", "asleep" or "sleeping" for a persistent managed host
+                    # (shown in pickers like any host); ``None`` for other hosts.
+                    "lifecycle": lifecycle_status(host, online=host_is_live(host, now=now)),
                     "configured_harnesses": host.configured_harnesses,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
@@ -763,6 +767,7 @@ def create_hosts_router(
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
+            "lifecycle": lifecycle_status(host, online=host_is_live(host)),
             "configured_harnesses": host.configured_harnesses,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
@@ -1514,6 +1519,8 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
+        # An install is admitted host work: a persistent host's sleep waits for it.
+        await admit_host_work(host.host_id, "harness_install")
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)

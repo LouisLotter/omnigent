@@ -110,6 +110,42 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    suspend: bool = False
+    admission: bool = False
+
+
+@dataclass(frozen=True)
+class AdmissionReport:
+    """Whether a sandbox currently accepts new work, as its provider reports it.
+
+    :param admitting: ``False`` refuses new work; work already admitted continues.
+    :param reason: Person-readable reason when not admitting, e.g.
+        ``"not saved: the last checkpoint is 25 minutes old"``.
+    :param generation: Provider runtime generation the report describes. A new
+        generation invalidates every earlier report.
+    """
+
+    admitting: bool
+    reason: str | None = None
+    generation: str | None = None
+
+
+SuspendOutcome = Literal["refused", "stopped", "unknown"]
+
+
+@dataclass(frozen=True)
+class SuspendResult:
+    """Outcome of :meth:`SandboxLifecycle.suspend`.
+
+    :param outcome: ``"refused"`` before any stop (the sandbox keeps running),
+        ``"stopped"`` once the stop is confirmed, or ``"unknown"`` when the stop
+        may have begun but is not confirmed. Repeating the call with the same
+        operation id reports the recorded outcome.
+    :param reason: Person-readable detail for a refusal, e.g. ``"saving"``.
+    """
+
+    outcome: SuspendOutcome
+    reason: str | None = None
 
 
 @dataclass(frozen=True)

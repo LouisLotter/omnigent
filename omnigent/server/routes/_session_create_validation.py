@@ -371,6 +371,16 @@ async def _authorize_host_for_workspace(
         host_id=host_id,
         host_store=host_store,
     )
+    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+    from omnigent.server.persistent_hosts import ensure_host_ready
+
+    # A new conversation on an asleep persistent host wakes it.
+    await ensure_host_ready(
+        host_id,
+        operation="new_conversation",
+        timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+        owner=host.user_id,
+    )
     # Wrong-replica classification, same as the /v1/hosts/* endpoints and
     # RunnerRouter: validate_workspace does a local host_registry miss
     # → "host is offline" (invalid_input), which the client can't recover

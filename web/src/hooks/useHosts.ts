@@ -21,6 +21,9 @@ export interface Host {
    * omit the field entirely.
    */
   sandbox_provider?: string | null;
+  /** "awake", "asleep" or "sleeping" for a persistent managed host (a cloud
+   *  computer that sleeps when idle); absent or null for other hosts. */
+  lifecycle?: "awake" | "asleep" | "sleeping" | null;
   /**
    * Per-harness readiness reported by the host's last connect, e.g.
    * `{"claude-sdk": true, "codex": "needs-auth"}`. `null`/absent means the
@@ -53,7 +56,8 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // field and are kept. `includeSandbox` opts a caller (the chat-header
   // HostBadge) back into seeing them so it can label sandbox sessions.
   if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  // Persistent managed hosts are long-lived computers, listed like any host.
+  return body.hosts.filter((h) => !h.sandbox_provider || h.lifecycle != null);
 }
 
 interface UseHostsOptions {

@@ -516,6 +516,8 @@ class SandboxLifecycle(ABC):
                 and getattr(type(self), "materialize_workspace", None)
                 is ExecModelHostLauncher.materialize_workspace
             ),
+            suspend=self._is_capability_overridden("suspend"),
+            admission=self._is_capability_overridden("admission"),
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
@@ -704,6 +706,35 @@ class SandboxLifecycle(ABC):
         """
         del sandbox_id
         return None
+
+    def suspend(self, sandbox_id: str, *, operation_id: str) -> _sandbox_types.SuspendResult:
+        """
+        Stop a quiescent sandbox, keeping its volume, so a persistent host can sleep.
+
+        Optional capability, called only by the managed-host sleep fence after
+        Omnigent has closed the host's admission and the host reported no live
+        runner. Repeating a call with the same *operation_id* must report the
+        recorded outcome rather than act again.
+
+        :param sandbox_id: The sandbox to stop, e.g. ``"sb-a1b2c3"``.
+        :param operation_id: Idempotency key for this sleep attempt.
+        :returns: ``refused``, ``stopped`` or ``unknown``.
+        :raises SandboxCapabilityError: When the provider cannot suspend.
+        """
+        raise self._capability_error("suspend a sandbox")
+
+    def admission(self, sandbox_id: str) -> _sandbox_types.AdmissionReport:
+        """
+        Report whether the sandbox currently admits new work.
+
+        Optional capability: providers without one always admit. A provider that
+        cannot determine the state answers not admitting, with the reason.
+
+        :param sandbox_id: The sandbox to inspect, e.g. ``"sb-a1b2c3"``.
+        :returns: The provider's current admission report.
+        """
+        del sandbox_id
+        return _sandbox_types.AdmissionReport(admitting=True)
 
     def _capability_error(self, action: str) -> SandboxCapabilityError:
         """

@@ -63,6 +63,8 @@ CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_MCP_REGISTRY = "mcp_registry"
+# The host answers ``host.list_runners`` with its live and launching runners:
+CAP_LIST_RUNNERS = "list_runners"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -74,6 +76,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_LIST_RUNNERS,
 ]
 
 
@@ -134,6 +137,8 @@ class HostFrameKind(str, Enum):
     RUNNER_EXITED = "host.runner_exited"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
+    LIST_RUNNERS = "host.list_runners"
+    LIST_RUNNERS_RESULT = "host.list_runners_result"
     STAT = "host.stat"
     STAT_RESULT = "host.stat_result"
     LIST_DIR = "host.list_dir"
@@ -420,6 +425,33 @@ class HostRunnerStatusResultFrame:
 
     request_id: str
     status: str
+
+
+@dataclass
+class HostListRunnersFrame:
+    """Server → host: which runners does this host have alive or launching?
+
+    Asked by the managed-host sleep fence before a persistent host's sandbox
+    is suspended, because stopping the host ends every runner on it.
+
+    :param request_id: Unique id for correlating the result.
+    """
+
+    request_id: str
+
+
+@dataclass
+class HostListRunnersResultFrame:
+    """Host → server: runners whose process is alive, plus launches in flight.
+
+    :param request_id: Correlates to the :class:`HostListRunnersFrame`.
+    :param runners: Runner IDs whose process has not exited.
+    :param launching: Number of runner launches queued or spawning.
+    """
+
+    request_id: str
+    runners: list[str] = field(default_factory=list)
+    launching: int = 0
 
 
 @dataclass
@@ -1278,6 +1310,8 @@ HostFrame = (
     | HostRunnerExitedFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
+    | HostListRunnersFrame
+    | HostListRunnersResultFrame
     | HostStatFrame
     | HostStatResultFrame
     | HostListDirFrame
@@ -1446,6 +1480,19 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_STATUS.value,
                 "request_id": frame.request_id,
                 "runner_id": frame.runner_id,
+            }
+        )
+    if isinstance(frame, HostListRunnersFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.LIST_RUNNERS.value, "request_id": frame.request_id}
+        )
+    if isinstance(frame, HostListRunnersResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.LIST_RUNNERS_RESULT.value,
+                "request_id": frame.request_id,
+                "runners": list(frame.runners),
+                "launching": frame.launching,
             }
         )
     if isinstance(frame, HostRunnerStatusResultFrame):
@@ -2117,6 +2164,17 @@ def _decode_known_host_frame(
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:
             return _decode_runner_status_result(msg)
+        case HostFrameKind.LIST_RUNNERS:
+            return HostListRunnersFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.LIST_RUNNERS_RESULT:
+            launching = msg.get("launching", 0)
+            if not isinstance(launching, int) or isinstance(launching, bool):
+                raise ValueError("host.list_runners_result launching must be an integer")
+            return HostListRunnersResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                runners=_optional_str_list(msg, "runners"),
+                launching=launching,
+            )
         case HostFrameKind.STAT:
             return _decode_stat(msg)
         case HostFrameKind.STAT_RESULT:

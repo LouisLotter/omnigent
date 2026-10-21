@@ -98,6 +98,8 @@ from omnigent.server.background_session_titles import (
     schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+from omnigent.server.persistent_hosts import ensure_host_ready, is_persistent_host
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -2382,6 +2384,13 @@ def register_events_routes(
         # a replacement.
         _runner_needs_session_init = False
         # Item event (message, function_call_output, etc.).
+        if conv.host_id is not None:
+            # A persistent host may be asleep or going to sleep: hold, wake, admit.
+            await ensure_host_ready(
+                conv.host_id,
+                operation="message",
+                timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+            )
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
             session_id=session_id,
             conv=conv,
@@ -3460,7 +3469,11 @@ def register_events_routes(
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_provider is not None:
+            if (
+                bound_host is not None
+                and bound_host.sandbox_provider is not None
+                and not is_persistent_host(bound_host)
+            ):
                 from omnigent.server.managed_hosts import terminate_managed_host
 
                 await terminate_managed_host(

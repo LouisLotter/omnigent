@@ -315,7 +315,9 @@ def create_scheduled_tasks_router(
                     host_id=host_id,
                     host_store=host_store,
                 )
-                if host.sandbox_provider is not None:
+                from omnigent.server.persistent_hosts import is_persistent_host
+
+                if host.sandbox_provider is not None and not is_persistent_host(host):
                     raise OmnigentError(
                         "automations cannot use an existing sandbox; "
                         "select a new sandbox for each run",

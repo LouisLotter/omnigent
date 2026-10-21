@@ -91,6 +91,8 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListRunnersFrame,
+    HostListRunnersResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
     HostMcpServersFrame,
@@ -2428,6 +2430,24 @@ class HostProcess:
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
+        )
+
+    async def _handle_list_runners(
+        self, frame: HostListRunnersFrame
+    ) -> HostListRunnersResultFrame:
+        """Report runners whose process is alive and launches still in flight.
+
+        The managed-host sleep fence asks this before suspending the sandbox,
+        because stopping the host ends every runner on it.
+        """
+        live = []
+        for runner_id, handle in list(self._runners.items()):
+            if await asyncio.to_thread(handle.proc.poll) is None:
+                live.append(runner_id)
+        return HostListRunnersResultFrame(
+            request_id=frame.request_id,
+            runners=live,
+            launching=len(self._pending_runner_launches),
         )
 
     async def _watch_runner(self, runner_id: str) -> None:
@@ -5003,6 +5023,8 @@ class HostProcess:
             await self._send_text(ws, encode_host_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
+        elif isinstance(frame, HostListRunnersFrame):
+            await self._send_text(ws, encode_host_frame(await self._handle_list_runners(frame)))
         elif isinstance(frame, HostStatFrame):
             await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):

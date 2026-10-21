@@ -49,6 +49,7 @@ from omnigent.host.frames import (
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
+    HostListRunnersResultFrame,
     HostListWorktreesResultFrame,
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
@@ -866,6 +867,12 @@ async def _receive_loop(
             status_future = conn.pending_runner_status.pop(frame.request_id, None)
             if status_future is not None and not status_future.done():
                 status_future.set_result({"status": frame.status})
+            continue
+
+        if isinstance(frame, HostListRunnersResultFrame):
+            list_future = conn.pending_runner_lists.pop(frame.request_id, None)
+            if list_future is not None and not list_future.done():
+                list_future.set_result({"runners": frame.runners, "launching": frame.launching})
             continue
 
         if isinstance(frame, HostStatResultFrame):
