@@ -86,7 +86,7 @@ class _RecordingAP:
             request=httpx.Request("GET", url),
         )
 
-    async def post(self, url: str, *, json: dict) -> httpx.Response:
+    async def post(self, url: str, *, json: dict, **_options: object) -> httpx.Response:
         """Record a POST and return 200 (a session id for a create).
 
         :param url: Request URL, e.g. ``"/v1/sessions"``.

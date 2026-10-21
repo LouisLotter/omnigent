@@ -72,7 +72,7 @@ class _RecordingClient:
         """Initialize with an empty record of posts."""
         self.posts: list[tuple[str, dict]] = []
 
-    async def post(self, url: str, *, json: dict) -> httpx.Response:
+    async def post(self, url: str, *, json: dict, **_options: object) -> httpx.Response:
         """
         Record ``(url, json)`` and return a 200 response.
 
