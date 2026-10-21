@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import types
 from dataclasses import dataclass, field
+from email.message import Message
 from pathlib import Path
 from typing import Any
-from urllib import request
+from urllib import error, request
 
 import pytest
 
@@ -232,6 +233,38 @@ def test_main_dismissal_issues_no_request(
         "main posted a verdict on dismissal — it must leave the "
         "elicitation outstanding for the web UI / server timeout."
     )
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_main_refused_credential_points_to_the_web_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+) -> None:
+    """
+    A 403 means this terminal's credential may not answer approvals.
+
+    A runner's delegated token is refused, so the popup says to answer in
+    the web UI instead of failing; other errors still close it loudly.
+    """
+    harness = _install_popup_harness(monkeypatch, tmp_path, answer="y")
+
+    def _refuse(req: request.Request, timeout: float | None = None) -> _FakeResponse:
+        raise error.HTTPError(req.full_url, status, "refused", Message(), None)
+
+    monkeypatch.setattr(
+        native_cost_popup,
+        "request",
+        types.SimpleNamespace(Request=request.Request, urlopen=_refuse),
+    )
+
+    if status == 403:
+        assert _run_main(harness) == 0
+        assert "Answer it in the web UI" in capsys.readouterr().out
+    else:
+        with pytest.raises(SystemExit, match="HTTP 500"):
+            _run_main(harness)
 
 
 def test_prompt_header_reflects_policy_name(

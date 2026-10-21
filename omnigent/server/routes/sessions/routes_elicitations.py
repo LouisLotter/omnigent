@@ -31,6 +31,9 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
+    refuse_delegated_credential as _refuse_delegated_credential,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
@@ -120,19 +123,23 @@ def register_elicitations_routes(
             optional form ``content``.
         :returns: ``{"queued": False}`` — resolution is synchronous
             and persists no conversation item.
-        :raises OmnigentError: 404 if no session exists.
+        :raises OmnigentError: 404 if no session exists; 403 for a
+            delegated credential such as a runner's token.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
         )
+        _refuse_delegated_credential(request, auth_provider, "answer approvals")
         conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        await _resolve_elicitation(
+            session_id, _resolve_data, runner_router, conversation_store, decided_by=user_id
+        )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

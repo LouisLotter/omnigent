@@ -28,7 +28,11 @@ from omnigent.policies.registry import (
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._auth_helpers import (
+    get_user_id,
+    refuse_delegated_credential,
+    require_access,
+)
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
@@ -177,6 +181,10 @@ def create_session_policies_router(
             if a policy with the same name already exists.
         """
         user_id = get_user_id(request, auth_provider)
+        # Runners add policies (sys_add_policy, sub-agent cost budgets), so a
+        # delegated credential may create one. Accepted risk: a new policy can
+        # write session state that other policies read. Update and delete need
+        # the person.
         if permission_store is not None:
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
@@ -332,6 +340,7 @@ def create_session_policies_router(
             session.
         """
         user_id = get_user_id(request, auth_provider)
+        refuse_delegated_credential(request, auth_provider, "change policies")
         if permission_store is not None:
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
@@ -409,6 +418,7 @@ def create_session_policies_router(
             permission.
         """
         user_id = get_user_id(request, auth_provider)
+        refuse_delegated_credential(request, auth_provider, "change policies")
         if permission_store is not None:
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store

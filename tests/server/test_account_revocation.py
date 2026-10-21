@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
+import jwt
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
@@ -37,13 +38,14 @@ def setup_app(tmp_path, monkeypatch):
     original = app_module.create_app
 
     def capture(**kwargs):
+        from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
         from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
             SqlAlchemyScheduledTaskStore,
         )
 
-        kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(
-            str(kwargs["account_store"]._engine.url)
-        )
+        db_url = str(kwargs["account_store"]._engine.url)
+        kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(db_url)
+        kwargs["policy_store"] = SqlAlchemyPolicyStore(db_url)
         captured.update(kwargs)
         return original(**kwargs)
 
@@ -208,7 +210,7 @@ def test_password_rotation_revokes_issued_credentials_and_keeps_work(setup_app, 
     assert refresh.json()["error"] == "invalid_grant"
     stale_runner = TestClient(alice.app)
     stale_runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
-    assert stale_runner.get("/auth/me").status_code == 401
+    assert stale_runner.get("/v1/sessions").status_code == 401
     browser = TestClient(alice.app)
     redeemed = browser.get(magic_path, follow_redirects=False)
     assert redeemed.status_code == 302
@@ -969,7 +971,7 @@ def test_runner_token_uses_saved_account_authority(
     issued = mint()
     assert issued.status_code == 200, issued.text
     runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
-    assert runner.get("/auth/me").status_code == 200
+    assert runner.get("/v1/sessions").status_code == 200
     # A separate administrator can delete either the host or session owner.
     stores["account_store"].set_admin("alice", True)
     deleter = alice if revoked_owner == "admin" else admin
@@ -1006,7 +1008,7 @@ def test_runner_token_uses_saved_account_authority(
             resume.set()
         if pending is not None:
             assert pending.result(timeout=15).status_code == 401
-    assert runner.get("/auth/me").status_code == (401 if revoked_owner == "alice" else 200)
+    assert runner.get("/v1/sessions").status_code == (401 if revoked_owner == "alice" else 200)
     assert mint().status_code == 401
 
 
@@ -1348,11 +1350,12 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
                     headers={RUNNER_TUNNEL_TOKEN_HEADER: bindings[replacement_runner]},
                 )
                 assert issued.status_code == 200, issued.text
+                token = issued.json()["token"]
                 authenticated = await runner.get(
-                    "/auth/me", headers={"Authorization": f"Bearer {issued.json()['token']}"}
+                    f"/v1/sessions/{session_id}", headers={"Authorization": f"Bearer {token}"}
                 )
                 assert authenticated.status_code == 200, authenticated.text
-                assert authenticated.json()["id"] == "alice"
+                assert jwt.decode(token, options={"verify_signature": False})["sub"] == "alice"
         finally:
             for comm in reversed(comms):
                 with contextlib.suppress(Exception):

@@ -27,6 +27,10 @@ verdict POST); the file carries ``ap_server_url`` + ``ap_auth_headers``.
 Dismissing the popup (Escape / Ctrl-C / EOF) exits **without** posting a
 verdict, leaving the elicitation outstanding so it can still be answered
 in the web UI or resolved by the server-side approval timeout.
+
+The server refuses verdicts carried by a runner's delegated token, since
+an approval must come from the person. The popup then says to answer in
+the web UI and stays open until that happens or it is dismissed.
 """
 
 from __future__ import annotations
@@ -481,7 +485,7 @@ def _post_verdict(
     session_id: str,
     elicitation_id: str,
     action: str,
-) -> None:
+) -> bool:
     """
     POST the verdict to the Omnigent elicitation-resolve endpoint.
 
@@ -502,8 +506,12 @@ def _post_verdict(
     :param elicitation_id: Correlation id of the outstanding
         elicitation, e.g. ``"elicit_deadbeef"``.
     :param action: MCP action verb — ``"accept"`` or ``"decline"``.
-    :raises SystemExit: On a transport error or non-2xx response, with a
-        short message (the popup closes; the web card remains usable).
+    :returns: ``True`` once delivered; ``False`` when the server refuses
+        this credential (HTTP 403), as it does for a runner's delegated
+        token, so the person must answer in the web UI.
+    :raises SystemExit: On a transport error or any other non-2xx
+        response, with a short message (the popup closes; the web card
+        remains usable).
     """
     url = (
         f"{ap_server_url.rstrip('/')}"
@@ -519,9 +527,12 @@ def _post_verdict(
         with request.urlopen(req, timeout=10.0):
             pass
     except error.HTTPError as exc:
+        if exc.code == 403:
+            return False
         raise SystemExit(f"cost-approval popup: resolve rejected (HTTP {exc.code})") from exc
     except error.URLError as exc:
         raise SystemExit(f"cost-approval popup: resolve unreachable ({exc.reason})") from exc
+    return True
 
 
 def _start_resolution_watcher(
@@ -634,13 +645,21 @@ def main(argv: list[str] | None = None) -> int:
         # the server-side approval timeout.
         print("\n  Dismissed — answer in the web UI or it will time out.\n")
         return 0
-    _post_verdict(
+    delivered = _post_verdict(
         ap_server_url=ap_server_url,
         auth_headers=auth_headers,
         session_id=args.session_id,
         elicitation_id=args.elicitation_id,
         action=action,
     )
+    if not delivered:
+        # The resolution watcher still closes this popup once the person
+        # answers in the web UI.
+        print("\n  This terminal can't answer approvals. Answer it in the web UI.")
+        print("\n  Press Enter to dismiss.")
+        with contextlib.suppress(EOFError, KeyboardInterrupt):
+            input()
+        return 0
     print(
         "\n  Approved — continuing.\n"
         if action == "accept"

@@ -1277,9 +1277,11 @@ const ELICIT_ID = "elicit_abc123";
 const REQUEST_STATE = JSON.stringify({ elicitation_id: ELICIT_ID, session_id: "conv_abc" });
 
 const mcpCalls = [];
+const evalBodies = [];
 let mcpCallCount = 0;
 global.fetch = async (url, request) => {
   if (typeof url === "string" && url.indexOf("/policies/evaluate") !== -1) {
+    evalBodies.push(JSON.parse(request.body));
     // The server-side ASK park collapses to a hard ALLOW after the human approves.
     return { ok: true, async json() { return { result: "POLICY_ACTION_ALLOW" }; } };
   }
@@ -1328,6 +1330,9 @@ require(extensionPath)(pi);
 
   // Exactly two /mcp calls: the initial ASK and ONE approval retry.
   assert.equal(mcpCallCount, 2, JSON.stringify(mcpCalls));
+  // The gate waits on the proxy's own approval, whose verdict the retry needs.
+  assert.equal(evalBodies.length, 1);
+  assert.equal(evalBodies[0]._omnigent_elicitation_id, ELICIT_ID);
   const retry = mcpCalls[1].body;
   assert.equal(retry.id, 2, "retry must use a different JSON-RPC id");
   assert.equal(retry.params.requestState, REQUEST_STATE);

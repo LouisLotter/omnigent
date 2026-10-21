@@ -207,13 +207,15 @@ function relayCredentials() {
  * the deliberate exception: that is the human approval window, not an outage,
  * and we keep waiting (re-attaching) rather than blocking.
  *
+ * @param {string} [approvalElicitationId] The /mcp proxy's pending approval
+ *   id for a bridged call; the gate waits on that approval instead of a new one.
  * @returns {Promise<{block: boolean, reason: string} | null>} A verdict.
  *   ``{block: true}`` either from a DENY or from failing closed; ``{block:
  *   false}`` on ALLOW; ``null`` only when the gate is structurally disabled
  *   (no server/session configured or no global fetch) so there is nothing to
  *   enforce against.
  */
-async function evalNativePolicyHttp(config, toolName, args) {
+async function evalNativePolicyHttp(config, toolName, args, approvalElicitationId) {
   if (
     !config ||
     !config.serverUrl ||
@@ -226,11 +228,12 @@ async function evalNativePolicyHttp(config, toolName, args) {
   const url = relay
     ? `${relay.url}/policies/evaluate`
     : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
-  // Mint one stable re-attach id for this tool call. Every (re)POST carries
-  // it so a re-park lands on the SAME elicitation — no duplicate approval
-  // card. Kept for the whole call, across both the park loop and any
-  // transient-error retries.
-  const elicitationId = mintEvaluateElicitationId();
+  // One stable re-attach id for this tool call. Every (re)POST carries it so
+  // a re-park lands on the SAME elicitation — no duplicate approval card.
+  // Kept for the whole call, across both the park loop and any
+  // transient-error retries. A bridged call waits on the /mcp proxy's own
+  // approval, whose recorded verdict its retry then needs.
+  const elicitationId = approvalElicitationId || mintEvaluateElicitationId();
   const body = JSON.stringify({
     event: {
       type: "PHASE_TOOL_CALL",
@@ -671,7 +674,12 @@ async function callOmnigentTool(config, toolName, args) {
     };
   }
 
-  const verdict = await evalNativePolicyHttp(config, toolName, args || {});
+  const verdict = await evalNativePolicyHttp(
+    config,
+    toolName,
+    args || {},
+    initial.elicitationId,
+  );
   if (verdict === null) {
     // The approval gate is structurally unavailable (no server/session/fetch,
     // or a transport error) — fail CLOSED rather than report false success.

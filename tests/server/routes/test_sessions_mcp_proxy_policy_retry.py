@@ -12,8 +12,11 @@ dependencies, following the pattern in ``test_sessions_mcp_proxy.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -21,6 +24,7 @@ import pytest
 
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.runner.mcp_execution_registry import MCP_OPERATION_ID_PARAM
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import (
@@ -318,20 +322,16 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
 
 
 @pytest.mark.asyncio
-async def test_retry_with_allow_policy_falls_through(
+async def test_retry_with_allow_policy_still_needs_an_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When the re-evaluated policy returns ALLOW on retry, the handler
-    should proceed to execution (not reject the call).
+    A retry needs a recorded approval even when the policy now allows.
 
-    This covers the case where label state changed between the original
-    ASK and the retry, so the policy no longer requires approval. The
-    handler must not reject a legitimately-allowed call just because it
-    arrived as a retry.
-
-    A failure here (unexpected error response) means the retry path
-    blocks ALLOW'd calls, which would break legitimate retry flows.
+    The retry claims the approval the person gave for this call; a policy
+    that no longer asks only changes which arguments execute. Without an
+    approval the retry is refused, so an approval that changed policy state
+    cannot be replayed through the ALLOW branch.
     """
     allow_engine = _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
 
@@ -355,21 +355,7 @@ async def test_retry_with_allow_policy_falls_through(
         runner_router=None,
     )
 
-    payload = json.loads(bytes(response.body))
-    # On ALLOW, the handler falls through to execution which needs a
-    # runner. With runner_router=None, it returns a "No runner bound"
-    # error — which proves the policy gate was passed (execution was
-    # attempted). If we get a "Denied by policy" error instead, the
-    # ALLOW path is broken.
-    if "error" in payload:
-        assert (
-            "runner" in payload["error"]["message"].lower()
-            or "No runner" in payload["error"]["message"]
-        ), (
-            f"Expected runner-unavailable error (proving policy passed), "
-            f"got: {payload['error']['message']!r}. "
-            f"If 'Denied by policy', the ALLOW path on retry is broken."
-        )
+    assert _parse_rpc_error(response)["message"] == "Elicitation not found or already resolved"
 
 
 @pytest.mark.asyncio
@@ -432,12 +418,12 @@ async def test_retry_session_mismatch_still_rejected(
 async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A retry with a server-issued elicitation in the pending map proceeds.
+    """A retry with a server-issued, person-approved elicitation proceeds.
 
-    Stores a real entry in ``_pending_policy_ask_writes`` before calling
-    the retry path. The handler must find the entry, accept the approval,
-    and fall through to execution (which fails with "No runner" — proving
-    the policy gate was passed).
+    Stores a real entry in ``_pending_policy_ask_writes`` and records the
+    person's verdict before calling the retry path. The handler must accept
+    the approval, consume it, and fall through to execution (which fails
+    with "No runner" — proving the policy gate was passed).
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
@@ -466,7 +452,10 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
         state_updates=None,
         set_labels=None,
         from_mcp=True,
+        reviewed_arguments={"command": "id -un"},
+        mcp_call_identity=(_SESSION_ID, "sys_os_shell", None, None),
     )
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice@example.com")
 
     try:
         response = await _handle_mcp_tools_call(
@@ -482,10 +471,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
         # On accept the handler falls through to execution, which needs
         # a runner.  With runner_router=None it returns a runner error —
         # proving the ASK gate was passed.
-        if "error" in payload:
-            assert "Elicitation not found" not in payload["error"]["message"], (
-                "Legitimate elicitation rejected as not found — the pending-map check is broken."
-            )
+        assert "runner" in payload["error"]["message"].lower(), payload
         # Entry must have been consumed (popped) by the retry path.
         assert eid not in _pending_policy_ask_writes, (
             "Entry should be popped after a successful retry"
@@ -593,7 +579,6 @@ async def test_duplicate_accept_verdicts_apply_relay_writes_once(
     re-runs non-idempotent ops (e.g. INCREMENT state updates for
     cost-budget counters).
     """
-    import asyncio
 
     from omnigent.server.routes.sessions import _apply_pending_policy_ask_writes
     from omnigent.spec.types import StateUpdate, StateUpdateAction
@@ -756,7 +741,7 @@ async def test_retry_dispatches_policy_owned_arguments(
     approval: str,
 ) -> None:
     """Approval preserves the reviewed call; ALLOW uses the current policy result."""
-    eid = "elicit_reviewed_call"
+    eid = ""
     original_arguments = {"value": "original"}
     dispatched: list[dict[str, Any]] = []
     label_writes: list[dict[str, str]] = []
@@ -788,8 +773,8 @@ async def test_retry_dispatches_policy_owned_arguments(
         )
         return engine, result
 
-    async def register(*args, **kwargs):
-        return eid
+    async def register(*args, elicitation_id, **kwargs):
+        return elicitation_id
 
     def execute(request: httpx.Request) -> httpx.Response:
         dispatched.append(json.loads(request.content))
@@ -823,6 +808,9 @@ async def test_retry_dispatches_policy_owned_arguments(
             initial = await call({"name": "example__lookup", "arguments": original_arguments})
             assert not dispatched
             assert not label_writes
+            eid = next(iter(initial["result"]["inputRequests"]))
+            # The person answers in the browser; the runner relays that answer.
+            orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, approval, "alice")
             state = json.loads(initial["result"]["requestState"])
             state["transformed_arguments"] = {"value": "client"}
             result = await call(
@@ -860,3 +848,329 @@ async def test_retry_dispatches_policy_owned_arguments(
             assert "transformed_arguments" not in json.loads(initial["result"]["requestState"])
         finally:
             _pending_policy_ask_writes.pop(eid, None)
+
+
+# ---------------------------------------------------------------------------
+# Recorded human verdicts
+# ---------------------------------------------------------------------------
+
+
+_OTHER_SESSION_ID = "conv_test_policy_retry_other"
+_RUNNER_ID = "runner_policy_retry"
+
+
+@dataclass
+class _StubConversations:
+    """Conversation store holding several canned conversations by id."""
+
+    conversations: dict[str, Conversation]
+
+    def get_conversation(self, session_id: str) -> Conversation | None:
+        """Return the canned conversation for *session_id*, if any."""
+        return self.conversations.get(session_id)
+
+
+@dataclass
+class _StubTunnelRegistry:
+    """Tunnel registry exposing one connected runner and its generation."""
+
+    generation: int
+
+    def get(self, runner_id: str) -> SimpleNamespace | None:
+        """Return the connected runner's session, or ``None`` for others."""
+        return SimpleNamespace(generation=self.generation) if runner_id == _RUNNER_ID else None
+
+
+def _runner_bound_conversation(session_id: str) -> Conversation:
+    """Build a conversation bound to :data:`_RUNNER_ID`."""
+    return Conversation(
+        id=session_id,
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        runner_id=_RUNNER_ID,
+    )
+
+
+@dataclass
+class _ApprovalHarness:
+    """Drive the MCP ASK and retry through ``_handle_mcp_tools_call``.
+
+    :param registry: Tunnel registry whose generation a test may change.
+    :param dispatched: Every tool call the runner was asked to execute.
+    :param dispatch_generations: The tunnel generation each execution was
+        pinned to, or ``None`` when unpinned.
+    """
+
+    registry: _StubTunnelRegistry
+    dispatched: list[dict[str, Any]]
+    dispatch_generations: list[int | None]
+
+    async def call(
+        self,
+        params: dict[str, Any],
+        *,
+        session_id: str = _SESSION_ID,
+        actor: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST one ``tools/call`` and return the JSON-RPC payload."""
+        response = await _handle_mcp_tools_call(
+            rpc_id=1,
+            session_id=session_id,
+            params=params,
+            conversation_store=_StubConversations(  # type: ignore[arg-type]
+                {sid: _runner_bound_conversation(sid) for sid in (_SESSION_ID, _OTHER_SESSION_ID)}
+            ),
+            agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=None,
+            actor=actor or {"run_as": "alice@example.com"},
+            request=SimpleNamespace(  # type: ignore[arg-type]
+                app=SimpleNamespace(state=SimpleNamespace(tunnel_registry=self.registry))
+            ),
+        )
+        return json.loads(bytes(response.body))
+
+    async def ask(self) -> tuple[str, dict[str, Any]]:
+        """Make the first call; return the elicitation id and retry params."""
+        initial = await self.call(
+            {
+                "name": "linkedin__post",
+                "arguments": {"text": "hello"},
+                MCP_OPERATION_ID_PARAM: "mcpop_1",
+            }
+        )
+        elicitation_id = next(iter(initial["result"]["inputRequests"]))
+        return elicitation_id, {
+            "name": "linkedin__post",
+            "arguments": {"text": "hello"},
+            MCP_OPERATION_ID_PARAM: "mcpop_1",
+            "requestState": initial["result"]["requestState"],
+            "inputResponses": {elicitation_id: {"action": "accept"}},
+        }
+
+
+@pytest.fixture
+def approval_harness(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ApprovalHarness]:
+    """An ASK-gated MCP tool whose runner execution is recorded."""
+    harness = _ApprovalHarness(_StubTunnelRegistry(generation=7), [], [])
+    engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.ALLOW))
+
+    async def evaluate(session_id, spec, store, conv, ctx):
+        if ctx.phase == Phase.TOOL_CALL:
+            return engine, PolicyResult(
+                action=PolicyAction.ASK, reason="post?", deciding_policies=["review"]
+            )
+        return engine, PolicyResult(action=PolicyAction.ALLOW)
+
+    def execute(request: httpx.Request) -> httpx.Response:
+        harness.dispatched.append(json.loads(request.content))
+        harness.dispatch_generations.append(request.extensions.get("runner_tunnel_generation"))
+        return httpx.Response(200, json={"result": {"output": "posted"}})
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(execute), base_url="http://runner")
+
+    async def get_runner(*args):
+        return runner
+
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "spec")
+    monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", evaluate)
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+    before = set(_pending_policy_ask_writes.keys())
+    yield harness
+    for key in set(_pending_policy_ask_writes.keys()) - before:
+        _pending_policy_ask_writes.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_person_approval_is_consumed_by_one_runner_retry(
+    approval_harness: _ApprovalHarness,
+) -> None:
+    """The normal path: a person approves, the runner's retry executes once."""
+    eid, retry = await approval_harness.ask()
+    assert not approval_harness.dispatched
+
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice@example.com")
+    executed = await approval_harness.call(retry)
+    duplicate = await approval_harness.call(retry)
+
+    assert "error" not in executed, executed
+    assert len(approval_harness.dispatched) == 1
+    assert approval_harness.dispatched[0]["params"]["arguments"] == {"text": "hello"}
+    assert duplicate["error"]["message"] == "Elicitation not found or already resolved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "message", "still_pending"),
+    [
+        ("forged_accept", "Tool call has not been approved", True),
+        ("declined", "Tool call denied by user", False),
+        ("changed_arguments", "Retry arguments do not match the approved request", False),
+        ("other_operation", "Approval does not match this call", False),
+        ("runner_reconnected", "Approval was granted before the runner reconnected", False),
+        ("other_session", "Approval does not match this call", True),
+        ("other_actor", "Approval does not match this call", True),
+        ("server_restart", "Elicitation not found or already resolved", False),
+    ],
+)
+async def test_retry_without_a_matching_person_approval_never_executes(
+    approval_harness: _ApprovalHarness, scenario: str, message: str, still_pending: bool
+) -> None:
+    """Every retry the person did not approve as-is is refused before execution."""
+    eid, retry = await approval_harness.ask()
+    if scenario != "forged_accept":
+        verdict = "decline" if scenario == "declined" else "accept"
+        orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, verdict, "alice")
+    session_id = _SESSION_ID
+    actor = None
+    if scenario == "changed_arguments":
+        retry["arguments"] = {"text": "something else"}
+    elif scenario == "other_operation":
+        retry[MCP_OPERATION_ID_PARAM] = "mcpop_2"
+    elif scenario == "runner_reconnected":
+        approval_harness.registry.generation += 1
+    elif scenario == "other_session":
+        session_id = _OTHER_SESSION_ID
+        retry["requestState"] = json.dumps({"session_id": session_id, "elicitation_id": eid})
+    elif scenario == "other_actor":
+        actor = {"run_as": "mallory@example.com"}
+    elif scenario == "server_restart":
+        _pending_policy_ask_writes.pop(eid)
+
+    refused = await approval_harness.call(retry, session_id=session_id, actor=actor)
+
+    assert refused["error"]["message"] == message
+    assert not approval_harness.dispatched
+    assert (eid in _pending_policy_ask_writes) is still_pending
+
+
+@pytest.mark.asyncio
+async def test_first_person_verdict_is_recorded_with_who_gave_it(
+    approval_harness: _ApprovalHarness,
+) -> None:
+    """Only this session's first answer is recorded, with the answering user."""
+    eid, _retry = await approval_harness.ask()
+
+    orchestration._record_mcp_approval_verdict(_OTHER_SESSION_ID, eid, "accept", "mallory")
+    assert _pending_policy_ask_writes[eid].verdict is None
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "decline", "alice")
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "bob")
+    recorded = _pending_policy_ask_writes[eid]
+
+    assert (recorded.verdict, recorded.decided_by) == ("decline", "alice")
+
+
+@pytest.mark.asyncio
+async def test_verdict_is_recorded_before_the_runner_hears_it(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner retries as soon as it hears the verdict, so the record comes first."""
+    eid, _retry = await approval_harness.ask()
+    seen_by_runner: list[str | None] = []
+
+    async def forward(session_id, data, runner_router):
+        seen_by_runner.append(_pending_policy_ask_writes[eid].verdict)
+
+    monkeypatch.setattr(orchestration, "_forward_approval_to_runner", forward)
+    await orchestration._resolve_elicitation(
+        _SESSION_ID, {"elicitation_id": eid, "action": "accept"}, None, decided_by="alice"
+    )
+
+    assert seen_by_runner == ["accept"]
+    assert _pending_policy_ask_writes[eid].decided_by == "alice"
+
+
+@pytest.mark.asyncio
+async def test_approved_retry_cannot_replay_once_policy_allows(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An approval that makes the policy allow (e.g. a recorded checkpoint) runs once."""
+    eid, retry = await approval_harness.ask()
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice")
+    assert "error" not in await approval_harness.call(retry)
+
+    engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.ALLOW))
+
+    async def allow(session_id, spec, store, conv, ctx):
+        return engine, PolicyResult(action=PolicyAction.ALLOW)
+
+    monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", allow)
+    replayed = await approval_harness.call(retry)
+
+    assert replayed["error"]["message"] == "Elicitation not found or already resolved"
+    assert len(approval_harness.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_call_executes_only_on_the_approved_connection(
+    approval_harness: _ApprovalHarness,
+) -> None:
+    """Execution is pinned to the runner connection the approval was granted on."""
+    eid, retry = await approval_harness.ask()
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice")
+
+    executed = await approval_harness.call(retry)
+
+    assert "error" not in executed, executed
+    assert approval_harness.dispatch_generations == [7]
+
+
+@pytest.mark.asyncio
+async def test_answer_given_while_the_prompt_is_published_is_kept(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The approval record exists before anyone can see, and answer, the prompt."""
+
+    def answer_during_fan_out(store, session_id, event):
+        orchestration._record_mcp_approval_verdict(
+            session_id, event["elicitation_id"], "accept", "alice"
+        )
+
+    monkeypatch.setattr(
+        orchestration, "_publish_elicitation_request_to_ancestors", answer_during_fan_out
+    )
+    _eid, retry = await approval_harness.ask()
+
+    assert "error" not in await approval_harness.call(retry)
+    assert len(approval_harness.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_external_input_continuation_stays_on_the_approved_connection(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call that pauses for an external MCP server's question resumes on the same connection."""
+    from omnigent.server.schemas import ElicitationResult
+
+    eid, retry = await approval_harness.ask()
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice")
+    replies = iter(
+        [
+            {"result": {"input_required": {"inputRequests": {"q1": {}}, "requestState": "s"}}},
+            {"result": {"output": "posted"}},
+        ]
+    )
+
+    def execute(request: httpx.Request) -> httpx.Response:
+        approval_harness.dispatched.append(json.loads(request.content))
+        approval_harness.dispatch_generations.append(
+            request.extensions.get("runner_tunnel_generation")
+        )
+        return httpx.Response(200, json=next(replies))
+
+    async def person_answers(*args: Any, **kwargs: Any) -> ElicitationResult:
+        return ElicitationResult(action="accept")
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(execute), base_url="http://runner")
+
+    async def get_runner(*args: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+    monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", person_answers)
+
+    executed = await approval_harness.call(retry)
+
+    assert "error" not in executed, executed
+    assert approval_harness.dispatch_generations == [7, 7]

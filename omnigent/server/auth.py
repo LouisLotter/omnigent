@@ -80,6 +80,11 @@ _DELEGATED_ALLOWED_PREFIXES = (
 )
 
 
+def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
+    """Return True if *path* is one of *prefixes* or a ``prefix/…`` sub-path."""
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+
+
 def delegated_path_allowed(path: str) -> bool:
     """Return True if a delegated access token may access *path*.
 
@@ -88,10 +93,38 @@ def delegated_path_allowed(path: str) -> bool:
     counts, so ``/v1/hosts`` and ``/v1/hosts/h1/runners`` pass but
     ``/v1/hostsX`` does not.
     """
-    for prefix in _DELEGATED_ALLOWED_PREFIXES:
-        if path == prefix or path.startswith(prefix + "/"):
-            return True
-    return False
+    return _path_under(path, _DELEGATED_ALLOWED_PREFIXES)
+
+
+# JWT claim naming who a credential was handed to on the owner's behalf.
+# ``POST /v1/runners/{id}/token`` sets it to :data:`RUNNER_DELEGATION`: the
+# token acts as the owner, but code holding it is not the owner in person.
+CREDENTIAL_DELEGATION_CLAIM = "delegated"
+RUNNER_DELEGATION = "runner"
+
+# Account administration and credential issuance. A delegated credential is
+# not a sign-in on these paths, so it can neither manage accounts nor obtain
+# a person's undelegated credential (device or CLI login consent).
+_DELEGATION_REFUSED_PREFIXES = ("/auth", "/oauth")
+
+
+def _route_path(request: HTTPConnection) -> str:
+    """Return the path the router matches: the request path below any ASGI ``root_path``."""
+    path = request.scope.get("path") or request.url.path
+    root_path = request.scope.get("root_path") or ""
+    if root_path and path.startswith(root_path + "/"):
+        return path[len(root_path) :]
+    return path
+
+
+def _session_token(request: HTTPConnection, cookie_name: str) -> str | None:
+    """Return the session JWT: the cookie for browsers, else a Bearer token for CLIs."""
+    token = request.cookies.get(cookie_name)
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    return token or None
 
 
 # Explicit single-user marker. Set by the managed local-server spawn
@@ -414,6 +447,21 @@ class AuthProvider(ABC):
         """
         return None
 
+    def credential_delegation(self, request: HTTPConnection) -> str | None:  # noqa: ARG002
+        """
+        Return who the request's credential was delegated to, if anyone.
+
+        A runner's minted token acts as its owner, yet the code holding it
+        is not that person. Routes that need a person's own decision, such
+        as answering an approval, refuse delegated credentials. Default:
+        ``None``, meaning every credential is the person's own.
+
+        :param request: The incoming HTTP request or WebSocket handshake.
+        :returns: The delegation, e.g. :data:`RUNNER_DELEGATION`, or
+            ``None`` for an undelegated credential.
+        """
+        return None
+
 
 _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
 
@@ -599,8 +647,10 @@ class UnifiedAuthProvider(AuthProvider):
         Accounts / OIDC modes sign a session JWT in the same HS256 format
         :meth:`_check_cookie` validates, so the runner can present it as
         ``Authorization: Bearer <jwt>`` on its HTTP callbacks and resolve
-        to *user_id*. Header/proxy mode returns ``None`` — identity there
-        is asserted by the upstream proxy and can't be minted server-side.
+        to *user_id*. The token carries the :data:`RUNNER_DELEGATION` claim
+        (see :meth:`credential_delegation`). Header/proxy mode returns
+        ``None`` — identity there is asserted by the upstream proxy and
+        can't be minted server-side.
 
         :param user_id: The session owner the runner acts as, e.g.
             ``"alice@example.com"``.
@@ -610,9 +660,7 @@ class UnifiedAuthProvider(AuthProvider):
         """
         if not user_id or user_id in _RESERVED_USERS:
             return None
-        if self._source not in ("oidc", "accounts"):
-            return None
-        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        cookie_config = self._cookie_config()
         if cookie_config is None:
             return None
         from omnigent.db.account_authority import account_generation
@@ -624,7 +672,51 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            delegated=RUNNER_DELEGATION,
         )
+
+    def credential_delegation(self, request: HTTPConnection) -> str | None:
+        """
+        Return the ``delegated`` claim of the request's session JWT.
+
+        Reads the same token :meth:`_check_cookie` authenticates (cookie
+        first, then Bearer). A malformed claim still counts as delegated;
+        :meth:`_check_cookie` already refuses such a token. Expiry is not
+        checked: a request authenticated before its token expired is still
+        delegated when a route asks later.
+
+        :param request: The incoming HTTP request or WebSocket handshake.
+        :returns: The delegation, e.g. :data:`RUNNER_DELEGATION`, or
+            ``None`` when the token is undelegated, absent or not signed by
+            this server, or this provider reads identity from a header.
+        """
+        import jwt
+
+        cookie_config = self._cookie_config()
+        if cookie_config is None:
+            return None
+        token = _session_token(request, cookie_config.session_cookie_name)
+        if token is None:
+            return None
+        try:
+            payload = jwt.decode(
+                token,
+                cookie_config.cookie_secret,
+                algorithms=["HS256"],
+                options={"verify_exp": False, "verify_nbf": False, "verify_iat": False},
+            )
+        except jwt.InvalidTokenError:
+            return None
+        delegation = payload.get(CREDENTIAL_DELEGATION_CLAIM)
+        return None if delegation is None else str(delegation)
+
+    def _cookie_config(self) -> AccountsConfig | OIDCConfig | None:
+        """Return the active JWT-cookie configuration, or ``None`` in header mode."""
+        if self._source == "oidc":
+            return self._oidc_config
+        if self._source == "accounts":
+            return self._accounts_config
+        return None
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
@@ -651,17 +743,11 @@ class UnifiedAuthProvider(AuthProvider):
         # — read the active config wherever it lives. The two configs
         # share `cookie_secret` and `session_cookie_name` properties
         # by construction (see AccountsConfig docstring).
-        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        cookie_config = self._cookie_config()
         if cookie_config is None:
             return None
-        cookie_name = cookie_config.session_cookie_name
-        token = request.cookies.get(cookie_name)
-        if not token:
-            # Fall back to Bearer token for CLI clients.
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
-        if not token:
+        token = _session_token(request, cookie_config.session_cookie_name)
+        if token is None:
             return None
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
@@ -699,6 +785,14 @@ class UnifiedAuthProvider(AuthProvider):
 
             bind_account_authority(user_id, generation)
 
+        # A delegated credential is never cached, so this check runs per request.
+        delegation = payload.get(CREDENTIAL_DELEGATION_CLAIM)
+        if delegation is not None and (
+            not isinstance(delegation, str)
+            or _path_under(_route_path(request), _DELEGATION_REFUSED_PREFIXES)
+        ):
+            return None
+
         if grant_id is not None or scope is not None:
             # A ``grant_id`` names a revocable stored grant, so it is checked
             # live against the denylist. The client-credentials grant has no
@@ -720,7 +814,7 @@ class UnifiedAuthProvider(AuthProvider):
                 return None
             return user_id
 
-        if self._account_check is None:
+        if self._account_check is None and delegation is None:
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)

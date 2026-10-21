@@ -97,6 +97,33 @@ def require_user(
     return user_id
 
 
+def refuse_delegated_credential(
+    request: Request,
+    auth_provider: AuthProvider | None,
+    action: str,
+) -> None:
+    """Refuse an action that needs a person's own credential.
+
+    A runner's minted token acts as its owner, so session access checks
+    pass for it. Answering an approval or changing what gates the agent
+    must come from the person, not from code holding that token.
+
+    :param request: The incoming FastAPI request.
+    :param auth_provider: The auth provider, or ``None`` when auth is off.
+    :param action: What the caller tried, completing "cannot ...", e.g.
+        ``"answer approvals"``.
+    :raises OmnigentError: 403 when the request's credential is delegated.
+    """
+    if auth_provider is None:
+        return
+    delegation = auth_provider.credential_delegation(request)
+    if delegation is not None:
+        raise OmnigentError(
+            f"A {delegation} credential cannot {action}; sign in as yourself to do this.",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 def _require_access_sync(
     user_id: str | None,
     conversation_id: str,

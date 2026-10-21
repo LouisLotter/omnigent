@@ -225,7 +225,9 @@ The URL and execution backend are independent of sessions. The **Omnigent policy
 adapter still requires a session**; calls without one return 422. This prototype
 does not expose a sessionless execution path with weaker policy enforcement.
 Delegated runner credentials can access `/v1/mcp`; this does not grant access to
-catalog/account-management endpoints.
+catalog/account-management endpoints. They carry a `delegated: "runner"` claim and
+cannot answer approvals, change or delete policies, add default policies, replace
+a session's agent, or use `/auth/*` and `/oauth/*`. They can add session policies.
 
 | Method | Parameters | Result |
 | --- | --- | --- |
@@ -257,7 +259,14 @@ could use this same gateway; naming is independent of credential ownership.
 `McpPolicyAdapter` wraps the backend with the existing `TOOL_CALL` and `TOOL_RESULT`
 policy handler. Request policies can allow, deny, transform arguments or ask for
 approval. Approval uses the existing `requestState` / `inputResponses` round trip;
-the reviewed arguments and call identity stay on the server. Result policies can
+the reviewed arguments and call identity stay on the server. The retry executes
+only on the verdict a person gave through the resolve URL or `approval` event,
+which the server records with who answered, even when the policy no longer asks.
+It is bound to the call's identity, operation, arguments and the runner's tunnel
+connection, executes only on that connection, and is consumed once. The caller's
+own `inputResponses` never approve a call, and a runner's delegated token cannot
+answer approvals. A native policy gate (Pi's bridged tools) may wait on the
+proxy's pending approval by its id, so the person answers the call once. Result policies can
 allow, transform or suppress output. A result-phase ASK withholds the output;
 interactive result review is not implemented. Adding it requires a server-held
 pending result and an approval continuation that releases or discards that result
