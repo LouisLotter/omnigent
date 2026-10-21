@@ -619,8 +619,9 @@ async def test_replacement_runner_keeps_a_dead_runners_unknown_outcome(
     ), "the runner must see the unknown outcome that blocks its continuation"
 
 
+@pytest.mark.parametrize("posted_as", ["one item", "item array"])
 async def test_late_result_settles_a_dead_runners_unknown_outcome_for_good(
-    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch, posted_as: str
 ) -> None:
     """The replacement delivers the interrupted call's result after the outcome was recorded.
 
@@ -674,17 +675,18 @@ async def test_late_result_settles_a_dead_runners_unknown_outcome_for_good(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
+            result = {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "function_call_output",
+                    "item_data": {"call_id": "call_1", "output": "appended"},
+                    "response_id": "resp_1",
+                    "source_id": "transcript:call_1:output",
+                },
+            }
             late = await client.post(
                 f"/v1/sessions/{replaced.id}/events",
-                json={
-                    "type": "external_conversation_item",
-                    "data": {
-                        "item_type": "function_call_output",
-                        "item_data": {"call_id": "call_1", "output": "appended"},
-                        "response_id": "resp_1",
-                        "source_id": "transcript:call_1:output",
-                    },
-                },
+                json=result if posted_as == "one item" else [result],
             )
         assert late.status_code in (200, 201, 202), late.text
         assert sessions._session_status_cache[replaced.id] == "failed"

@@ -3461,6 +3461,11 @@ async def _persist_external_conversation_items(
         if not persisted.deduplicated:
             _publish_persisted_external_item(session_id, body, persisted)
         await record_claude_subagent_return(session_id, persisted, conversation_store)
+    if any(
+        persisted.type == "function_call_output" and not persisted.deduplicated
+        for persisted in persisted_items
+    ):
+        await settle_late_tool_result(session_id, conversation_store)
     if error is not None:
         raise error
     return [persisted.id for persisted in persisted_items]
