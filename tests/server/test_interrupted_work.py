@@ -166,3 +166,19 @@ def test_list_read_settles_an_orphaned_turn_as_interrupted_not_idle(
     error = _last_task_error_from_labels(_labels(store, session_id))
     assert error is not None and error["code"] == "runner_disconnected"
     assert "Bash was running and its outcome is unknown" in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_outcome_already_recorded_is_kept_on_every_later_reattach(
+    store: SqlAlchemyConversationStore, session_id: str
+) -> None:
+    """The second reconnect of the replacement must not clear what the first recorded."""
+    _append(store, session_id, _user("append a line"), _call("call_1", "Bash"))
+    _session_status_cache[session_id] = "running"
+    first = _init_answer(continuation_blocked=True, runner_incarnation_id="b" * 32)
+    assert await keep_interrupted_outcome(session_id, first, store, runner_id="runner_new")
+
+    second = _init_answer(continuation_blocked=False, runner_incarnation_id="b" * 32)
+    assert await keep_interrupted_outcome(session_id, second, store, runner_id="runner_new")
+    error = _last_task_error_from_labels(_labels(store, session_id))
+    assert error is not None and error["code"] == INTERRUPTED_OUTCOME_UNKNOWN_CODE

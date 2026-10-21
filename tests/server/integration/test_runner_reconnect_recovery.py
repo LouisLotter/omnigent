@@ -595,3 +595,25 @@ async def test_replacement_runner_keeps_a_dead_runners_unknown_outcome(
         assert error["code"] == "interrupted_outcome_unknown"
         assert "Bash" in error["message"]
         assert replaced_now.labels[RUNNER_INCARNATION_LABEL_KEY] == "a" * 32
+
+    # The replacement reconnects again: the outcome must still be unknown, and
+    # the next initialization still tells the runner not to continue.
+    init_labels: list[dict[str, str]] = []
+
+    async def respond_again(request: httpx.Request) -> httpx.Response:
+        labels = json.loads(request.content)["session_init"]["snapshot"]["labels"]
+        init_labels.append(labels)
+        return httpx.Response(
+            201, json={"runner_incarnation_id": "a" * 32, "continuation_blocked": False}
+        )
+
+    async with _recover(app, monkeypatch, respond_again) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        again = store.get_conversation(replaced.id)
+        assert sessions._session_status_cache.get(replaced.id, again.live_status) == "failed"
+        error = _last_task_error_from_labels(again.labels)
+        assert error is not None and error["code"] == "interrupted_outcome_unknown"
+    assert any(
+        labels.get("omnigent.last_task_error_code") == "interrupted_outcome_unknown"
+        for labels in init_labels
+    ), "the runner must see the unknown outcome that blocks its continuation"

@@ -15,6 +15,11 @@ SESSION_INIT_PAYLOAD_KEY = "session_init"
 # Conversation label naming the runner process (incarnation) that last
 # initialized the session, written by the server from the runner's answer.
 RUNNER_INCARNATION_LABEL_KEY = "omnigent.runner_incarnation"
+# The server's persisted failure code, and the code it records for work a dead
+# runner left with an unknown outcome. Until the person acts, that work is never
+# continued, by any runner.
+LAST_TASK_ERROR_CODE_LABEL_KEY = "omnigent.last_task_error_code"
+INTERRUPTED_OUTCOME_UNKNOWN_CODE = "interrupted_outcome_unknown"
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -144,11 +149,17 @@ def automatic_continuation_allowed(
 
     :param envelope: The initialization envelope, or ``None`` for a legacy body.
     :param incarnation_id: This runner process's incarnation id.
-    :returns: ``False`` when another incarnation held the session and the
-        person did not ask to continue.
+    :returns: ``False`` when another incarnation held the session, or the
+        session still carries an unknown outcome, and the person did not ask
+        to continue.
     """
-    if envelope is not None and envelope.continuation_requested:
+    if envelope is None:
         return True
+    if envelope.continuation_requested:
+        return True
+    labels = envelope.snapshot.labels
+    if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == INTERRUPTED_OUTCOME_UNKNOWN_CODE:
+        return False
     return earlier_runner_incarnation(envelope, incarnation_id) is None
 
 

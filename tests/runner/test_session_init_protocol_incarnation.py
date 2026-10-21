@@ -55,3 +55,29 @@ def test_incarnation_check(
 def test_legacy_body_keeps_its_behaviour() -> None:
     assert earlier_runner_incarnation(None, "me") is None
     assert automatic_continuation_allowed(None, "me") is True
+
+
+def test_an_unknown_outcome_blocks_continuation_until_the_person_asks() -> None:
+    """Even the runner now holding the session never continues work left unknown."""
+    from omnigent.runner.session_init_protocol import (
+        INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+        LAST_TASK_ERROR_CODE_LABEL_KEY,
+    )
+
+    labels = {
+        RUNNER_INCARNATION_LABEL_KEY: "me",
+        LAST_TASK_ERROR_CODE_LABEL_KEY: INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+    }
+    assert automatic_continuation_allowed(_envelope(labels), "me") is False
+    assert (
+        automatic_continuation_allowed(_envelope(labels, continuation_requested=True), "me")
+        is True
+    )
+
+
+def test_error_code_label_matches_the_servers() -> None:
+    """The runner reads the label the server writes."""
+    from omnigent.runner.session_init_protocol import LAST_TASK_ERROR_CODE_LABEL_KEY
+    from omnigent.server.routes._sessions.common import _LAST_TASK_ERROR_CODE_LABEL_KEY
+
+    assert LAST_TASK_ERROR_CODE_LABEL_KEY == _LAST_TASK_ERROR_CODE_LABEL_KEY

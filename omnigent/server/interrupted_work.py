@@ -17,13 +17,15 @@ import logging
 import httpx
 
 from omnigent.entities import Conversation
-from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
+from omnigent.runner.session_init_protocol import (
+    INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+    LAST_TASK_ERROR_CODE_LABEL_KEY,
+    RUNNER_INCARNATION_LABEL_KEY,
+)
 from omnigent.server.schemas import ErrorDetail
 from omnigent.stores.conversation_store import ConversationStore
 
 _logger = logging.getLogger(__name__)
-
-INTERRUPTED_OUTCOME_UNKNOWN_CODE = "interrupted_outcome_unknown"
 
 # How far back the current turn's unanswered tool call is looked for.
 _TOOL_CALL_LOOKBACK_ITEMS = 200
@@ -203,7 +205,8 @@ async def keep_interrupted_outcome(
     :param response: The runner's answer to the initialization.
     :param conversation_store: Store for the transcript and failure labels.
     :param runner_id: The replacement runner, recorded as the failure's owner.
-    :returns: ``True`` when the state was kept, so the caller must not clear it.
+    :returns: ``True`` when the state is kept, including one recorded earlier,
+        so the caller must not clear it.
     """
     from omnigent.server.child_session_recovery import _interrupted
     from omnigent.server.routes._sessions.helpers import (
@@ -213,10 +216,17 @@ async def keep_interrupted_outcome(
 
     if not 200 <= response.status_code < 300:
         return False
+    conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conversation is None:
+        return False
+    if conversation.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == (
+        INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    ):
+        # Already recorded: only the person's next message or retry clears it.
+        return True
     if _init_answer(response).get("continuation_blocked") is not True:
         return False
-    conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conversation is None or not _interrupted(conversation):
+    if not _interrupted(conversation):
         return False
     tool = await unanswered_tool_call(conversation_store, session_id)
     error = interrupted_outcome_error(tool)
