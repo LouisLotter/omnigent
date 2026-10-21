@@ -271,6 +271,37 @@ The reaper reuses one launcher per workspace and provider. Override
 `reaper_identity(workspace_id)` when background termination needs a scoped
 credential context; the default context is a no-op.
 
+### Turn-aligned checkpoints
+
+A provider that can snapshot a sandbox or back up its volume can implement
+`checkpoint(sandbox_id, *, reason)`. It starts a provider-side save and returns
+once the provider has accepted it, optionally with an operation id for the
+server log. The server then asks for a save when a turn on a managed host ends
+(`reason="turn_completed"`) and, while a turn runs, whenever `max_interval_s`
+passes without one (`reason="long_turn"`). A turn end counts only after it has
+held for ten seconds without the session running again, so a brief idle
+reported by a terminal watcher mid-turn does not trigger a save.
+
+Each server process sends one call at a time per sandbox: requests made while a
+call is in flight fold into one follow-up call. A provider must still accept a
+call while an earlier save is running, or from another server replica, for
+example by folding it into a follow-up save. Providers that keep the default `checkpoint` are skipped, and the server
+logs that once. A launcher that returns its own `SandboxCapabilities` must also
+set `checkpoint=True`.
+
+```yaml
+sandbox:
+  provider: acme
+  server_url: https://your-host
+  checkpoint:            # optional; these are the defaults
+    enabled: true
+    max_interval_s: 600  # long-turn save interval
+    min_interval_s: 0    # minimum spacing between calls for one sandbox
+```
+
+In a `providers:` list, a top-level `checkpoint` block applies to every entry,
+and an entry's own block replaces it.
+
 ## Provider capabilities
 
 Providers declare their feature set via a `capabilities` property returning
@@ -286,6 +317,7 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+| `checkpoint` | Implements `checkpoint()` for turn-aligned saves of managed sandboxes |
 
 ## Network policy for harness bridge servers
 

@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
 from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
-from omnigent.server import session_live_state, session_metadata_logging
+from omnigent.server import managed_host_checkpoints, session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
@@ -418,6 +418,34 @@ async def test_external_session_status_still_forwards_to_runner(
             assert failure["attributes"]["provider_error_param"] == "input[3].content"
     assert body["data"] == expected_data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+@pytest.mark.parametrize(
+    ("event_type", "data", "status"),
+    [
+        pytest.param("external_session_status", {"status": "idle"}, "idle", id="turn-end"),
+        pytest.param("external_session_status", {"status": "failed"}, "failed", id="failed"),
+        pytest.param("subagent.status", {"idle": True}, "idle", id="subagent-idle"),
+    ],
+)
+async def test_native_turn_end_reaches_the_checkpoint_hook(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    data: dict[str, Any],
+    status: str,
+) -> None:
+    """Native forwarders end turns here: Claude's Stop hook, Codex's turn/completed, OpenCode."""
+    checkpoint_edges: list[tuple[str, str | None, str]] = []
+    monkeypatch.setattr(
+        managed_host_checkpoints, "note_status", lambda *edge: checkpoint_edges.append(edge)
+    )
+    sid = status_route.parent_id
+    response = await status_route.client.post(
+        f"/v1/sessions/{sid}/events", json={"type": event_type, "data": data}
+    )
+    assert response.status_code == 202, response.text
+    assert checkpoint_edges == [(sid, "running", status)]
 
 
 @pytest.mark.parametrize("is_child", [False, True], ids=["main", "native-child"])

@@ -516,6 +516,7 @@ class SandboxLifecycle(ABC):
                 and getattr(type(self), "materialize_workspace", None)
                 is ExecModelHostLauncher.materialize_workspace
             ),
+            checkpoint=self._is_capability_overridden("checkpoint"),
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
@@ -605,6 +606,32 @@ class SandboxLifecycle(ABC):
             support keep-alive configuration.
         """
         raise self._capability_error("configure keep-alive")
+
+    def checkpoint(
+        self, sandbox_id: str, *, reason: _sandbox_types.CheckpointReason
+    ) -> str | None:
+        """
+        Start a provider-side save of the sandbox and return once the provider
+        has accepted it, without waiting for the save to finish.
+
+        Optional capability: the default raises :class:`SandboxCapabilityError`
+        and the managed path (:mod:`omnigent.server.managed_host_checkpoints`)
+        skips such providers. A provider that implements it is asked after each
+        completed turn on the host and periodically while a long turn runs. One
+        server process sends one call at a time per sandbox, but a call may
+        still arrive while an earlier save runs, or from another server replica;
+        folding it into one follow-up save is enough. A stopped sandbox has
+        nothing new to save, so never start one to take it. Any provider that
+        can snapshot a sandbox or back up its volume can implement it.
+
+        :param sandbox_id: The sandbox to save, e.g. ``"sb-a1b2c3"``.
+        :param reason: Why the save is requested, e.g. ``"turn_completed"``.
+        :returns: The provider's id for the accepted save, recorded in the
+            server log, or ``None`` when it has none.
+        :raises SandboxCapabilityError: When the provider cannot save a sandbox.
+        :raises SandboxGoneError: When the sandbox no longer exists.
+        """
+        raise self._capability_error("checkpoint a sandbox")
 
     def forward_capability_error(self) -> SandboxCapabilityError:
         """

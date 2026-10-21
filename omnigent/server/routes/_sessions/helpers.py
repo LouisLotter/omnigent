@@ -108,7 +108,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, shutdown_state
+from omnigent.server import managed_host_checkpoints, presence, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -4956,6 +4956,8 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    # Every publish, not only changes: other paths also write this cache.
+    managed_host_checkpoints.note_status(session_id, previous_status, status)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,

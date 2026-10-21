@@ -44,6 +44,12 @@ stores into ``create_app``):
            enabled: true          # default: false
            terminate_after_offline_days: 30  # default: 30 days
            sweep_interval_s: 86400            # default: 1 day
+         checkpoint:              # optional; per provider entry. Acts only for
+                                  # launchers that implement `checkpoint`
+                                  # (see managed_host_checkpoints)
+           enabled: true          # default: true
+           max_interval_s: 600    # default: 600; save a running turn this often
+           min_interval_s: 0      # default: 0; minimum spacing between saves
          host_config:             # optional; provider-agnostic. Verbatim
                                   # in-sandbox ~/.omnigent/config.yaml content,
                                   # installed before `omnigent host` starts
@@ -631,6 +637,58 @@ class ManagedLaunchTracker:
         entry.settled.set()
 
 
+# Ceiling on the checkpoint intervals: a day is far past useful, and keeps the
+# timer arithmetic finite.
+_MAX_CHECKPOINT_INTERVAL_S: float = 24 * 3600
+
+
+def _checkpoint_interval_s(key: str, value: object, *, allow_zero: bool) -> float:
+    """Validate one ``sandbox.checkpoint`` interval and return it in seconds."""
+    lowest = "0" if allow_zero else "greater than 0"
+    message = (
+        f"sandbox.checkpoint.{key} must be a number of seconds from {lowest} "
+        f"to {int(_MAX_CHECKPOINT_INTERVAL_S)}"
+    )
+    # bool is an int subclass; nan fails both comparisons and inf the upper one.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    above_lowest = value >= 0 if allow_zero else value > 0
+    if not (above_lowest and value <= _MAX_CHECKPOINT_INTERVAL_S):
+        raise ValueError(message)
+    return float(value)
+
+
+@dataclass(frozen=True)
+class SandboxCheckpointPolicy:
+    """When the server asks a provider to checkpoint a managed sandbox.
+
+    Applies only to providers whose launcher implements
+    :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.checkpoint`;
+    see :mod:`omnigent.server.managed_host_checkpoints`.
+
+    :param enabled: Whether turn-aligned checkpoints are requested at all.
+    :param max_interval_s: While a turn runs, request a ``long_turn`` save
+        whenever this many seconds pass without one, e.g. ``600``.
+    :param min_interval_s: Minimum seconds between two ``checkpoint`` calls
+        for one sandbox; requests made sooner wait and fold together.
+    """
+
+    enabled: bool = True
+    max_interval_s: float = 600.0
+    min_interval_s: float = 0.0
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("sandbox.checkpoint.enabled must be a boolean")
+        longest = _checkpoint_interval_s("max_interval_s", self.max_interval_s, allow_zero=False)
+        shortest = _checkpoint_interval_s("min_interval_s", self.min_interval_s, allow_zero=True)
+        if shortest > longest:
+            raise ValueError(
+                "sandbox.checkpoint.min_interval_s must not exceed "
+                "sandbox.checkpoint.max_interval_s"
+            )
+
+
 @dataclass
 class ManagedSandboxConfig:
     """
@@ -692,6 +750,8 @@ class ManagedSandboxConfig:
     :param default_model_options: Optional, request-scoped provider catalog used
         when no host catalog is available for the selected harness and user.
         Supplies choices without selecting a default or provisioning a host.
+    :param checkpoint: When to ask this provider to checkpoint a sandbox. Has
+        no effect unless the launcher implements ``checkpoint``.
     """
 
     server_url: str
@@ -705,6 +765,7 @@ class ManagedSandboxConfig:
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
+    checkpoint: SandboxCheckpointPolicy = dataclass_field(default_factory=SandboxCheckpointPolicy)
 
 
 @dataclass(frozen=True)
@@ -1519,6 +1580,18 @@ def _parse_git_clone_options(raw: object) -> GitCloneOptions:
     return GitCloneOptions(**raw)
 
 
+def _parse_checkpoint_policy(raw: object) -> SandboxCheckpointPolicy:
+    """Parse a provider entry's ``checkpoint`` block; absent means the defaults."""
+    if raw is None:
+        return SandboxCheckpointPolicy()
+    if not isinstance(raw, dict):
+        raise ValueError("server config 'sandbox.checkpoint' must be a mapping")
+    _reject_unknown_keys(
+        raw, {"enabled", "max_interval_s", "min_interval_s"}, "sandbox.checkpoint"
+    )
+    return SandboxCheckpointPolicy(**raw)
+
+
 def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSandboxConfig:
     """
     Parse one provider's ``sandbox`` mapping (the scalar ``provider:`` shape).
@@ -1538,6 +1611,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         )
     warm_pool = _parse_agent_sandbox_warm_pool(raw)
     git_clone = _parse_git_clone_options(raw.get("git_clone"))
+    checkpoint = _parse_checkpoint_policy(raw.get("checkpoint"))
     server_url = raw.get("server_url")
     if not isinstance(server_url, str) or not server_url.strip():
         raise ValueError(
@@ -1790,6 +1864,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         host_config=host_config,
         model_discovery=model_discovery,
         git_clone=git_clone,
+        checkpoint=checkpoint,
     )
 
 
