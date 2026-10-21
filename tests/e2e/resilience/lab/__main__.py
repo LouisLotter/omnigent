@@ -29,6 +29,7 @@ Faults (LINK is client, host or model; TAGS narrow it, e.g. runner.tunnel,host.t
   delay LINK SECONDS MS [TAGS]    add latency per chunk
   reset LINK [TAGS]               RST live connections now
   close LINK [TAGS]               FIN live connections now
+  ping-only LINK [TAGS]           answer live WebSockets' pings, drop their data
   restart-server SECONDS          stop the server, wait, start it (a deploy)
   crash-server SECONDS            SIGKILL the server, wait, start it
   sleep-host SECONDS              freeze host processes and drop their network
@@ -140,6 +141,10 @@ class _Console:
 
     def do_close(self, args: list[str]) -> None:
         print(f"closed {self._link(args[0]).close(self._tags(args, 1))} connection(s)")
+
+    def do_ping_only(self, args: list[str]) -> None:
+        caught = self._link(args[0]).ping_only(self._tags(args, 1))
+        print(f"{caught} connection(s) left half-open")
 
     def do_restart_server(self, args: list[str], *, graceful: bool = True) -> None:
         action = functools.partial(

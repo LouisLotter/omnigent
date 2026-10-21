@@ -6,12 +6,16 @@ import asyncio
 import contextlib
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.client import ClientConnection, connect
 
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.proxy import (
@@ -23,6 +27,13 @@ from tests.e2e.resilience.lab.proxy import (
     tag_matches,
 )
 from tests.e2e.resilience.lab.tls import TlsInterceptor
+from tests.e2e.resilience.lab.websocket_frames import (
+    OP_BINARY,
+    OP_PING,
+    OP_TEXT,
+    FrameSplitter,
+    encode_frame,
+)
 
 _TUNNEL = b"GET /v1/runners/r1/tunnel HTTP/1.1\r\nHost: x\r\n\r\n"
 _HTTP = b"POST /v1/sessions/conv_1/events HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -377,3 +388,141 @@ def test_flap_reset_leaves_listener_refusal_working(loop_thread: LoopThread) -> 
     flap.clear()
     with proxy.refuse(), pytest.raises(ConnectionRefusedError):
         socket.create_connection(("127.0.0.1", proxy.port), timeout=1)
+
+
+@dataclass
+class _WebSocketUpstream:
+    """A real WebSocket server that echoes and records what reaches it."""
+
+    port: int
+    received: list[str]
+    connections: list[ServerConnection]
+    closed: threading.Event
+
+
+async def _start_websocket_upstream(ping_interval: float | None) -> _WebSocketUpstream:
+    received: list[str] = []
+    connections: list[ServerConnection] = []
+    closed = threading.Event()
+
+    async def _handle(ws: ServerConnection) -> None:
+        connections.append(ws)
+        try:
+            async for message in ws:
+                received.append(str(message))
+                await ws.send(f"echo: {message}")
+        except ConnectionClosed:
+            pass
+        finally:
+            closed.set()
+
+    server = await serve(
+        _handle,
+        "127.0.0.1",
+        0,
+        ping_interval=ping_interval,
+        ping_timeout=None if ping_interval is None else ping_interval * 3,
+    )
+    return _WebSocketUpstream(
+        int(server.sockets[0].getsockname()[1]), received, connections, closed
+    )
+
+
+def _websocket_client(proxy: FaultProxy) -> ClientConnection:
+    return connect(
+        f"ws://127.0.0.1:{proxy.port}/v1/runners/r1/tunnel",
+        open_timeout=5,
+        close_timeout=_HOLD_S,
+    )
+
+
+def _proxy_to(loop: LoopThread, port: int) -> FaultProxy:
+    proxy = FaultProxy(
+        "host", ("127.0.0.1", port), loop=loop, events=EventLog(), classify=host_link
+    )
+    proxy.start()
+    return proxy
+
+
+def test_ping_only_answers_pings_and_drops_data_both_ways(loop_thread: LoopThread) -> None:
+    upstream = loop_thread.run(_start_websocket_upstream(ping_interval=None))
+    proxy = _proxy_to(loop_thread, upstream.port)
+    with _websocket_client(proxy) as client:
+        client.send("before")
+        assert client.recv(timeout=2) == "echo: before"
+        [conn] = proxy.connections({"runner.tunnel"})
+        assert conn.last_s2c_message_age_s is not None
+
+        assert proxy.ping_only({"runner.tunnel"}) == 1
+        # The server side sees the tunnel drop at once.
+        assert upstream.closed.wait(timeout=2)
+        client.send("after")
+        with pytest.raises(TimeoutError):
+            client.recv(timeout=_HOLD_S)
+        assert upstream.received == ["before"]
+        # The client's keepalive is still satisfied.
+        assert client.ping().wait(timeout=2)
+        [conn] = proxy.connections({"runner.tunnel"})
+        assert (conn.ping_only, conn.pings_answered) == ("abort", 1)
+
+        # A new connection passes, as through a path that dropped the old one.
+        with _websocket_client(proxy) as fresh:
+            fresh.send("fresh")
+            assert fresh.recv(timeout=2) == "echo: fresh"
+    _wait(lambda: not proxy.connections())
+    [gave_up] = [
+        event
+        for event in proxy._events.events(kind="disconnect")
+        if event.fields["reason"] == "client_gave_up"
+    ]
+    assert gave_up.fields["tag"] == "runner.tunnel"
+
+
+def test_ping_only_hold_keeps_the_server_side_open_with_its_pings_answered(
+    loop_thread: LoopThread,
+) -> None:
+    upstream = loop_thread.run(_start_websocket_upstream(ping_interval=0.1))
+    proxy = _proxy_to(loop_thread, upstream.port)
+    with _websocket_client(proxy) as client:
+        client.send("before")
+        assert client.recv(timeout=2) == "echo: before"
+        assert proxy.ping_only(server_leg="hold") == 1
+        loop_thread.run(upstream.connections[0].send("from the server"))
+        client.send("from the client")
+        with pytest.raises(TimeoutError):
+            client.recv(timeout=_HOLD_S * 2)
+        # Several of the server's keepalive timeouts passed without a close.
+        assert not upstream.closed.is_set()
+        assert upstream.received == ["before"]
+    # Once the client gives up, the held server side is released.
+    assert upstream.closed.wait(timeout=2)
+
+
+def test_ping_only_skips_connections_that_are_not_websockets(loop_thread: LoopThread) -> None:
+    upstream = _upstream(loop_thread, "upgrade")
+    proxy = _proxy(loop_thread, upstream)
+    with contextlib.closing(_connect(proxy, _TUNNEL)) as raw_upgrade:
+        assert _recv(raw_upgrade).startswith(b"HTTP/1.1 101")
+        assert proxy.ping_only() == 0
+        raw_upgrade.sendall(b"not a frame")
+        assert _recv(raw_upgrade) == b"echo:not a frame"
+
+
+def test_frame_splitter_yields_whole_frames_from_any_chunking() -> None:
+    ping = encode_frame(OP_PING, b"keepalive", masked=True)
+    big = encode_frame(OP_TEXT, b"x" * 70_000, masked=False)
+    medium = encode_frame(OP_BINARY, b"y" * 300, masked=True)
+    head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
+    stream = head + ping + big + medium
+    splitter = FrameSplitter(http_head=True)
+    passthrough = b""
+    frames = []
+    for index in range(0, len(stream), 7):
+        chunk_head, chunk_frames = splitter.feed(stream[index : index + 7])
+        passthrough += chunk_head
+        frames.extend(chunk_frames)
+    assert passthrough == head
+    assert [frame.raw for frame in frames] == [ping, big, medium]
+    assert [frame.opcode for frame in frames] == [OP_PING, OP_TEXT, OP_BINARY]
+    # Control payloads are unmasked; data payloads are never read.
+    assert [frame.payload for frame in frames] == [b"keepalive", b"", b""]

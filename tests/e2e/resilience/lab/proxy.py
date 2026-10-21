@@ -17,6 +17,8 @@ while others keep flowing. Faults model what a real network does to TCP:
 - ``sever_held``: cut requests that waited too long for a response, like a
   front door with a request cap (504 before any response bytes).
 - ``flap``: alternate a blackhole (or reset + refuse) with healthy periods.
+- ``ping_only``: leave live WebSocket connections half-open with false
+  liveness: the proxy answers the client's pings and drops every other frame.
 
 With a :class:`~tests.e2e.resilience.lab.tls.TlsInterceptor`, ``CONNECT``
 tunnels (a harness honoring ``HTTPS_PROXY``) are terminated locally and only
@@ -47,6 +49,13 @@ from typing import Any, Literal, TypeVar
 
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.tls import TlsInterceptor, valid_hostname
+from tests.e2e.resilience.lab.websocket_frames import (
+    DATA_OPCODES,
+    OP_PING,
+    OP_PONG,
+    FrameSplitter,
+    encode_frame,
+)
 
 T = TypeVar("T")
 
@@ -54,6 +63,10 @@ T = TypeVar("T")
 LinkClassifier = Callable[[str, str], str]
 
 UpstreamDown = Literal["reset", "gateway"]
+
+#: What a ``ping_only`` fault does to the server side: ``abort`` resets it, as a
+#: server sees a dropped tunnel; ``hold`` keeps it open and answers its pings.
+ServerLeg = Literal["abort", "hold"]
 
 _CHUNK = 64 * 1024
 _FIRST_LINE_LIMIT = 16 * 1024
@@ -76,6 +89,7 @@ _MODEL_API_PATH = re.compile(r"/v1/(messages|models|responses|chat/completions)(
 _RUNNER_TUNNEL = re.compile(r"^/v1/runners/[^/]+/tunnel$")
 _HOST_TUNNEL = re.compile(r"^/v1/hosts/[^/]+/tunnel$")
 _TERMINAL_ATTACH = re.compile(r"^/v1/sessions/[^/]+/resources/terminals/[^/]+/attach$")
+_WEBSOCKET_UPGRADE = re.compile(rb"(?im)^upgrade:[ \t]*websocket[ \t]*\r?$")
 
 
 def client_link(method: str, path: str) -> str:
@@ -208,6 +222,11 @@ class ConnectionInfo:
     :param c2s_bytes: Bytes forwarded client to upstream.
     :param s2c_bytes: Bytes forwarded upstream to client.
     :param upgraded: Whether the upstream answered ``101 Switching Protocols``.
+    :param last_s2c_message_age_s: Seconds since the last WebSocket data frame
+        from upstream was forwarded, or ``None`` if none was.
+    :param ping_only: The server leg's treatment once ``ping_only`` caught the
+        connection, or ``None`` while it forwards normally.
+    :param pings_answered: Client pings the proxy answered itself.
     """
 
     id: int
@@ -219,6 +238,9 @@ class ConnectionInfo:
     c2s_bytes: int
     s2c_bytes: int
     upgraded: bool
+    last_s2c_message_age_s: float | None = None
+    ping_only: ServerLeg | None = None
+    pings_answered: int = 0
 
 
 @dataclass(eq=False)
@@ -237,18 +259,31 @@ class _Connection:
     upgraded: bool = False
     ended: asyncio.Event = field(default_factory=asyncio.Event)
     end_reason: str | None = None
+    websocket_request: bool = False
+    # Set on upgrade, so WebSocket connections forward whole frames only.
+    frames_c2s: FrameSplitter | None = None
+    frames_s2c: FrameSplitter | None = None
+    last_s2c_message_mono: float | None = None
+    ping_only: ServerLeg | None = None
+    pings_answered: int = 0
 
     def info(self, proxy: str) -> ConnectionInfo:
+        now = time.monotonic()
         return ConnectionInfo(
             id=self.id,
             proxy=proxy,
             tag=self.tag,
             request_line=self.request_line,
             opened_wall=self.opened_wall,
-            age_s=time.monotonic() - self.opened_mono,
+            age_s=now - self.opened_mono,
             c2s_bytes=self.c2s_bytes,
             s2c_bytes=self.s2c_bytes,
             upgraded=self.upgraded,
+            last_s2c_message_age_s=None
+            if self.last_s2c_message_mono is None
+            else now - self.last_s2c_message_mono,
+            ping_only=self.ping_only,
+            pings_answered=self.pings_answered,
         )
 
     def awaiting_response(self) -> bool:
@@ -417,6 +452,25 @@ class FaultProxy:
         :returns: How many connections were closed.
         """
         return self._run(self._end_matching(tags, rst=False, reason="close"))
+
+    def ping_only(
+        self, tags: Iterable[str] | None = None, *, server_leg: ServerLeg = "abort"
+    ) -> int:
+        """Leave matching live WebSocket connections half-open with false liveness.
+
+        From now on the proxy answers the client's protocol pings itself and
+        forwards no other frame in either direction, so the client's keepalive
+        stays satisfied while no message gets through. A caught connection stays
+        that way until the client gives up; new connections pass, as a fresh
+        socket does through a path that left an old one half-open.
+
+        :param tags: Link selectors, e.g. ``{"host.tunnel"}``; ``None`` for all.
+        :param server_leg: ``abort`` resets the server side, as a server sees a
+            dropped tunnel; ``hold`` keeps it open and answers its pings, so the
+            server notices only through its own application-level timeout.
+        :returns: How many connections were caught.
+        """
+        return self._run(self._catch_ping_only(tags, server_leg))
 
     def recycle(self, lifetime_s: float, tags: Iterable[str] | None = None) -> Fault:
         """Close matching connections once they live longer than *lifetime_s*.
@@ -673,6 +727,45 @@ class FaultProxy:
         self._emit(reason, tags=self._describe(selectors), connections=ended)
         return ended
 
+    async def _catch_ping_only(self, tags: Iterable[str] | None, server_leg: ServerLeg) -> int:
+        selectors = None if tags is None else frozenset(tags)
+        caught = 0
+        for conn in self._connections.values():
+            if (
+                conn.ended.is_set()
+                or conn.frames_s2c is None
+                or conn.ping_only is not None
+                or not tag_matches(conn.tag, selectors)
+            ):
+                continue
+            conn.ping_only = server_leg
+            if server_leg == "abort" and conn.upstream_writer is not None:
+                _abort_with_rst(conn.upstream_writer)
+            caught += 1
+        self._emit(
+            "ping_only", tags=self._describe(selectors), server_leg=server_leg, connections=caught
+        )
+        return caught
+
+    def _websocket_bytes(
+        self, conn: _Connection, splitter: FrameSplitter, data: bytes, *, upstream: bool
+    ) -> bytes:
+        """Return what to forward of *data*: whole frames, or nothing once caught."""
+        head, frames = splitter.feed(data)
+        if conn.ping_only is None:
+            if not upstream and any(frame.opcode in DATA_OPCODES for frame in frames):
+                conn.last_s2c_message_mono = time.monotonic()
+            return head + b"".join(frame.raw for frame in frames)
+        for frame in frames:
+            if frame.opcode != OP_PING:
+                continue
+            if upstream:
+                conn.client_writer.write(encode_frame(OP_PONG, frame.payload, masked=False))
+                conn.pings_answered += 1
+            elif conn.ping_only == "hold" and conn.upstream_writer is not None:
+                conn.upstream_writer.write(encode_frame(OP_PONG, frame.payload, masked=True))
+        return head
+
     def _end(self, conn: _Connection, *, rst: bool, reason: str) -> None:
         if conn.ended.is_set():
             return
@@ -758,6 +851,7 @@ class FaultProxy:
             if first is None:
                 return
             first_read_at = time.monotonic()
+        conn.websocket_request = _WEBSOCKET_UPGRADE.search(first) is not None
         try:
             upstream_reader, upstream_writer = await asyncio.open_connection(*self.upstream)
         except OSError as exc:
@@ -859,6 +953,12 @@ class FaultProxy:
                     await self._wait_open(conn)
                     if conn.ended.is_set():
                         return
+                if not data and conn.ping_only is not None:
+                    # The client never hears of the server side going away; once
+                    # the client gives up, both sides end.
+                    if upstream:
+                        self._end(conn, rst=data is None, reason="client_gave_up")
+                    return
                 if data is None:
                     self._end(conn, rst=True, reason="peer_reset")
                     return
@@ -877,6 +977,14 @@ class FaultProxy:
                     await asyncio.sleep(len(data) / min(r.value for r in throttles))
                 if not upstream and conn.s2c_bytes == 0 and data.startswith(b"HTTP/1.1 101"):
                     conn.upgraded = True
+                    if conn.websocket_request:
+                        conn.frames_c2s = FrameSplitter(http_head=False)
+                        conn.frames_s2c = FrameSplitter(http_head=True)
+                splitter = conn.frames_c2s if upstream else conn.frames_s2c
+                if splitter is not None:
+                    data = self._websocket_bytes(conn, splitter, data, upstream=upstream)
+                    if not data:
+                        continue
                 writer.write(data)
                 now = time.monotonic()
                 if upstream:
