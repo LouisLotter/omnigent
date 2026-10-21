@@ -835,6 +835,99 @@ async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
 
 
+async def _post_from_a_client_that_hung_up(
+    app: FastAPI, client: httpx.AsyncClient, path: str, body: dict[str, Any]
+) -> int:
+    """
+    Run one POST through *app* whose client hangs up once the body is read.
+
+    :param app: The ASGI app under test.
+    :param client: Test client whose default headers carry the caller identity.
+    :param path: Request path.
+    :param body: JSON body.
+    :returns: The response status the app sent to the departed client.
+    """
+    import json as _json
+
+    raw = _json.dumps(body).encode()
+    messages = [{"type": "http.request", "body": raw, "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = [(b"content-type", b"application/json"), (b"host", b"test")] + [
+        (name.lower().encode(), value.encode())
+        for name, value in client.headers.items()
+        if name.lower() not in {"content-type", "host"}
+    ]
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 50000),
+        "server": ("test", 80),
+    }
+    await app(scope, receive, send)
+    return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+
+async def test_tool_call_ask_repost_from_a_departed_client_leaves_the_verdict(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A re-post that waited behind a zombie poll and was abandoned spends no verdict.
+
+    A host re-posts an unanswered poll every period. While the first poll is a
+    zombie holding the gate (its connection half-open), each re-post queues
+    behind it and its own client gives up. The answer must reach the re-post
+    that is still listening, not an abandoned one.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    path = f"/v1/sessions/{session_id}/policies/evaluate"
+    body = {
+        **_tool_call_request("Bash"),
+        "_omnigent_elicitation_id": "elicit_evaluate_" + "5" * 32,
+    }
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    zombie = asyncio.create_task(client.post(path, json=body))
+    elicitation_id = await drain
+    abandoned = asyncio.create_task(_post_from_a_client_that_hung_up(app, client, path, body))
+    await asyncio.sleep(0.1)
+    assert not abandoned.done(), "the re-post waits behind the zombie's gate"
+
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept"},
+    )
+    assert verdict.status_code == 202, verdict.text
+    await asyncio.wait_for(zombie, timeout=5)
+    assert await asyncio.wait_for(abandoned, timeout=5) == 499
+
+    listening = await asyncio.wait_for(client.post(path, json=body), timeout=5)
+    assert listening.status_code == 200, listening.text
+    assert listening.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
 async def test_tool_call_ask_returns_deny_on_decline(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

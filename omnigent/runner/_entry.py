@@ -70,6 +70,11 @@ _RUNNER_THREADPOOL_MAX_WORKERS_ENV_VAR = "OMNIGENT_RUNNER_THREADPOOL_MAX_WORKERS
 # finishes cleanly; a tunnel wedged past this is cancelled so shutdown can't
 # hang forever.
 _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
+# Default budget for the runner's calls to the server. Calls that may park
+# (approvals, policy checks) pass their own timeouts; every other call still
+# gets a finite read, so a keep-alive connection that went half-open fails
+# instead of hanging the caller.
+_SERVER_CLIENT_TIMEOUT = httpx.Timeout(5.0, read=60.0)
 # Re-mint a delegated runner's owner JWT this many seconds before it
 # expires, so a live session's HTTP callbacks never present an expired
 # token. Well under the server-side token TTL.
@@ -1477,7 +1482,7 @@ def create_app(
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
             **({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token is not None else {}),
         },
-        timeout=httpx.Timeout(5.0, read=None),
+        timeout=_SERVER_CLIENT_TIMEOUT,
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
         # Databricks Apps OAuth login redirect (302 →

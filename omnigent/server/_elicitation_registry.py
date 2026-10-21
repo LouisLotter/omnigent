@@ -122,11 +122,38 @@ _harness_pre_resolved_elicitations: WorkspaceScopedCache[str, _PreResolvedHarnes
 )
 
 
+@dataclass(frozen=True)
+class _HarnessElicitationDeadline:
+    """
+    When one parked harness elicitation stops waiting, across re-parks.
+
+    A host re-posts a long-poll that went unanswered with the same id, and
+    each re-post re-parks the elicitation. The wait still ends when the first
+    park's timeout runs out, instead of restarting with every re-post.
+
+    :param session_id: Session that parked the elicitation, e.g. ``"conv_abc123"``.
+    :param request_fingerprint: Digest of the question, so a different question
+        that reuses the id starts its own deadline.
+    :param deadline: ``time.monotonic()`` value at which the wait ends.
+    """
+
+    session_id: str
+    request_fingerprint: str
+    deadline: float
+
+
+# Maps ``elicitation_id`` to its wait deadline while it may still be re-parked.
+# Popped when the wait settles or times out; pruned once long past.
+_harness_elicitation_deadlines: WorkspaceScopedCache[str, _HarnessElicitationDeadline] = (
+    WorkspaceScopedCache()
+)
+
+
 def reset_for_tests() -> None:
     """
     Clear every elicitation registry. For test isolation only.
 
-    The four registries are module-global and keyed by
+    The registries are module-global and keyed by
     ``elicitation_id``, so entries left behind by one test (a severed
     long-poll, an unresolved prompt, a pre-resolved tombstone) are
     visible to every later test in the same worker process. Mirrors
@@ -137,11 +164,14 @@ def reset_for_tests() -> None:
     _harness_elicitation_owners.clear()
     _harness_parked_elicitations.clear()
     _harness_pre_resolved_elicitations.clear()
+    _harness_elicitation_deadlines.clear()
 
 
 __all__ = [
+    "_HarnessElicitationDeadline",
     "_ParkedHarnessElicitation",
     "_PreResolvedHarnessElicitation",
+    "_harness_elicitation_deadlines",
     "_harness_elicitation_owners",
     "_harness_elicitation_registry",
     "_harness_parked_elicitations",

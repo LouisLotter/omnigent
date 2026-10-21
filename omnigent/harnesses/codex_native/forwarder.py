@@ -75,6 +75,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -144,14 +145,16 @@ _SIDE_CHAT_POLL_SECONDS = 0.5
 # when ``data.started`` is true) so the web UI paints a live reasoning block.
 _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE = "external_output_reasoning_delta"
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
-# Per-attempt client budget for the elicitation long-poll, slightly above
-# the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
-# the server's own timeout (empty-body fail-ask) wins over a client cut.
-# Also reused as the total re-POST budget across severed long-polls.
+# Total budget for the elicitation long-poll across re-posts, slightly above
+# the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so the
+# server's own timeout (empty-body fail-ask) wins over a client cut.
 _CODEX_ELICITATION_REQUEST_TIMEOUT_SECONDS = 86405.0
 # Fail unreachable-server connects fast into the backoff loop instead of
 # inheriting the day-long read budget.
 _CODEX_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
+# A poll without an answer for this long is re-posted with the same id, so a
+# half-open connection costs one period instead of the day-long budget.
+_CODEX_ELICITATION_POLL_READ_TIMEOUT_SECONDS = LONG_POLL_READ_TIMEOUT_S
 # First retry must land inside the server's re-park grace (proxies sever
 # idle long-polls); later retries back off.
 _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
@@ -4595,6 +4598,7 @@ async def _post_codex_elicitation_request(
     timeout = httpx.Timeout(
         _CODEX_ELICITATION_REQUEST_TIMEOUT_SECONDS,
         connect=_CODEX_ELICITATION_CONNECT_TIMEOUT_SECONDS,
+        read=_CODEX_ELICITATION_POLL_READ_TIMEOUT_SECONDS,
     )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _CODEX_ELICITATION_REQUEST_TIMEOUT_SECONDS

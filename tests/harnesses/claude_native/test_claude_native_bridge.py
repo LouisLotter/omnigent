@@ -12213,18 +12213,26 @@ class _ScriptedPolicyClient:
         self.steps = list(steps)
         self.calls = 0
         self.bodies: list[dict[str, object] | None] = []
+        self.timeouts: list[httpx.Timeout | None] = []
 
-    async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
+    async def post(
+        self,
+        url: str,
+        json: dict[str, object] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> SimpleNamespace:
         """Replay the next step as a minimal httpx-Response-shaped namespace.
 
         :param url: Evaluate path (ignored).
         :param json: Forwarded EvaluationRequest; recorded for identity checks.
+        :param timeout: Per-request timeout; recorded.
         :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
         del url
         self.bodies.append(json)
+        self.timeouts.append(timeout)
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
         if step is None:
@@ -12515,6 +12523,126 @@ async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
         assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [0.4, 0.4]
     finally:
         relay.close()
+
+
+class _HeldPollTimeout(httpx.ReadTimeout):
+    """A poll the server held for the relay's whole read period without an answer."""
+
+    def __init__(self, clock: Mock) -> None:
+        super().__init__("no answer within the poll period")
+        self._clock = clock
+
+    def __call__(self) -> None:
+        period = claude_native_bridge._RELAY_POLICY_POLL_READ_TIMEOUT_S
+        self._clock.monotonic.return_value += period
+
+
+class _SilentPolicyClient(_ScriptedPolicyClient):
+    """Scripted client whose ``_HeldPollTimeout`` steps first spend a poll period."""
+
+    async def post(
+        self,
+        url: str,
+        json: dict[str, object] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> SimpleNamespace:
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
+        if isinstance(step, _HeldPollTimeout):
+            step()
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_reparks_polls_left_unanswered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A check parked for a person, or stuck on a dead connection, re-posts its id."""
+    held = _HeldPollTimeout(_policy_retry_clock)
+    client = _SilentPolicyClient(held, held, held, held, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == "", "the answer after four silent polls must still arrive"
+        assert client.calls == 5
+        assert len({body["_omnigent_elicitation_id"] for body in client.bodies if body}) == 1
+        assert {timeout.read for timeout in client.timeouts if timeout is not None} == {
+            claude_native_bridge._RELAY_POLICY_POLL_READ_TIMEOUT_S
+        }
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_policies_evaluate_answers_502_for_an_unanswered_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proxy path reports a silent poll so the calling hook re-posts its id."""
+    client = _ScriptedPolicyClient(httpx.ReadTimeout("no answer within the poll period"))
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+    try:
+        async with httpx.AsyncClient(
+            base_url=info["url"],
+            headers={"Authorization": f"Bearer {info['token']}"},
+            trust_env=False,
+        ) as relay_client:
+            response = await relay_client.post("/policies/evaluate", json=_PRE_TOOL_USE_PAYLOAD)
+        assert response.status_code == 502
+        assert "ReadTimeout" in response.text
+        assert client.timeouts[0] is not None
+        assert client.timeouts[0].read == claude_native_bridge._RELAY_POLICY_POLL_READ_TIMEOUT_S
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_recovers_from_a_half_open_server_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A policy check whose connection went half-open is answered on a new one.
+
+    The server reads the first request and never answers or closes, as a
+    keep-alive connection left half-open by the network does. The relay gives
+    up on it after one poll period and re-posts the same id, which a new
+    connection answers.
+    """
+    from tests._helpers.half_open_http import half_open_http_server
+
+    monkeypatch.setattr(claude_native_bridge, "_RELAY_POLICY_POLL_READ_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_bridge, "_RELAY_POLICY_HELD_POLL_FLOOR_S", 0.1)
+    monkeypatch.setattr(claude_native_bridge, "_RELAY_POLICY_FUTURE_TIMEOUT_S", 5.0)
+
+    def respond(method: str, path: str, body: bytes) -> tuple[int, object]:
+        del method, path, body
+        return 200, {"result": "POLICY_ACTION_DENY", "reason": "blocked after the stall"}
+
+    async with half_open_http_server(respond, stalled=1) as server:
+        async with httpx.AsyncClient(base_url=server.url, trust_env=False) as policy_client:
+            relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, policy_client)
+            try:
+                started = time.monotonic()
+                body = await asyncio.to_thread(
+                    _relay_request_raw,
+                    bridge_dir,
+                    "/hook/claude/evaluate-policy",
+                    _PRE_TOOL_USE_PAYLOAD,
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                relay.close()
+
+    output = json.loads(body)
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert elapsed < 5.0
+    assert len(server.requests) == 2
+    assert server.connections == 2, "the stalled connection must not be reused"
+    sent_ids = {json.loads(raw)["_omnigent_elicitation_id"] for *_, raw in server.requests}
+    assert len(sent_ids) == 1
 
 
 @pytest.mark.asyncio

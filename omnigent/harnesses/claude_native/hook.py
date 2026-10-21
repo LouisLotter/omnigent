@@ -34,6 +34,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 
 # The observer path (the default, most frequent invocation — Claude blocks
 # on it per Stop/UserPromptSubmit/TaskCreated/...) must not pay the
@@ -65,9 +66,9 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
-# Re-POST a silent held poll just past the gateway's 300s idle cut: after a
-# host network outage the gateway's reply never arrives and the socket is dead.
-_PERMISSION_POLL_READ_TIMEOUT_S = 330.0
+# Re-POST a silent held poll well inside the server's 300 s memory of an answer
+# given in the gap: a half-open connection never delivers the reply.
+_PERMISSION_POLL_READ_TIMEOUT_S = LONG_POLL_READ_TIMEOUT_S
 
 
 def _env_int(name: str, default: int) -> int:

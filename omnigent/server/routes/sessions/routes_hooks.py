@@ -85,6 +85,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _native_ask_gate_lock,
+    _poll_request_disconnect,
     _publish_policy_denied,
     _resolve_harness,
     _structured_ask_user_question,
@@ -142,6 +143,27 @@ def _create_route_decision_id(
             if isinstance(decision_id, str) and decision_id:
                 return decision_id
     return None
+
+
+# How long a request queued behind an ASK gate is probed for a departed client.
+_DEPARTED_CLIENT_PROBE_S = 0.05
+
+
+async def _client_has_left(request: Request) -> bool:
+    """
+    Return whether the client of a request that already read its body hung up.
+
+    Uses the blocking receive, which sees a disconnect through every middleware
+    layer; ``Request.is_disconnected`` can miss it behind a wrapped receive.
+
+    :param request: The in-flight request.
+    :returns: ``True`` when a disconnect arrives within a short probe.
+    """
+    try:
+        await asyncio.wait_for(_poll_request_disconnect(request), _DEPARTED_CLIENT_PROBE_S)
+    except TimeoutError:
+        return False
+    return True
 
 
 def _invalid_evaluate_elicitation_id() -> OmnigentError:
@@ -978,6 +1000,11 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
+                    if hook_elicitation_id is not None and await _client_has_left(request):
+                        # A re-post that outlived its poll while an earlier poll held
+                        # the lock: answering it would spend a verdict its live
+                        # successor needs.
+                        return Response(status_code=499)
                     engine = _build_engine()
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (

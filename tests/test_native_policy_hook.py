@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from omnigent.native import native_policy_hook
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from omnigent.native.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
@@ -730,6 +731,81 @@ def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
     )
     initial = native_policy_hook._EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     assert sleeps == [initial, initial], "a severed held poll re-POSTs inside the re-park grace"
+
+
+class _SilentPollClient:
+    """``httpx.Client`` fake whose first polls stay silent until the read timeout."""
+
+    silent_polls = 0
+    bodies: list[dict[str, object]] = []
+    read_timeouts: list[float | None] = []
+
+    def __init__(self, *, headers: dict[str, str], timeout: httpx.Timeout) -> None:
+        del headers
+        type(self).read_timeouts.append(timeout.read)
+
+    def __enter__(self) -> _SilentPollClient:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+        cls = type(self)
+        cls.bodies.append(json)
+        request = httpx.Request("POST", url)
+        if len(cls.bodies) <= cls.silent_polls:
+            _CLOCK["t"] += cls.read_timeouts[-1] or 0.0
+            raise httpx.ReadTimeout("no answer on a half-open connection", request=request)
+        return httpx.Response(200, text='{"result":"POLICY_ACTION_ALLOW"}', request=request)
+
+
+_CLOCK = {"t": 0.0}
+
+
+@pytest.fixture
+def silent_poll_client(monkeypatch: pytest.MonkeyPatch) -> type[_SilentPollClient]:
+    """Install the silent-poll fake with a fake clock and no real sleeps."""
+    _CLOCK["t"] = 0.0
+    _SilentPollClient.silent_polls = 0
+    _SilentPollClient.bodies = []
+    _SilentPollClient.read_timeouts = []
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: _CLOCK["t"])
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _SilentPollClient)
+    return _SilentPollClient
+
+
+def test_post_evaluate_with_retry_reparks_a_silent_poll_with_the_same_id(
+    silent_poll_client: type[_SilentPollClient],
+) -> None:
+    """A poll on a half-open connection re-POSTs its id after one period instead of hanging."""
+    silent_poll_client.silent_polls = 2
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert error is None
+    assert len(silent_poll_client.bodies) == 3
+    assert len({body["_omnigent_elicitation_id"] for body in silent_poll_client.bodies}) == 1
+    assert set(silent_poll_client.read_timeouts) == {LONG_POLL_READ_TIMEOUT_S}
+
+
+def test_post_evaluate_with_retry_stops_reparking_at_the_callers_budget(
+    silent_poll_client: type[_SilentPollClient],
+) -> None:
+    """Re-parks never outlast the caller's total read budget."""
+    silent_poll_client.silent_polls = 100
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 100.0, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None and error.startswith("request error")
+    assert len(silent_poll_client.bodies) == 3
 
 
 def test_post_evaluate_with_retry_slow_429_spends_the_budget(

@@ -127,10 +127,12 @@ from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import managed_host_checkpoints, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
+    _harness_elicitation_deadlines,
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _HarnessElicitationDeadline,
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
@@ -536,7 +538,15 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
             return tombstone.result
+        # A re-park keeps the first park's deadline, so re-posts never extend it.
+        timeout_s = _remaining_harness_elicitation_wait(
+            session_id, elicitation_id, request_fingerprint, timeout_s
+        )
+        if timeout_s <= 0:
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
+            return None
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
             elicitation_id=elicitation_id,
@@ -602,6 +612,10 @@ async def _publish_and_wait_for_harness_elicitation(
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
+        # Only a wait severed before its deadline may be re-parked.
+        first_park = _harness_elicitation_deadlines.get(elicitation_id)
+        if first_park is not None and (settled or first_park.deadline <= time.monotonic()):
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:
@@ -627,6 +641,77 @@ async def _publish_and_wait_for_harness_elicitation(
                     elicitation_id,
                     settled_action,
                 )
+
+
+def _remaining_harness_elicitation_wait(
+    session_id: str, elicitation_id: str, request_fingerprint: str, timeout_s: float
+) -> float:
+    """
+    Return how long this park of *elicitation_id* may still wait.
+
+    The first park records its deadline. A host re-posts a poll that went
+    unanswered with the same id, and that re-park waits only for what is left,
+    so a per-policy ``ask_timeout`` still ends the question on time.
+
+    :param session_id: Session parking the elicitation, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The elicitation's id, e.g. ``"elicit_claude_0f3a..."``.
+    :param request_fingerprint: Digest of the question's params.
+    :param timeout_s: This park's own timeout, e.g. ``300.0``.
+    :returns: Seconds left, ``0.0`` once the first park's deadline has passed.
+    """
+    now = time.monotonic()
+    _prune_harness_elicitation_deadlines(now)
+    first_park = _harness_elicitation_deadlines.get(elicitation_id)
+    if (
+        first_park is None
+        or first_park.session_id != session_id
+        or first_park.request_fingerprint != request_fingerprint
+    ):
+        first_park = _HarnessElicitationDeadline(
+            session_id=session_id,
+            request_fingerprint=request_fingerprint,
+            deadline=now + timeout_s,
+        )
+        _harness_elicitation_deadlines[elicitation_id] = first_park
+    return max(0.0, first_park.deadline - now)
+
+
+def _harness_elicitation_was_parked(session_id: str, elicitation_id: str) -> bool:
+    """
+    Return whether *elicitation_id* is a re-park of a question still waiting.
+
+    :param session_id: Session asking, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The elicitation's id, e.g. ``"elicit_evaluate_0f3a..."``.
+    :returns: ``True`` when an earlier park of this id has not settled yet.
+    """
+    first_park = _harness_elicitation_deadlines.get(elicitation_id)
+    return first_park is not None and first_park.session_id == session_id
+
+
+def _prune_harness_elicitation_deadlines(now: float) -> None:
+    """
+    Drop deadlines of waits that were severed and never re-parked.
+
+    :param now: ``time.monotonic()`` reading.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    expired = [
+        elicitation_id
+        for elicitation_id, first_park in _harness_elicitation_deadlines.items()
+        if now - first_park.deadline > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
+    ]
+    for elicitation_id in expired:
+        _harness_elicitation_deadlines.pop(elicitation_id, None)
+    overflow = (
+        len(_harness_elicitation_deadlines) - _facade._HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES
+    )
+    if overflow > 0:
+        oldest = sorted(_harness_elicitation_deadlines.items(), key=lambda item: item[1].deadline)[
+            :overflow
+        ]
+        for elicitation_id, _first_park in oldest:
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
 
 
 def _schedule_deferred_elicitation_clear(
@@ -2567,9 +2652,11 @@ async def _hold_native_ask_gate_impl(
     # this ASK in the native terminal before parking on the web verdict.
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
-    _spawn_native_approval_popup_forward(
-        session_id, elicitation_id, params.message, result.deciding_policy
-    )
+    if not _harness_elicitation_was_parked(session_id, elicitation_id):
+        # A re-park of the same question keeps the popup it already raised.
+        _spawn_native_approval_popup_forward(
+            session_id, elicitation_id, params.message, result.deciding_policy
+        )
     verdict = await _publish_and_wait_for_harness_elicitation(
         request,
         session_id=session_id,
