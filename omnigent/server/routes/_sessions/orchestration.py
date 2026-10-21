@@ -368,6 +368,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
+from omnigent.server.routes._sessions.interrupt_delivery import cancel_pending_interrupt
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -7818,6 +7819,8 @@ async def _dispatch_session_event_to_runner_impl(
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
+        # A new message supersedes a Stop still waiting for the runner.
+        cancel_pending_interrupt(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

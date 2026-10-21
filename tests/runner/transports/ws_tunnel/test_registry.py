@@ -122,6 +122,26 @@ async def test_wait_for_runner_resolves_when_runner_registers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_runner_newer_than_a_generation_waits_for_the_reconnect() -> None:
+    """A caller whose request was lost on one tunnel waits for the next one."""
+    reg = TunnelRegistry()
+    stale = reg.register("r1", _NoopWS(), _hello())
+
+    assert (
+        await reg.wait_for_runner("r1", timeout_s=0, newer_than_generation=stale.generation)
+        is None
+    )
+    task = asyncio.create_task(
+        reg.wait_for_runner("r1", timeout_s=1.0, newer_than_generation=stale.generation)
+    )
+    await _wait_until(lambda: reg.connect_waiter_count("r1") == 1)
+    replacement = reg.register("r1", _NoopWS(), _hello())
+
+    assert await task is replacement
+    assert reg.connect_waiter_count("r1") == 0
+
+
+@pytest.mark.asyncio
 async def test_wait_for_runner_timeout_removes_waiter() -> None:
     """Timed-out waiters do not leave stale registry state."""
     reg = TunnelRegistry()

@@ -237,6 +237,10 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
+from omnigent.server.routes._sessions.interrupt_delivery import (
+    cancel_pending_interrupt,
+    deliver_interrupt_after_reconnect,
+)
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _cancel_runner_relays,
@@ -1544,7 +1548,15 @@ def register_events_routes(
                 target_session_id,
                 runner_router,
             )
+            # Which tunnel carries this Stop, so a lost one waits for the reconnect.
+            interrupt_tunnels = getattr(request.app.state, "tunnel_registry", None)
+            interrupt_tunnel = (
+                interrupt_tunnels.get(conv.runner_id)
+                if interrupt_tunnels is not None and conv.runner_id is not None
+                else None
+            )
             interrupt_delivered = False
+            interrupt_lost = runner_client is None
             if runner_client is not None:
                 try:
                     interrupt_resp = await runner_client.post(
@@ -1555,10 +1567,12 @@ def register_events_routes(
                     interrupt_delivered = interrupt_resp.status_code < 400
                 except (httpx.HTTPError, ConnectionError):
                     # WSTunnelTransport raises bare ConnectionError on tunnel close.
+                    interrupt_lost = True
                     _logger.exception(
                         "Interrupt forward failed for %r",
                         session_id,
                     )
+            interrupt_delivery = "delivered" if interrupt_delivered else "failed"
             if not interrupt_delivered:
                 if codex_child:
                     raise OmnigentError(
@@ -1568,7 +1582,25 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                if interrupt_lost and conv.runner_id is not None and interrupt_tunnels is not None:
+                    # The tunnel dropped or went silent: send it again once the
+                    # runner reconnects, if the turn is still running then.
+                    from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+                    deliver_interrupt_after_reconnect(
+                        session_id,
+                        runner_id=conv.runner_id,
+                        after_generation=(
+                            interrupt_tunnel.generation if interrupt_tunnel is not None else None
+                        ),
+                        tunnel_registry=interrupt_tunnels,
+                        runner_router=runner_router,
+                        queued_pending_ids=queued_pending_ids,
+                        wait_s=RUNNER_DISCONNECT_GRACE_S,
+                    )
+                    interrupt_delivery = "pending"
             elif not codex_child:
+                cancel_pending_interrupt(session_id)
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if stop_codex_side_chat:
                 await asyncio.to_thread(
@@ -1576,7 +1608,12 @@ def register_events_routes(
                     session_id,
                     {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                 )
-            return {"queued": False}
+            if runner_client is None and conv.runner_id is None:
+                # No runner holds this session, so there is nothing to deliver to.
+                return {"queued": False}
+            # "pending": the runner was unreachable, and the Stop is sent again
+            # when it reconnects; "failed": the runner refused it.
+            return {"queued": False, "delivery": interrupt_delivery}
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)

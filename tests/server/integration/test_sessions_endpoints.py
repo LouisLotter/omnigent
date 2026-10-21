@@ -10480,6 +10480,82 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         await fake_runner.aclose()
 
 
+async def test_stop_on_a_silent_runner_tunnel_is_reported_and_sent_after_reconnect(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Stop the runner never answered is reported pending and lands after the reconnect.
+
+    On a half-open tunnel the interrupt forward times out while the turn runs
+    on. The route answers ``"delivery": "pending"`` instead of a silent 202,
+    and sends the Stop again over the runner's next tunnel.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import interrupt_delivery
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    interrupts: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            interrupts.append(request)
+            if len(interrupts) == 1:
+                raise httpx.ReadTimeout("no answer on a half-open tunnel", request=request)
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+
+    async def _fake_get_runner_client(session_id: str, runner_router: object, **_: Any) -> Any:
+        del session_id, runner_router
+        return fake_runner
+
+    class _NoopWS:
+        async def send_text(self, data: str) -> None:
+            del data
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    def _hello() -> HelloFrame:
+        return HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    registry = app.state.tunnel_registry
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, "runner_silent_tunnel")
+    registry.register("runner_silent_tunnel", _NoopWS(), _hello())
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+        )
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"queued": False, "delivery": "pending"}
+        assert session_id not in _interrupt_fenced_sessions, "the turn still runs"
+
+        registry.register("runner_silent_tunnel", _NoopWS(), _hello())
+        for _ in range(200):
+            if not interrupt_delivery.has_pending_interrupt(session_id):
+                break
+            await asyncio.sleep(0.01)
+        assert len(interrupts) == 2, "the Stop must be sent again over the new tunnel"
+        assert session_id in _interrupt_fenced_sessions
+    finally:
+        interrupt_delivery.cancel_pending_interrupt(session_id)
+        registry.deregister("runner_silent_tunnel", retire=False)
+        sessions_module._session_status_cache.pop(session_id, None)
+        _interrupt_fenced_sessions.discard(session_id)
+        await fake_runner.aclose()
+
+
 @pytest.mark.parametrize(
     "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
 )
