@@ -20,7 +20,7 @@ short-lived token minted from that user's authorization — never a shared PAT.
   authorize screen. GitHub redirects back to
   `…/v1/connections/github/callback`, which exchanges the `code` for a
   **user-to-server** access token (+ refresh token) and stores it encrypted
-  (KMS) in the credential store. The `state` is signed with a subkey derived
+  in the credential store. The `state` is signed with a subkey derived
   from the App's client secret, and the callback rebinds `state.sub` to the
   authenticated caller so it can't be replayed or cross-bound.
 - **Use (in the sandbox).** On sandbox launch the server vends that user's
@@ -45,8 +45,9 @@ short-lived token minted from that user's authorization — never a shared PAT.
 - Your Omnigent server's public origin, e.g.
   `https://omnigent.example.com`. The OAuth callback must be
   reachable from a browser at `…/v1/connections/github/callback`.
-- The credential store configured (`OMNIGENT_CREDENTIAL_*` / KMS) so tokens can
-  be encrypted at rest — the connect store is only wired when it is present.
+- The credential store configured (`OMNIGENT_CREDENTIAL_CIPHER`: AWS KMS, Vault
+  Transit or an HTTP key service) so tokens can be encrypted at rest — the
+  connect store is only wired when it is present.
 
 ---
 
@@ -182,7 +183,7 @@ but no redirect URI can be resolved (neither `OMNIGENT_GITHUB_APP_REDIRECT_URI`
 nor `OMNIGENT_DOMAIN`), the feature logs a warning and **stays disabled**.
 
 > The at-rest encryption of stored tokens is the credential store's concern
-> (`OMNIGENT_CREDENTIAL_*` / KMS), not GitHub's — see
+> (`OMNIGENT_CREDENTIAL_CIPHER` and that backend's settings), not GitHub's — see
 > [`designs/CREDENTIAL_STORE.md`](../designs/CREDENTIAL_STORE.md).
 
 ---

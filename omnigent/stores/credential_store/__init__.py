@@ -1,8 +1,9 @@
 """Provider-agnostic per-user credential store.
 
 The SQLAlchemy backend (:class:`CredentialStore`) behind the
-:class:`SecretCipher` port (AWS-KMS implementation). Provider façades live in
-:mod:`omnigent.connections`. See ``designs/CREDENTIAL_STORE.md``.
+:class:`SecretCipher` port (AWS KMS, Vault Transit or an HTTP key service).
+Provider façades live in :mod:`omnigent.connections`. See
+``designs/CREDENTIAL_STORE.md``.
 """
 
 from omnigent.stores.credential_store.secret_cipher import (
@@ -11,6 +12,7 @@ from omnigent.stores.credential_store.secret_cipher import (
     SecretCipher,
     SecretContext,
     build_secret_cipher,
+    cipher_setup_hint,
 )
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
@@ -21,4 +23,5 @@ __all__ = [
     "SecretCipher",
     "SecretContext",
     "build_secret_cipher",
+    "cipher_setup_hint",
 ]
