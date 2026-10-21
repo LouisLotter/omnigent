@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import dataclasses
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -184,8 +185,11 @@ async def test_distinct_request_waits_while_another_owns_admission(
     owner_done = asyncio.Event()
     order: list[str] = []
 
+    owner_admitted = asyncio.Event()
+
     async def owner() -> None:
         await persistent_hosts.ensure_host_ready(HOST_ID, operation="message", timeout_s=5)
+        owner_admitted.set()
         await asyncio.sleep(0.3)  # the fence closes meanwhile
         await persistent_hosts.admit_host_work(HOST_ID, "runner_launch")
         order.append("owner launch admitted")
@@ -197,7 +201,7 @@ async def test_distinct_request_waits_while_another_owns_admission(
         order.append("other launch admitted")
 
     owner_task = asyncio.create_task(owner())
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(owner_admitted.wait(), 5)
     fence = asyncio.create_task(persistent_hosts.sleep_if_idle(HOST_ID))
     await asyncio.sleep(0.1)
     other_task = asyncio.create_task(other())
@@ -929,6 +933,78 @@ async def test_report_already_too_old_on_arrival_is_unknown(
     assert persistent_hosts._states[HOST_ID].report is None
 
 
+async def test_reply_from_before_a_sleep_never_admits_into_the_next_generation(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A positive report asked for before a sleep and wake cannot admit work afterwards."""
+    asked, release = threading.Event(), threading.Event()
+    real = host.computer.admission
+    calls = {"n": 0}
+
+    def delayed_first_reply(sandbox_id: str) -> AdmissionReport | None:
+        calls["n"] += 1
+        report = real(sandbox_id)
+        if calls["n"] == 1:
+            asked.set()
+            release.wait(10)
+        return report
+
+    monkeypatch.setattr(host.computer, "admission", delayed_first_reply)
+    request = asyncio.create_task(_ready("message", timeout_s=10)())
+    assert await asyncio.to_thread(asked.wait, 10)
+    assert await persistent_hosts.sleep_if_idle(HOST_ID) == "stopped"
+    await persistent_hosts.start_host_now(HOST_ID)
+    host.computer.admitting = False  # the new generation refuses new work
+    release.set()
+    with pytest.raises(OmnigentError) as raised:
+        await asyncio.wait_for(request, 10)
+    assert raised.value.code == ErrorCode.HOST_NOT_ADMITTING
+
+
+async def test_host_deleted_while_admission_is_asked_admits_nothing(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting the host while its admission report is pending refuses the waiting work."""
+    gate = host.computer.admission_gate = threading.Event()
+    request = asyncio.create_task(_ready("message", timeout_s=10)())
+    assert await asyncio.to_thread(host.computer.parked.wait, 10)
+    current = host.store.get_host(HOST_ID)
+    assert current is not None
+    await persistent_hosts.delete_host(current)
+    gate.set()
+    with pytest.raises(OmnigentError) as raised:
+        await asyncio.wait_for(request, 10)
+    assert raised.value.code == ErrorCode.NOT_FOUND
+
+
+async def test_waiting_on_an_unknown_sleep_respects_the_deadline(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow repeat of an unknown sleep never holds work past its own deadline."""
+    host.computer.suspend_gate = threading.Event()
+    fence = asyncio.create_task(persistent_hosts.sleep_if_idle(HOST_ID))
+    await asyncio.to_thread(host.computer.suspend_accepted.wait, 10)
+    fence.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await fence
+    started = persistent_hosts.time.monotonic()
+    with pytest.raises(OmnigentError) as raised:
+        await persistent_hosts.ensure_host_ready(HOST_ID, operation="message", timeout_s=0.3)
+    assert raised.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert persistent_hosts.time.monotonic() - started < 2.0
+    state = persistent_hosts._states[HOST_ID]
+    operation = state.unknown_suspend_operation
+    assert operation is not None and state.recovery_task is not None
+    host.computer.suspend_gate.set()
+    outcome = "unknown"
+    for _ in range(50):
+        outcome = await persistent_hosts.sleep_if_idle(HOST_ID, only_operation=operation)
+        if outcome != "unknown":
+            break
+        await asyncio.sleep(0.05)
+    assert outcome == "stopped"
+
+
 async def test_start_again_waits_for_an_unknown_sleep_to_resolve(host: FakeHost) -> None:
     """An explicit start never resumes or re-arms before a pending sleep reports."""
     host.computer.suspend_gate = threading.Event()
@@ -1143,6 +1219,12 @@ async def test_deleting_while_provisioning_still_removes_the_new_sandbox(
     assert task is not None
     assert await asyncio.to_thread(provisioning.wait, 10)
     await persistent_hosts.delete_host(created)
+    # A new computer takes the deleted one's name before the provision returns.
+    fresh.computer.on_provision = None
+    reused = fresh.store.create_persistent_host(
+        host_id=uuid.uuid4().hex, name="Doomed", user_id=OWNER, provider="fakepersist"
+    )
+    assert reused.name == "Doomed"
     release.set()
     with contextlib.suppress(OmnigentError):
         await asyncio.wait_for(task, 10)

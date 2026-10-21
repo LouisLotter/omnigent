@@ -129,6 +129,13 @@ class _HostLifecycle:
     idle_since: float | None = None
     # The sleep-intent write in flight, kept so a cancelled fence can learn its result.
     pending_intent: asyncio.Future[bool] | None = None
+    # The shared resolution of an unknown sleep that waiting work waits on.
+    recovery_task: asyncio.Task[str] | None = None
+    # Bumped whenever the sandbox stops or a new one comes up, so a provider
+    # reply requested before that never counts for the new generation.
+    epoch: int = 0
+    # Set when the host is deleted, so work still waiting on it is refused.
+    removed: bool = False
 
     def __post_init__(self) -> None:
         self.admitting.set()
@@ -140,6 +147,11 @@ class _HostLifecycle:
     def waking(self) -> bool:
         """Whether a wake or first start is in flight on this replica."""
         return self.wake_task is not None and not self.wake_task.done()
+
+    def new_generation(self) -> None:
+        """Forget the last admission report and every reply still in flight."""
+        self.report = None
+        self.epoch += 1
 
     def publish(self, stage: str, error: str | None = None) -> None:
         """Report a wake stage to every observer waiting on this host."""
@@ -220,7 +232,9 @@ def forget(host_id: str) -> None:
     sandbox it was provisioning is removed rather than lost.
     """
     _connections.pop(host_id, None)
-    _states.pop(host_id, None)
+    state = _states.pop(host_id, None)
+    if state is not None:
+        state.removed = True
 
 
 def manage_url(host: Host) -> str | None:
@@ -430,6 +444,8 @@ async def _until_admitted(
                 raise _not_admitting(host, report)
             if time.monotonic() >= deadline:
                 raise _unavailable(f"{host.name} did not become ready within {timeout_s:.0f}s")
+            if state.removed:
+                raise OmnigentError(f"host {host.name!r} was removed", code=ErrorCode.NOT_FOUND)
             # No await from here to the grant: a sleep that closed admission
             # while this task awaited is seen, and the loop waits for it.
             if state.admitting.is_set() and _host_registry.get(host_id) is not None:
@@ -527,13 +543,26 @@ async def _wait_admitting(state: _HostLifecycle, host: Host, deadline: float) ->
                 f"{host.name} is {state.closed_reason or 'not admitting'}; try again shortly"
             )
         if state.unknown_suspend_operation is not None:
-            # A wake waits for the earlier sleep's outcome; ask for it again.
-            await sleep_if_idle(host.host_id, only_operation=state.unknown_suspend_operation)
+            # A wake waits for the earlier sleep's outcome; ask for it again,
+            # once for every waiter, and only as long as this waiter may wait.
+            recovery = _recovery_task(host.host_id, state, state.unknown_suspend_operation)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(recovery), remaining)
             if not state.admitting.is_set():
-                await asyncio.sleep(min(1.0, max(remaining, 0)))
+                await asyncio.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
             continue
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(state.admitting.wait(), remaining)
+
+
+def _recovery_task(host_id: str, state: _HostLifecycle, operation_id: str) -> asyncio.Task[str]:
+    """The shared repeat of an unknown sleep, started if none is running."""
+    if state.recovery_task is None or state.recovery_task.done():
+        state.recovery_task = asyncio.create_task(
+            sleep_if_idle(host_id, only_operation=operation_id), name=f"sleep-outcome-{host_id}"
+        )
+        state.recovery_task.add_done_callback(_log_background_failure)
+    return state.recovery_task
 
 
 def _launcher(host: Host) -> SandboxHostLauncher | None:
@@ -569,6 +598,7 @@ async def _fresh_report(
     """
     if host.sandbox_id is None:
         return None
+    epoch = state.epoch
     try:
         report = await asyncio.to_thread(launcher.admission, host.sandbox_id)
     except SandboxGoneError:
@@ -576,7 +606,8 @@ async def _fresh_report(
     except Exception:  # noqa: BLE001 — an unanswered refresh is "unknown", never a refusal.
         _logger.warning("admission report for host %s failed", host.host_id, exc_info=True)
         return None
-    if report is None:
+    if report is None or state.epoch != epoch:
+        # Unknown, or asked before the sandbox stopped or came up again.
         return None
     observed_at = report.observed_at if report.observed_at is not None else time.time()
     if time.time() - observed_at > max_age_s:
@@ -595,13 +626,13 @@ def _wake_task(
         state.wake_task = asyncio.create_task(
             _wake(host_id, state, provision=provision), name=f"wake-host-{host_id}"
         )
-        state.wake_task.add_done_callback(_log_wake_failure)
+        state.wake_task.add_done_callback(_log_background_failure)
     assert state.wake_task is not None
     return state.wake_task
 
 
-def _log_wake_failure(task: asyncio.Task[None]) -> None:
-    """Retrieve a wake's failure, which its waiters report and a first start records."""
+def _log_background_failure(task: asyncio.Task[Any]) -> None:
+    """Retrieve a shared task's failure, which its waiters report and a first start records."""
     if not task.cancelled() and task.exception() is not None:
         _logger.info("%s failed: %s", task.get_name(), task.exception())
 
@@ -709,7 +740,6 @@ async def _provision(
         await asyncio.to_thread(
             _host_store.retain_orphan_sandbox,
             host_id=host.host_id,
-            name=host.name,
             user_id=host.user_id,
             provider=launcher.provider,
             sandbox_id=sandbox_id,
@@ -749,7 +779,7 @@ async def _bring_up(
     else:
         await _bring_up_untyped(host, launcher, entry, state, deadline)
     # A new generation starts with a fresh admission report.
-    state.report = None
+    state.new_generation()
 
 
 async def _bring_up_untyped(
@@ -1139,7 +1169,7 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                 )
                 if result.outcome == "stopped":
                     _host_registry.deregister(host_id)
-                    state.report = None
+                    state.new_generation()
             outcome = result.outcome
             return outcome  # noqa: RET504 — ``finally`` reads the outcome.
         finally:

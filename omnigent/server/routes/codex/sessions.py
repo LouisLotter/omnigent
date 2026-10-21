@@ -409,8 +409,9 @@ async def _forward_codex_goal_event(
     :returns: Runner forward result, or ``None`` if no runner could be
         reached.
     """
-    if event.get("type") != "goal_get" and conv.host_id is not None:
-        # A goal change is new work: a persistent host must be awake and admitting.
+    if _goal_event_starts_work(event) and conv.host_id is not None:
+        # A goal that starts or resumes work is new work: a persistent host must
+        # be awake and admitting. Reading, pausing or clearing a goal never is.
         await ensure_host_ready(
             conv.host_id,
             operation="codex_goal",
@@ -439,6 +440,14 @@ async def _forward_codex_goal_event(
     if runner_client is None:
         return None
     return await _post_codex_goal_event_to_runner(session_id, runner_client, event)
+
+
+def _goal_event_starts_work(event: dict[str, Any]) -> bool:
+    """Whether a goal event starts or resumes autonomous work."""
+    kind = event.get("type")
+    if kind in ("goal_get", "goal_clear"):
+        return False
+    return not (kind == "goal_status" and event.get("status") == "paused")
 
 
 async def _require_codex_native_goal_session(
