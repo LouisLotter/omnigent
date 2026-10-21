@@ -757,6 +757,14 @@ import time; time.sleep(60)
 """
 
 
+def _exited(pid: int) -> bool:
+    """Whether *pid* is gone or a zombie, tolerating it vanishing mid-check."""
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except (psutil.Error, OSError):
+        return True
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
 def test_child_armed_with_parent_death_signal_dies_with_a_killed_parent() -> None:
     """A parent killed outright takes its armed child with it."""
@@ -771,9 +779,7 @@ def test_child_armed_with_parent_death_signal_dies_with_a_killed_parent() -> Non
         parent.wait(timeout=5)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if not psutil.pid_exists(child_pid) or (
-                psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
-            ):
+            if _exited(child_pid):
                 break
             time.sleep(0.05)
         else:
