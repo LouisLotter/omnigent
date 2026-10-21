@@ -9639,6 +9639,8 @@ async def _register_policy_elicitation(
     result: PolicyResult,
     arguments_preview: str,
     conversation_store: ConversationStore,
+    *,
+    elicitation_id: str | None = None,
 ) -> str:
     """
     Publish an elicitation request event on the session stream.
@@ -9657,10 +9659,12 @@ async def _register_policy_elicitation(
         the elicitation UI preview (max ~1024 chars).
     :param conversation_store: Store used to mirror child-session
         prompts into ancestor streams.
-    :returns: The generated elicitation id,
-        e.g. ``"elicit_a1b2c3..."``.
+    :param elicitation_id: Id the caller already allocated, or ``None``
+        to mint one.
+    :returns: The elicitation id, e.g. ``"elicit_a1b2c3..."``.
     """
-    elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    if elicitation_id is None:
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
     elicitation = ElicitationRequest(
         message=result.reason or "Approval required",
         requested_schema={},
@@ -12016,60 +12020,61 @@ def _record_mcp_approval_verdict(
     """
     if not isinstance(elicitation_id, str):
         return
-    approval_id = _mcp_approval_decided_by_answer(session_id, elicitation_id)
-    if approval_id is None:
-        return
-    pending = _pending_policy_ask_writes.get(approval_id)
-    if pending is None or pending.verdict is not None:
+    pending = _pending_policy_ask_writes.get(elicitation_id)
+    if (
+        pending is None
+        or not pending.from_mcp
+        or pending.verdict is not None
+        or pending.mcp_call_identity is None
+        or pending.mcp_call_identity[0] != session_id
+    ):
         return
     verdict = action if action in ("accept", "decline", "cancel") else "decline"
-    _pending_policy_ask_writes[approval_id] = dataclasses.replace(
+    _pending_policy_ask_writes[elicitation_id] = dataclasses.replace(
         pending, verdict=cast("str", verdict), decided_by=decided_by
     )
     _logger.info(
         "MCP tool call approval recorded: session=%r elicitation=%r verdict=%r by=%r",
         session_id,
-        approval_id,
+        elicitation_id,
         verdict,
         decided_by,
         extra={"session_id": session_id},
     )
 
 
-def _mcp_approval_decided_by_answer(session_id: str, elicitation_id: str) -> str | None:
+def _pending_mcp_approval_for_call(
+    session_id: str,
+    elicitation_id: str,
+    tool_name: object,
+    arguments: object,
+    credential_user: str | None,
+) -> _PendingPolicyAskWrites | None:
     """
-    Return the id of the pending MCP approval that an answer decides.
+    Return this session's pending MCP approval for exactly this call.
 
-    That is the answered elicitation itself when it is this session's MCP
-    approval. A native policy gate held for the same call also decides
-    it: Pi's bridged tools wait on such a gate, then retry through
-    ``/mcp`` with the MCP elicitation's id. The gate matches one unanswered
-    approval for the same session, tool and arguments.
+    A native policy gate may wait on such an approval instead of opening its
+    own (Pi's bridged tools do), so a person answers the call once.
 
-    :param session_id: Session the answer was posted to, e.g. ``"conv_abc"``.
-    :param elicitation_id: The answered elicitation id.
-    :returns: The MCP approval's elicitation id, or ``None``.
+    :param session_id: Session asking, e.g. ``"conv_abc"``.
+    :param elicitation_id: The MCP approval's elicitation id.
+    :param tool_name: Namespaced tool name of the gated call.
+    :param arguments: Arguments of the gated call.
+    :param credential_user: Authenticated caller, who must have made the call.
+    :returns: The pending approval, or ``None`` when it is not this call's.
     """
     pending = _pending_policy_ask_writes.get(elicitation_id)
-    if pending is not None:
-        identity = pending.mcp_call_identity
-        if pending.from_mcp and identity is not None and identity[0] == session_id:
-            return elicitation_id
+    if pending is None or not pending.from_mcp or pending.mcp_call_identity is None:
         return None
-    parked = _harness_parked_elicitations.get(elicitation_id)
-    if parked is None or parked.session_id != session_id or parked.tool_name is None:
+    asked_session, asked_tool, _actor, asked_user = pending.mcp_call_identity
+    if (
+        asked_session != session_id
+        or asked_tool != tool_name
+        or asked_user != credential_user
+        or pending.reviewed_arguments != arguments
+    ):
         return None
-    for approval_id, candidate in _pending_policy_ask_writes.items():
-        identity = candidate.mcp_call_identity
-        if (
-            candidate.from_mcp
-            and candidate.verdict is None
-            and identity is not None
-            and identity[:2] == (session_id, parked.tool_name)
-            and candidate.reviewed_arguments == (parked.tool_input or {})
-        ):
-            return approval_id
-    return None
+    return pending
 
 
 def _claim_recorded_mcp_approval(
@@ -12195,6 +12200,8 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
     operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+    # An approved retry executes only on the runner connection it was approved for.
+    approved_runner_generation: int | None = None
 
     def _runner_execute_body(
         execute_params: dict[str, Any],
@@ -12272,32 +12279,34 @@ async def _handle_mcp_tools_call(
                 f"Denied by policy: {retry_result.reason or 'no reason given'}",
             )
 
+        # A retry executes only against the verdict a person gave through the
+        # server, never the caller's own answer, even when the policy now
+        # allows: otherwise an approval that changed policy state replays.
+        elicitation_id_from_state = state.get("elicitation_id", "")
+        if not isinstance(elicitation_id_from_state, str):
+            return _mcp_error_response(rpc_id, -32000, "Invalid requestState")
+        approval = (
+            input_responses.get(elicitation_id_from_state)
+            if isinstance(input_responses, dict)
+            else None
+        )
+        claimed = _claim_recorded_mcp_approval(
+            elicitation_id_from_state,
+            approval.get("action") if isinstance(approval, dict) else None,
+            identity=(
+                session_id,
+                namespaced_name,
+                (actor or {}).get("run_as"),
+                credential_user,
+            ),
+            operation_id=operation_id,
+            runner_generation=_session_runner_generation(request, conv),
+            arguments=arguments,
+        )
+        if isinstance(claimed, str):
+            return _mcp_error_response(rpc_id, -32000, claimed)
+        approved_runner_generation = claimed.runner_generation
         if retry_result.action == PolicyAction.ASK:
-            # Policy still requires approval: execute only against the verdict
-            # a person gave through the server, never the caller's own answer.
-            elicitation_id_from_state = state.get("elicitation_id", "")
-            if not isinstance(elicitation_id_from_state, str):
-                return _mcp_error_response(rpc_id, -32000, "Invalid requestState")
-            approval = (
-                input_responses.get(elicitation_id_from_state)
-                if isinstance(input_responses, dict)
-                else None
-            )
-            claimed = _claim_recorded_mcp_approval(
-                elicitation_id_from_state,
-                approval.get("action") if isinstance(approval, dict) else None,
-                identity=(
-                    session_id,
-                    namespaced_name,
-                    (actor or {}).get("run_as"),
-                    credential_user,
-                ),
-                operation_id=operation_id,
-                runner_generation=_session_runner_generation(request, conv),
-                arguments=arguments,
-            )
-            if isinstance(claimed, str):
-                return _mcp_error_response(rpc_id, -32000, claimed)
             # Approval applies to the stored call and its reviewed transform.
             arguments = cast(
                 "dict[str, object]",
@@ -12305,17 +12314,16 @@ async def _handle_mcp_tools_call(
                 if claimed.transformed_arguments is not None
                 else claimed.reviewed_arguments,
             )
-            # Apply the deciding policy's deferred writes now that the user
-            # approved (POLICIES.md §7.2: only on accept).
-            if claimed.set_labels:
-                await asyncio.to_thread(engine.apply_label_writes, claimed.set_labels)
-            if claimed.state_updates:
-                with contextlib.suppress(ConversationNotFoundError):
-                    await asyncio.to_thread(engine.apply_state_updates, claimed.state_updates)
-        else:
-            # The current policy controls arguments when approval is no longer required.
-            if retry_result.data is not None:
-                arguments = cast("dict[str, object]", retry_result.data)
+        elif retry_result.data is not None:
+            # The current policy controls arguments once approval is no longer required.
+            arguments = cast("dict[str, object]", retry_result.data)
+        # Apply the deciding policy's deferred writes now that the user
+        # approved (POLICIES.md §7.2: only on accept).
+        if claimed.set_labels:
+            await asyncio.to_thread(engine.apply_label_writes, claimed.set_labels)
+        if claimed.state_updates:
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(engine.apply_state_updates, claimed.state_updates)
         # Fall through to execution.
     else:
         # ── First call: evaluate TOOL_CALL policy ────────────────────
@@ -12351,13 +12359,9 @@ async def _handle_mcp_tools_call(
             # Emit elicitation SSE event (for REPL approval UI) and return
             # InputRequiredResult per the MCP MRTR spec so the runner can
             # park on the approval Future and retry when the user decides.
-            elicitation_id = await _register_policy_elicitation(
-                session_id,
-                call_result,
-                json.dumps(arguments)[:1024],
-                conversation_store,
-            )
-            # Keep the reviewed call and deferred writes together until approval.
+            # Record the reviewed call before the prompt is visible, so an
+            # answer given while it is still being published is kept.
+            elicitation_id = f"elicit_{secrets.token_hex(16)}"
             _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
                 state_updates=call_result.state_updates,
                 set_labels=call_result.set_labels,
@@ -12373,6 +12377,17 @@ async def _handle_mcp_tools_call(
                 mcp_operation_id=operation_id,
                 runner_generation=_session_runner_generation(request, conv),
             )
+            try:
+                await _register_policy_elicitation(
+                    session_id,
+                    call_result,
+                    json.dumps(arguments)[:1024],
+                    conversation_store,
+                    elicitation_id=elicitation_id,
+                )
+            except BaseException:
+                _pending_policy_ask_writes.pop(elicitation_id, None)
+                raise
             # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
                 "elicitation_id": elicitation_id,
@@ -12447,6 +12462,12 @@ async def _handle_mcp_tools_call(
             return _mcp_error_response(
                 rpc_id, -32000, f"No runner bound for session {session_id!r}"
             )
+        # The tunnel transport refuses the request on any other connection.
+        pinned: dict[str, Any] = (
+            {"extensions": {"runner_tunnel_generation": approved_runner_generation}}
+            if approved_runner_generation is not None
+            else {}
+        )
         try:
             exec_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
@@ -12457,6 +12478,7 @@ async def _handle_mcp_tools_call(
                 # ``sys_session_send`` returns a launch handle immediately; this
                 # timeout now protects ordinary runner proxy hangs.
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
+                **pinned,
             )
             exec_resp.raise_for_status()
             exec_data = exec_resp.json()

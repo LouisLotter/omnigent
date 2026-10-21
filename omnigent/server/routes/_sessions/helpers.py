@@ -8936,12 +8936,9 @@ async def _apply_pending_policy_ask_writes(
         # MCP entries: the retry path (POST /mcp with requestState)
         # pops and applies the writes itself. Applying here too would
         # double-apply non-idempotent ops (e.g. INCREMENT state
-        # updates for cost-budget counters). Leave the entry for the
-        # retry path (it owns cleanup), dropping it only on decline.
-        if data.get("action") != "accept":
-            # Declined — remove the stashed writes (POLICIES.md §7.2:
-            # a denied ASK leaves no trace).
-            _pending_policy_ask_writes.pop(elicitation_id, None)
+        # updates for cost-budget counters). The entry holds the
+        # recorded verdict, so it stays for the retry to consume; a
+        # declined retry drops the writes (POLICIES.md §7.2).
         return
     # Non-MCP relay path: claim the entry atomically (no await between
     # the get above and this pop, so duplicate verdicts — a client

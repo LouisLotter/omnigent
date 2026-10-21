@@ -6,10 +6,12 @@ Accounts-mode app, real routes. The runner holds the owner JWT minted by
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from mcp.types import CallToolResult, TextContent, Tool
@@ -91,17 +93,22 @@ def _session_using_tracker(person: TestClient) -> str:
     return session_id
 
 
+def _tools_call_body(**params: Any) -> dict[str, Any]:
+    """A gateway ``tools/call`` request posting "hello", with extra params."""
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "post_update", "arguments": {"text": "hello"}, **params},
+    }
+
+
 def _tools_call(runner: TestClient, session_id: str, **params: Any) -> dict[str, Any]:
     """Send one gateway ``tools/call`` as the runner and return the JSON-RPC body."""
     response = runner.post(
         "/v1/mcp/tracker",
         headers={"X-Omnigent-Session-Id": session_id},
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "post_update", "arguments": {"text": "hello"}, **params},
-        },
+        json=_tools_call_body(**params),
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -195,11 +202,11 @@ def _policy_body(name: str) -> dict[str, Any]:
 
 
 def test_policy_changes_need_the_person(setup_app: Any) -> None:
-    """Only the person changes policies; the runner may still add session policies.
+    """Only the person adds, changes or removes policies; a runner may cap a sub-agent.
 
-    ``sys_add_policy`` and child cost budgets create session policies with
-    the runner's token, so creation stays open. Adding a policy cannot lift
-    an existing ASK or DENY.
+    A new policy can write session state that other policies read, so the
+    runner's token cannot add one, except the sub-agent cost budget
+    ``sys_session_send`` attaches, which only asks or denies.
     """
     admin, _alice, stores, _ = setup_app
     session_id = create_session(admin).json()["session_id"]
@@ -214,15 +221,27 @@ def test_policy_changes_need_the_person(setup_app: Any) -> None:
     assert admin.patch(default_url, json={"enabled": False}).status_code == 200
     assert admin.delete(default_url).status_code == 200
 
-    added = runner.post(
-        f"/v1/sessions/{session_id}/policies", json=_policy_body("runner-added-gate")
-    )
+    session_policies = f"/v1/sessions/{session_id}/policies"
+    assert runner.post(session_policies, json=_policy_body("state-writer")).status_code == 403
+    added = admin.post(session_policies, json=_policy_body("person-gate"))
     assert added.status_code == 200, added.text
-    session_url = f"/v1/sessions/{session_id}/policies/{added.json()['id']}"
+    session_url = f"{session_policies}/{added.json()['id']}"
     assert runner.patch(session_url, json={"enabled": False}).status_code == 403
     assert runner.delete(session_url).status_code == 403
     assert admin.patch(session_url, json={"enabled": False}).status_code == 200
     assert admin.delete(session_url).status_code == 200
+
+    budget = runner.post(
+        session_policies,
+        json={
+            "name": "__subagent_cost_budget",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+            "factory_params": {"max_cost_usd": 1.0},
+        },
+    )
+    assert budget.status_code == 200, budget.text
+    assert runner.delete(f"{session_policies}/{budget.json()['id']}").status_code == 403
 
 
 def _bundle_upload(name: str) -> dict[str, Any]:
@@ -305,3 +324,107 @@ def test_runner_ordinary_traffic_is_unaffected(setup_app: Any, tracker: AsyncMoc
     assert [tool["name"] for tool in listed.json()["result"]["tools"]] == ["post_update"]
     assert child.status_code == 201, child.text
     assert runner.post(f"/v1/runners/{runner_id}/token").status_code == 200
+
+
+def _evaluate_body(elicitation_id: str, text: str) -> dict[str, Any]:
+    """Body of the native policy gate a Pi bridged tool waits on before its retry."""
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {"name": "tracker__post_update", "arguments": {"text": text}},
+            "context": {},
+        },
+        "_omnigent_elicitation_id": elicitation_id,
+    }
+
+
+def _evaluate_tool_call(client: TestClient, session_id: str, elicitation_id: str, text: str):
+    """POST the native policy gate as the runner."""
+    return client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_evaluate_body(elicitation_id, text),
+    )
+
+
+def test_native_gate_reports_an_mcp_approval_already_answered(
+    setup_app: Any, tracker: AsyncMock
+) -> None:
+    """Pi's gate names the /mcp approval itself; an earlier answer is reported, not re-asked."""
+    _admin, alice, stores, _ = setup_app
+    session_id = _session_using_tracker(alice)
+    runner = _delegated_runner(alice, stores, session_id)
+    elicitation_id, retry = _ask(runner, session_id)
+
+    alice.post(_resolve_url(session_id, elicitation_id), json={"action": "accept"})
+    gate = _evaluate_tool_call(runner, session_id, elicitation_id, "hello")
+
+    assert gate.json()["result"] == "POLICY_ACTION_ALLOW", gate.text
+    assert "result" in _tools_call(runner, session_id, **retry)
+    assert "error" in _tools_call(runner, session_id, **retry)
+    tracker.call_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_gate_waits_on_the_mcp_approval_itself(
+    setup_app: Any, tracker: AsyncMock
+) -> None:
+    """While Pi's gate waits on the /mcp approval, one browser answer releases one call.
+
+    Both requests share the server's event loop, as in production.
+    """
+    from omnigent.server._elicitation_registry import _harness_parked_elicitations
+
+    _admin, alice, stores, _ = setup_app
+    session_id = _session_using_tracker(alice)
+    runner = _delegated_runner(alice, stores, session_id)
+    elicitation_id, retry = _ask(runner, session_id)
+    transport = httpx.ASGITransport(app=alice.app)
+
+    async with (
+        httpx.AsyncClient(
+            transport=transport, base_url="http://testserver", headers=dict(runner.headers)
+        ) as runner_http,
+        httpx.AsyncClient(
+            transport=transport, base_url="http://testserver", cookies=alice.cookies
+        ) as person_http,
+    ):
+        waiting = asyncio.create_task(
+            runner_http.post(
+                f"/v1/sessions/{session_id}/policies/evaluate",
+                json=_evaluate_body(elicitation_id, "hello"),
+            )
+        )
+        async with asyncio.timeout(15):
+            while elicitation_id not in _harness_parked_elicitations:
+                await asyncio.sleep(0.05)
+        approved = await person_http.post(
+            _resolve_url(session_id, elicitation_id), json={"action": "accept"}
+        )
+        gate = await asyncio.wait_for(waiting, timeout=15)
+        executed = await runner_http.post(
+            "/v1/mcp/tracker",
+            headers={"X-Omnigent-Session-Id": session_id},
+            json=_tools_call_body(**retry),
+        )
+
+    assert approved.status_code == 202, approved.text
+    assert gate.json()["result"] == "POLICY_ACTION_ALLOW", gate.text
+    assert executed.json()["result"]["content"][0]["text"] == "posted", executed.text
+    tracker.call_tool.assert_awaited_once()
+
+
+def test_native_gate_cannot_borrow_another_calls_approval(
+    setup_app: Any, tracker: AsyncMock
+) -> None:
+    """A gate naming an MCP approval must describe that exact call."""
+    _admin, alice, stores, _ = setup_app
+    session_id = _session_using_tracker(alice)
+    runner = _delegated_runner(alice, stores, session_id)
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    other_arguments = _evaluate_tool_call(runner, session_id, elicitation_id, "something else")
+    unknown = _evaluate_tool_call(runner, session_id, "elicit_" + "0" * 32, "hello")
+
+    assert other_arguments.status_code == 400, other_arguments.text
+    assert unknown.status_code == 400, unknown.text

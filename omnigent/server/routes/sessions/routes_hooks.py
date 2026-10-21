@@ -89,6 +89,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate,
+    _pending_mcp_approval_for_call,
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
@@ -139,6 +140,15 @@ def _create_route_decision_id(
             if isinstance(decision_id, str) and decision_id:
                 return decision_id
     return None
+
+
+def _invalid_evaluate_elicitation_id() -> OmnigentError:
+    """Return the error for an evaluate re-attach id that names no usable elicitation."""
+    return OmnigentError(
+        "Policy evaluate '_omnigent_elicitation_id' must match 'elicit_evaluate_' + "
+        "32 hex chars, or name this tool call's pending MCP approval.",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 def register_hooks_routes(
@@ -697,16 +707,18 @@ def register_hooks_routes(
         # required — absent on non-retrying callers (old hooks, direct API use).
         raw_elicitation_id = payload.get("_omnigent_elicitation_id")
         hook_elicitation_id: str | None = None
+        # A bridged MCP call may instead wait on the /mcp proxy's own pending
+        # approval; that id is bound to the exact call once ``data`` is known.
+        mcp_approval_id: str | None = None
         if raw_elicitation_id is not None:
-            if not isinstance(raw_elicitation_id, str) or not (
-                _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(raw_elicitation_id)
+            if isinstance(raw_elicitation_id, str) and _EVALUATE_HOOK_ELICITATION_ID_RE.fullmatch(
+                raw_elicitation_id
             ):
-                raise OmnigentError(
-                    "Policy evaluate '_omnigent_elicitation_id' must match "
-                    "'elicit_evaluate_' + 32 hex chars.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            hook_elicitation_id = raw_elicitation_id
+                hook_elicitation_id = raw_elicitation_id
+            elif isinstance(raw_elicitation_id, str) and phase == Phase.TOOL_CALL:
+                mcp_approval_id = raw_elicitation_id
+            else:
+                raise _invalid_evaluate_elicitation_id()
         # Validation is driven from the per-phase schema above rather than
         # from a chain of conditionals: rules that live in branches get
         # applied to whichever phase happens to reach that branch. The three
@@ -774,6 +786,25 @@ def register_hooks_routes(
                     else {"name": resolved_name}
                 )
         data = raw_data or {}
+        if mcp_approval_id is not None:
+            mcp_approval = _pending_mcp_approval_for_call(
+                session_id,
+                mcp_approval_id,
+                data.get("name") if isinstance(data, dict) else None,
+                (data.get("arguments") or {}) if isinstance(data, dict) else None,
+                user_id,
+            )
+            if mcp_approval is None:
+                raise _invalid_evaluate_elicitation_id()
+            if mcp_approval.verdict is not None:
+                # Answered before this gate waited: report that answer.
+                answered: dict[str, Any] = (
+                    {"result": "POLICY_ACTION_ALLOW"}
+                    if mcp_approval.verdict == "accept"
+                    else {"result": "POLICY_ACTION_DENY", "reason": "Approval was declined."}
+                )
+                return Response(content=json.dumps(answered), media_type="application/json")
+            hook_elicitation_id = mcp_approval_id
         raw_event_context = event.get("context")
         if raw_event_context is not None and not isinstance(raw_event_context, dict):
             raise OmnigentError(

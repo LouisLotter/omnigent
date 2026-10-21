@@ -322,20 +322,16 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
 
 
 @pytest.mark.asyncio
-async def test_retry_with_allow_policy_falls_through(
+async def test_retry_with_allow_policy_still_needs_an_approval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When the re-evaluated policy returns ALLOW on retry, the handler
-    should proceed to execution (not reject the call).
+    A retry needs a recorded approval even when the policy now allows.
 
-    This covers the case where label state changed between the original
-    ASK and the retry, so the policy no longer requires approval. The
-    handler must not reject a legitimately-allowed call just because it
-    arrived as a retry.
-
-    A failure here (unexpected error response) means the retry path
-    blocks ALLOW'd calls, which would break legitimate retry flows.
+    The retry claims the approval the person gave for this call; a policy
+    that no longer asks only changes which arguments execute. Without an
+    approval the retry is refused, so an approval that changed policy state
+    cannot be replayed through the ALLOW branch.
     """
     allow_engine = _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
 
@@ -359,21 +355,7 @@ async def test_retry_with_allow_policy_falls_through(
         runner_router=None,
     )
 
-    payload = json.loads(bytes(response.body))
-    # On ALLOW, the handler falls through to execution which needs a
-    # runner. With runner_router=None, it returns a "No runner bound"
-    # error — which proves the policy gate was passed (execution was
-    # attempted). If we get a "Denied by policy" error instead, the
-    # ALLOW path is broken.
-    if "error" in payload:
-        assert (
-            "runner" in payload["error"]["message"].lower()
-            or "No runner" in payload["error"]["message"]
-        ), (
-            f"Expected runner-unavailable error (proving policy passed), "
-            f"got: {payload['error']['message']!r}. "
-            f"If 'Denied by policy', the ALLOW path on retry is broken."
-        )
+    assert _parse_rpc_error(response)["message"] == "Elicitation not found or already resolved"
 
 
 @pytest.mark.asyncio
@@ -597,7 +579,6 @@ async def test_duplicate_accept_verdicts_apply_relay_writes_once(
     re-runs non-idempotent ops (e.g. INCREMENT state updates for
     cost-budget counters).
     """
-    import asyncio
 
     from omnigent.server.routes.sessions import _apply_pending_policy_ask_writes
     from omnigent.spec.types import StateUpdate, StateUpdateAction
@@ -760,7 +741,7 @@ async def test_retry_dispatches_policy_owned_arguments(
     approval: str,
 ) -> None:
     """Approval preserves the reviewed call; ALLOW uses the current policy result."""
-    eid = "elicit_reviewed_call"
+    eid = ""
     original_arguments = {"value": "original"}
     dispatched: list[dict[str, Any]] = []
     label_writes: list[dict[str, str]] = []
@@ -792,8 +773,8 @@ async def test_retry_dispatches_policy_owned_arguments(
         )
         return engine, result
 
-    async def register(*args, **kwargs):
-        return eid
+    async def register(*args, elicitation_id, **kwargs):
+        return elicitation_id
 
     def execute(request: httpx.Request) -> httpx.Response:
         dispatched.append(json.loads(request.content))
@@ -827,6 +808,7 @@ async def test_retry_dispatches_policy_owned_arguments(
             initial = await call({"name": "example__lookup", "arguments": original_arguments})
             assert not dispatched
             assert not label_writes
+            eid = next(iter(initial["result"]["inputRequests"]))
             # The person answers in the browser; the runner relays that answer.
             orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, approval, "alice")
             state = json.loads(initial["result"]["requestState"])
@@ -917,10 +899,13 @@ class _ApprovalHarness:
 
     :param registry: Tunnel registry whose generation a test may change.
     :param dispatched: Every tool call the runner was asked to execute.
+    :param dispatch_generations: The tunnel generation each execution was
+        pinned to, or ``None`` when unpinned.
     """
 
     registry: _StubTunnelRegistry
     dispatched: list[dict[str, Any]]
+    dispatch_generations: list[int | None]
 
     async def call(
         self,
@@ -968,7 +953,7 @@ class _ApprovalHarness:
 @pytest.fixture
 def approval_harness(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ApprovalHarness]:
     """An ASK-gated MCP tool whose runner execution is recorded."""
-    harness = _ApprovalHarness(_StubTunnelRegistry(generation=7), [])
+    harness = _ApprovalHarness(_StubTunnelRegistry(generation=7), [], [])
     engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.ALLOW))
 
     async def evaluate(session_id, spec, store, conv, ctx):
@@ -980,6 +965,7 @@ def approval_harness(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ApprovalHarne
 
     def execute(request: httpx.Request) -> httpx.Response:
         harness.dispatched.append(json.loads(request.content))
+        harness.dispatch_generations.append(request.extensions.get("runner_tunnel_generation"))
         return httpx.Response(200, json={"result": {"output": "posted"}})
 
     runner = httpx.AsyncClient(transport=httpx.MockTransport(execute), base_url="http://runner")
@@ -1096,33 +1082,55 @@ async def test_verdict_is_recorded_before_the_runner_hears_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("same_call", [True, False])
-async def test_native_gate_answer_decides_the_same_mcp_call(
-    approval_harness: _ApprovalHarness, same_call: bool
+async def test_approved_retry_cannot_replay_once_policy_allows(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pi waits on a native policy gate, then retries through ``/mcp``.
+    """An approval that makes the policy allow (e.g. a recorded checkpoint) runs once."""
+    eid, retry = await approval_harness.ask()
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice")
+    assert "error" not in await approval_harness.call(retry)
 
-    A person's answer to that gate decides the matching MCP approval; a gate
-    for other arguments decides nothing.
-    """
-    from omnigent.server._elicitation_registry import (
-        _harness_parked_elicitations,
-        _ParkedHarnessElicitation,
+    engine = _FixedPolicyEngine(PolicyResult(action=PolicyAction.ALLOW))
+
+    async def allow(session_id, spec, store, conv, ctx):
+        return engine, PolicyResult(action=PolicyAction.ALLOW)
+
+    monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", allow)
+    replayed = await approval_harness.call(retry)
+
+    assert replayed["error"]["message"] == "Elicitation not found or already resolved"
+    assert len(approval_harness.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_call_executes_only_on_the_approved_connection(
+    approval_harness: _ApprovalHarness,
+) -> None:
+    """Execution is pinned to the runner connection the approval was granted on."""
+    eid, retry = await approval_harness.ask()
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice")
+
+    executed = await approval_harness.call(retry)
+
+    assert "error" not in executed, executed
+    assert approval_harness.dispatch_generations == [7]
+
+
+@pytest.mark.asyncio
+async def test_answer_given_while_the_prompt_is_published_is_kept(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The approval record exists before anyone can see, and answer, the prompt."""
+
+    def answer_during_fan_out(store, session_id, event):
+        orchestration._record_mcp_approval_verdict(
+            session_id, event["elicitation_id"], "accept", "alice"
+        )
+
+    monkeypatch.setattr(
+        orchestration, "_publish_elicitation_request_to_ancestors", answer_during_fan_out
     )
-
     _eid, retry = await approval_harness.ask()
-    gate_id = "elicit_evaluate_" + "0" * 32
-    _harness_parked_elicitations[gate_id] = _ParkedHarnessElicitation(
-        session_id=_SESSION_ID,
-        tool_name="linkedin__post",
-        tool_input={"text": "hello" if same_call else "other"},
-        resolved_elsewhere=asyncio.Event(),
-    )
-    try:
-        orchestration._record_mcp_approval_verdict(_SESSION_ID, gate_id, "accept", "alice")
-        result = await approval_harness.call(retry)
-    finally:
-        _harness_parked_elicitations.pop(gate_id, None)
 
-    assert ("error" not in result) is same_call
-    assert len(approval_harness.dispatched) == (1 if same_call else 0)
+    assert "error" not in await approval_harness.call(retry)
+    assert len(approval_harness.dispatched) == 1

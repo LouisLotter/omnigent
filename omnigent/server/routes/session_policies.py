@@ -51,6 +51,10 @@ from omnigent.telemetry.installation_id import get_installation_id as _get_insta
 
 _logger = logging.getLogger(__name__)
 
+# Handlers a delegated runner credential may attach. A sub-agent cost budget
+# only asks or denies, and writes state only when a person approves its ASK.
+_RUNNER_ADDABLE_HANDLERS = frozenset({"omnigent.policies.builtins.cost.subagent_cost_budget"})
+
 
 def _generate_policy_id() -> str:
     """Generate a unique policy identifier.
@@ -178,9 +182,14 @@ def create_session_policies_router(
         :returns: The created policy as a serialized dict.
         :raises OmnigentError: 401/403 if the user lacks edit
             permission, 404 if the session is not found, or 409
-            if a policy with the same name already exists.
+            if a policy with the same name already exists; 403 for a
+            delegated credential adding any policy but a cost budget.
         """
         user_id = get_user_id(request, auth_provider)
+        # A new policy can write session state that other policies read,
+        # so only a person adds one; a runner may still cap its sub-agents.
+        if not (body.type == "python" and body.handler in _RUNNER_ADDABLE_HANDLERS):
+            refuse_delegated_credential(request, auth_provider, "change policies")
         if permission_store is not None:
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store

@@ -108,6 +108,15 @@ RUNNER_DELEGATION = "runner"
 _DELEGATION_REFUSED_PREFIXES = ("/auth", "/oauth")
 
 
+def _route_path(request: HTTPConnection) -> str:
+    """Return the path the router matches: the request path below any ASGI ``root_path``."""
+    path = request.scope.get("path") or request.url.path
+    root_path = request.scope.get("root_path") or ""
+    if root_path and path.startswith(root_path + "/"):
+        return path[len(root_path) :]
+    return path
+
+
 def _session_token(request: HTTPConnection, cookie_name: str) -> str | None:
     """Return the session JWT: the cookie for browsers, else a Bearer token for CLIs."""
     token = request.cookies.get(cookie_name)
@@ -672,12 +681,14 @@ class UnifiedAuthProvider(AuthProvider):
 
         Reads the same token :meth:`_check_cookie` authenticates (cookie
         first, then Bearer). A malformed claim still counts as delegated;
-        :meth:`_check_cookie` already refuses such a token.
+        :meth:`_check_cookie` already refuses such a token. Expiry is not
+        checked: a request authenticated before its token expired is still
+        delegated when a route asks later.
 
         :param request: The incoming HTTP request or WebSocket handshake.
         :returns: The delegation, e.g. :data:`RUNNER_DELEGATION`, or
-            ``None`` when the token is undelegated, invalid or absent, or
-            this provider reads identity from a header.
+            ``None`` when the token is undelegated, absent or not signed by
+            this server, or this provider reads identity from a header.
         """
         import jwt
 
@@ -688,7 +699,12 @@ class UnifiedAuthProvider(AuthProvider):
         if token is None:
             return None
         try:
-            payload = jwt.decode(token, cookie_config.cookie_secret, algorithms=["HS256"])
+            payload = jwt.decode(
+                token,
+                cookie_config.cookie_secret,
+                algorithms=["HS256"],
+                options={"verify_exp": False, "verify_nbf": False, "verify_iat": False},
+            )
         except jwt.InvalidTokenError:
             return None
         delegation = payload.get(CREDENTIAL_DELEGATION_CLAIM)
@@ -773,7 +789,7 @@ class UnifiedAuthProvider(AuthProvider):
         delegation = payload.get(CREDENTIAL_DELEGATION_CLAIM)
         if delegation is not None and (
             not isinstance(delegation, str)
-            or _path_under(request.url.path, _DELEGATION_REFUSED_PREFIXES)
+            or _path_under(_route_path(request), _DELEGATION_REFUSED_PREFIXES)
         ):
             return None
 

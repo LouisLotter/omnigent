@@ -274,11 +274,12 @@ class _FakeReq:
         cookies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         path: str = "/v1/sessions",
+        root_path: str = "",
     ) -> None:
         self.cookies = cookies or {}
         self.headers = headers or {}
-        self.url = URL(path)
-        self.scope: dict[str, object] = {}
+        self.url = URL(root_path + path)
+        self.scope: dict[str, object] = {"path": root_path + path, "root_path": root_path}
 
 
 def test_accounts_source_reads_valid_cookie() -> None:
@@ -418,6 +419,33 @@ def test_runner_token_is_delegated_and_a_login_is_not() -> None:
     assert UnifiedAuthProvider(source="header").credential_delegation(runner) is None
 
 
+def test_runner_token_stays_delegated_after_it_expires() -> None:
+    """A request authenticated before expiry is still delegated when a route checks later.
+
+    The accounts middleware authenticates once per request; a route reads
+    the delegation afterwards, possibly after a slow body has let the token
+    expire. Only a token this server did not sign reads as undelegated.
+    """
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    expired = provider.mint_runner_token("alice@example.com", -1)
+    forged = jwt.encode(
+        jwt.decode(expired, options={"verify_signature": False}),
+        secrets.token_bytes(32),
+        algorithm="HS256",
+    )
+
+    assert provider.get_user_id(_FakeReq(headers={"Authorization": f"Bearer {expired}"})) is None
+    assert (
+        provider.credential_delegation(_FakeReq(headers={"Authorization": f"Bearer {expired}"}))
+        == "runner"
+    )
+    assert (
+        provider.credential_delegation(_FakeReq(headers={"Authorization": f"Bearer {forged}"}))
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("path", "allowed"),
     [
@@ -431,14 +459,17 @@ def test_runner_token_is_delegated_and_a_login_is_not() -> None:
         ("/oauth/token", False),
     ],
 )
+@pytest.mark.parametrize("root_path", ["", "/omnigent"])
 @pytest.mark.parametrize("source", ["accounts", "oidc"])
 def test_runner_token_is_not_a_sign_in_for_account_administration(
-    source: str, path: str, allowed: bool
+    source: str, root_path: str, path: str, allowed: bool
 ) -> None:
     """A delegated token authenticates ordinary routes but never ``/auth`` or ``/oauth``.
 
     OIDC mode caches validated tokens, so the token is first used on an
     allowed path: a cached identity must not carry it past the refusal.
+    Under an ASGI ``root_path`` the router matches below the mount, and so
+    does the refusal.
     """
     from tests.server.integration.oidc_fixtures import make_oidc_config
 
@@ -452,7 +483,8 @@ def test_runner_token_is_not_a_sign_in_for_account_administration(
 
     assert provider.get_user_id(_FakeReq(headers=headers)) == "alice@example.com"
     expected = "alice@example.com" if allowed else None
-    assert provider.get_user_id(_FakeReq(headers=headers, path=path)) == expected
+    request = _FakeReq(headers=headers, path=path, root_path=root_path)
+    assert provider.get_user_id(request) == expected
 
 
 def test_malformed_delegation_claim_is_rejected() -> None:
