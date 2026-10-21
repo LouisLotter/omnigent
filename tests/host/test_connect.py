@@ -8079,6 +8079,25 @@ async def test_quiesce_reports_live_runners_launches_and_host_operations(
     assert report == HostQuiesceResultFrame(request_id="q2")
 
 
+async def test_quiesce_counts_a_launch_that_completes_while_it_polls() -> None:
+    """A launch that turns into a runner during the process polls is still reported."""
+    host = _make_host_process()
+    host._pending_runner_launches["runner-next"] = {asyncio.get_running_loop().create_future()}
+    started = SimpleNamespace(proc=SimpleNamespace(poll=lambda: None))
+
+    def exited_while_the_launch_completes() -> int:
+        host._runners["runner-next"] = started  # type: ignore[assignment]
+        host._pending_runner_launches.pop("runner-next")
+        return 0
+
+    host._runners["runner-old"] = SimpleNamespace(  # type: ignore[assignment]
+        proc=SimpleNamespace(poll=exited_while_the_launch_completes)
+    )
+    report = await host._handle_quiesce(HostQuiesceFrame(request_id="q"))
+    assert report.runners == ["runner-next"]
+    assert report.launching == 1
+
+
 async def test_read_only_host_requests_are_not_host_operations() -> None:
     """Reads are safe to cut off, so ``host.quiesce`` does not count them."""
     host = _make_host_process()

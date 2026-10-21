@@ -357,6 +357,8 @@ class HostStore:
                             SqlHost.token_expires_at >= now,
                             SqlHost.sandbox_id.is_not(None),
                             SqlHost.deleted_at.is_(None),
+                            # A sleep in progress has revoked the token.
+                            SqlHost.sleep_operation_id.is_(None),
                         )
                         .values(
                             name=name,
@@ -1558,6 +1560,41 @@ class HostStore:
             )
 
         run_write_transaction(self._session_immediate, "record_host_start_failure", write)
+
+    def retain_orphan_sandbox(
+        self, *, host_id: str, name: str, user_id: str, provider: str, sandbox_id: str
+    ) -> None:
+        """
+        Keep a tombstone for a sandbox whose host was deleted while it was provisioned.
+
+        Written only when removing the new sandbox right away failed, so the
+        managed-sandbox reaper retries its removal like any deleted host's.
+
+        :param host_id: The deleted host's identifier.
+        :param name: Its display name.
+        :param user_id: Its owner.
+        :param provider: Sandbox provider name, e.g. ``"cloudflare"``.
+        :param sandbox_id: The provisioned sandbox awaiting removal.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> None:
+            session.add(
+                SqlHost(
+                    user_id=user_id,
+                    name=name,
+                    host_id=host_id,
+                    status=encode_host_status("offline"),
+                    created_at=now,
+                    updated_at=now,
+                    sandbox_provider=provider,
+                    sandbox_id=sandbox_id,
+                    lifecycle=encode_host_lifecycle("persistent"),
+                    deleted_at=now,
+                )
+            )
+
+        run_write_transaction(self._lifecycle_session, "retain_orphan_sandbox", write)
 
     def list_deleted_persistent_hosts(self, user_id: str) -> list[Host]:
         """

@@ -8,8 +8,8 @@ survive: lost replies, unanswered status reports, slow or refused stops.
 
 :class:`FakeHost` is the host process on that computer: it connects to the
 registry only with a launch token the store accepts, answers ``host.quiesce``
-from its runner and operation lists (and directory listings with an empty
-directory), and reconnects with its current token.
+from its runner and operation lists (and directory listings and plugin
+inventories with empty answers), and reconnects with its current token.
 """
 
 from __future__ import annotations
@@ -23,9 +23,12 @@ from typing import Any, ClassVar
 import click
 
 from omnigent.host.frames import (
+    CAP_PLUGINS,
     CAP_QUIESCE,
     HostHelloFrame,
     HostListDirFrame,
+    HostPluginsFrame,
+    HostPluginsResultFrame,
     HostQuiesceFrame,
     HostQuiesceResultFrame,
     decode_host_frame,
@@ -102,6 +105,7 @@ class FakeComputer(SandboxHostLauncher):
     in_flight: set[str] = field(default_factory=set)
     provision_error: str | None = None
     on_provision: Callable[[], None] | None = None
+    terminate_error: str | None = None
     # The supervisor taking a start's parameters: the host process connects.
     on_host_start: Callable[[str], None] | None = None
 
@@ -234,6 +238,8 @@ class FakeComputer(SandboxHostLauncher):
     def terminate(self, sandbox_id: str) -> None:
         del sandbox_id
         self.events.append("terminate")
+        if self.terminate_error is not None:
+            raise LostReplyError(self.terminate_error)
 
 
 @dataclass
@@ -267,7 +273,7 @@ class FakeHost:
             version="test",
             frame_protocol_version=1,
             name=row.name,
-            capabilities=[CAP_QUIESCE] if self.quiesce else [],
+            capabilities=[CAP_PLUGINS, CAP_QUIESCE] if self.quiesce else [CAP_PLUGINS],
         )
         conn = self.registry.register(
             self.host_id, _FakeWs(), hello, owner=OWNER, registered_with_managed_token=True
@@ -286,6 +292,12 @@ class FakeHost:
             if outbound is None:
                 return
             frame = decode_host_frame(outbound.data)
+            if isinstance(frame, HostPluginsFrame):
+                plugins = conn.pending_plugins.pop(frame.request_id, None)
+                if plugins is not None and not plugins.done():
+                    plugins.set_result(
+                        HostPluginsResultFrame(request_id=frame.request_id, status="ok")
+                    )
             if isinstance(frame, HostListDirFrame):
                 listing = conn.pending_list_dirs.pop(frame.request_id, None)
                 if listing is not None and not listing.done():
@@ -328,3 +340,58 @@ def register_persistent_row(store: HostStore, *, token: str = FIRST_TOKEN) -> No
 def call_soon(loop: asyncio.AbstractEventLoop, callback: Callable[..., Any], *args: Any) -> None:
     """Run *callback* on *loop* from a provider thread, as the supervisor's host would."""
     loop.call_soon_threadsafe(callback, *args)
+
+
+@dataclass
+class FakeUntypedComputer(SandboxHostLauncher):
+    """A persistent sandbox whose provider only answers ``is_running``.
+
+    :ivar running: What ``is_running`` answers; ``None`` is "cannot tell".
+    """
+
+    provider: ClassVar[str] = "fakepersist"
+    can_resume: ClassVar[bool] = True
+
+    running: bool | None = False
+    events: list[str] = field(default_factory=list)
+    on_host_start: Callable[[str], None] | None = None
+
+    def prepare(self) -> None:
+        return None
+
+    def provision(self, name: str) -> str:
+        del name
+        self.events.append("provision")
+        self.running = True  # an exec-model sandbox runs once created
+        return SANDBOX_ID
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        del sandbox_id
+        return self.running
+
+    def resume(self, sandbox_id: str) -> None:
+        del sandbox_id
+        self.events.append("resume")
+        self.running = True
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repos: Sequence[RepoWorkspace] = (),
+        host_config: dict[str, object] | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        del sandbox_id, host_id, host_name, server_url, repos, host_config, on_stage
+        self.events.append("start_host")
+        if self.on_host_start is not None:
+            self.on_host_start(token)
+        return "/root/workspace"
+
+    def terminate(self, sandbox_id: str) -> None:
+        del sandbox_id
+        self.events.append("terminate")

@@ -294,3 +294,13 @@ async def test_every_entry_path_refuses_new_work_with_the_reason(env: _Env, entr
     assert error["code"] == "host_not_admitting"
     assert "the last save is 35 minutes old" in error["message"]
     assert env.host.computer.events == []
+
+
+async def test_inventory_request_wakes_an_asleep_computer(env: _Env) -> None:
+    """Host inventory routes (here, plugins) wake an asleep computer like any host request."""
+    register_persistent_row(env.app.state.host_store)
+    env.host.computer.status = "stopped"
+    response = await env.client.get(f"/v1/hosts/{HOST_ID}/plugins")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"plugins": []}
+    assert env.host.computer.events == ["resume", "claim", "start_host"]

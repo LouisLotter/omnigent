@@ -790,7 +790,7 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
         conn = await ready_host_connection(
-            host, host_registry, operation="model_options", renews_idle=False
+            host.host_id, host, host_registry, operation="model_options", renews_idle=False
         )
         _require_harness_setup_support(conn, "pre-launch model listing")
 
@@ -852,7 +852,7 @@ def create_hosts_router(
             owned = await asyncio.to_thread(
                 resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
             )
-            await ready_host_connection(owned, host_registry, operation="runner_launch")
+            await ready_host_connection(host_id, owned, host_registry, operation="runner_launch")
 
         # Authorize against BOTH the host and the session before
         # spawning anything (see _host_launch for the threat model).
@@ -1337,7 +1337,7 @@ def create_hosts_router(
             )
 
         conn = await ready_host_connection(
-            host, host_registry, operation="list_dir", renews_idle=False
+            host.host_id, host, host_registry, operation="list_dir", renews_idle=False
         )
 
         result = await _proxy_list_dir(
@@ -1427,7 +1427,9 @@ def create_hosts_router(
                 detail="path must be absolute or tilde-prefixed",
             )
 
-        conn = await ready_host_connection(host, host_registry, operation="create_dir")
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="create_dir"
+        )
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1514,7 +1516,9 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
-        conn = await ready_host_connection(host, host_registry, operation="install_harness")
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="install_harness"
+        )
         _require_harness_setup_support(conn, "UI-driven harness installs")
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
@@ -1629,7 +1633,9 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
-        conn = await ready_host_connection(host, host_registry, operation="store_secret")
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="store_secret"
+        )
         _require_harness_setup_support(conn, "storing harness credentials")
 
         frame = HostStoreSecretFrame(
@@ -1710,7 +1716,7 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
 
         conn = await ready_host_connection(
-            host, host_registry, operation="detect_credentials", renews_idle=False
+            host.host_id, host, host_registry, operation="detect_credentials", renews_idle=False
         )
         _require_harness_setup_support(conn, "detecting existing credentials")
 
@@ -1767,7 +1773,7 @@ def create_hosts_router(
             raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
 
         conn = await ready_host_connection(
-            host, host_registry, operation="list_worktrees", renews_idle=False
+            host.host_id, host, host_registry, operation="list_worktrees", renews_idle=False
         )
 
         try:

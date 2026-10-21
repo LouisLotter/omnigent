@@ -1984,3 +1984,23 @@ def test_deleted_persistent_hosts_are_listed_for_removal(host_store: HostStore) 
     assert [host.host_id for host in listed] == [deleted.host_id]
     assert kept.host_id not in {host.host_id for host in listed}
     assert host_store.list_deleted_persistent_hosts("bob@example.com") == []
+
+
+def test_launch_token_registration_is_refused_while_a_sleep_is_pending(
+    host_store: HostStore,
+) -> None:
+    """A handshake that resolved its token before the sleep committed cannot then register."""
+    host = _armed_persistent(host_store, "launch-token")
+    assert host_store.begin_host_sleep(host.host_id, operation_id="op-1")
+    with pytest.raises(ValueError, match="no longer valid"):
+        host_store.upsert_on_connect(
+            host_id=host.host_id,
+            name=host.name,
+            user_id=host.user_id,
+            managed_token="launch-token",
+        )
+    host_store.end_host_sleep(host.host_id, operation_id="op-1", stopped=False)
+    registered = host_store.upsert_on_connect(
+        host_id=host.host_id, name=host.name, user_id=host.user_id, managed_token="launch-token"
+    )
+    assert registered.status == "online"

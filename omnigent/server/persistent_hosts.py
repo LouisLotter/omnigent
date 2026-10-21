@@ -214,11 +214,13 @@ def _lifecycle_lock(host_id: str) -> asyncio.Lock:
 
 
 def forget(host_id: str) -> None:
-    """Drop lifecycle state for a deleted host, cancelling its wake."""
+    """Drop lifecycle state for a deleted host.
+
+    A wake in flight is left to finish: it fails on the deleted row, and a
+    sandbox it was provisioning is removed rather than lost.
+    """
     _connections.pop(host_id, None)
-    state = _states.pop(host_id, None)
-    if state is not None and state.wake_task is not None:
-        state.wake_task.cancel()
+    _states.pop(host_id, None)
 
 
 def manage_url(host: Host) -> str | None:
@@ -412,7 +414,12 @@ async def _until_admitted(
             raise OmnigentError(f"host {host.name!r} is not yours", code=ErrorCode.FORBIDDEN)
         host = current
         if _host_registry.get(host_id) is not None:
-            report = await _admission(host, state)
+            try:
+                report = await asyncio.wait_for(
+                    _admission(host, state), max(deadline - time.monotonic(), 0)
+                )
+            except TimeoutError:
+                report = None
             if report is None:
                 # Unknown is never a refusal: ask again while the work waits.
                 if time.monotonic() >= deadline:
@@ -421,6 +428,8 @@ async def _until_admitted(
                 continue
             if not report.admitting:
                 raise _not_admitting(host, report)
+            if time.monotonic() >= deadline:
+                raise _unavailable(f"{host.name} did not become ready within {timeout_s:.0f}s")
             # No await from here to the grant: a sleep that closed admission
             # while this task awaited is seen, and the loop waits for it.
             if state.admitting.is_set() and _host_registry.get(host_id) is not None:
@@ -480,22 +489,32 @@ async def admit_host_work(host_id: str, operation: str) -> None:
     )
 
 
-async def wake_if_persistent(host_id: str) -> bool:
-    """Wake *host_id* through its lifecycle if it is persistent.
+async def wake_if_persistent(host_id: str, host_store: HostStore) -> bool:
+    """Wake *host_id* through its lifecycle if its row is persistent.
 
     Used by the generic managed-host wake so every wake of a persistent host
-    takes the same single-flight, repair-not-re-arm path.
+    takes the same single-flight, repair-not-re-arm path. The row decides,
+    not the configuration: a persistent host whose provider is no longer
+    configured as persistent is refused, never woken as a disposable sandbox.
 
+    :param host_id: The host to wake.
+    :param host_store: The caller's host store.
     :returns: ``False`` when the host is not persistent (nothing was done).
     :raises OmnigentError: When the wake fails; never ``SandboxGoneError``, so
         no caller can answer it by provisioning a blank sandbox.
     """
-    host = await _persistent_host(host_id)
-    if host is None:
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or not is_persistent_host(host):
         return False
     entry = _entry_for(host)
-    timeout_s = entry.host_online_timeout_s if entry is not None else ADMISSION_WAIT_S
-    await ensure_host_ready(host_id, operation="wake", timeout_s=timeout_s, host=host)
+    if entry is None or not enabled():
+        raise _unavailable(
+            f"{host.name} is a persistent host, but its provider is no longer configured "
+            "for persistent hosts"
+        )
+    await ensure_host_ready(
+        host_id, operation="wake", timeout_s=entry.host_online_timeout_s, host=host
+    )
     return True
 
 
@@ -534,15 +553,20 @@ async def _admission(host: Host, state: _HostLifecycle) -> AdmissionReport | Non
     if state.report is not None and time.time() - state.report_at <= policy.admission_max_age_s:
         return state.report
     try:
-        return await _fresh_report(host, launcher, state)
+        return await _fresh_report(host, launcher, state, max_age_s=policy.admission_max_age_s)
     except SandboxGoneError:
         raise _unavailable(f"{host.name} no longer exists on {host.sandbox_provider}") from None
 
 
 async def _fresh_report(
-    host: Host, launcher: SandboxHostLauncher, state: _HostLifecycle
+    host: Host, launcher: SandboxHostLauncher, state: _HostLifecycle, *, max_age_s: float
 ) -> AdmissionReport | None:
-    """Ask the provider for a new report; ``None`` when it cannot answer."""
+    """Ask the provider for a new report.
+
+    :param max_age_s: Oldest provider reply accepted; an older one is unknown.
+    :returns: The report, or ``None`` when the provider could not answer or
+        answered from a reply that is already too old. Neither is cached.
+    """
     if host.sandbox_id is None:
         return None
     try:
@@ -554,8 +578,11 @@ async def _fresh_report(
         return None
     if report is None:
         return None
-    state.report = report
-    state.report_at = report.observed_at if report.observed_at is not None else time.time()
+    observed_at = report.observed_at if report.observed_at is not None else time.time()
+    if time.time() - observed_at > max_age_s:
+        _logger.warning("admission report for host %s is too old to use", host.host_id)
+        return None
+    state.report, state.report_at = report, observed_at
     return report
 
 
@@ -597,6 +624,15 @@ async def _wake(host_id: str, state: _HostLifecycle, *, provision: bool) -> None
         are recorded on the host, so it shows as failed with the reason.
     """
     assert _host_store is not None and _host_registry is not None
+    pending = await asyncio.to_thread(_host_store.get_host, host_id)
+    if pending is None:
+        raise _unavailable(f"host {host_id} no longer exists")
+    pending_entry = _entry_for(pending)
+    online_wait_s = (
+        pending_entry.host_online_timeout_s if pending_entry is not None else ADMISSION_WAIT_S
+    )
+    # A sleep whose outcome is unknown resolves before anything is resumed or re-armed.
+    await _wait_admitting(state, pending, time.monotonic() + online_wait_s)
     async with _lifecycle_lock(host_id):
         if _host_registry.get(host_id) is not None:
             return
@@ -650,8 +686,14 @@ async def _provision(
 ) -> Host | None:
     """Provision the sandbox for a pending persistent host.
 
+    The provider is asked under the host's stable name
+    (:func:`~omnigent.server.managed_hosts.managed_host_name`), so a provider
+    that provisions idempotently by name returns the same sandbox when a start
+    is retried after a crash between its reply and the row update.
+
     :returns: The host with its sandbox recorded, or ``None`` when the host
-        was deleted meanwhile (its new sandbox is then removed).
+        was deleted meanwhile; its new sandbox is then removed, and kept as a
+        tombstone the reaper retries if that removal fails.
     """
     assert _host_store is not None
     state.publish("provisioning")
@@ -661,10 +703,16 @@ async def _provision(
     attached = await asyncio.to_thread(
         _host_store.attach_persistent_sandbox, host.host_id, sandbox_id=sandbox_id
     )
-    if attached is None:
-        # Deleted during provisioning: removing the new sandbox completes that deletion.
-        await _terminate_sandbox_best_effort(
-            launcher, sandbox_id, host_id=host.host_id, provider=launcher.provider
+    if attached is None and not await _terminate_sandbox_best_effort(
+        launcher, sandbox_id, host_id=host.host_id, provider=launcher.provider
+    ):
+        await asyncio.to_thread(
+            _host_store.retain_orphan_sandbox,
+            host_id=host.host_id,
+            name=host.name,
+            user_id=host.user_id,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
         )
     return attached
 
@@ -713,19 +761,31 @@ async def _bring_up_untyped(
 ) -> None:
     """Wake through ``is_running`` for a provider without a typed status.
 
-    A running sandbox is repaired, never re-armed: its host reconnects with
-    its current token. Only a stopped sandbox is resumed and started anew.
+    A running sandbox whose host was started before is repaired, never
+    re-armed: its host reconnects with its current token. A stopped sandbox
+    is resumed and started anew, as is a running one whose host never started
+    (its first start). An unknown status (``None``) is asked again within the
+    deadline, never taken as stopped.
     """
     assert host.sandbox_id is not None
-    if await asyncio.to_thread(launcher.is_running, host.sandbox_id):
+    while (running := await asyncio.to_thread(launcher.is_running, host.sandbox_id)) is None:
+        if await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S):
+            return
+        if time.monotonic() >= deadline:
+            raise _unavailable(f"{host.name}: computer status unknown; try again shortly")
+    if running and host.token_expires_at is not None:
         _logger.info("Host %s sandbox is running; waiting for it to reconnect", host.host_id)
         state.publish("connecting")
         if not await _await_online(host.host_id, deadline):
             raise _unavailable(f"{host.name} is running but did not reconnect")
         return
-    state.publish("provisioning")
-    await _call_launcher(host, launcher.resume, host.sandbox_id)
-    await _arm_and_start(host, launcher, entry, state, attempt=None)
+    if not running:
+        state.publish("provisioning")
+        await _call_launcher(host, launcher.resume, host.sandbox_id)
+    claim = await _claim_start(host, launcher, uuid.uuid4().hex, deadline)
+    if claim.granted:
+        current = await asyncio.to_thread(_require_host, host.host_id)
+        await _arm_and_start(current, launcher, entry, state, attempt=claim.attempt)
     if not await _await_online(host.host_id, deadline):
         raise _unavailable(
             f"{host.name} did not come online within {entry.host_online_timeout_s:g}s"
@@ -754,6 +814,8 @@ async def _bring_up_typed(
         if launcher.capabilities.start_claims
         else ("start_claimed", "started_no_host")
     )
+    assert entry.persistent is not None
+    max_age_s = entry.persistent.admission_max_age_s
     claim_operation = uuid.uuid4().hex
     started_at: float | None = None
     start_delivered = False
@@ -764,7 +826,7 @@ async def _bring_up_typed(
             raise _unavailable(
                 f"{host.name} did not come online within {entry.host_online_timeout_s:g}s"
             )
-        report = await _fresh_report(host, launcher, state)
+        report = await _fresh_report(host, launcher, state, max_age_s=max_age_s)
         status = report.status if report is not None else None
         if status is None or status in ("host_running", "stopping"):
             # Unknown, a live host reconnecting, or a stop in progress: wait.

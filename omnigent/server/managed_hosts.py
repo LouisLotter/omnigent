@@ -4245,7 +4245,7 @@ async def resume_managed_host(
     from omnigent.server import persistent_hosts
 
     # A persistent host wakes through its lifecycle, which never re-arms a live one.
-    if await persistent_hosts.wake_if_persistent(host_id):
+    if await persistent_hosts.wake_if_persistent(host_id, host_store):
         return
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.

@@ -26,7 +26,7 @@ from omnigent.server.auth import LEVEL_OWNER, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import ready_host_connection, resolve_host_owner
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
@@ -505,7 +505,7 @@ def create_imports_router(
             item_count=len(items),
         )
 
-    def _resolve_import_target(
+    async def _resolve_import_target(
         request: Request, body: LocalImportRequest
     ) -> tuple[str | None, HostConnection]:
         """Validate a host-mediated import and return ``(user_id, host_conn)``.
@@ -522,13 +522,15 @@ def create_imports_router(
             )
         user_id = require_user(request, auth_provider)
         # Owns-host check + live connection, mirroring the runner-launch path.
-        host = resolve_host_owner(user_id=user_id, host_id=body.host_id, host_store=host_store)
-        host_conn = host_registry.get(body.host_id)
-        if host_conn is None:
-            # A live host absent from THIS replica is a wrong-replica landing, not
-            # an offline host: WRONG_REPLICA (400) so the client re-addresses
-            # keyless, CONFLICT (409) only when the row is genuinely stale.
-            raise host_absent_error(host)
+        host = await asyncio.to_thread(
+            resolve_host_owner, user_id=user_id, host_id=body.host_id, host_store=host_store
+        )
+        # A live host absent from THIS replica is a wrong-replica landing, not
+        # an offline host: WRONG_REPLICA (400) so the client re-addresses
+        # keyless, CONFLICT (409) only when the row is genuinely stale.
+        host_conn = await ready_host_connection(
+            body.host_id, host, host_registry, operation="import_local", renews_idle=False
+        )
         return user_id, host_conn
 
     async def _import_local_core(
@@ -687,7 +689,7 @@ def create_imports_router(
         mid-stream this raises after the sessions read so far are already
         committed; a retry is idempotent (they come back as already-imported).
         """
-        user_id, host_conn = _resolve_import_target(request, body)
+        user_id, host_conn = await _resolve_import_target(request, body)
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
@@ -739,7 +741,7 @@ def create_imports_router(
         retry is idempotent). Request validation still fails ahead of the stream
         with the usual HTTP error.
         """
-        user_id, host_conn = _resolve_import_target(request, body)
+        user_id, host_conn = await _resolve_import_target(request, body)
 
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}

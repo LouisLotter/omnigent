@@ -2499,17 +2499,25 @@ class HostProcess:
         """Report live runners, runner launches and mutating host operations.
 
         The persistent-host sleep fence asks this before the sandbox stops,
-        because stopping the host ends every runner and operation on it.
+        because stopping the host ends every runner and operation on it. The
+        process polls await, so launches and operations are read both before
+        and after them, and a runner registered meanwhile counts as live.
         """
+        launching = len(self._pending_runner_launches)
+        operations = set(self._host_operations)
+        polled = list(self._runners.items())
         live = []
-        for runner_id, handle in list(self._runners.items()):
+        for runner_id, handle in polled:
             if await asyncio.to_thread(handle.proc.poll) is None:
                 live.append(runner_id)
+        seen = {runner_id for runner_id, _handle in polled}
+        live.extend(runner_id for runner_id in list(self._runners) if runner_id not in seen)
+        operations.update(self._host_operations)
         return HostQuiesceResultFrame(
             request_id=frame.request_id,
             runners=live,
-            launching=len(self._pending_runner_launches),
-            operations=sorted(self._host_operations.elements()),
+            launching=max(launching, len(self._pending_runner_launches)),
+            operations=sorted(operations),
         )
 
     @contextlib.contextmanager

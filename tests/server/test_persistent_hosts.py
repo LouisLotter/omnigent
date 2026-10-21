@@ -40,6 +40,7 @@ from tests.server.persistent_host_fakes import (
     SANDBOX_ID,
     FakeComputer,
     FakeHost,
+    FakeUntypedComputer,
     call_soon,
     register_persistent_row,
 )
@@ -214,14 +215,15 @@ async def test_operation_longer_than_any_lease_keeps_the_host_awake(
     host: FakeHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An admitted operation blocks sleep for as long as it runs, not for a fixed lease."""
-    release = asyncio.Event()
+    admitted, release = asyncio.Event(), asyncio.Event()
 
     async def long_install() -> None:
         await persistent_hosts.admit_host_work(HOST_ID, "harness_install")
+        admitted.set()
         await release.wait()
 
     install = asyncio.create_task(long_install())
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(admitted.wait(), 5)
     clock = persistent_hosts.time.monotonic
     monkeypatch.setattr(persistent_hosts.time, "monotonic", lambda: clock() + 3600)
     outcomes = await persistent_hosts.PersistentHostIdleMonitor().sweep_once()
@@ -697,15 +699,16 @@ async def test_drop_around_an_admitted_launch_neither_rearms_nor_sleeps(
     waking a second one, and no sleep runs while the operation is admitted.
     """
     monkeypatch.setattr(persistent_hosts, "FENCE_DRAIN_S", 0.3)
-    continue_launch = asyncio.Event()
+    admitted, continue_launch = asyncio.Event(), asyncio.Event()
 
     async def message_then_launch() -> None:
         await persistent_hosts.ensure_host_ready(HOST_ID, operation="message", timeout_s=5)
+        admitted.set()
         await continue_launch.wait()
         await persistent_hosts.admit_host_work(HOST_ID, "runner_launch")
 
     turn = asyncio.create_task(message_then_launch())
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(admitted.wait(), 5)
     host.drop()
     assert await persistent_hosts.sleep_if_idle(HOST_ID) == "abandoned"
     continue_launch.set()
@@ -796,9 +799,9 @@ async def test_cached_status_never_authorizes_a_rearm(
 def _first_then_real(first: AdmissionReport, real: Callable[..., Any]) -> Callable[..., Any]:
     calls = {"n": 0}
 
-    async def report(*args: Any) -> AdmissionReport | None:
+    async def report(*args: Any, **kwargs: Any) -> AdmissionReport | None:
         calls["n"] += 1
-        return first if calls["n"] == 1 else await real(*args)
+        return first if calls["n"] == 1 else await real(*args, **kwargs)
 
     return report
 
@@ -882,6 +885,133 @@ async def test_report_age_counts_from_the_provider_reply(
     await asyncio.sleep(1.1)
     await asyncio.create_task(_ready("message")())
     assert calls["n"] == 2
+
+
+async def test_admission_answer_after_the_deadline_admits_nothing(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow provider answer that arrives after the request's deadline admits nothing."""
+    real = host.computer.admission
+
+    def slow_admission(sandbox_id: str) -> AdmissionReport | None:
+        threading.Event().wait(0.5)
+        return real(sandbox_id)
+
+    monkeypatch.setattr(host.computer, "admission", slow_admission)
+    with pytest.raises(OmnigentError) as raised:
+        await asyncio.create_task(_ready("message", timeout_s=0.1)())
+    assert raised.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert persistent_hosts._states[HOST_ID].admitted() == []
+
+
+@pytest.mark.parametrize("admitting", [True, False])
+async def test_report_already_too_old_on_arrival_is_unknown(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch, admitting: bool
+) -> None:
+    """A launcher answering from a stale cached reply neither admits nor refuses."""
+    policy = dataclasses.replace(
+        persistent_hosts.policy_for(host.store.get_host(HOST_ID)), admission_max_age_s=60
+    )
+    monkeypatch.setattr(persistent_hosts, "policy_for", lambda _host: policy)
+    host.computer.admitting = admitting
+    real = host.computer.admission
+
+    def stale_reply(sandbox_id: str) -> AdmissionReport | None:
+        report = real(sandbox_id)
+        assert report is not None
+        return dataclasses.replace(report, observed_at=persistent_hosts.time.time() - 600)
+
+    monkeypatch.setattr(host.computer, "admission", stale_reply)
+    with pytest.raises(OmnigentError) as raised:
+        await asyncio.create_task(_ready("message", timeout_s=0.3)())
+    assert raised.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert "computer status unknown" in str(raised.value)
+    assert persistent_hosts._states[HOST_ID].report is None
+
+
+async def test_start_again_waits_for_an_unknown_sleep_to_resolve(host: FakeHost) -> None:
+    """An explicit start never resumes or re-arms before a pending sleep reports."""
+    host.computer.suspend_gate = threading.Event()
+    fence = asyncio.create_task(persistent_hosts.sleep_if_idle(HOST_ID))
+    await asyncio.to_thread(host.computer.suspend_accepted.wait, 10)
+    fence.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await fence
+    start = persistent_hosts.start_host_now(HOST_ID)
+    await asyncio.sleep(0.3)
+    assert host.computer.events == ["suspend"]
+    host.computer.suspend_gate.set()
+    await asyncio.wait_for(start, 10)
+    assert host.computer.events == ["suspend", "stopped", "resume", "claim", "start_host"]
+    assert host.registry.get(HOST_ID) is not None
+
+
+# ── Providers without a typed status ───────────────────────────────────
+
+
+@pytest.fixture
+async def untyped(db_uri: str) -> AsyncIterator[tuple[FakeHost, FakeUntypedComputer]]:
+    """A persistent host on a provider that only answers ``is_running``."""
+    store, registry = HostStore(db_uri), HostRegistry()
+    computer = FakeUntypedComputer()
+    fake = FakeHost(store, registry, FakeComputer())
+    loop = asyncio.get_running_loop()
+    computer.on_host_start = lambda token: call_soon(loop, fake.connect, token)
+    persistent_hosts._states.clear()
+    persistent_hosts.configure(
+        store,
+        registry,
+        ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="http://omnigent.test",
+                launcher_factory=lambda: computer,
+                token_ttl_s=3600,
+                provider=computer.provider,
+                persistent=PersistentHostPolicy(),
+                online_timeout_s=2,
+            )
+        ),
+    )
+    yield fake, computer
+    fake.close()
+    persistent_hosts.configure(None, None, None)
+    persistent_hosts._states.clear()
+
+
+async def test_untyped_unknown_status_is_never_taken_as_stopped(
+    untyped: tuple[FakeHost, FakeUntypedComputer],
+) -> None:
+    """``is_running() is None`` holds the wake; nothing is resumed or re-armed."""
+    fake, computer = untyped
+    register_persistent_row(fake.store)
+    computer.running = None
+    with pytest.raises(OmnigentError) as raised:
+        await persistent_hosts.ensure_host_ready(HOST_ID, operation="message", timeout_s=5)
+    assert "computer status unknown" in str(raised.value)
+    assert computer.events == []
+    assert fake.store.resolve_launch_token(HOST_ID, FIRST_TOKEN) is not None
+
+
+async def test_untyped_running_host_is_repaired_and_a_first_start_is_started(
+    untyped: tuple[FakeHost, FakeUntypedComputer],
+) -> None:
+    """A running sandbox with an armed host is only waited for; a fresh one is started."""
+    fake, computer = untyped
+    created = await persistent_hosts.create_host(owner=OWNER, name="Computer", provider=None)
+    fake.host_id = created.host_id
+    await asyncio.wait_for(persistent_hosts.start_host_now(created.host_id), 5)
+    assert computer.events == ["provision", "start_host"]
+    computer.events.clear()
+    first_token = fake.token
+    fake.drop()
+    request = asyncio.create_task(
+        persistent_hosts.ensure_host_ready(created.host_id, operation="message", timeout_s=5)
+    )
+    await asyncio.sleep(0.2)
+    assert fake.connect()  # the live host reconnects on its own
+    await asyncio.wait_for(request, 5)
+    assert computer.events == []
+    assert fake.token == first_token
 
 
 # ── Lifecycle: create, failure, removal ────────────────────────────────
@@ -989,6 +1119,51 @@ async def test_host_deleted_during_provisioning_removes_the_new_sandbox(
     fresh.computer.on_provision = delete_meanwhile
     await _created(fresh)
     assert fresh.computer.events == ["provision", "terminate"]
+
+
+@pytest.mark.parametrize("removal_fails", [False, True])
+async def test_deleting_while_provisioning_still_removes_the_new_sandbox(
+    fresh: FakeHost, removal_fails: bool
+) -> None:
+    """The public delete path during a paused provision never loses the sandbox.
+
+    The provision finishes, finds the host gone and removes its sandbox; when
+    that removal fails, a tombstone keeps the sandbox for the reaper to retry.
+    """
+    provisioning, release = threading.Event(), threading.Event()
+
+    def pause() -> None:
+        provisioning.set()
+        release.wait(10)
+
+    fresh.computer.on_provision = pause
+    fresh.computer.terminate_error = "provider unreachable" if removal_fails else None
+    created = await persistent_hosts.create_host(owner=OWNER, name="Doomed", provider=None)
+    task = persistent_hosts._states[created.host_id].wake_task
+    assert task is not None
+    assert await asyncio.to_thread(provisioning.wait, 10)
+    await persistent_hosts.delete_host(created)
+    release.set()
+    with contextlib.suppress(OmnigentError):
+        await asyncio.wait_for(task, 10)
+    assert fresh.computer.events == ["provision", "terminate"]
+    leftovers = fresh.store.list_deleted_persistent_hosts(OWNER)
+    assert [row.sandbox_id for row in leftovers] == ([SANDBOX_ID] if removal_fails else [])
+
+
+async def test_removed_persistent_policy_never_wakes_the_host_as_disposable(
+    host: FakeHost,
+) -> None:
+    """A persistent row whose provider lost its persistent policy is refused, not re-armed."""
+    await _asleep(host)
+    plain = ManagedSandboxDeployment.single(
+        dataclasses.replace(persistent_hosts._deployment.configs[0], persistent=None)
+    )
+    persistent_hosts.configure(host.store, host.registry, plain)
+    with pytest.raises(OmnigentError) as raised:
+        await resume_managed_host(HOST_ID, host.store, plain, force=True)
+    assert "no longer configured" in str(raised.value)
+    assert host.computer.events == []
 
 
 async def test_sandbox_gone_marks_the_host_failed_and_never_provisions(host: FakeHost) -> None:
