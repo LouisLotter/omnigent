@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 import httpx
 import jwt
 
+from omnigent.server.auth import CREDENTIAL_DELEGATION_CLAIM
+
 _logger = logging.getLogger(__name__)
 
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
@@ -59,6 +61,7 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    delegated: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -77,6 +80,8 @@ def mint_session_token(
         ``"accounts"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback,
         never included in runner, refresh, or CLI-issued credentials.
+    :param delegated: Who the token is handed to on the user's behalf, e.g.
+        ``"runner"``; ``None`` for the user's own sign-in.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -90,6 +95,8 @@ def mint_session_token(
         payload["account_generation"] = account_generation
     if cli_login_ticket is not None:
         payload["cli_login_ticket"] = cli_login_ticket
+    if delegated is not None:
+        payload[CREDENTIAL_DELEGATION_CLAIM] = delegated
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 

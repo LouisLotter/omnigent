@@ -28,8 +28,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import URL
 
 from omnigent.server.accounts_bootstrap import (
     bootstrap_admin,
@@ -271,9 +273,11 @@ class _FakeReq:
         *,
         cookies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        path: str = "/v1/sessions",
     ) -> None:
         self.cookies = cookies or {}
         self.headers = headers or {}
+        self.url = URL(path)
         self.scope: dict[str, object] = {}
 
 
@@ -382,6 +386,95 @@ def test_mint_runner_token_round_trips_to_owner() -> None:
 
     request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
     assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_runner_token_is_delegated_and_a_login_is_not() -> None:
+    """A minted runner token carries the runner delegation; a login cookie does not."""
+    from omnigent.server.oidc import mint_session_cookie
+
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    runner_token = provider.mint_runner_token("alice@example.com", 1800)
+    assert runner_token is not None
+    assert jwt.decode(runner_token, options={"verify_signature": False})["delegated"] == "runner"
+    login = mint_session_cookie(
+        user_id="alice@example.com",
+        cookie_secret=_TEST_COOKIE_SECRET,
+        ttl_hours=8,
+        provider="accounts",
+    )
+
+    runner = _FakeReq(headers={"Authorization": f"Bearer {runner_token}"})
+    browser = _FakeReq(cookies={cfg.session_cookie_name: login})
+    assert provider.credential_delegation(runner) == "runner"
+    assert provider.credential_delegation(browser) is None
+    assert provider.credential_delegation(_FakeReq()) is None
+    # The browser's cookie wins over a runner bearer on the same request.
+    both = _FakeReq(
+        cookies={cfg.session_cookie_name: login},
+        headers={"Authorization": f"Bearer {runner_token}"},
+    )
+    assert provider.credential_delegation(both) is None
+    assert UnifiedAuthProvider(source="header").credential_delegation(runner) is None
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed"),
+    [
+        ("/v1/sessions/conv_1/events", True),
+        ("/v1/runners/runner_1/status", True),
+        ("/authority", True),
+        ("/auth/me", False),
+        ("/auth/users/alice", False),
+        ("/auth/cli-approve", False),
+        ("/oauth/device/approve", False),
+        ("/oauth/token", False),
+    ],
+)
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_runner_token_is_not_a_sign_in_for_account_administration(
+    source: str, path: str, allowed: bool
+) -> None:
+    """A delegated token authenticates ordinary routes but never ``/auth`` or ``/oauth``.
+
+    OIDC mode caches validated tokens, so the token is first used on an
+    allowed path: a cached identity must not carry it past the refusal.
+    """
+    from tests.server.integration.oidc_fixtures import make_oidc_config
+
+    provider = (
+        UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+        if source == "accounts"
+        else UnifiedAuthProvider(source="oidc", oidc_config=make_oidc_config())
+    )
+    token = provider.mint_runner_token("alice@example.com", 1800)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert provider.get_user_id(_FakeReq(headers=headers)) == "alice@example.com"
+    expected = "alice@example.com" if allowed else None
+    assert provider.get_user_id(_FakeReq(headers=headers, path=path)) == expected
+
+
+def test_malformed_delegation_claim_is_rejected() -> None:
+    """A token whose delegation claim is not a string authenticates nowhere."""
+    from omnigent.server.oidc import mint_session_token
+
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    token = jwt.encode(
+        {
+            **jwt.decode(
+                mint_session_token("alice@example.com", _TEST_COOKIE_SECRET, 1800, "accounts"),
+                options={"verify_signature": False},
+            ),
+            "delegated": ["runner"],
+        },
+        _TEST_COOKIE_SECRET,
+        algorithm="HS256",
+    )
+    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    assert provider.get_user_id(request) is None
+    assert provider.credential_delegation(request) == "['runner']"
 
 
 def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
