@@ -21,6 +21,12 @@ RUNNER_INCARNATION_LABEL_KEY = "omnigent.runner_incarnation"
 # continued, by any runner.
 LAST_TASK_ERROR_CODE_LABEL_KEY = "omnigent.last_task_error_code"
 INTERRUPTED_OUTCOME_UNKNOWN_CODE = "interrupted_outcome_unknown"
+# The same work once the unanswered call's result arrived: its outcome is known,
+# but the turn was still not continued.
+INTERRUPTED_OUTCOME_KNOWN_CODE = "interrupted_outcome_known"
+INTERRUPTED_WORK_CODES = frozenset(
+    {INTERRUPTED_OUTCOME_UNKNOWN_CODE, INTERRUPTED_OUTCOME_KNOWN_CODE}
+)
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -160,15 +166,15 @@ def automatic_continuation_allowed(
         history holds an assistant reply or a tool call. ``False`` only for work
         nothing has started yet, such as a new session's seeded first message.
     :returns: ``False`` when another or an unknown incarnation did the work, or
-        the session still carries an unknown outcome, and the person did not
-        ask to continue.
+        the session still carries interrupted work, and the person did not ask
+        to continue.
     """
     if envelope is None:
         return True
     if envelope.continuation_requested:
         return True
     labels = envelope.snapshot.labels
-    if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == INTERRUPTED_OUTCOME_UNKNOWN_CODE:
+    if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) in INTERRUPTED_WORK_CODES:
         return False
     holder = labels.get(RUNNER_INCARNATION_LABEL_KEY)
     if not holder:

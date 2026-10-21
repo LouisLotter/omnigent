@@ -65,6 +65,14 @@ CAP_MCP_TOOLS = "mcp_tools"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host answers ``host.quiesce`` with its live runners and host operations:
 CAP_QUIESCE = "quiesce"
+# The host keeps the result of each host-changing request, by ``request_id``, for
+# :data:`OPERATION_RECORD_RETENTION_S`, and answers a repeat with it instead of
+# acting again. ``HostHelloFrame.incarnation`` names the process that keeps them.
+CAP_OPERATION_RECORDS = "operation_records"
+
+# How long a host keeps a finished operation's result: longer than any server
+# wait for one (the launch budget's ceiling is an hour).
+OPERATION_RECORD_RETENTION_S = 2 * 3600.0
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -77,6 +85,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
     CAP_QUIESCE,
+    CAP_OPERATION_RECORDS,
 ]
 
 
@@ -219,6 +228,8 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
+    :param incarnation: Random identifier of this host process, the same on
+        each of its reconnects and new after a restart. Absent from older hosts.
     """
 
     version: str
@@ -232,6 +243,7 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    incarnation: str | None = None
 
 
 @dataclass
@@ -417,10 +429,14 @@ class HostRunnerStatusResultFrame:
         * ``"sign_in_pending"`` — this live, unconnected runner is waiting
           within its bounded host sign-in window. Keep the original input.
         * ``"dead"`` — the host has this runner but its process has
-          exited. It will never connect; relaunch now.
-        * ``"unknown"`` — the host has no record of this runner (it was
-          stopped, or a fresh post-restart host never spawned it).
-          Relaunch now.
+          exited, or this host process received its launch and no longer
+          tracks it (reaped, stopped or refused). It will never connect;
+          relaunch now.
+        * ``"unknown"`` — the host has no record of this runner (an older
+          host that stopped it, or a fresh post-restart host never spawned
+          it). Relaunch now. From the host process the launch was sent to,
+          within :data:`OPERATION_RECORD_RETENTION_S`, it means that process
+          never received the launch.
     """
 
     request_id: str
@@ -1413,6 +1429,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "incarnation": frame.incarnation,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2325,6 +2342,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        incarnation=_optional_nullable_str(msg, "incarnation"),
     )
 
 

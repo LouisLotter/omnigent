@@ -247,6 +247,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
         resp = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": _WORKSPACE})
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["session_id"]
+    assert resp.json()["runner_launch"] == "started"
     accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
     assert float(accepted["attributes"]["create_acl_ms"]) >= 0
 
@@ -285,6 +286,7 @@ async def test_multipart_create_launch_failure_keeps_binding(
         agent_name="bundle-host-launchfail-agent",
     )
     assert resp.status_code == 201, resp.text
+    assert resp.json()["runner_launch"] == "failed"
     conv = conv_store.get_conversation(resp.json()["session_id"])
     assert conv is not None
     assert conv.host_id == _HOST_ID

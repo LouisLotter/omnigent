@@ -75,16 +75,19 @@ def test_legacy_body_keeps_its_behaviour() -> None:
     assert automatic_continuation_allowed(None, "me") is True
 
 
-def test_an_unknown_outcome_blocks_continuation_until_the_person_asks() -> None:
-    """Even the runner now holding the session never continues work left unknown."""
+@pytest.mark.parametrize("code", ["interrupted_outcome_unknown", "interrupted_outcome_known"])
+def test_interrupted_work_blocks_continuation_until_the_person_asks(code: str) -> None:
+    """Even the runner now holding the session never continues interrupted work,
+    whether or not the unanswered call's result arrived later."""
     from omnigent.runner.session_init_protocol import (
-        INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+        INTERRUPTED_WORK_CODES,
         LAST_TASK_ERROR_CODE_LABEL_KEY,
     )
 
+    assert code in INTERRUPTED_WORK_CODES
     labels = {
         RUNNER_INCARNATION_LABEL_KEY: "me",
-        LAST_TASK_ERROR_CODE_LABEL_KEY: INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+        LAST_TASK_ERROR_CODE_LABEL_KEY: code,
     }
     assert automatic_continuation_allowed(_envelope(labels), "me") is False
     assert (

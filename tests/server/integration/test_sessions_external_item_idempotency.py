@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.runtime import pending_inputs
 from tests.server.helpers import create_test_agent
@@ -185,3 +186,41 @@ def test_client_cannot_smuggle_a_stable_id() -> None:
         },
     )
     assert _build_new_item(body, "resp").stable_id is None
+
+
+async def test_item_answer_waits_until_its_write_is_durable(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    """An unconfirmed write is not acknowledged; the forwarder's retry is, once durable."""
+    session_id = await _create_session(client, "idem-durable")
+    answers = [False, True]
+
+    async def barrier() -> bool:
+        return answers.pop(0)
+
+    app.state.durability_barrier = barrier
+    data = {
+        "item_type": "message",
+        "item_data": {
+            "role": "assistant",
+            "agent": "worker",
+            "content": [{"type": "output_text", "text": "durable once"}],
+        },
+        "response_id": "resp_codex_echo",
+        "source_id": "rec-durable:0:message",
+    }
+    try:
+        unconfirmed = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "external_conversation_item", "data": data},
+        )
+        assert unconfirmed.status_code == 503, unconfirmed.text
+        assert unconfirmed.json()["error"]["code"] == "durability_unconfirmed"
+        retried = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "external_conversation_item", "data": data},
+        )
+        assert retried.status_code == 202, retried.text
+    finally:
+        app.state.durability_barrier = None
+    assert await _message_texts(client, session_id) == ["durable once"]

@@ -132,6 +132,7 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
+from omnigent.host.operation_records import HostOperationRecords
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
@@ -518,6 +519,15 @@ _MUTATING_HOST_OPERATIONS: dict[type, str] = {
     HostRemoveWorktreeFrame: "remove_worktree",
     HostFsWriteFrame: "fs_write",
 }
+
+
+def _operation_request_id(frame: object) -> str | None:
+    """Return the ``request_id`` of a host-changing request, else ``None``."""
+    if type(frame) is not HostLaunchRunnerFrame and type(frame) not in _MUTATING_HOST_OPERATIONS:
+        return None
+    request_id = getattr(frame, "request_id", None)
+    return request_id if isinstance(request_id, str) and request_id else None
+
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -1236,6 +1246,8 @@ class HostProcess:
             self._interactive_shells = ["bash"]
         self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
+        # Outcomes of host-changing requests, so a repeat after a drop is not run again.
+        self._operation_records = HostOperationRecords()
         from omnigent.host.skills import HostSkillDiscovery
 
         self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
@@ -2469,9 +2481,10 @@ class HostProcess:
         status queries remain independent.
 
         A tracked running process is ``alive`` (booting or serving), an
-        exited process is ``dead``, and an untracked runner with no pending
-        launch is ``unknown``. The server can recover promptly in the latter
-        two cases.
+        exited process is ``dead``, and so is an untracked runner whose launch
+        this process received: it exited and was reaped, was stopped, or was
+        refused. Any other untracked runner is ``unknown``. The server can
+        recover promptly in the latter two cases.
 
         :param frame: The status query frame.
         :returns: Liveness, or ``sign_in_pending`` for an exact bounded startup wait.
@@ -2481,7 +2494,9 @@ class HostProcess:
             await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
         if handle is None:
-            status = "unknown"
+            status = (
+                "dead" if self._operation_records.received_launch(frame.runner_id) else "unknown"
+            )
         else:
             # poll() is a lock-free waitpid for a direct-Popen runner, but a
             # blocking control-socket round-trip (bounded only by the 30s
@@ -4836,6 +4851,7 @@ class HostProcess:
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
+            incarnation=self._operation_records.incarnation,
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -5090,6 +5106,10 @@ class HostProcess:
     ) -> None:
         """Handle a decoded host frame and send its result back.
 
+        A host-changing request is recorded before its handler's first await.
+        A repeat of one already received is answered with the recorded result,
+        once it is known, and not carried out again.
+
         :param ws: The open tunnel connection, used to send the result.
         :param frame: A decoded host frame (one of the
             ``Host*Frame`` request types); unrecognized frame types are
@@ -5100,6 +5120,43 @@ class HostProcess:
             # Defensive for direct callers; production handles this inline in
             # _serve_frames so detached request tasks cannot swallow it.
             self._raise_connection_error(frame)
+        request_id = _operation_request_id(frame)
+        if request_id is None:
+            await self._handle_host_frame(ws, frame)
+            return
+        runner_id = (
+            token_bound_runner_id(frame.binding_token)
+            if isinstance(frame, HostLaunchRunnerFrame) and frame.binding_token.strip()
+            else None
+        )
+        earlier = self._operation_records.claim(request_id, runner_id=runner_id)
+        if earlier is not None:
+            recorded = await asyncio.shield(earlier)
+            if recorded is not None:
+                await self._send_text(ws, recorded)
+            return
+        try:
+            await self._handle_host_frame(ws, frame)
+        finally:
+            # A handler that ended without answering leaves the outcome unknown.
+            self._operation_records.finish(request_id, None)
+
+    async def _send_operation_result(
+        self, ws: websockets.asyncio.client.ClientConnection, result: HostFrame
+    ) -> None:
+        """Record a host-changing request's result, then send it."""
+        text = encode_host_frame(result)
+        request_id = getattr(result, "request_id", None)
+        if isinstance(request_id, str):
+            self._operation_records.finish(request_id, text)
+        await self._send_text(ws, text)
+
+    async def _handle_host_frame(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        frame: object,
+    ) -> None:
+        """Run the handler for one decoded host frame and send its result."""
         if isinstance(frame, HostLaunchRunnerFrame):
             completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             if frame.binding_token.strip():
@@ -5113,11 +5170,11 @@ class HostProcess:
                     launch_result = await self._handle_launch(frame)
             finally:
                 completion.set_result(None)
-            await self._send_text(ws, encode_host_frame(launch_result))
+            await self._send_operation_result(ws, launch_result)
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)
-            await self._send_text(ws, encode_host_frame(stop_result))
+            await self._send_operation_result(ws, stop_result)
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostQuiesceFrame):
@@ -5127,7 +5184,7 @@ class HostProcess:
         elif isinstance(frame, HostListDirFrame):
             await self._send_text(ws, encode_host_frame(self._handle_list_dir(frame)))
         elif isinstance(frame, HostCreateDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
+            await self._send_operation_result(ws, self._handle_create_dir(frame))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
@@ -5137,7 +5194,7 @@ class HostProcess:
                     install_result.configured_harnesses,
                     install_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(install_result))
+            await self._send_operation_result(ws, install_result)
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
@@ -5147,16 +5204,16 @@ class HostProcess:
                     secret_result.configured_harnesses,
                     secret_result.gateway_inference,
                 )
-            await self._send_text(ws, encode_host_frame(secret_result))
+            await self._send_operation_result(ws, secret_result)
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
             # off the event loop.
             credentials_result = await asyncio.to_thread(self._handle_detect_credentials, frame)
             await self._send_text(ws, encode_host_frame(credentials_result))
         elif isinstance(frame, HostCreateWorktreeFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_create_worktree(frame)))
+            await self._send_operation_result(ws, await self._handle_create_worktree(frame))
         elif isinstance(frame, HostRemoveWorktreeFrame):
-            await self._send_text(ws, encode_host_frame(await self._handle_remove_worktree(frame)))
+            await self._send_operation_result(ws, await self._handle_remove_worktree(frame))
         elif isinstance(frame, HostListWorktreesFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_list_worktrees(frame)))
         elif isinstance(frame, HostFsRequestFrame):
@@ -5167,7 +5224,7 @@ class HostProcess:
         elif isinstance(frame, HostFsWriteFrame):
             # gh/git writes can block; run off the event loop and reply back.
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
-            await self._send_text(ws, encode_host_frame(fs_write_result))
+            await self._send_operation_result(ws, fs_write_result)
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await self._send_text(ws, encode_host_frame(skills_result))

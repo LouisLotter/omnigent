@@ -94,6 +94,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.durability import DurabilityBarrier
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -1363,6 +1364,7 @@ def create_app(
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
     host_sharded: bool = False,
+    durability_barrier: DurabilityBarrier | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1506,6 +1508,11 @@ def create_app(
         400 recovers only for a client that sent the slice-key header and
         retries without it, which the web client does only for requests it
         keyed itself.
+    :param durability_barrier: Async callable that returns ``True`` once every
+        commit made before the call is durable, for a database that replicates
+        asynchronously. Transcript items are acknowledged to their senders only
+        then; ``None`` treats a commit as durable (see
+        :mod:`omnigent.server.durability`).
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1895,6 +1902,7 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
+    app.state.durability_barrier = durability_barrier
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry

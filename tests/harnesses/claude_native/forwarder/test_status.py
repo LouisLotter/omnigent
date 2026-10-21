@@ -551,6 +551,59 @@ async def test_post_external_session_status_includes_and_omits_response_id() -> 
 
 
 @pytest.mark.asyncio
+async def test_hook_status_edge_keeps_its_idempotency_key_across_retries(tmp_path: Path) -> None:
+    """A Stop edge retried after a failed POST keeps its key, so the server applies it once."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "claude-session"})
+    keys: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get("Idempotency-Key"))
+        return httpx.Response(503 if len(keys) == 1 else 200, json={})
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_abc"
+        )
+        for _ in range(2):
+            state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+                response_id="resp_turn_1",
+            )
+
+    assert len(keys) == 2
+    assert keys[0] and keys[0] == keys[1]
+
+
+def test_retry_tracker_names_an_event_until_it_is_handled() -> None:
+    """The id is stable across a key's retries, and new once the key is cleared or given up."""
+    tracker = forwarder._PostRetryTracker(max_permanent_attempts=1)
+    first = tracker.edge_id("hook:0:0:idle")
+    assert tracker.edge_id("hook:0:0:idle") == first
+    assert tracker.edge_id("hook:1:0:idle") != first
+    tracker.clear("hook:0:0:idle")
+    assert tracker.edge_id("hook:0:0:idle") != first
+    named = tracker.edge_id("hook:2:0:idle")
+    request = httpx.Request("POST", "http://ap/v1/sessions/conv_abc/events")
+    rejected = httpx.HTTPStatusError(
+        "rejected", request=request, response=httpx.Response(400, request=request)
+    )
+    assert tracker.record_failure("hook:2:0:idle", rejected, session_id="conv_abc").exhausted
+    assert tracker.edge_id("hook:2:0:idle") != named
+
+
+@pytest.mark.asyncio
 async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) -> None:
     """
     A ``Stop`` → idle edge carries the turn's ``response_id`` when one is known.

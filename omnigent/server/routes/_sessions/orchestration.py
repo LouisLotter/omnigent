@@ -97,7 +97,11 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
 from omnigent.runner.routing import RunnerRouter
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.session_init_protocol import (
+    INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+    LAST_TASK_ERROR_CODE_LABEL_KEY,
+    build_runner_session_init_payload,
+)
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
     auto_harness_session,
@@ -157,7 +161,7 @@ from omnigent.server.bundles import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
-from omnigent.server.interrupted_work import with_unanswered_tool
+from omnigent.server.interrupted_work import settle_late_tool_result, with_unanswered_tool
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -3284,6 +3288,8 @@ async def _persist_external_conversation_item_unlocked(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
+        # Its first post may have ended before settling the interrupted outcome.
+        await _settle_if_late_result(session_id, conv, persisted, conversation_store)
         return persisted.id
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
@@ -3357,7 +3363,22 @@ async def _persist_external_conversation_item_unlocked(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
     await record_claude_subagent_return(session_id, persisted, conversation_store)
+    await _settle_if_late_result(session_id, conv, persisted, conversation_store)
     return persisted.id
+
+
+async def _settle_if_late_result(
+    session_id: str,
+    conv: Conversation,
+    persisted: ConversationItem,
+    conversation_store: ConversationStore,
+) -> None:
+    """Settle an interrupted, unknown outcome that this tool result may answer."""
+    if (
+        persisted.type == "function_call_output"
+        and conv.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    ):
+        await settle_late_tool_result(session_id, conversation_store)
 
 
 def _new_external_conversation_item(
@@ -3452,6 +3473,9 @@ async def _persist_external_conversation_items(
         if not persisted.deduplicated:
             _publish_persisted_external_item(session_id, body, persisted)
         await record_claude_subagent_return(session_id, persisted, conversation_store)
+    # Duplicates count too: their first post may have ended before settling.
+    if any(persisted.type == "function_call_output" for persisted in persisted_items):
+        await settle_late_tool_result(session_id, conversation_store)
     if error is not None:
         raise error
     return [persisted.id for persisted in persisted_items]

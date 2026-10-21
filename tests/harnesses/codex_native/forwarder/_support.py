@@ -22,24 +22,28 @@ class _RecordingClient:
     def __init__(self) -> None:
         """Initialize with an empty record of posts."""
         self.posts: list[tuple[str, dict]] = []
+        self.headers: list[dict[str, str] | None] = []
 
     async def post(
         self,
         url: str,
         *,
         json: dict,
-        timeout: float | None = None,
+        timeout: object = None,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         """
-        Record ``(url, json)`` and return a 200 response.
+        Record ``(url, json)`` and its headers, and return a 200 response.
 
         :param url: Request URL, e.g. ``"/v1/sessions/conv_x/events"``.
         :param json: JSON body, e.g.
             ``{"type": "external_model_change", "data": {"model": "gpt-5.4"}}``.
         :param timeout: Ignored request timeout used by transient delta posts.
+        :param headers: Request headers, e.g. a status edge's ``Idempotency-Key``.
         :returns: A real ``httpx.Response`` with status 200.
         """
         self.posts.append((url, json))
+        self.headers.append(headers)
         return httpx.Response(200, request=httpx.Request("POST", url))
 
 
@@ -50,7 +54,7 @@ class _RaisingPostClient:
         self._exc = exc
         self.calls = 0
 
-    async def post(self, url: str, json: object) -> httpx.Response:
+    async def post(self, url: str, json: object, **_options: object) -> httpx.Response:
         self.calls += 1
         raise self._exc
 

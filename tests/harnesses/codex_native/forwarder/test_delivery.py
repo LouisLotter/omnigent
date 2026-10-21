@@ -35,7 +35,9 @@ async def test_post_session_event_dead_letters_durable_event_on_permanent_failur
 
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+    async def _failing_inner(
+        client, session_id, *, event_type, data, max_attempts, timeout, idempotency_key=None
+    ):
         return fwd._PostResult(
             response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
         )
@@ -75,7 +77,9 @@ async def test_post_session_event_does_not_dead_letter_ephemeral_event(
     """
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+    async def _failing_inner(
+        client, session_id, *, event_type, data, max_attempts, timeout, idempotency_key=None
+    ):
         return fwd._PostResult(
             response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
         )
@@ -113,7 +117,9 @@ async def test_post_session_event_dead_letters_usage_on_permanent_failure(
 
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+    async def _failing_inner(
+        client, session_id, *, event_type, data, max_attempts, timeout, idempotency_key=None
+    ):
         return fwd._PostResult(
             response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
         )
@@ -390,7 +396,9 @@ async def test_post_session_event_dead_letters_ambiguous_classification(
 
     fwd._reset_forward_health()
 
-    async def _ambiguous_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+    async def _ambiguous_inner(
+        client, session_id, *, event_type, data, max_attempts, timeout, idempotency_key=None
+    ):
         return fwd._PostResult(
             response=None, delivered_ambiguous=True, transport_error="ReadTimeout"
         )
@@ -428,7 +436,9 @@ async def test_post_session_event_dead_letters_records_http_status(
 
     fwd._reset_forward_health()
 
-    async def _failing_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+    async def _failing_inner(
+        client, session_id, *, event_type, data, max_attempts, timeout, idempotency_key=None
+    ):
         return fwd._PostResult(
             response=httpx.Response(503, request=httpx.Request("POST", "http://test"))
         )
@@ -475,7 +485,9 @@ async def test_replay_dead_letters_before_resume_reposts_proven_undelivered(
 
     posted: list[dict] = []
 
-    async def _ok_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+    async def _ok_inner(
+        client, session_id, *, event_type, data, max_attempts, timeout, idempotency_key=None
+    ):
         posted.append(
             {
                 "session_id": session_id,
@@ -577,6 +589,24 @@ async def test_post_session_event_inner_single_attempt_and_timeout() -> None:
     assert result.response.status_code == 503
 
 
+async def test_status_edge_keeps_one_idempotency_key_across_its_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server applies a retried status edge once only if every attempt names it alike."""
+    monkeypatch.setattr(fwd, "_sleep", AsyncMock())
+    client = _RecordingPostClient(
+        httpx.Response(503, request=httpx.Request("POST", "http://test"))
+    )
+    await fwd._post_status(client, "conv_codex1", "idle", response_id="codex_turn_1")
+    await fwd._post_status(client, "conv_codex1", "idle", response_id="codex_turn_2")
+
+    keys = [call["headers"]["Idempotency-Key"] for call in client.calls]
+    first_edge, second_edge = keys[: fwd._POST_MAX_ATTEMPTS], keys[fwd._POST_MAX_ATTEMPTS :]
+    assert len(first_edge) == len(second_edge) == fwd._POST_MAX_ATTEMPTS
+    assert len(set(first_edge)) == len(set(second_edge)) == 1
+    assert first_edge[0] != second_edge[0]
+
+
 async def test_post_session_event_records_connectivity_failure_for_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -593,7 +623,7 @@ async def test_post_session_event_records_connectivity_failure_for_watchdog(
     class _AlwaysConnectError:
         """Stub client whose every POST fails to connect."""
 
-        async def post(self, url: str, *, json: object) -> httpx.Response:
+        async def post(self, url: str, *, json: object, **_options: object) -> httpx.Response:
             """Raise a connect error mimicking an unreachable server."""
             del json
             raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))

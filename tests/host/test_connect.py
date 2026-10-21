@@ -38,6 +38,7 @@ from omnigent.host.connect import (
     run_host_process,
 )
 from omnigent.host.frames import (
+    CAP_OPERATION_RECORDS,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -6285,6 +6286,9 @@ async def test_host_diagnostics_correlate_real_socket_closes_and_reset_on_reconn
     assert [r["phase"] for r in rows] == ["connected", "disconnected"] * 2
     assert len(hellos) == 2
     assert hellos[0].connection_id != hellos[1].connection_id
+    # One host process: the same incarnation on every reconnect.
+    assert hellos[0].incarnation and hellos[0].incarnation == hellos[1].incarnation
+    assert CAP_OPERATION_RECORDS in hellos[0].capabilities
     for hello, (start, end) in zip(hellos, (rows[:2], rows[2:]), strict=True):
         assert hello.connection_id
         assert start["connection_id"] == end["connection_id"] == hello.connection_id
@@ -7738,7 +7742,7 @@ async def test_runner_status_settles_after_unsuccessful_launch(
     outcome: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Refusal and handler failure must release status waiters."""
+    """Refusal and handler failure release status waiters, which report the runner dead."""
     host = _make_host_process()
     ws = _CollectingWs()
     entered = asyncio.Event()
@@ -7774,7 +7778,8 @@ async def test_runner_status_settles_after_unsuccessful_launch(
         assert not query.done()
         release.set()
         result = await asyncio.wait_for(query, 5.0)
-        assert result.status == "unknown"
+        # The host received this launch, so the runner will never connect.
+        assert result.status == "dead"
         assert not host._pending_runner_launches
     finally:
         release.set()
@@ -7782,6 +7787,95 @@ async def test_runner_status_settles_after_unsuccessful_launch(
         if query is not None:
             query.cancel()
             await asyncio.gather(query, return_exceptions=True)
+
+
+async def test_repeated_request_returns_the_recorded_result_without_acting_again(
+    tmp_path: Path,
+) -> None:
+    """A request the server sends again after a drop is answered as the first time."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    frame = HostCreateDirFrame(request_id="mkdir-1", path=str(tmp_path / "new"))
+    await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+    # Acting again would answer "already exists".
+    await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+    first, repeat = (decode_host_frame(raw) for raw in ws.sent)
+    assert isinstance(first, HostCreateDirResultFrame)
+    assert first.status == "ok" and first.error is None
+    assert repeat == first
+
+
+async def test_repeated_launch_waits_for_the_first_and_spawns_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A launch repeated while the first is still spawning shares its result."""
+    host = _make_host_process()
+    first_ws, second_ws = _CollectingWs(), _CollectingWs()
+    loop = asyncio.get_running_loop()
+    spawning = asyncio.Event()
+    release_spawn = threading.Event()
+    spawned: list[Mock] = []
+
+    def _spawn(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        proc = Mock(spec=subprocess.Popen, pid=4321)
+        proc.poll.return_value = None
+        spawned.append(proc)
+        loop.call_soon_threadsafe(spawning.set)
+        assert release_spawn.wait(5.0), "test did not release spawn"
+        return proc, tmp_path / "runner.log"
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda _harness: True)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr(host, "_watch_runner", AsyncMock())
+    frame = HostLaunchRunnerFrame(
+        request_id="launch-1",
+        binding_token="repeat-token",
+        workspace=str(tmp_path),
+        harness="claude-native",
+    )
+    launch = asyncio.create_task(host._dispatch_host_frame(first_ws, frame))  # type: ignore[arg-type]
+    repeat: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(spawning.wait(), 5.0)
+        # The first tunnel dropped; the same request arrives on the next one.
+        repeat = asyncio.create_task(host._dispatch_host_frame(second_ws, frame))  # type: ignore[arg-type]
+        await asyncio.sleep(0.05)
+        assert not repeat.done(), "a repeat must wait for the launch already running"
+    finally:
+        release_spawn.set()
+        await asyncio.wait_for(
+            asyncio.gather(launch, *([repeat] if repeat else []), return_exceptions=True), 5.0
+        )
+        await asyncio.gather(*host._watcher_tasks)
+    assert len(spawned) == 1
+    assert first_ws.sent == second_ws.sent
+    result = decode_host_frame(second_ws.sent[0])
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert (result.request_id, result.status) == ("launch-1", "launched")
+
+
+async def test_repeat_of_a_request_whose_handler_failed_is_neither_run_nor_answered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A handler that failed may have acted, so its repeat stays unanswered (outcome unknown)."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    calls: list[str] = []
+
+    def _fail(frame: HostCreateDirFrame) -> HostCreateDirResultFrame:
+        calls.append(frame.request_id)
+        raise OSError("disk went away mid-request")
+
+    monkeypatch.setattr(host, "_handle_create_dir", _fail)
+    frame = HostCreateDirFrame(request_id="mkdir-1", path=str(tmp_path / "new"))
+    with pytest.raises(OSError):
+        await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+    await asyncio.wait_for(host._dispatch_host_frame(ws, frame), 1.0)  # type: ignore[arg-type]
+    assert calls == ["mkdir-1"]
+    assert ws.sent == []
 
 
 async def test_stop_frame_never_overtakes_launch(

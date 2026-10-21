@@ -617,3 +617,98 @@ async def test_replacement_runner_keeps_a_dead_runners_unknown_outcome(
         labels.get("omnigent.last_task_error_code") == "interrupted_outcome_unknown"
         for labels in init_labels
     ), "the runner must see the unknown outcome that blocks its continuation"
+
+
+@pytest.mark.parametrize("first_settlement_lost", [False, True])
+@pytest.mark.parametrize("posted_as", ["one item", "item array"])
+async def test_late_result_settles_a_dead_runners_unknown_outcome_for_good(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    posted_as: str,
+    first_settlement_lost: bool,
+) -> None:
+    """The replacement delivers the interrupted call's result after the outcome was recorded.
+
+    The record then says the outcome is known. It still blocks continuation until
+    the person acts, and a later re-attach never turns it back into unknown. A
+    post whose settlement was cut short is settled by the sender's retry.
+    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.entities import FunctionCallData, MessageData, NewConversationItem
+    from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+
+    store = app.state.runner_router._conversation_store
+    replaced = _create_session(app, agent.id)
+    store.set_labels(replaced.id, {RUNNER_INCARNATION_LABEL_KEY: "d" * 32})
+    store.append(
+        replaced.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "go"}]),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(agent="a", name="Bash", arguments="{}", call_id="call_1"),
+            ),
+        ],
+    )
+    init_labels: list[dict[str, str]] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        labels = json.loads(request.content)["session_init"]["snapshot"]["labels"]
+        init_labels.append(labels)
+        earlier = labels.get(RUNNER_INCARNATION_LABEL_KEY)
+        return httpx.Response(
+            201,
+            json={
+                "runner_incarnation_id": "a" * 32,
+                "continuation_blocked": earlier not in (None, "a" * 32),
+            },
+        )
+
+    def recorded_code() -> str | None:
+        conversation = store.get_conversation(replaced.id)
+        error = _last_task_error_from_labels(conversation.labels)
+        return error["code"] if error is not None else None
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert recorded_code() == "interrupted_outcome_unknown"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            result = {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "function_call_output",
+                    "item_data": {"call_id": "call_1", "output": "appended"},
+                    "response_id": "resp_1",
+                    "source_id": "transcript:call_1:output",
+                },
+            }
+            body = result if posted_as == "one item" else [result]
+            if first_settlement_lost:
+                with monkeypatch.context() as cut_short:
+                    cut_short.setattr(orchestration, "settle_late_tool_result", AsyncMock())
+                    first = await client.post(f"/v1/sessions/{replaced.id}/events", json=body)
+                assert first.status_code in (200, 201, 202), first.text
+                assert recorded_code() == "interrupted_outcome_unknown"
+            late = await client.post(f"/v1/sessions/{replaced.id}/events", json=body)
+        assert late.status_code in (200, 201, 202), late.text
+        assert sessions._session_status_cache[replaced.id] == "failed"
+        assert recorded_code() == "interrupted_outcome_known"
+
+    init_labels.clear()
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert recorded_code() == "interrupted_outcome_known"
+    assert [labels.get("omnigent.last_task_error_code") for labels in init_labels] == [
+        "interrupted_outcome_known"
+    ], "the runner must still be told not to continue"

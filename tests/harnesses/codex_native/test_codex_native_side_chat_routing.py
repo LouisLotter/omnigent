@@ -47,7 +47,7 @@ class _FakeRunnerClient:
         self.posts: list[tuple[str, _JsonObject]] = []
         self._resp = resp or _FakeResp()
 
-    async def post(self, url: str, *, json: _JsonObject) -> _FakeResp:
+    async def post(self, url: str, *, json: _JsonObject, **_options: object) -> _FakeResp:
         self.posts.append((url, json))
         return self._resp
 

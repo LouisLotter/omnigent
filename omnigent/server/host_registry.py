@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from cachetools import TTLCache
 
@@ -40,6 +40,8 @@ from omnigent.db.account_authority import (
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
+    CAP_OPERATION_RECORDS,
+    OPERATION_RECORD_RETENTION_S,
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
@@ -53,6 +55,11 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, Tunn
 from omnigent.stores.host_store import LAUNCH_TOKEN_ONLY_REFUSAL, HostRegistrationRefusedError
 
 _logger = logging.getLogger(__name__)
+
+_AnswerT = TypeVar("_AnswerT")
+
+# How often a request whose tunnel closed looks for the host's reconnect.
+_RECONNECT_POLL_S = 0.1
 
 _expected_host_owner: ContextVar[AccountAuthority | None] = ContextVar(
     "expected_host_owner", default=None
@@ -960,6 +967,104 @@ class HostRegistry:
                 allow_unbound,
                 transfer_from_host_id,
             )
+
+    async def await_answer(
+        self,
+        conn: HostConnection,
+        pending: str,
+        request_id: str,
+        frame: str,
+        answer: asyncio.Future[_AnswerT],
+        *,
+        timeout_s: float,
+    ) -> _AnswerT:
+        """
+        Await a host request's answer, sending it again if its tunnel closes first.
+
+        A host that keeps operation records answers a request it already
+        received with the recorded result instead of acting again (see
+        :mod:`omnigent.host.operation_records`). So when the tunnel closes
+        before the answer, the request is sent again under the same
+        ``request_id`` once the same host process reconnects, within the
+        caller's budget. A restarted host or an older one leaves the outcome
+        unknown, as before.
+
+        :param conn: The connection the request was sent on.
+        :param pending: Name of its map of pending answers, e.g.
+            ``"pending_installs"``, where *answer* is registered.
+        :param request_id: The request's id, e.g. ``"9f2c41d07ab35e18"``.
+        :param frame: The encoded request frame, as sent.
+        :param answer: The future registered for the answer.
+        :param timeout_s: The caller's whole budget, e.g. ``30.0``.
+        :returns: The host's answer.
+        :raises asyncio.TimeoutError: When no answer arrived within the budget.
+        :raises HostOperationOutcomeUnknownError: When the tunnel closed and the
+            request could not be sent again to the same host process in time.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        sent_at = time.monotonic()
+        current, waiting = conn, answer
+        repeated_from: list[HostConnection] = []
+        try:
+            while True:
+                try:
+                    result = await asyncio.wait_for(waiting, max(0.0, deadline - loop.time()))
+                except HostOperationOutcomeUnknownError:
+                    successor = await self._same_process_reconnect(current, deadline, sent_at)
+                    if successor is None:
+                        raise
+                else:
+                    for earlier in repeated_from:
+                        _release_unanswered(earlier, request_id)
+                    return result
+                if current is not conn:
+                    getattr(current, pending).pop(request_id, None)
+                repeated_from.append(current)
+                current, waiting = successor, loop.create_future()
+                getattr(current, pending)[request_id] = waiting
+                try:
+                    self.send_text(current, frame)
+                except ConnectionError as exc:
+                    raise HostOperationOutcomeUnknownError(
+                        f"host '{conn.host_id}' could not be asked again: {exc}"
+                    ) from exc
+                _logger.info(
+                    "Sent host request %s again after its tunnel closed",
+                    request_id,
+                    extra={"host_id": conn.host_id},
+                )
+        finally:
+            if current is not conn:
+                getattr(current, pending).pop(request_id, None)
+
+    async def _same_process_reconnect(
+        self, closed: HostConnection, deadline: float, sent_at: float
+    ) -> HostConnection | None:
+        """Wait for the host process behind *closed* to reconnect, until *deadline*."""
+        incarnation = closed.hello.incarnation
+        if incarnation is None or CAP_OPERATION_RECORDS not in closed.hello.capabilities:
+            return None
+        loop = asyncio.get_running_loop()
+        # Past the retention the host may have forgotten the request and would run it again.
+        while time.monotonic() - sent_at < OPERATION_RECORD_RETENTION_S:
+            current = self.get(closed.host_id, closed.workspace_id)
+            if current is not None and current is not closed:
+                same_process = (
+                    current.hello.incarnation == incarnation
+                    and CAP_OPERATION_RECORDS in current.hello.capabilities
+                )
+                # Owned as when the request was sent: an owner change ends the request.
+                same_owner = (current.owner, current.account_generation) == (
+                    closed.owner,
+                    closed.account_generation,
+                )
+                return current if same_process and same_owner else None
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(_RECONNECT_POLL_S, remaining))
+        return None
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.

@@ -586,23 +586,25 @@ def create_host_tunnel_router(
             disconnect_error = exc
             ended_by = "handler_cancelled"
             # Cancelled between registering and starting its tasks: no teardown ran.
-            if conn is not None and host_registry.deregister(host_id, conn=conn):
-                with anyio.move_on_after(_DISCONNECT_CLEANUP_TIMEOUT_S, shield=True):
-                    await _mark_offline(host_store, host_id, managed_token)
+            await _release_registration(host_registry, host_store, host_id, conn, managed_token)
             raise
         except HostRegistrationRefusedError as exc:
             # An expected refusal, reported to the host's operator, not a server fault.
             disconnect_error = exc
             _logger.warning("Refusing host %s registration: %s", host_id, exc)
-            await _send_connection_error(ws, stage=stage, error=str(exc), retryable=exc.retryable)
-            if conn is not None:
-                conn.close_requested_code = 4009
-                conn.close_requested_reason = "host registration refused"
-            with contextlib.suppress(Exception):
-                await ws.close(code=4009, reason="host registration refused")
-            if conn is not None and host_registry.deregister(host_id, conn=conn):
-                await asyncio.to_thread(
-                    host_store.set_offline, host_id, launch_token=managed_token
+            try:
+                await _send_connection_error(
+                    ws, stage=stage, error=str(exc), retryable=exc.retryable
+                )
+                if conn is not None:
+                    conn.close_requested_code = 4009
+                    conn.close_requested_reason = "host registration refused"
+                with contextlib.suppress(Exception):
+                    await ws.close(code=4009, reason="host registration refused")
+            finally:
+                # Also when cancelled while reporting: nothing else would deregister it.
+                await _release_registration(
+                    host_registry, host_store, host_id, conn, managed_token
                 )
         except WebSocketDisconnect as exc:
             disconnect_error = exc
@@ -632,26 +634,26 @@ def create_host_tunnel_router(
                 extra=debug_event("host_tunnel", phase="error", stage=stage, **connection_attrs()),
             )
             retryable = stage in {"registration", "registry", "connected"}
-            await _send_connection_error(
-                ws,
-                stage=stage,
-                error=str(exc),
-                retryable=retryable,
-            )
-            if conn is not None:
-                conn.close_requested_code = 4005
-                conn.close_requested_reason = "host connection failed"
-            with contextlib.suppress(Exception):
-                await ws.close(code=4005, reason="host connection failed")
-            if conn is not None:
-                if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(
-                        host_store.set_offline, host_id, launch_token=managed_token
-                    )
-            elif host_persisted:
-                await asyncio.to_thread(
-                    host_store.set_offline, host_id, launch_token=managed_token
+            try:
+                await _send_connection_error(
+                    ws,
+                    stage=stage,
+                    error=str(exc),
+                    retryable=retryable,
                 )
+                if conn is not None:
+                    conn.close_requested_code = 4005
+                    conn.close_requested_reason = "host connection failed"
+                with contextlib.suppress(Exception):
+                    await ws.close(code=4005, reason="host connection failed")
+            finally:
+                if conn is not None:
+                    await _release_registration(
+                        host_registry, host_store, host_id, conn, managed_token
+                    )
+                elif host_persisted:
+                    with anyio.move_on_after(_DISCONNECT_CLEANUP_TIMEOUT_S, shield=True):
+                        await _mark_offline(host_store, host_id, managed_token)
         finally:
             if conn is not None or disconnect_error is not None:
                 log = _logger.info
@@ -691,6 +693,22 @@ def create_host_tunnel_router(
                 )
 
     return router
+
+
+async def _release_registration(
+    host_registry: HostRegistry,
+    host_store: HostStore,
+    host_id: str,
+    conn: HostConnection | None,
+    launch_token: str | None,
+) -> None:
+    """Deregister this tunnel's connection and mark its host offline, shielded and bounded.
+
+    A replaced connection leaves its successor registered and online.
+    """
+    if conn is not None and host_registry.deregister(host_id, conn=conn):
+        with anyio.move_on_after(_DISCONNECT_CLEANUP_TIMEOUT_S, shield=True):
+            await _mark_offline(host_store, host_id, launch_token)
 
 
 async def _mark_offline(host_store: HostStore, host_id: str, launch_token: str | None) -> None:

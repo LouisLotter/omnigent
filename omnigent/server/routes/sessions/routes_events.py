@@ -8,7 +8,7 @@ import itertools
 import secrets
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -97,6 +97,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.durability import commits_durable, durability_barrier
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 from omnigent.server.persistent_hosts import (
@@ -288,6 +289,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
+from omnigent.server.status_edges import StatusEdges, status_edge_id
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
@@ -357,6 +359,22 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         _SUBAGENT_STATUS_TYPE,
     }
 )
+
+
+def _records_an_outcome(event_type: object, data: object) -> bool:
+    """
+    Whether an event records an outcome its sender forgets once acknowledged.
+
+    A transcript item, and a turn-end status edge (``idle`` or ``failed``),
+    whose failure detail is persisted.
+    """
+    if event_type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+        return True
+    return (
+        event_type == _EXTERNAL_SESSION_STATUS_TYPE
+        and isinstance(data, Mapping)
+        and data.get("status") in ("idle", "failed")
+    )
 
 
 def _is_batchable_external_item(event: SessionEventInput) -> bool:
@@ -611,14 +629,14 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
-    from omnigent.server.interrupted_work import INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    from omnigent.server.interrupted_work import INTERRUPTED_WORK_CODES
     from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
     last_error = _last_task_error_from_labels(conv.labels)
     # Retry is the person asking: a replacement runner may continue the work
     # a dead one was doing, including work it declined to continue on its own.
     continue_interrupted = (
-        last_error is not None and last_error.get("code") == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+        last_error is not None and last_error.get("code") in INTERRUPTED_WORK_CODES
     )
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
@@ -855,17 +873,52 @@ def register_events_routes(
                         session_id, list(run), conversation_store
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
+                if any(_records_an_outcome(event.type, event.data) for event in body):
+                    await _require_durable(request)
                 return acks
-            return await _post_event_impl(
+            ack = await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type == "message" else None,
             )
+            if _records_an_outcome(body.type, body.data):
+                await _require_durable(request)
+            return ack
+
+    async def _require_durable(request: Request) -> None:
+        """Answer a recorded outcome only once it is durable."""
+        if not await commits_durable(durability_barrier(request.app)):
+            raise OmnigentError(
+                "The outcome was recorded, but its durability is not yet confirmed. "
+                "Send it again.",
+                code=ErrorCode.DURABILITY_UNCONFIRMED,
+            )
 
     router.include_router(event_router)
 
     async def ingest_runner_batch(
+        *,
+        app: Any,
+        headers: Headers,
+        owner: str | None,
+        runner_id: str,
+        batch: EventBatchFrame,
+    ) -> EventAckFrame:
+        """Apply bounded, authenticated runner events; acknowledge recorded items once durable."""
+        ack = await _apply_runner_batch(
+            app=app, headers=headers, owner=owner, runner_id=runner_id, batch=batch
+        )
+        recorded = any(
+            _records_an_outcome(event.get("type"), event.get("data"))
+            for event in batch.events[: ack.applied]
+        )
+        if recorded and not await commits_durable(durability_barrier(app)):
+            # The runner keeps the events and sends them again; item writes are idempotent.
+            return EventAckFrame(batch.id, 0, ErrorCode.DURABILITY_UNCONFIRMED, retryable=True)
+        return ack
+
+    async def _apply_runner_batch(
         *,
         app: Any,
         headers: Headers,
@@ -938,7 +991,27 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    status_edges = StatusEdges()
+
     async def _post_event_impl(
+        request: Request | _RunnerEventContext,
+        session_id: str,
+        body: SessionEventInput,
+        in_flight: contextlib.ExitStack | None = None,
+    ) -> dict[str, bool | str]:
+        """Apply a session event; a status edge its sender retried is applied once."""
+        edge_id = (
+            status_edge_id(request.headers)
+            if body.type == _EXTERNAL_SESSION_STATUS_TYPE and isinstance(request, Request)
+            else None
+        )
+        if edge_id is None:
+            return await _apply_event(request, session_id, body, in_flight)
+        return await status_edges.apply_once(
+            session_id, edge_id, lambda: _apply_event(request, session_id, body, in_flight)
+        )
+
+    async def _apply_event(
         request: Request | _RunnerEventContext,
         session_id: str,
         body: SessionEventInput,
@@ -1512,6 +1585,7 @@ def register_events_routes(
             queued_pending_ids: list[str] = []
             # A later message must keep this Stop from being redelivered.
             stop_generation = input_generation(session_id)
+            stop_pressed_at = time.monotonic()
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -1618,6 +1692,7 @@ def register_events_routes(
                         queued_pending_ids=queued_pending_ids,
                         wait_s=RUNNER_DISCONNECT_GRACE_S,
                         stop_generation=stop_generation,
+                        pressed_at=stop_pressed_at,
                     ):
                         interrupt_delivery = "pending"
             elif not codex_child:

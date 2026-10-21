@@ -12,6 +12,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1030,6 +1031,16 @@ class _PostRetryTracker:
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
         self._entries: dict[str, _PostRetryEntry] = {}
+        self._edge_ids: dict[str, str] = {}
+
+    def edge_id(self, key: str) -> str:
+        """
+        Return the id naming ``key``'s event on every attempt, so the server applies it once.
+
+        :param key: Stable retry key, e.g. ``"hook:2:0:idle"``.
+        :returns: A random id, the same until the key is cleared or given up.
+        """
+        return self._edge_ids.setdefault(key, uuid.uuid4().hex)
 
     def retry_delay_s(self, key: str) -> float | None:
         """
@@ -1067,6 +1078,7 @@ class _PostRetryTracker:
         :returns: None.
         """
         self._entries.pop(key, None)
+        self._edge_ids.pop(key, None)
         # A cleared key means the post got through (or was ambiguously
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
@@ -1122,6 +1134,7 @@ class _PostRetryTracker:
         )
         if give_up:
             self._entries.pop(key, None)
+            self._edge_ids.pop(key, None)
             return _PostRetryDecision(
                 attempts=entry.attempts,
                 delay_s=0.0,
@@ -4455,6 +4468,7 @@ async def _forward_available_status_events(
                 if status == "failed"
                 else None,
                 failure_context=failure_context,
+                idempotency_key=retry_tracker.edge_id(retry_key),
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

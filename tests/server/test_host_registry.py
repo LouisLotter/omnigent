@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, CAP_OPERATION_RECORDS, HostHelloFrame
 from omnigent.server.host_registry import (
     ConcurrentRegistrationError,
     HostRegistry,
@@ -794,3 +794,84 @@ async def test_unanswered_operation_hold_outlives_other_references_to_its_connec
     held = retired()
     assert held is not None, "the retired connection was collected with its hold"
     assert set(held.inflight_unanswered) == {"req_install"}
+
+
+def _records_hello(incarnation: str | None) -> HostHelloFrame:
+    """A hello from a host process that keeps operation records, or an older host."""
+    return HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="test-host",
+        capabilities=[CAP_OPERATION_RECORDS] if incarnation else [],
+        incarnation=incarnation,
+    )
+
+
+_INSTALL_FRAME = '{"kind": "host.install_harness", "request_id": "req_1", "harness": "claude"}'
+
+
+async def test_request_is_sent_again_to_the_same_host_process_after_its_tunnel_closes() -> None:
+    """The host process answers the repeat from its record, so the caller gets the outcome."""
+    registry = HostRegistry()
+    old = registry.register("host_rep", FakeWebSocket(), _records_hello("inc-1"), owner="bob")
+    answer: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+    old.pending_installs["req_1"] = answer
+    registry.send_text(old, _INSTALL_FRAME)
+    waiter = asyncio.create_task(
+        registry.await_answer(
+            old, "pending_installs", "req_1", _INSTALL_FRAME, answer, timeout_s=5
+        )
+    )
+    await asyncio.sleep(0)
+    registry.deregister("host_rep")
+    await asyncio.sleep(0.05)
+    assert not waiter.done(), "the caller must wait for the host to reconnect"
+    assert "req_1" in old.inflight_unanswered
+
+    new = registry.register("host_rep", FakeWebSocket(), _records_hello("inc-1"), owner="bob")
+    repeated = await asyncio.wait_for(new.outbound_queue.get(), 1.0)
+    assert repeated is not None and repeated.data == _INSTALL_FRAME
+    new.pending_installs["req_1"].set_result({"status": "ok"})
+    assert await asyncio.wait_for(waiter, 1.0) == {"status": "ok"}
+    assert new.pending_installs == {}
+    # The outcome is known, so a sleep fence no longer waits for it.
+    assert "req_1" not in old.inflight_unanswered
+
+
+@pytest.mark.parametrize(
+    ("first", "after_restart", "reconnects", "new_owner"),
+    [
+        ("inc-1", "inc-2", True, "bob"),
+        (None, None, True, "bob"),
+        ("inc-1", "inc-1", False, "bob"),
+        ("inc-1", "inc-1", True, "carol"),
+    ],
+    ids=["host-restarted", "older-host", "no-reconnect-in-time", "owner-changed"],
+)
+async def test_request_whose_tunnel_closed_stays_unknown_without_the_same_host_process(
+    first: str | None, after_restart: str | None, reconnects: bool, new_owner: str
+) -> None:
+    """A restarted or older host may have acted already, so the request is never sent again."""
+    from omnigent.server.host_registry import HostOperationOutcomeUnknownError
+
+    registry = HostRegistry()
+    old = registry.register("host_rep", FakeWebSocket(), _records_hello(first), owner="bob")
+    answer: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+    old.pending_installs["req_1"] = answer
+    waiter = asyncio.create_task(
+        registry.await_answer(
+            old, "pending_installs", "req_1", _INSTALL_FRAME, answer, timeout_s=0.5
+        )
+    )
+    await asyncio.sleep(0)
+    registry.deregister("host_rep")
+    if reconnects:
+        new = registry.register(
+            "host_rep", FakeWebSocket(), _records_hello(after_restart), owner=new_owner
+        )
+    with pytest.raises(HostOperationOutcomeUnknownError):
+        await asyncio.wait_for(waiter, 2.0)
+    if reconnects:
+        assert new.outbound_queue.empty()
+        assert new.pending_installs == {}
+    assert "req_1" in old.inflight_unanswered

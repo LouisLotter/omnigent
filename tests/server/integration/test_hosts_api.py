@@ -693,6 +693,249 @@ async def test_launch_runner_settles_a_launch_whose_result_was_lost(
             assert "exited" in resp.json()["detail"]
 
 
+class _TunnelledHost:
+    """A real host process behind the app's tunnel, whose first launch the test can lose.
+
+    The runner spawn is faked; every other frame is handled by the real
+    :class:`HostProcess`, including its operation records.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from unittest.mock import AsyncMock, Mock
+
+        from omnigent.host.connect import HostProcess
+        from omnigent.host.identity import HostIdentity
+
+        self.process = HostProcess(
+            identity=HostIdentity(host_id=_HOST_ID, name="laptop"),
+            server_url="http://test",
+        )
+        self.launches: list[str] = []
+        self.spawned = 0
+        self.tunnel_closed = asyncio.Event()
+        self._tasks: list[asyncio.Task[None]] = []
+
+        def _spawn(*_args: object) -> tuple[Mock, Path]:
+            self.spawned += 1
+            proc = Mock(pid=4000 + self.spawned)
+            proc.poll.return_value = None
+            return proc, tmp_path / "runner.log"
+
+        monkeypatch.setattr(self.process, "_current_auth_token", lambda **_kwargs: None)
+        monkeypatch.setattr(self.process, "_spawn_runner_proc", _spawn)
+        monkeypatch.setattr(self.process, "_watch_runner", AsyncMock())
+
+    async def connect(self, app: FastAPI, registry: HostRegistry) -> ApplicationCommunicator:
+        """Open a tunnel as this host process and wait until the server registers it."""
+        from omnigent.host.frames import HOST_CAPABILITIES
+
+        comm = ApplicationCommunicator(app, _websocket_scope(f"/v1/hosts/{_HOST_ID}/tunnel"))
+        await comm.send_input({"type": "websocket.connect"})
+        assert (await comm.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+        before = registry.get(_HOST_ID)
+        hello = HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="laptop",
+            capabilities=list(HOST_CAPABILITIES),
+            incarnation=self.process._operation_records.incarnation,
+        )
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(hello)})
+        while registry.get(_HOST_ID) in (None, before):
+            await asyncio.sleep(0.01)
+        return comm
+
+    def serve(
+        self, comm: ApplicationCommunicator, *, lose: str | None = None, close: bool = True
+    ) -> None:
+        """
+        Hand the server's frames on *comm* to the host process.
+
+        :param lose: For the first launch: ``"request"`` never reaches the host,
+            ``"result"`` is carried out and its answer lost, ``"reaped"`` as well
+            and the runner then exits and is reaped.
+        :param close: Whether the tunnel then closes.
+        """
+        from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+
+        host = self.process
+
+        class _Tunnel:
+            def __init__(self, forward: bool) -> None:
+                self.forward = forward
+
+            async def send(self, raw: str) -> None:
+                if self.forward:
+                    await comm.send_input({"type": "websocket.receive", "text": raw})
+
+        async def close_tunnel() -> None:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1006})
+            self.tunnel_closed.set()
+
+        async def pump() -> None:
+            losing = lose
+            while True:
+                output = await comm.receive_output(timeout=budget(30.0))
+                if output["type"] != "websocket.send":
+                    return
+                try:
+                    frame = decode_host_frame(output["text"])
+                except ValueError:
+                    continue
+                if not isinstance(frame, HostLaunchRunnerFrame) or losing is None:
+                    if isinstance(frame, HostLaunchRunnerFrame):
+                        self.launches.append(frame.request_id)
+                    host._start_frame_task(_Tunnel(forward=True), output["text"])  # type: ignore[arg-type]
+                    continue
+                self.launches.append(frame.request_id)
+                fault, losing = losing, None
+                if fault != "request":
+                    await host._dispatch_host_frame(_Tunnel(forward=False), frame)  # type: ignore[arg-type]
+                if fault == "reaped":
+                    from omnigent.runner.identity import token_bound_runner_id
+
+                    host._runners.pop(token_bound_runner_id(frame.binding_token))
+                if close:
+                    await close_tunnel()
+                    return
+
+        self._tasks.append(asyncio.create_task(pump()))
+
+    async def stop(self) -> None:
+        """End the pumps and the host's frame tasks."""
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, *self.process._frame_tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("lost", ["result", "request"])
+async def test_launch_whose_tunnel_closed_is_answered_once_the_host_reconnects(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    lost: str,
+) -> None:
+    """
+    The server sends the launch again to the same host process, which answers
+    it from its record when it already launched, and launches it otherwise.
+
+    Either way the runner is launched exactly once and the caller gets the
+    real outcome instead of an unknown one.
+    """
+    app, registry, _hs, conv_store = host_api_app
+    host = _TunnelledHost(monkeypatch, tmp_path)
+    host.serve(await host.connect(app, registry), lose=lost)
+    conv = conv_store.create_conversation(agent_id=None)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            post = asyncio.create_task(
+                client.post(
+                    f"/v1/hosts/{_HOST_ID}/runners",
+                    json={"session_id": conv.id, "workspace": str(tmp_path)},
+                )
+            )
+            await asyncio.wait_for(host.tunnel_closed.wait(), budget(10.0))
+            host.serve(await host.connect(app, registry))
+            resp = await asyncio.wait_for(post, budget(20.0))
+    finally:
+        await host.stop()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "launching"
+    assert host.spawned == 1
+    first, repeat = host.launches
+    assert repeat == first, "the launch must be repeated under its own request id"
+
+
+@pytest.mark.parametrize(
+    ("lost", "expected_status", "expected_detail"),
+    [
+        ("reaped", 502, "exited"),
+        ("request", 503, "did not receive"),
+    ],
+    ids=["received-then-reaped", "never-received"],
+)
+async def test_launch_settlement_uses_the_host_process_records(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    lost: str,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    """
+    A launch whose answer never came is settled from the receiving process's records.
+
+    A runner that process launched and has since reaped is reported as exited.
+    A launch that process never received is reported as such: nothing started.
+    """
+    from omnigent.server.routes._host_launch import (
+        LAUNCH_TIMEOUT_ENV_VAR,
+        resolve_launch_timeout_s,
+    )
+
+    monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "1")
+    resolve_launch_timeout_s.cache_clear()
+    app, registry, _hs, conv_store = host_api_app
+    host = _TunnelledHost(monkeypatch, tmp_path)
+    host.serve(await host.connect(app, registry), lose=lost, close=False)
+    conv = conv_store.create_conversation(agent_id=None)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": str(tmp_path)},
+            )
+    finally:
+        resolve_launch_timeout_s.cache_clear()
+        await host.stop()
+
+    assert resp.status_code == expected_status, resp.text
+    assert expected_detail in resp.json()["detail"]
+    assert host.spawned == (1 if lost == "reaped" else 0)
+    updated = conv_store.get_conversation(conv.id)
+    assert updated is not None and updated.runner_id is None
+
+
+async def test_launch_to_a_restarted_host_stays_unknown(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A new host process cannot know whether its predecessor launched, so nothing is repeated."""
+    from omnigent.server.routes._host_launch import (
+        LAUNCH_TIMEOUT_ENV_VAR,
+        resolve_launch_timeout_s,
+    )
+
+    monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "5")
+    resolve_launch_timeout_s.cache_clear()
+    app, registry, _hs, conv_store = host_api_app
+    old = _TunnelledHost(monkeypatch, tmp_path)
+    old.serve(await old.connect(app, registry), lose="result")
+    conv = conv_store.create_conversation(agent_id=None)
+    restarted = _TunnelledHost(monkeypatch, tmp_path)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            post = asyncio.create_task(
+                client.post(
+                    f"/v1/hosts/{_HOST_ID}/runners",
+                    json={"session_id": conv.id, "workspace": str(tmp_path)},
+                )
+            )
+            await asyncio.wait_for(old.tunnel_closed.wait(), budget(10.0))
+            restarted.serve(await restarted.connect(app, registry))
+            resp = await asyncio.wait_for(post, budget(20.0))
+    finally:
+        resolve_launch_timeout_s.cache_clear()
+        await old.stop()
+        await restarted.stop()
+
+    assert resp.status_code == 504, resp.text
+    assert (old.spawned, restarted.spawned) == (1, 0)
+    assert restarted.launches == []
+
+
 @pytest.mark.parametrize(
     (
         "wire_error_code",

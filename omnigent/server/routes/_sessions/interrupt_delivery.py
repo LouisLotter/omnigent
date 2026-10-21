@@ -5,25 +5,28 @@ dropped, or went half-open, the forward fails or goes unanswered while the
 turn keeps running. Instead of answering as if the Stop had landed, the
 route reports it as pending and this module sends it again once the runner
 reconnects, provided the turn is still running and nobody has sent a new
-message since.
+message since. The re-sent Stop says how long ago it was pressed, so the
+runner never applies it to a turn that began after that.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import httpx
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event
+from omnigent.runner.resent_stop import PRESSED_AGO_FIELD, TURN_ENDED_STATUS
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import pending_inputs
 
 _logger = logging.getLogger(__name__)
 
-# Bound on the redelivered interrupt's own forward.
+# Bound on the redelivered interrupt's whole forward, queuing included.
 _INTERRUPT_FORWARD_TIMEOUT_S = 5.0
 
 # One pending redelivery per session; a newer Stop or message replaces it.
@@ -85,6 +88,7 @@ def deliver_interrupt_after_reconnect(
     queued_pending_ids: list[str],
     wait_s: float,
     stop_generation: int,
+    pressed_at: float,
 ) -> bool:
     """
     Send a lost Stop again once the runner's tunnel is back.
@@ -101,6 +105,7 @@ def deliver_interrupt_after_reconnect(
         for a dropped runner.
     :param stop_generation: :func:`input_generation` when the person pressed
         Stop. A newer message means the Stop is not redelivered.
+    :param pressed_at: When the person pressed Stop, from :func:`time.monotonic`.
     :returns: ``False`` when a newer message already superseded the Stop.
     """
     if input_generation(session_id) != stop_generation:
@@ -117,6 +122,7 @@ def deliver_interrupt_after_reconnect(
             queued_pending_ids=queued_pending_ids,
             wait_s=wait_s,
             stop_generation=stop_generation,
+            pressed_at=pressed_at,
         ),
         name=f"interrupt-after-reconnect-{session_id}",
     )
@@ -140,6 +146,7 @@ async def _deliver_after_reconnect(
     queued_pending_ids: list[str],
     wait_s: float,
     stop_generation: int,
+    pressed_at: float,
 ) -> None:
     from omnigent.server.routes._sessions.common import (
         _interrupt_fenced_sessions,
@@ -156,7 +163,9 @@ async def _deliver_after_reconnect(
         if input_generation(session_id) != stop_generation:
             outcome = "superseded_by_new_message"
         elif _session_status_cache.get(session_id) in ("running", "waiting"):
-            outcome = await _send_interrupt(session_id, runner_router, _get_runner_client)
+            outcome = await _send_interrupt(
+                session_id, runner_router, _get_runner_client, pressed_at=pressed_at
+            )
             if outcome == "delivered":
                 _interrupt_fenced_sessions.add(session_id)
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
@@ -173,21 +182,42 @@ async def _deliver_after_reconnect(
     )
 
 
-async def _send_interrupt(session_id: str, runner_router: Any, get_runner_client: Any) -> str:
+async def _send_interrupt(
+    session_id: str, runner_router: Any, get_runner_client: Any, *, pressed_at: float
+) -> str:
     """
     Forward one interrupt to the session's current runner.
 
-    :returns: ``"delivered"``, ``"refused"`` or ``"lost"``.
+    :returns: ``"delivered"``, ``"turn_already_ended"`` when the runner found
+        the turn it was pressed for over, ``"refused"`` or ``"lost"``.
     """
     client: httpx.AsyncClient | None = await get_runner_client(session_id, runner_router)
     if client is None:
         return "lost"
     try:
-        response = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": "interrupt"},
-            timeout=_INTERRUPT_FORWARD_TIMEOUT_S,
-        )
-    except (httpx.HTTPError, ConnectionError):
+        # One deadline over queuing and answer, so a stale Stop is not sent late.
+        async with asyncio.timeout(_INTERRUPT_FORWARD_TIMEOUT_S):
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "interrupt",
+                    PRESSED_AGO_FIELD: round(max(0.0, time.monotonic() - pressed_at), 3),
+                },
+                timeout=_INTERRUPT_FORWARD_TIMEOUT_S,
+            )
+    except (httpx.HTTPError, ConnectionError, TimeoutError):
         return "lost"
-    return "delivered" if response.status_code < 400 else "refused"
+    if response.status_code < 400:
+        return "delivered"
+    if response.status_code == 409 and _answer_status(response) == TURN_ENDED_STATUS:
+        return "turn_already_ended"
+    return "refused"
+
+
+def _answer_status(response: httpx.Response) -> object:
+    """Return the ``status`` field of a JSON answer, or ``None``."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body.get("status") if isinstance(body, dict) else None
