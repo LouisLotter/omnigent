@@ -546,8 +546,14 @@ async def _wait_admitting(state: _HostLifecycle, host: Host, deadline: float) ->
             # A wake waits for the earlier sleep's outcome; ask for it again,
             # once for every waiter, and only as long as this waiter may wait.
             recovery = _recovery_task(host.host_id, state, state.unknown_suspend_operation)
-            with contextlib.suppress(TimeoutError):
+            try:
                 await asyncio.wait_for(asyncio.shield(recovery), remaining)
+            except TimeoutError:
+                pass
+            except Exception:  # noqa: BLE001 — admission stays closed; it is asked again.
+                _logger.warning(
+                    "sleep outcome for host %s unresolved", host.host_id, exc_info=True
+                )
             if not state.admitting.is_set():
                 await asyncio.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
             continue
@@ -1115,6 +1121,10 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
         conn = _host_registry.get(host_id)
         if operation_id is None and conn is None:
             return outcome
+        if operation_id is not None:
+            # Resolving an earlier sleep: until its outcome is learned and
+            # recorded, any failure here keeps admission closed.
+            outcome = "unknown"
         state.admitting.clear()
         state.closed_reason = "going to sleep"
         try:
@@ -1140,14 +1150,10 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                         _host_store.begin_host_sleep, host_id, operation_id=operation_id
                     )
                 )
-            if state.pending_intent is not None:
-                recorded = await asyncio.shield(state.pending_intent)
-                state.pending_intent = None
-            else:
-                current = await asyncio.to_thread(_host_store.get_host, host_id)
-                recorded = current is not None and current.sleep_operation_id == operation_id
+            recorded = await _sleep_intent_recorded(state, host_id, operation_id)
             if not recorded:
-                # Nothing was written, so nothing stopped and the token is unchanged.
+                # No intent is recorded: none was written, so nothing stopped and
+                # the token is unchanged, or its outcome is already recorded.
                 outcome = "abandoned"
                 return outcome  # noqa: RET504 — ``finally`` reads the outcome.
             outcome = "unknown"
@@ -1178,6 +1184,29 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                 state.closed_reason = None
                 state.idle_since = None
                 state.admitting.set()
+
+
+async def _sleep_intent_recorded(state: _HostLifecycle, host_id: str, operation_id: str) -> bool:
+    """Whether the sleep intent *operation_id* is durably recorded for the host.
+
+    Learns it from the intent write still in flight when there is one;
+    otherwise, or when that write failed ambiguously, from the store. A
+    failed or cancelled read raises, leaving the outcome unknown.
+    """
+    assert _host_store is not None
+    if state.pending_intent is not None:
+        try:
+            recorded = await asyncio.shield(state.pending_intent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the write may have committed; the store knows.
+            _logger.warning("sleep intent write for host %s failed", host_id, exc_info=True)
+        else:
+            state.pending_intent = None
+            return recorded
+        state.pending_intent = None
+    current = await asyncio.to_thread(_host_store.get_host, host_id)
+    return current is not None and current.sleep_operation_id == operation_id
 
 
 async def recover_pending_sleeps() -> list[str]:
@@ -1312,9 +1341,13 @@ class PersistentHostIdleMonitor:
         outcomes: dict[str, str] = {}
         for host_id, state in list(_states.items()):
             if state.unknown_suspend_operation is not None:
-                outcomes[host_id] = await sleep_if_idle(
-                    host_id, only_operation=state.unknown_suspend_operation
-                )
+                try:
+                    outcomes[host_id] = await sleep_if_idle(
+                        host_id, only_operation=state.unknown_suspend_operation
+                    )
+                except Exception:  # noqa: BLE001 — admission stays closed until the next sweep.
+                    _logger.warning("sleep outcome for host %s unresolved", host_id, exc_info=True)
+                    outcomes[host_id] = "unknown"
         for host_id in _host_registry.online_host_ids():
             host = await _persistent_host(host_id)
             conn = _host_registry.get(host_id)

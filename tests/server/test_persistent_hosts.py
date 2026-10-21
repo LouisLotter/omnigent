@@ -615,6 +615,133 @@ async def test_lost_suspend_reply_keeps_admission_closed_until_the_same_operatio
     assert host.computer.events[-1] == "admitted"
 
 
+class _FlakyStore:
+    """Wraps one store method so it fails, blocks or succeeds on demand."""
+
+    def __init__(self, store: HostStore, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.real = getattr(store, name)
+        self.failures = 0
+        self.gate: threading.Event | None = None
+        self.entered = threading.Event()
+        monkeypatch.setattr(store, name, self)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.entered.set()
+        if self.gate is not None:
+            self.gate.wait(10)
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("database unavailable")
+        return self.real(*args, **kwargs)
+
+
+async def _unknown_sleep(host: FakeHost) -> str:
+    """A sleep whose stop was accepted but whose reply was lost."""
+    host.computer.lose_suspend_replies = 1
+    assert await persistent_hosts.sleep_if_idle(HOST_ID) == "unknown"
+    operation = persistent_hosts._states[HOST_ID].unknown_suspend_operation
+    assert operation is not None
+    return operation
+
+
+def _still_unresolved(operation: str) -> None:
+    state = persistent_hosts._states[HOST_ID]
+    assert not state.admitting.is_set()
+    assert state.unknown_suspend_operation == operation
+
+
+@pytest.mark.parametrize("fault", ["failed", "blocked", "cancelled"])
+async def test_unknown_sleep_stays_closed_while_its_intent_cannot_be_read(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    """A failed, blocked or cancelled read of the sleep intent keeps admission closed.
+
+    Nothing is admitted, the operation is kept, the provider is never asked to
+    stop twice, and once the database answers again the sleep resolves and the
+    next request wakes the computer.
+    """
+    operation = await _unknown_sleep(host)
+    reads = _FlakyStore(host.store, "get_host", monkeypatch)
+    if fault == "failed":
+        reads.failures = 1
+        with pytest.raises(RuntimeError):
+            await persistent_hosts.sleep_if_idle(HOST_ID, only_operation=operation)
+    else:
+        reads.gate = threading.Event()
+        recovery = asyncio.create_task(
+            persistent_hosts.sleep_if_idle(HOST_ID, only_operation=operation)
+        )
+        assert await asyncio.to_thread(reads.entered.wait, 10)
+        if fault == "cancelled":
+            recovery.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await recovery
+            reads.gate.set()
+        else:
+            # Work waiting meanwhile is refused at its deadline, never admitted.
+            with pytest.raises(OmnigentError):
+                await asyncio.create_task(_ready("message", timeout_s=0.3)())
+            reads.gate.set()
+            assert await asyncio.wait_for(recovery, 10) == "stopped"
+    if fault != "blocked":
+        _still_unresolved(operation)
+        reads.gate = None
+        assert await persistent_hosts.sleep_if_idle(HOST_ID, only_operation=operation) == "stopped"
+    assert persistent_hosts._states[HOST_ID].admitting.is_set()
+    assert host.computer.events.count("suspend") == 1
+    assert set(host.computer.suspend_operations) == {operation}
+    await asyncio.create_task(_admitted_after(host, _ready("message")))
+    assert host.computer.events[-4:] == ["resume", "claim", "start_host", "admitted"]
+
+
+@pytest.mark.parametrize("acknowledged", ["committed", "not_committed"])
+async def test_ambiguous_intent_write_is_settled_from_the_store(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch, acknowledged: str
+) -> None:
+    """An intent write that raised is reconciled by reading what the store holds.
+
+    Committed: the sleep goes ahead once, with that operation. Not committed:
+    nothing stopped, admission reopens and the token still works.
+    """
+    real = host.store.begin_host_sleep
+
+    def write_then_fail(host_id: str, *, operation_id: str) -> bool:
+        if acknowledged == "committed":
+            real(host_id, operation_id=operation_id)
+        raise RuntimeError("connection reset after the write")
+
+    monkeypatch.setattr(host.store, "begin_host_sleep", write_then_fail)
+    outcome = await persistent_hosts.sleep_if_idle(HOST_ID)
+    state = persistent_hosts._states[HOST_ID]
+    if acknowledged == "committed":
+        assert outcome == "stopped"
+        assert host.computer.events == ["suspend", "stopped"]
+    else:
+        assert outcome == "abandoned"
+        assert host.computer.events == []
+        assert host.store.resolve_launch_token(HOST_ID, FIRST_TOKEN) is not None
+    assert state.admitting.is_set() and state.unknown_suspend_operation is None
+
+
+async def test_restart_with_an_unreadable_store_keeps_the_sleep_closed(
+    host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a restart, recovery that cannot read the store yet is retried, not abandoned."""
+    operation = await _unknown_sleep(host)
+    persistent_hosts._states.clear()
+    host.registry.deregister(HOST_ID)
+    assert await persistent_hosts.recover_pending_sleeps() == [HOST_ID]
+    reads = _FlakyStore(host.store, "get_host", monkeypatch)
+    reads.failures = 1
+    outcomes = await persistent_hosts.PersistentHostIdleMonitor().sweep_once()
+    assert outcomes[HOST_ID] == "unknown"
+    _still_unresolved(operation)
+    outcomes = await persistent_hosts.PersistentHostIdleMonitor().sweep_once()
+    assert outcomes[HOST_ID] == "stopped"
+    assert persistent_hosts._states[HOST_ID].admitting.is_set()
+    assert host.computer.events.count("suspend") == 1
+
+
 async def test_confirmed_sleep_revokes_the_token_and_a_stale_token_stays_refused(
     host: FakeHost,
 ) -> None:
