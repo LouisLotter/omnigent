@@ -369,3 +369,47 @@ async def test_tunnel_closed_after_send_is_an_unknown_outcome() -> None:
 def test_runner_request_may_have_been_delivered(error: BaseException, expected: bool) -> None:
     """Only a request that provably never left is safe to send again."""
     assert runner_request_may_have_been_delivered(error) is expected
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_a_read_timeout_cannot_hold_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel whose owner loop stalls still lets the read timeout through promptly."""
+    from omnigent.runner.transports.ws_tunnel import transport as transport_module
+
+    monkeypatch.setattr(transport_module, "_CANCEL_ENQUEUE_TIMEOUT_S", 0.05)
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello())
+    real_send = reg.send_text
+    sends = 0
+
+    async def send_then_stall(session: RunnerSession, data: str, **kwargs: object) -> None:
+        nonlocal sends
+        sends += 1
+        if sends > 1:
+            await asyncio.Future()  # the cancel never gets queued
+        await real_send(session, data, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(reg, "send_text", send_then_stall)
+    client = httpx.AsyncClient(transport=WSTunnelTransport(reg, "r1"), base_url="http://runner")
+
+    with pytest.raises(httpx.ReadTimeout):
+        await asyncio.wait_for(client.get("/v1/health", timeout=0.05), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_frame_queued_after_its_write_timeout_is_dropped() -> None:
+    """A request its caller abandoned is never sent once the owner loop catches up."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    state = reg.open_request("r1", "req_late")
+    reg.close_request("r1", "req_late", session=state.session)
+
+    with pytest.raises(ConnectionError, match="abandoned"):
+        await reg.send_text(
+            session,
+            '{"type": "request"}',
+            still_wanted=lambda: reg.request_is_open(session, "req_late"),
+        )
+    assert session.outbound_queue.empty()

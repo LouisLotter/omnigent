@@ -87,6 +87,11 @@ def _request_timeout(request: httpx.Request, kind: str) -> float | None:
     return float(value) if isinstance(value, int | float) else None
 
 
+# Bound on queuing a cancel for a request that already timed out, so cleanup on
+# a stalled tunnel never outlasts the caller's own timeout by much.
+_CANCEL_ENQUEUE_TIMEOUT_S = 1.0
+
+
 async def _cancel_on_runner(registry: TunnelRegistry, state: RequestState, req_id: str) -> None:
     """
     Ask the runner to abort a request this side gave up on, best effort.
@@ -98,9 +103,12 @@ async def _cancel_on_runner(registry: TunnelRegistry, state: RequestState, req_i
     if not registry.request_is_open(state.session, req_id):
         return
     try:  # noqa: SIM105 — contextlib.suppress doesn't work with await
-        await registry.send_text(
-            state.session,
-            encode_frame(RequestCancelFrame(id=req_id, reason="client_timeout")),
+        await asyncio.wait_for(
+            registry.send_text(
+                state.session,
+                encode_frame(RequestCancelFrame(id=req_id, reason="client_timeout")),
+            ),
+            _CANCEL_ENQUEUE_TIMEOUT_S,
         )
     except Exception:  # noqa: BLE001 — best-effort cleanup
         pass
@@ -254,6 +262,8 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                                 stream=True,
                             )
                         ),
+                        # A frame queued only after the caller gave up is dropped.
+                        still_wanted=lambda: self._registry.request_is_open(state.session, req_id),
                     ),
                     _request_timeout(request, "write"),
                 )

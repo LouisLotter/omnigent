@@ -764,7 +764,12 @@ class TunnelRegistry:
         )
 
     async def send_text(
-        self, session: RunnerSession, data: str, *, app_ping_ts: int | None = None
+        self,
+        session: RunnerSession,
+        data: str,
+        *,
+        app_ping_ts: int | None = None,
+        still_wanted: Callable[[], bool] | None = None,
     ) -> None:
         """Enqueue one outbound WebSocket frame on the session's owner loop.
 
@@ -772,6 +777,9 @@ class TunnelRegistry:
             the frame.
         :param data: Encoded tunnel frame JSON.
         :param app_ping_ts: Application ping token, only for heartbeat diagnostics.
+        :param still_wanted: Checked on the owner loop just before queuing; when
+            it returns ``False`` the frame is dropped, e.g. for a request its
+            caller abandoned while the owner loop was busy.
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
@@ -788,6 +796,8 @@ class TunnelRegistry:
                 with self._lock:
                     if self._sessions.get(session.runner_id) is not session:
                         raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                    if still_wanted is not None and not still_wanted():
+                        raise ConnectionError("request was abandoned before it was sent")
                     frame = OutboundFrame(
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )
