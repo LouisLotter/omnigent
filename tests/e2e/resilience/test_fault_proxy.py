@@ -30,6 +30,7 @@ from tests.e2e.resilience.lab.tls import TlsInterceptor
 from tests.e2e.resilience.lab.websocket_frames import (
     OP_BINARY,
     OP_PING,
+    OP_PONG,
     OP_TEXT,
     FrameSplitter,
     encode_frame,
@@ -508,21 +509,96 @@ def test_ping_only_skips_connections_that_are_not_websockets(loop_thread: LoopTh
         assert _recv(raw_upgrade) == b"echo:not a frame"
 
 
+_UPGRADE_HEAD = (
+    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+)
+
+
+def _split_feed(splitter: FrameSplitter, stream: bytes, cuts: list[int]) -> tuple[bytes, list]:
+    passthrough, frames = b"", []
+    for start, end in zip([0, *cuts], [*cuts, len(stream)], strict=True):
+        chunk_passthrough, chunk_frames = splitter.feed(stream[start:end])
+        passthrough += chunk_passthrough
+        frames.extend(chunk_frames)
+    return passthrough, frames
+
+
 def test_frame_splitter_yields_whole_frames_from_any_chunking() -> None:
     ping = encode_frame(OP_PING, b"keepalive", masked=True)
     big = encode_frame(OP_TEXT, b"x" * 70_000, masked=False)
     medium = encode_frame(OP_BINARY, b"y" * 300, masked=True)
-    head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
-    stream = head + ping + big + medium
-    splitter = FrameSplitter(http_head=True)
-    passthrough = b""
-    frames = []
-    for index in range(0, len(stream), 7):
-        chunk_head, chunk_frames = splitter.feed(stream[index : index + 7])
-        passthrough += chunk_head
-        frames.extend(chunk_frames)
-    assert passthrough == head
+    stream = _UPGRADE_HEAD + ping + big + medium
+    splitter = FrameSplitter(response_head=True)
+    passthrough, frames = _split_feed(splitter, stream, list(range(7, len(stream), 7)))
+    assert passthrough == _UPGRADE_HEAD
+    assert splitter.websocket
     assert [frame.raw for frame in frames] == [ping, big, medium]
     assert [frame.opcode for frame in frames] == [OP_PING, OP_TEXT, OP_BINARY]
     # Control payloads are unmasked; data payloads are never read.
     assert [frame.payload for frame in frames] == [b"keepalive", b"", b""]
+
+
+def test_frame_splitter_finds_a_head_cut_anywhere() -> None:
+    data = encode_frame(OP_TEXT, b"after the head", masked=False)
+    for cut in range(1, len(_UPGRADE_HEAD) + 1):
+        splitter = FrameSplitter(response_head=True)
+        passthrough, frames = _split_feed(splitter, _UPGRADE_HEAD + data, [cut])
+        assert passthrough == _UPGRADE_HEAD, cut
+        assert [frame.raw for frame in frames] == [data], cut
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n",
+    ],
+    ids=["plain-response", "other-upgrade"],
+)
+def test_frame_splitter_passes_other_responses_through(head: bytes) -> None:
+    splitter = FrameSplitter(response_head=True)
+    body = b"\x81\x7fnot a frame"
+    passthrough, frames = _split_feed(splitter, head + body, [5, len(head) + 2])
+    assert (passthrough, frames) == (head + body, [])
+    assert not splitter.websocket
+    assert splitter.upgraded == head.startswith(b"HTTP/1.1 101")
+
+
+def test_ping_only_catches_a_websocket_whose_response_head_was_split(
+    loop_thread: LoopThread,
+) -> None:
+    """The upgrade is recognised however the server's response is segmented."""
+    received: list[bytes] = []
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        cut = _UPGRADE_HEAD.index(b"Upgrade")
+        writer.write(_UPGRADE_HEAD[:cut])
+        await writer.drain()
+        await asyncio.sleep(0.05)
+        writer.write(_UPGRADE_HEAD[cut:] + encode_frame(OP_TEXT, b"hello", masked=False))
+        await writer.drain()
+        while data := await reader.read(65536):
+            received.append(data)
+        writer.close()
+
+    async def _start() -> int:
+        server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+        return int(server.sockets[0].getsockname()[1])
+
+    proxy = _proxy_to(loop_thread, loop_thread.run(_start()))
+    request = (
+        b"GET /v1/hosts/h1/tunnel HTTP/1.1\r\nHost: x\r\n"
+        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    )
+    with contextlib.closing(_connect(proxy, request)) as sock:
+        expected = _UPGRADE_HEAD + encode_frame(OP_TEXT, b"hello", masked=False)
+        reply = b""
+        while len(reply) < len(expected):
+            reply += _recv(sock)
+        assert reply == expected
+        assert proxy.ping_only({"host.tunnel"}) == 1
+        sock.sendall(encode_frame(OP_TEXT, b"dropped", masked=True))
+        sock.sendall(encode_frame(OP_PING, b"are you there", masked=True))
+        assert _recv(sock) == encode_frame(OP_PONG, b"are you there", masked=False)
+    assert received == []

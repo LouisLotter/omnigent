@@ -89,7 +89,6 @@ _MODEL_API_PATH = re.compile(r"/v1/(messages|models|responses|chat/completions)(
 _RUNNER_TUNNEL = re.compile(r"^/v1/runners/[^/]+/tunnel$")
 _HOST_TUNNEL = re.compile(r"^/v1/hosts/[^/]+/tunnel$")
 _TERMINAL_ATTACH = re.compile(r"^/v1/sessions/[^/]+/resources/terminals/[^/]+/attach$")
-_WEBSOCKET_UPGRADE = re.compile(rb"(?im)^upgrade:[ \t]*websocket[ \t]*\r?$")
 
 
 def client_link(method: str, path: str) -> str:
@@ -259,8 +258,8 @@ class _Connection:
     upgraded: bool = False
     ended: asyncio.Event = field(default_factory=asyncio.Event)
     end_reason: str | None = None
-    websocket_request: bool = False
-    # Set on upgrade, so WebSocket connections forward whole frames only.
+    # Frame-aware forwarding: the response head is read first, and WebSocket
+    # connections then forward whole frames only.
     frames_c2s: FrameSplitter | None = None
     frames_s2c: FrameSplitter | None = None
     last_s2c_message_mono: float | None = None
@@ -733,7 +732,7 @@ class FaultProxy:
         for conn in self._connections.values():
             if (
                 conn.ended.is_set()
-                or conn.frames_s2c is None
+                or conn.frames_c2s is None
                 or conn.ping_only is not None
                 or not tag_matches(conn.tag, selectors)
             ):
@@ -752,6 +751,9 @@ class FaultProxy:
     ) -> bytes:
         """Return what to forward of *data*: whole frames, or nothing once caught."""
         head, frames = splitter.feed(data)
+        if not upstream and conn.frames_c2s is None and splitter.websocket:
+            # The client sends frames only after this response reaches it.
+            conn.frames_c2s = FrameSplitter(response_head=False)
         if conn.ping_only is None:
             if not upstream and any(frame.opcode in DATA_OPCODES for frame in frames):
                 conn.last_s2c_message_mono = time.monotonic()
@@ -851,7 +853,9 @@ class FaultProxy:
             if first is None:
                 return
             first_read_at = time.monotonic()
-        conn.websocket_request = _WEBSOCKET_UPGRADE.search(first) is not None
+        if _request_line(first)[0] == "GET":
+            # Only a GET can open a WebSocket.
+            conn.frames_s2c = FrameSplitter(response_head=True)
         try:
             upstream_reader, upstream_writer = await asyncio.open_connection(*self.upstream)
         except OSError as exc:
@@ -975,16 +979,15 @@ class FaultProxy:
                 throttles = self._active("throttle", conn.tag)
                 if throttles:
                     await asyncio.sleep(len(data) / min(r.value for r in throttles))
-                if not upstream and conn.s2c_bytes == 0 and data.startswith(b"HTTP/1.1 101"):
-                    conn.upgraded = True
-                    if conn.websocket_request:
-                        conn.frames_c2s = FrameSplitter(http_head=False)
-                        conn.frames_s2c = FrameSplitter(http_head=True)
                 splitter = conn.frames_c2s if upstream else conn.frames_s2c
                 if splitter is not None:
                     data = self._websocket_bytes(conn, splitter, data, upstream=upstream)
+                    if not upstream and splitter.upgraded:
+                        conn.upgraded = True
                     if not data:
                         continue
+                elif not upstream and conn.s2c_bytes == 0 and data.startswith(b"HTTP/1.1 101"):
+                    conn.upgraded = True
                 writer.write(data)
                 now = time.monotonic()
                 if upstream:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import struct
 from dataclasses import dataclass
 
@@ -12,6 +13,10 @@ OP_BINARY = 0x2
 OP_PING = 0x9
 OP_PONG = 0xA
 DATA_OPCODES = frozenset({OP_CONTINUATION, OP_TEXT, OP_BINARY})
+
+_HEAD_LIMIT = 16 * 1024
+_SWITCHING_PROTOCOLS = re.compile(rb"^HTTP/1\.[01] 101 ")
+_UPGRADE_WEBSOCKET = re.compile(rb"(?im)^upgrade:[ \t]*websocket[ \t]*\r?$")
 
 
 @dataclass(frozen=True)
@@ -30,33 +35,49 @@ class Frame:
 
 
 class FrameSplitter:
-    """Split one direction of an upgraded connection into whole frames.
+    """Split one direction of a WebSocket connection into whole frames.
 
-    :param http_head: Whether the stream starts with an HTTP head (the server's
-        ``101`` response) that passes through before the first frame.
+    :param response_head: Whether the stream starts with the server's response
+        head. It is held until complete, then passed through; frames follow only
+        if it accepted a WebSocket upgrade, and otherwise every later byte
+        passes through as it is.
     """
 
-    def __init__(self, *, http_head: bool) -> None:
+    def __init__(self, *, response_head: bool) -> None:
         self._buffer = bytearray()
-        self._in_head = http_head
+        self._in_head = response_head
+        self._passthrough = False
+        #: Whether the response switched protocols, known once its head is complete.
+        self.upgraded = not response_head
+        #: Whether frames follow, known once the response head is complete.
+        self.websocket = not response_head
 
     def feed(self, data: bytes) -> tuple[bytes, list[Frame]]:
         """Consume *data*.
 
         :param data: Bytes read from the socket.
-        :returns: Head bytes to forward as they are, then every frame now complete.
-            A partial frame stays buffered until its remaining bytes arrive.
+        :returns: Bytes to forward as they are (the response head, or everything
+            after a response that is not a WebSocket upgrade), then every frame now
+            complete. A partial head or frame stays buffered until it completes.
         """
+        if self._passthrough:
+            return data, []
         self._buffer += data
         head = b""
         if self._in_head:
             end = self._buffer.find(b"\r\n\r\n")
-            if end < 0:
-                head, self._buffer = bytes(self._buffer), bytearray()
-                return head, []
-            head = bytes(self._buffer[: end + 4])
-            del self._buffer[: end + 4]
+            if end < 0 and len(self._buffer) <= _HEAD_LIMIT:
+                return b"", []
             self._in_head = False
+            if end >= 0:
+                head = bytes(self._buffer[: end + 4])
+                del self._buffer[: end + 4]
+                self.upgraded = _SWITCHING_PROTOCOLS.match(head) is not None
+                self.websocket = self.upgraded and _UPGRADE_WEBSOCKET.search(head) is not None
+            if not self.websocket:
+                self._passthrough = True
+                rest, self._buffer = bytes(self._buffer), bytearray()
+                return head + rest, []
         frames: list[Frame] = []
         while (frame := self._next_frame()) is not None:
             frames.append(frame)
