@@ -97,7 +97,11 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
 from omnigent.runner.routing import RunnerRouter
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runner.session_init_protocol import (
+    INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+    LAST_TASK_ERROR_CODE_LABEL_KEY,
+    build_runner_session_init_payload,
+)
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
     auto_harness_session,
@@ -157,7 +161,7 @@ from omnigent.server.bundles import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
-from omnigent.server.interrupted_work import with_unanswered_tool
+from omnigent.server.interrupted_work import settle_late_tool_result, with_unanswered_tool
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -3357,6 +3361,11 @@ async def _persist_external_conversation_item_unlocked(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
     await record_claude_subagent_return(session_id, persisted, conversation_store)
+    if (
+        persisted.type == "function_call_output"
+        and conv.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    ):
+        await settle_late_tool_result(session_id, conversation_store)
     return persisted.id
 
 

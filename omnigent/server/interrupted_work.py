@@ -6,7 +6,8 @@ reached the transcript. A replacement runner never continues that work on its
 own (see :func:`omnigent.runner.session_init_protocol.automatic_continuation_allowed`).
 The server records which incarnation holds each session, names the tool call
 left without a result, and keeps an "interrupted, outcome unknown" failure on
-the session that only the person's next action clears.
+the session that only the person's next action clears. When that call's result
+arrives later, the failure says the outcome is known, and never goes back.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import httpx
 
 from omnigent.entities import Conversation
 from omnigent.runner.session_init_protocol import (
+    INTERRUPTED_OUTCOME_KNOWN_CODE,
     INTERRUPTED_OUTCOME_UNKNOWN_CODE,
+    INTERRUPTED_WORK_CODES,
     LAST_TASK_ERROR_CODE_LABEL_KEY,
     RUNNER_INCARNATION_LABEL_KEY,
 )
@@ -145,6 +148,24 @@ def interrupted_outcome_error(tool: tuple[str, str] | None) -> ErrorDetail:
     )
 
 
+def interrupted_outcome_known_error(tool_name: str) -> ErrorDetail:
+    """
+    Build the failure for interrupted work whose unanswered call's result arrived later.
+
+    :param tool_name: The call's tool, e.g. ``"Bash"``.
+    :returns: The failure to publish and persist.
+    """
+    return ErrorDetail(
+        code=INTERRUPTED_OUTCOME_KNOWN_CODE,
+        title="Interrupted",
+        message=(
+            f"The runner stopped while {tool_name} was running. Its result arrived "
+            "afterwards and is in the conversation, but the turn was not continued."
+        ),
+        remediation="Check the result, then continue or retry.",
+    )
+
+
 async def with_unanswered_tool(
     error: ErrorDetail, conversation_store: ConversationStore, session_id: str
 ) -> ErrorDetail:
@@ -216,9 +237,7 @@ async def keep_interrupted_outcome(
     conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conversation is None:
         return False
-    if conversation.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == (
-        INTERRUPTED_OUTCOME_UNKNOWN_CODE
-    ):
+    if conversation.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) in INTERRUPTED_WORK_CODES:
         # Already recorded: only the person's next message or retry clears it.
         return True
     if _init_answer(response).get("continuation_blocked") is not True:
@@ -240,4 +259,72 @@ async def keep_interrupted_outcome(
         owner_runner_id=runner_id,
         item_id=tool[0] if tool is not None else None,
     )
+    # The result may have arrived while the record was written.
+    await settle_late_tool_result(session_id, conversation_store)
     return True
+
+
+async def settle_late_tool_result(session_id: str, conversation_store: ConversationStore) -> None:
+    """
+    Settle an "interrupted, outcome unknown" record once its call's result arrives.
+
+    A replacement runner, or a forwarder's retry, can deliver the result of the
+    call a dead runner left unanswered. The outcome is then known, but the turn
+    was still not continued, so the failure stays until the person acts. A
+    record that another call is still without a result names that call instead.
+    A settled record never goes back to unknown.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the transcript and failure labels.
+    """
+    from omnigent.server.routes._sessions.common import (
+        _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
+        _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY,
+    )
+    from omnigent.server.routes._sessions.helpers import (
+        _persist_session_status_error_labels,
+        _publish_status,
+    )
+
+    def recorded_call() -> tuple[str, str | None] | None:
+        conversation = conversation_store.get_conversation(session_id)
+        if conversation is None:
+            return None
+        labels = conversation.labels
+        item_id = labels.get(_LAST_TASK_ERROR_ITEM_ID_LABEL_KEY)
+        if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) != INTERRUPTED_OUTCOME_UNKNOWN_CODE:
+            return None
+        if not item_id:
+            return None
+        return item_id, labels.get(_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY) or None
+
+    recorded = await asyncio.to_thread(recorded_call)
+    if recorded is None:
+        return
+    item_id, owner_runner_id = recorded
+    unanswered = await unanswered_tool_call(conversation_store, session_id)
+    if unanswered is not None and unanswered[0] == item_id:
+        return
+    if unanswered is not None:
+        error = interrupted_outcome_error(unanswered)
+    else:
+        call = await asyncio.to_thread(conversation_store.get_item, session_id, item_id)
+        error = interrupted_outcome_known_error(
+            str(getattr(getattr(call, "data", None), "name", "") or "a tool")
+        )
+    # Recheck: the person's message may have cleared the record meanwhile.
+    if await asyncio.to_thread(recorded_call) != recorded:
+        return
+    _logger.info(
+        "Session %s: the interrupted call's result arrived; its outcome is known",
+        session_id,
+        extra={"session_id": session_id},
+    )
+    _publish_status(session_id, "failed", error, failure_origin="interrupted_call_answered")
+    await _persist_session_status_error_labels(
+        session_id,
+        error,
+        conversation_store,
+        owner_runner_id=owner_runner_id,
+        item_id=unanswered[0] if unanswered is not None else item_id,
+    )

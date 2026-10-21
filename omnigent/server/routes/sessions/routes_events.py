@@ -611,14 +611,14 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
-    from omnigent.server.interrupted_work import INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    from omnigent.server.interrupted_work import INTERRUPTED_WORK_CODES
     from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
     last_error = _last_task_error_from_labels(conv.labels)
     # Retry is the person asking: a replacement runner may continue the work
     # a dead one was doing, including work it declined to continue on its own.
     continue_interrupted = (
-        last_error is not None and last_error.get("code") == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+        last_error is not None and last_error.get("code") in INTERRUPTED_WORK_CODES
     )
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,

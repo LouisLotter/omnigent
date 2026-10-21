@@ -17,9 +17,11 @@ from omnigent.entities import (
 )
 from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
 from omnigent.server.interrupted_work import (
+    INTERRUPTED_OUTCOME_KNOWN_CODE,
     INTERRUPTED_OUTCOME_UNKNOWN_CODE,
     keep_interrupted_outcome,
     record_runner_incarnation,
+    settle_late_tool_result,
     unanswered_tool_call,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -182,3 +184,62 @@ async def test_an_unknown_outcome_already_recorded_is_kept_on_every_later_reatta
     assert await keep_interrupted_outcome(session_id, second, store, runner_id="runner_new")
     error = _last_task_error_from_labels(_labels(store, session_id))
     assert error is not None and error["code"] == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+
+
+@pytest.mark.asyncio
+async def test_a_late_result_settles_the_unknown_outcome_for_good(
+    store: SqlAlchemyConversationStore, session_id: str
+) -> None:
+    """The call's late result makes the outcome known, still interrupted, never unknown again."""
+    (effect_id,) = _append(store, session_id, _user("append a line"), _call("call_1", "Bash"))[1:]
+    _session_status_cache[session_id] = "running"
+    answer = _init_answer(continuation_blocked=True, runner_incarnation_id="b" * 32)
+    assert await keep_interrupted_outcome(session_id, answer, store, runner_id="runner_new")
+
+    _append(store, session_id, _output("call_1"))
+    await settle_late_tool_result(session_id, store)
+
+    assert _session_status_cache[session_id] == "failed"
+    error = _last_task_error_from_labels(_labels(store, session_id))
+    assert error is not None
+    assert error["code"] == INTERRUPTED_OUTCOME_KNOWN_CODE
+    assert "Bash" in error["message"] and "not continued" in error["message"]
+    assert error["item_id"] == effect_id
+    # Every later re-attach keeps it, and nothing turns it back into unknown.
+    assert await keep_interrupted_outcome(session_id, answer, store, runner_id="runner_new")
+    await settle_late_tool_result(session_id, store)
+    error = _last_task_error_from_labels(_labels(store, session_id))
+    assert error is not None and error["code"] == INTERRUPTED_OUTCOME_KNOWN_CODE
+
+
+@pytest.mark.asyncio
+async def test_a_late_result_of_one_call_names_the_call_still_without_one(
+    store: SqlAlchemyConversationStore, session_id: str
+) -> None:
+    """With two calls left unanswered, the outcome stays unknown for the other."""
+    first_id, _second_id = _append(
+        store, session_id, _user("two effects"), _call("call_1", "Read"), _call("call_2", "Bash")
+    )[1:]
+    _session_status_cache[session_id] = "running"
+    answer = _init_answer(continuation_blocked=True)
+    assert await keep_interrupted_outcome(session_id, answer, store, runner_id="runner_new")
+
+    _append(store, session_id, _output("call_2"))
+    await settle_late_tool_result(session_id, store)
+
+    error = _last_task_error_from_labels(_labels(store, session_id))
+    assert error is not None
+    assert error["code"] == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    assert "Read" in error["message"]
+    assert error["item_id"] == first_id
+
+
+@pytest.mark.asyncio
+async def test_a_result_after_the_person_acted_changes_nothing(
+    store: SqlAlchemyConversationStore, session_id: str
+) -> None:
+    """Only a recorded unknown outcome is settled; a cleared one stays cleared."""
+    _append(store, session_id, _user("append a line"), _call("call_1", "Bash"))
+    _append(store, session_id, _output("call_1"))
+    await settle_late_tool_result(session_id, store)
+    assert _last_task_error_from_labels(_labels(store, session_id)) is None
