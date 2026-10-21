@@ -1589,6 +1589,39 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         session_stream.close(session_id)
 
 
+@pytest.mark.parametrize("final_status", ["idle", "failed"])
+async def test_relayed_turn_end_reaches_the_checkpoint_hook(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, final_status: str
+) -> None:
+    """In-runner harnesses and native terminal watchers end turns through the relay."""
+    from omnigent.server import managed_host_checkpoints
+    from omnigent.server.routes._sessions import common
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    checkpoint_edges: list[tuple[str, str | None, str]] = []
+    monkeypatch.setattr(
+        managed_host_checkpoints, "note_status", lambda *edge: checkpoint_edges.append(edge)
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    events = [
+        {"type": "session.status", "status": "running"},
+        {"type": "session.status", "status": final_status},
+    ]
+    try:
+        await _relay_runner_stream_once(
+            conv.id,
+            _ScriptedRunnerClient(release, events),
+            store,  # type: ignore[arg-type]
+        )
+    finally:
+        common._session_status_cache.pop(conv.id, None)
+        common._session_active_response_cache.pop(conv.id, None)
+    assert checkpoint_edges == [(conv.id, None, "running"), (conv.id, "running", final_status)]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("prior_error_code", "expect_cleared"),
@@ -1613,11 +1646,16 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
     failure with any other code must stay sticky, exactly as before.
     """
     from omnigent.runtime import session_stream
+    from omnigent.server import managed_host_checkpoints
     from omnigent.server.routes import sessions as sessions_module
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
+    )
+    checkpoint_edges: list[tuple[str, str | None, str]] = []
+    monkeypatch.setattr(
+        managed_host_checkpoints, "note_status", lambda *edge: checkpoint_edges.append(edge)
     )
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
@@ -1658,11 +1696,14 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
             )
             assert idle_edges, f"no idle edge reached the stream; saw {statuses}"
             assert persisted is None, f"disconnect labels survived recovery: {persisted}"
+            # The turn finished during the outage, so it still asks for a save.
+            assert (session_id, "failed", "idle") in checkpoint_edges
         else:
             assert sessions_module._session_status_cache.get(session_id) == "failed", (
                 f"a genuine {prior_error_code} failure was downgraded to idle; saw {statuses}"
             )
             assert persisted is not None and persisted["code"] == prior_error_code
+            assert (session_id, "failed", "idle") not in checkpoint_edges
     finally:
         gate.set()
         if collector is not None:

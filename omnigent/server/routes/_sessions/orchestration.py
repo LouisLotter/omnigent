@@ -124,7 +124,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import managed_host_checkpoints, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -3834,6 +3834,7 @@ async def _publish_runner_recovered_status_impl(
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
     _session_status_cache[session_id] = "idle"
+    managed_host_checkpoints.note_status(session_id, "failed", "idle")
     session_live_state.persist_live_status(session_id, "idle")
     event = SessionStatusEvent(
         type="session.status",

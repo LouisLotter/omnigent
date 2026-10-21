@@ -108,7 +108,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, shutdown_state
+from omnigent.server import managed_host_checkpoints, presence, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -4958,6 +4958,7 @@ def _publish_status(
     _session_status_cache[session_id] = status
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
+        managed_host_checkpoints.note_status(session_id, previous_status, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.

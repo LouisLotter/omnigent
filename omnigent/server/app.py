@@ -77,7 +77,12 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_checkpoints,
+    managed_host_keepalive,
+    session_live_state,
+    shutdown_state,
+)
 from omnigent.server.auth import (
     AuthProvider,
     SharingMode,
@@ -1807,6 +1812,10 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        turn_checkpoints = app_inst.state.turn_checkpoint_scheduler
+        if turn_checkpoints is not None:
+            turn_checkpoints.start()
+
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
         if sandbox_config is not None and sandbox_config.reaper.enabled:
             if host_store is None:
@@ -1827,6 +1836,8 @@ def create_app(
         finally:
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
+            if turn_checkpoints is not None:
+                await turn_checkpoints.aclose()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -2109,6 +2120,11 @@ def create_app(
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
+    # Ask checkpoint-capable providers to save a managed sandbox at turn ends and
+    # during long turns; no-op without a sandbox config.
+    app.state.turn_checkpoint_scheduler = managed_host_checkpoints.configure(
+        conversation_store, host_store, sandbox_config
+    )
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")

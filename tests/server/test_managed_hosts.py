@@ -38,6 +38,7 @@ from omnigent.onboarding.sandboxes.registry import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.managed_host_checkpoints import TurnCheckpointScheduler
 from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
@@ -2383,6 +2384,37 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
 
     if enabled:
         assert reaper._task is None
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_lifespan_runs_the_turn_checkpoint_scheduler(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    configured: bool,
+) -> None:
+    """The app owns one scheduler when sandboxes are configured, live only while it runs."""
+    config = (
+        parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+        if configured
+        else None
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config, host_store=HostStore(db_uri))
+    scheduler = app.state.turn_checkpoint_scheduler
+    assert isinstance(scheduler, TurnCheckpointScheduler) is configured
+    if scheduler is None:
+        return
+
+    def tasks_started_by_an_edge() -> int:
+        tasks_before = asyncio.all_tasks()
+        scheduler.note_status("conv_edge", "running", "idle")
+        return len(asyncio.all_tasks() - tasks_before)
+
+    # Status changes count only while the server runs.
+    assert tasks_started_by_an_edge() == 0
+    async with app.router.lifespan_context(app):
+        assert tasks_started_by_an_edge() > 0
+    assert tasks_started_by_an_edge() == 0
 
 
 @pytest.mark.parametrize(
