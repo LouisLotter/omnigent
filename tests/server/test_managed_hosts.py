@@ -54,6 +54,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     RepoWorkspace,
+    SandboxCheckpointPolicy,
     host_resume_supported,
     launch_managed_host,
     managed_repo_labels,
@@ -234,6 +235,63 @@ def test_parse_reaper_rejects_per_provider_override() -> None:
                     {"provider": "modal", "reaper": {"enabled": True}},
                     {"provider": "e2b"},
                 ],
+            }
+        )
+
+
+def test_parse_checkpoint_policy_defaults_and_per_provider_entries() -> None:
+    """Absent means the defaults; a shared block applies unless an entry sets its own."""
+    single = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert single is not None
+    assert single.default.checkpoint == SandboxCheckpointPolicy(
+        enabled=True, max_interval_s=600, min_interval_s=0
+    )
+
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "checkpoint": {"max_interval_s": 900, "min_interval_s": 30},
+            "providers": [
+                {"provider": "modal"},
+                {"provider": "e2b", "checkpoint": {"enabled": False}},
+            ],
+        }
+    )
+    assert config is not None
+    modal, e2b = config.offered()
+    assert modal.checkpoint == SandboxCheckpointPolicy(max_interval_s=900, min_interval_s=30)
+    assert e2b.checkpoint == SandboxCheckpointPolicy(enabled=False)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_fragment"),
+    [
+        (True, "must be a mapping"),
+        ({"enabled": "yes"}, "enabled must be a boolean"),
+        ({"max_interval_s": 0}, "max_interval_s must be a number"),
+        ({"max_interval_s": -600}, "max_interval_s must be a number"),
+        ({"max_interval_s": "600"}, "max_interval_s must be a number"),
+        ({"max_interval_s": True}, "max_interval_s must be a number"),
+        ({"max_interval_s": float("nan")}, "max_interval_s must be a number"),
+        ({"max_interval_s": float("inf")}, "max_interval_s must be a number"),
+        ({"max_interval_s": 86401}, "max_interval_s must be a number"),
+        ({"min_interval_s": -1}, "min_interval_s must be a number"),
+        ({"min_interval_s": None}, "min_interval_s must be a number"),
+        ({"min_interval_s": 601}, "must not exceed"),
+        ({"interval_s": 600}, "unknown key"),
+    ],
+)
+def test_parse_checkpoint_policy_rejects_malformed_config(
+    checkpoint: object,
+    expected_fragment: str,
+) -> None:
+    """A checkpoint typo fails server startup instead of silently changing saves."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "checkpoint": checkpoint,
             }
         )
 
