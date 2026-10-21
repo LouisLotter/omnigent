@@ -74,15 +74,23 @@ class _FakeTime:
 
 
 class _Worker:
-    """Runs blocking calls inline; an unset ``hold`` keeps checkpoint calls in flight."""
+    """Runs blocking calls inline; unset events keep named calls in flight.
+
+    ``before`` holds a call before it runs, like a busy thread pool; ``after``
+    holds its result, like a slow call. Keys are the scheduler's method names.
+    """
 
     def __init__(self) -> None:
-        self.hold: asyncio.Event | None = None
+        self.before: dict[str, asyncio.Event] = {}
+        self.after: dict[str, asyncio.Event] = {}
 
     async def __call__(self, function: Callable[..., Any], /, *args: Any) -> Any:
-        if self.hold is not None and function.__name__ == "_checkpoint":
-            await self.hold.wait()
-        return function(*args)
+        if (gate := self.before.get(function.__name__)) is not None:
+            await gate.wait()
+        result = function(*args)
+        if (gate := self.after.get(function.__name__)) is not None:
+            await gate.wait()
+        return result
 
 
 class _Stores:
@@ -229,8 +237,8 @@ async def make_harness() -> AsyncIterator[Callable[..., _Harness]]:
 
     yield make
     for harness in harnesses:
-        if harness.worker.hold is not None:
-            harness.worker.hold.set()
+        for gate in (*harness.worker.before.values(), *harness.worker.after.values()):
+            gate.set()
         await harness.scheduler.aclose()
 
 
@@ -342,7 +350,7 @@ async def test_turn_ends_during_an_in_flight_request_fold_into_one_follow_up(
         harness.publish(session_id, "running")
     await harness.time.advance_to(1)
 
-    harness.worker.hold = asyncio.Event()  # keep the first call in flight
+    held = harness.worker.before["_checkpoint"] = asyncio.Event()  # first call in flight
     harness.publish("conv1", "idle")
     await harness.time.advance_to(1 + _DEBOUNCE_S)
     harness.publish("conv2", "idle")
@@ -350,7 +358,7 @@ async def test_turn_ends_during_an_in_flight_request_fold_into_one_follow_up(
     await harness.time.advance_to(30)
     assert harness.launcher.calls == []
 
-    harness.worker.hold.set()
+    held.set()
     await _settle()
     assert harness.reasons == ["turn_completed", "turn_completed"]
 
@@ -363,13 +371,13 @@ async def test_folded_follow_up_keeps_the_turn_completed_reason(
     for session_id in ("long", "first", "second"):
         harness.stores.add_session(session_id)
         harness.publish(session_id, "running")
-    harness.worker.hold = asyncio.Event()
+    held = harness.worker.before["_checkpoint"] = asyncio.Event()
     harness.publish("first", "idle")
     await harness.time.advance_to(20)
     harness.publish("second", "idle")
     # "second" folds at 30; the long turn then comes due at 630 and folds too.
     await harness.time.advance_to(700)
-    harness.worker.hold.set()
+    held.set()
     await _settle()
     assert harness.reasons == ["turn_completed", "turn_completed"]
 
@@ -431,8 +439,9 @@ async def test_any_checkpoint_on_the_host_restarts_the_long_turn_interval(
     assert harness.call_times == [310, 910]
 
 
+@pytest.mark.parametrize("recheck", ["returned", "still-in-flight"])
 async def test_long_turn_resumes_after_a_lull_seen_at_its_recheck(
-    make_harness: Callable[..., _Harness],
+    make_harness: Callable[..., _Harness], recheck: str
 ) -> None:
     """An idle persisted just before the recheck must not end long-turn saves."""
     harness = make_harness()
@@ -440,8 +449,13 @@ async def test_long_turn_resumes_after_a_lull_seen_at_its_recheck(
     harness.publish("conv1", "running")
     await harness.time.advance_to(599)
     harness.publish("conv1", "idle")
+    slow_read = harness.worker.after["_resolve_targets"] = asyncio.Event()
+    if recheck == "returned":
+        slow_read.set()
     await harness.time.advance_to(605)
+    # The session runs again; the recheck read "idle" and may not have returned yet.
     harness.publish("conv1", "running")
+    slow_read.set()
     await harness.time.advance_to(1300)
     assert harness.reasons == ["long_turn", "long_turn"]
     assert harness.call_times == [605, 1205]
@@ -518,21 +532,29 @@ async def test_min_interval_spaces_checkpoint_calls(
     assert harness.call_times == [10, 70]
 
 
+@pytest.mark.parametrize(
+    ("held", "expected_call_times"),
+    [
+        pytest.param("before", [100, 160], id="busy-worker-pool"),
+        pytest.param("after", [10, 160], id="slow-provider-call"),
+    ],
+)
 async def test_min_interval_is_measured_from_the_end_of_a_slow_call(
-    make_harness: Callable[..., _Harness],
+    make_harness: Callable[..., _Harness], held: str, expected_call_times: list[float]
 ) -> None:
     harness = make_harness(policy=SandboxCheckpointPolicy(min_interval_s=60))
     for session_id in ("conv1", "conv2"):
         harness.stores.add_session(session_id)
         harness.publish(session_id, "running")
-    harness.worker.hold = asyncio.Event()
+    gates = harness.worker.before if held == "before" else harness.worker.after
+    gate = gates["_checkpoint"] = asyncio.Event()
     harness.publish("conv1", "idle")
     await harness.time.advance_to(20)
     harness.publish("conv2", "idle")
     await harness.time.advance_to(100)
-    harness.worker.hold.set()
+    gate.set()
     await harness.time.advance_to(500)
-    assert harness.call_times == [100, 160]
+    assert harness.call_times == expected_call_times
 
 
 # ── providers and hosts that are skipped ─────────────────────────────────────
@@ -585,10 +607,27 @@ async def test_a_launcher_that_fails_to_build_is_retried(
         for _ in range(3):
             harness.publish("conv1", "running", "idle")
             await harness.time.advance_to(harness.time.now + 100)
-    assert harness.reasons == ["turn_completed"]
-    assert harness.launchers_built >= 3
+    # The first turn's start and end both failed to build it; later turns save.
+    assert harness.reasons == ["turn_completed", "turn_completed"]
     failures = [r for r in caplog.records if "could not build" in r.getMessage()]
     assert len(failures) == 1
+
+
+async def test_a_launcher_that_fails_to_build_is_retried_within_a_long_turn(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    harness = make_harness()
+    harness.factory_failures = 1
+    harness.stores.add_session("conv1")
+    harness.publish("conv1", "running")
+    for moment in (300, 900, 1500):
+        await harness.time.advance_to(moment)
+        harness.publish("conv1", "running")
+    await harness.time.advance_to(1850)
+    harness.publish("conv1", "idle")
+    await harness.time.advance_to(1900)
+    assert harness.reasons == ["long_turn", "long_turn", "long_turn", "turn_completed"]
+    assert harness.call_times == [600, 1200, 1800, 1860]
 
 
 @pytest.mark.parametrize(

@@ -85,12 +85,14 @@ class _Target:
 class _Turn:
     """One session's turn, from its first edge until its end has held.
 
-    ``targets`` resolves to ``None`` when the stores could not be read.
+    ``targets`` resolves to ``None`` when the hosts could not be determined.
+    ``activity`` counts busy publishes, so a stale read can be recognised.
     """
 
     context: contextvars.Context
     targets: asyncio.Task[list[_Target] | None]
     busy_since: float | None = None
+    activity: int = 0
     ending: asyncio.Task[None] | None = None
     long_turn: asyncio.Task[None] | None = None
 
@@ -211,6 +213,7 @@ class TurnCheckpointScheduler:
     def _turn_running(self, key: _Key, turn: _Turn | None) -> None:
         if turn is None:
             turn = self._start_turn(key)
+        turn.activity += 1
         if turn.ending is not None:
             # Running again before the end held: it was a lull, not the end.
             turn.ending.cancel()
@@ -260,10 +263,12 @@ class TurnCheckpointScheduler:
                 await self._sleep(due - now)
                 continue
             # Re-read first: the session may have been deleted, or its turn may
-            # have ended where this replica could not see it. If the read
-            # fails, save anyway rather than drop the long turn.
+            # have ended where this replica could not see it. Keep watching
+            # through a failed read, or an "ended" read that newer local
+            # activity contradicts.
+            activity = turn.activity
             rechecked = await self._resolve(key[1], require_busy=True)
-            if rechecked is not None:
+            if rechecked is not None and (rechecked or turn.activity == activity):
                 targets = rechecked
             if not targets and self._turns.get(key) is turn and not _active(turn.ending):
                 del self._turns[key]
@@ -367,8 +372,8 @@ class TurnCheckpointScheduler:
         :param session_id: The session, e.g. ``"conv_abc123"``.
         :param require_busy: Return nothing once the session's persisted
             status says its turn is over.
-        :returns: The targets, possibly empty, or ``None`` when the stores
-            could not be read.
+        :returns: The targets, possibly empty, or ``None`` when they could not
+            be determined: a store failed, or a launcher could not be built.
         """
         try:
             targets = await self._run_sync(self._resolve_targets, session_id, require_busy)
@@ -385,26 +390,29 @@ class TurnCheckpointScheduler:
             self._turns.clear()
         return targets
 
-    def _resolve_targets(self, session_id: str, require_busy: bool) -> list[_Target]:
-        providers = self._checkpoint_providers()
+    def _resolve_targets(self, session_id: str, require_busy: bool) -> list[_Target] | None:
+        providers, settled = self._checkpoint_providers()
         if not providers:
-            return []
+            # Unknown, not empty, while a launcher that failed to build is retried.
+            return [] if settled else None
         conversation = self._conversation_store.get_conversation(session_id)
         if conversation is None:
             return []
         if require_busy and conversation.live_status in _TURN_END_STATUSES:
             return []
         targets: list[_Target] = []
+        unknown = False
         for host_id in sorted(self._host_ids(conversation)):
             host = self._host_store.get_host(host_id)
-            if host is None or not host.sandbox_id:
+            if host is None or not host.sandbox_id or host.sandbox_provider is None:
                 continue
             provider = host.sandbox_provider
-            if provider is None or provider not in providers:
+            if provider not in providers:
+                unknown = unknown or not settled
                 continue
             policy = self._deployment.recorded(provider).checkpoint
             targets.append(_Target(host_id, provider, policy))
-        return targets
+        return None if unknown and not targets else targets
 
     def _host_ids(self, conversation: Conversation) -> set[str]:
         if conversation.host_id:
@@ -420,8 +428,12 @@ class TurnCheckpointScheduler:
             }
         return set()
 
-    def _checkpoint_providers(self) -> frozenset[str]:
-        """Offered providers that implement checkpoint with an enabled policy."""
+    def _checkpoint_providers(self) -> tuple[frozenset[str], bool]:
+        """Offered providers that implement checkpoint with an enabled policy.
+
+        :returns: Those providers, and whether every eligible entry was checked
+            (``False`` while a launcher that failed to build awaits a retry).
+        """
         with self._providers_lock:
             settled = True
             for index, entry in enumerate(self._deployment.offered()):
@@ -456,7 +468,7 @@ class TurnCheckpointScheduler:
             providers = {name for name in self._entry_providers.values() if name is not None}
             capable = frozenset(providers - self._dropped_providers)
             self._none_capable = settled and not capable
-            return capable
+            return capable, settled
 
     def _checkpoint(self, target: _Target, reason: CheckpointReason) -> None:
         host = self._host_store.get_host(target.host_id)
