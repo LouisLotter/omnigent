@@ -102,6 +102,7 @@ _DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
 _CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 # Rechecks a launch-token tunnel makes when other tunnels for its host register meanwhile.
 _LAUNCH_TOKEN_REGISTRATION_ATTEMPTS = 3
+_REPLACED_REFUSAL = "A newer connection for this host replaced this one."
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -433,6 +434,9 @@ def create_host_tunnel_router(
                 is None
             ):
                 raise HostRegistrationRefusedError(SUPERSEDED_LAUNCH_TOKEN_REFUSAL, retryable=True)
+            # A newer tunnel may have replaced this one during that check.
+            if conn.retirement_reason is not None:
+                raise HostRegistrationRefusedError(_REPLACED_REFUSAL, retryable=True)
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
@@ -548,21 +552,7 @@ def create_host_tunnel_router(
                             finally:
                                 # A replaced connection must not mark its successor offline.
                                 if host_registry.deregister(host_id, conn=conn):
-                                    offline_cancelled = threading.Event()
-                                    try:
-                                        await asyncio.to_thread(
-                                            host_store.set_offline,
-                                            host_id,
-                                            cancelled=offline_cancelled.is_set,
-                                            launch_token=managed_token,
-                                        )
-                                    except Exception:
-                                        _logger.exception(
-                                            "Failed to mark host %s offline after disconnect",
-                                            host_id,
-                                        )
-                                    finally:
-                                        offline_cancelled.set()
+                                    await _mark_offline(host_store, host_id, managed_token)
                         if cleanup_scope.cancel_called:
                             # The row ages out via its liveness TTL if persistence stalls.
                             _logger.warning("Timed out cleaning up host %s", host_id)
@@ -595,6 +585,10 @@ def create_host_tunnel_router(
         except asyncio.CancelledError as exc:
             disconnect_error = exc
             ended_by = "handler_cancelled"
+            # Cancelled between registering and starting its tasks: no teardown ran.
+            if conn is not None and host_registry.deregister(host_id, conn=conn):
+                with anyio.move_on_after(_DISCONNECT_CLEANUP_TIMEOUT_S, shield=True):
+                    await _mark_offline(host_store, host_id, managed_token)
             raise
         except HostRegistrationRefusedError as exc:
             # An expected refusal, reported to the host's operator, not a server fault.
@@ -699,6 +693,22 @@ def create_host_tunnel_router(
     return router
 
 
+async def _mark_offline(host_store: HostStore, host_id: str, launch_token: str | None) -> None:
+    """Mark a disconnected host offline, skipping the write if this call is abandoned first.
+
+    :param launch_token: The token the tunnel registered with, ``None`` for a bearer.
+    """
+    abandoned = threading.Event()
+    try:
+        await asyncio.to_thread(
+            host_store.set_offline, host_id, cancelled=abandoned.is_set, launch_token=launch_token
+        )
+    except Exception:
+        _logger.exception("Failed to mark host %s offline after disconnect", host_id)
+    finally:
+        abandoned.set()
+
+
 async def _register_launch_token_tunnel(
     host_registry: HostRegistry,
     host_store: HostStore,
@@ -800,7 +810,8 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
     """
     while True:
         frame = await conn.outbound_queue.get()
-        if frame is None:
+        # A replaced or deregistered connection sends none of its queued frames.
+        if frame is None or conn.retirement_reason is not None:
             conn.sender_end_reason = "queue_retired"
             return
         conn.diagnostics.dequeued(frame)

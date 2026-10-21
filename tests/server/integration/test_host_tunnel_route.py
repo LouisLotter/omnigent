@@ -2226,6 +2226,123 @@ async def test_refused_old_token_never_marks_offline_the_host_a_new_token_is_reg
     await newer.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+async def test_tunnel_replaced_during_its_token_recheck_never_carries_a_frame(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunnel overtaken while its last token check was in flight never starts.
+
+    Work queued on it while it was registered is never sent, even though the
+    check itself found the token valid.
+    """
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-old")
+    checked, release = threading.Event(), threading.Event()
+    resolve_launch_token = store.resolve_launch_token
+    old_token_checks = 0
+
+    def stall_old_token_recheck(host_id: str, token: str) -> object:
+        nonlocal old_token_checks
+        resolved = resolve_launch_token(host_id, token)
+        if token == "tunnel-token-old":
+            old_token_checks += 1
+            # The first check is the one before accept.
+            if old_token_checks == 2:
+                checked.set()
+                release.wait(budget(5.0))
+        return resolved
+
+    monkeypatch.setattr(store, "resolve_launch_token", stall_old_token_recheck)
+    try:
+        old = await _connect_managed(app, "tunnel-token-old")
+        await old.send_input({"type": "websocket.receive", "text": _make_hello(_MANAGED_NAME)})
+        assert await asyncio.to_thread(checked.wait, budget(5.0))
+        stale = registry.get(_HOST_ID)
+        assert stale is not None
+        registry.send_text(stale, "work-queued-on-the-old-host")
+        _supersede_launch_token(store, "replacement")
+        newer = await _connect_managed(app, "tunnel-token-new")
+        await newer.send_input({"type": "websocket.receive", "text": _make_hello(_MANAGED_NAME)})
+
+        async def wait_for_replacement() -> None:
+            while registry.get(_HOST_ID) is stale:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_replacement(), budget(2.0))
+        current = registry.get(_HOST_ID)
+    finally:
+        release.set()
+
+    refusal = await _sole_refusal(old)
+    await old.wait(timeout=budget(2.0))
+    assert await old.receive_nothing()
+
+    assert refusal.retryable and "replaced this one" in refusal.error
+    assert current is not None and current.retirement_reason is None
+    assert registry.get(_HOST_ID) is current
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "online"
+    await newer.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("cancellation", ["task", "scope"])
+@pytest.mark.parametrize("credential", ["launch token", "bearer"])
+async def test_tunnel_cancelled_during_its_registration_recheck_is_deregistered(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, credential: str, cancellation: str
+) -> None:
+    """A tunnel cancelled after registering, before its tasks start, leaves no registry entry."""
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    cancel_scopes: list[anyio.CancelScope] = []
+
+    async def cancellable_app(scope, receive, send):
+        with anyio.CancelScope() as cancel_scope:
+            cancel_scopes.append(cancel_scope)
+            await app(scope, receive, send)
+
+    if credential == "launch token":
+        _register_managed(store, host_id=_HOST_ID, token="tunnel-token-current")
+        scope = _managed_scope(_TUNNEL_PATH, "tunnel-token-current")
+        recheck_name = "resolve_launch_token"
+    else:
+        scope = _websocket_scope(_TUNNEL_PATH)
+        recheck_name = "registers_only_with_launch_token"
+    recheck = getattr(store, recheck_name)
+    checked, release = threading.Event(), threading.Event()
+    checks = 0
+
+    def stall_recheck(*args: object) -> object:
+        nonlocal checks
+        result = recheck(*args)
+        checks += 1
+        # The first check is the one before accept.
+        if checks == 2:
+            checked.set()
+            release.wait(budget(5.0))
+        return result
+
+    monkeypatch.setattr(store, recheck_name, stall_recheck)
+    communicator = ApplicationCommunicator(cancellable_app, scope)
+    try:
+        await communicator.send_input({"type": "websocket.connect"})
+        accepted = await communicator.receive_output(timeout=budget(1.0))
+        assert accepted["type"] == "websocket.accept"
+        hello = _make_hello(_MANAGED_NAME if credential == "launch token" else "alices-laptop")
+        await communicator.send_input({"type": "websocket.receive", "text": hello})
+        assert await asyncio.to_thread(checked.wait, budget(5.0))
+        assert registry.get(_HOST_ID) is not None
+        if cancellation == "task":
+            communicator.future.cancel()
+        else:
+            cancel_scopes[0].cancel()
+        done, _pending = await asyncio.wait({communicator.future}, timeout=budget(2.0))
+        assert done
+    finally:
+        release.set()
+
+    assert registry.get(_HOST_ID) is None
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "offline"
+
+
 @pytest.mark.parametrize("credential", ["launch token", "bearer"])
 async def test_delayed_handshake_with_a_current_credential_still_registers(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, credential: str
@@ -2379,7 +2496,10 @@ async def test_host_sender_loop_swallows_send_after_close_race() -> None:
         application_state=WebSocketState.DISCONNECTED,
     )
     conn = SimpleNamespace(
-        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+        host_id=_HOST_ID,
+        outbound_queue=asyncio.Queue(),
+        diagnostics=TunnelDiagnostics(),
+        retirement_reason=None,
     )
     conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await host_tunnel._sender_loop(ws, conn)  # returns without raising
@@ -2399,11 +2519,34 @@ async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
         application_state=WebSocketState.CONNECTED,
     )
     conn = SimpleNamespace(
-        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+        host_id=_HOST_ID,
+        outbound_queue=asyncio.Queue(),
+        diagnostics=TunnelDiagnostics(),
+        retirement_reason=None,
     )
     conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     with pytest.raises(RuntimeError):
         await host_tunnel._sender_loop(ws, conn)
+
+
+async def test_host_sender_loop_never_sends_for_a_replaced_connection() -> None:
+    """Frames queued on a connection before a newer one replaced it are never sent."""
+    from omnigent.server.routes import host_tunnel
+
+    registry = HostRegistry()
+    hello = HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="test-laptop")
+    replaced = registry.register(_HOST_ID, _FakeSenderWebSocket(), hello, owner=None)
+    registry.send_text(replaced, "frame-for-the-replaced-host")
+    registry.register(_HOST_ID, _FakeSenderWebSocket(), hello, owner=None)
+    ws = _FakeSenderWebSocket()
+
+    await host_tunnel._sender_loop(ws, replaced)
+
+    assert ws.sent == []
+    assert (replaced.retirement_reason, replaced.sender_end_reason) == (
+        "replaced",
+        "queue_retired",
+    )
 
 
 @pytest.fixture
