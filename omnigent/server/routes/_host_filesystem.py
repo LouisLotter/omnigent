@@ -102,7 +102,14 @@ async def read_workspace_from_host(
                 f"host '{host_conn.host_id}' connection lost during fs read"
             ) from exc
         try:
-            result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+            result = await host_registry.await_answer(
+                host_conn,
+                "pending_fs_requests",
+                request_id,
+                frame,
+                future,
+                timeout_s=_FS_TIMEOUT_S,
+            )
         except ConnectionError as exc:
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' disconnected before answering the fs read"
@@ -185,7 +192,14 @@ async def write_workspace_from_host(
                 f"host '{host_conn.host_id}' connection lost during fs write"
             ) from exc
         try:
-            result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+            result = await host_registry.await_answer(
+                host_conn,
+                "pending_fs_requests",
+                request_id,
+                frame,
+                future,
+                timeout_s=_FS_TIMEOUT_S,
+            )
         except ConnectionError as exc:
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' disconnected before answering the fs write"

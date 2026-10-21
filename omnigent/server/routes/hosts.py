@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 import secrets
+import time
 import weakref
 from typing import Any
 
@@ -118,6 +119,8 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+# The answer to a launch whose result never arrived, by what became of it.
+_UNANSWERED_LAUNCH_STATUS = {"failed": 502, "not_received": 503, "unknown": 504}
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -347,7 +350,14 @@ async def _proxy_create_dir(
                 detail=f"host '{host_conn.host_id}' connection lost",
             ) from exc
         try:
-            return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
+            return await host_registry.await_answer(
+                host_conn,
+                "pending_create_dirs",
+                request_id,
+                frame,
+                future,
+                timeout_s=_CREATE_DIR_TIMEOUT_S,
+            )
         except (asyncio.TimeoutError, ConnectionError) as exc:
             raise _unanswered_host_request(
                 host_conn.host_id, "create_dir", _CREATE_DIR_TIMEOUT_S, exc
@@ -403,7 +413,14 @@ async def _proxy_install_harness(
                 detail=f"host '{host_conn.host_id}' connection lost",
             ) from exc
         try:
-            return await asyncio.wait_for(future, timeout=_INSTALL_HARNESS_TIMEOUT_S)
+            return await host_registry.await_answer(
+                host_conn,
+                "pending_installs",
+                request_id,
+                frame,
+                future,
+                timeout_s=_INSTALL_HARNESS_TIMEOUT_S,
+            )
         except (asyncio.TimeoutError, ConnectionError) as exc:
             raise _unanswered_host_request(
                 host_conn.host_id, "install_harness", _INSTALL_HARNESS_TIMEOUT_S, exc
@@ -441,19 +458,27 @@ async def _proxy_store_secret(
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = frame.request_id
+    encoded = encode_host_frame(frame)
     loop = asyncio.get_running_loop()
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
     host_conn.pending_secret_writes[request_id] = future
     try:
         try:
-            host_registry.send_text(host_conn, encode_host_frame(frame))
+            host_registry.send_text(host_conn, encoded)
         except ConnectionError as exc:
             raise HTTPException(
                 status_code=502,
                 detail=f"host '{host_conn.host_id}' connection lost",
             ) from exc
         try:
-            return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
+            return await host_registry.await_answer(
+                host_conn,
+                "pending_secret_writes",
+                request_id,
+                encoded,
+                future,
+                timeout_s=_STORE_SECRET_TIMEOUT_S,
+            )
         except (asyncio.TimeoutError, ConnectionError) as exc:
             raise _unanswered_host_request(
                 host_conn.host_id, "store_secret", _STORE_SECRET_TIMEOUT_S, exc
@@ -1153,10 +1178,15 @@ def create_hosts_router(
             ) from None
 
         launch_timeout_s = resolve_launch_timeout_s()
+        launch_sent_at = time.monotonic()
         try:
-            result = await asyncio.wait_for(
+            result = await host_registry.await_answer(
+                conn,
+                "pending_launches",
+                request_id,
+                launch_frame,
                 future,
-                timeout=launch_timeout_s,
+                timeout_s=launch_timeout_s,
             )
         except (asyncio.TimeoutError, ConnectionError):
             conn.pending_launches.pop(request_id, None)
@@ -1168,16 +1198,20 @@ def create_hosts_router(
                 host_registry=host_registry,
                 tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                 runner_exit_reports=getattr(request.app.state, "runner_exit_reports", None),
+                sent_to=conn,
+                sent_at=launch_sent_at,
             )
             if settled == "started":
                 result = {"status": "started"}
             else:
                 await _rollback_failed_launch()
                 raise HTTPException(
-                    status_code=502 if settled == "failed" else 504,
+                    status_code=_UNANSWERED_LAUNCH_STATUS[settled],
                     detail=(
                         "the runner exited while starting"
                         if settled == "failed"
+                        else "the host did not receive the launch request; nothing was started"
+                        if settled == "not_received"
                         else f"host did not respond to launch request within "
                         f"{launch_timeout_s:g}s (raise {LAUNCH_TIMEOUT_ENV_VAR} "
                         f"if this launch needs longer)"

@@ -6296,9 +6296,13 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         try:
-            result = await asyncio.wait_for(
+            result = await host_registry.await_answer(
+                host_conn,
+                "pending_launches",
+                request_id,
+                launch_frame,
                 launch_future,
-                timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
+                timeout_s=_HOST_LAUNCH_RESULT_TIMEOUT_S,
             )
         except (asyncio.TimeoutError, ConnectionError):
             # No result yet — fall through to the caller's connect wait, which
@@ -7355,9 +7359,13 @@ async def _stop_session_host_runner(
         if attempt is not None:
             attempt.dispatched = True
         try:
-            result = await asyncio.wait_for(
+            result = await host_registry.await_answer(
+                conn,
+                "pending_stops",
+                request_id,
+                stop_frame,
                 future,
-                timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
+                timeout_s=_STOP_RUNNER_RESULT_TIMEOUT_S,
             )
         except (asyncio.TimeoutError, ConnectionError):
             _logger.warning(

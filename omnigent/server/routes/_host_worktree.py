@@ -126,7 +126,7 @@ async def _await_host_worktree_result(
     *,
     host_registry: HostRegistry,
     host_conn: HostConnection,
-    pending: dict[str, asyncio.Future[dict[str, object]]],
+    pending: str,
     request_id: str,
     frame: str,
     op: str,
@@ -140,8 +140,8 @@ async def _await_host_worktree_result(
 
     :param host_registry: Registry used to enqueue the outbound frame.
     :param host_conn: Live host connection.
-    :param pending: The connection's pending-future map for this op
-        (``pending_create_worktrees`` or ``pending_remove_worktrees``).
+    :param pending: Name of the connection's pending-future map for this op,
+        e.g. ``"pending_create_worktrees"``.
     :param request_id: Correlation id already embedded in ``frame``.
     :param frame: Encoded host frame to send.
     :param op: Short label for error messages, e.g.
@@ -152,7 +152,7 @@ async def _await_host_worktree_result(
         reply within :data:`_WORKTREE_TIMEOUT_S`.
     """
     future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
-    pending[request_id] = future
+    getattr(host_conn, pending)[request_id] = future
     try:
         try:
             host_registry.send_text(host_conn, frame)
@@ -161,7 +161,9 @@ async def _await_host_worktree_result(
                 f"host '{host_conn.host_id}' connection lost during {op}"
             ) from exc
         try:
-            return await asyncio.wait_for(future, timeout=_WORKTREE_TIMEOUT_S)
+            return await host_registry.await_answer(
+                host_conn, pending, request_id, frame, future, timeout_s=_WORKTREE_TIMEOUT_S
+            )
         except (asyncio.TimeoutError, ConnectionError) as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to {op} within "
@@ -169,7 +171,7 @@ async def _await_host_worktree_result(
                 "that does not support worktrees)"
             ) from exc
     finally:
-        pending.pop(request_id, None)
+        getattr(host_conn, pending).pop(request_id, None)
 
 
 async def create_worktree_on_host(
@@ -214,7 +216,7 @@ async def create_worktree_on_host(
     result = await _await_host_worktree_result(
         host_registry=host_registry,
         host_conn=host_conn,
-        pending=host_conn.pending_create_worktrees,
+        pending="pending_create_worktrees",
         request_id=request_id,
         frame=frame,
         op="worktree creation",
@@ -272,7 +274,7 @@ async def remove_worktree_on_host(
     result = await _await_host_worktree_result(
         host_registry=host_registry,
         host_conn=host_conn,
-        pending=host_conn.pending_remove_worktrees,
+        pending="pending_remove_worktrees",
         request_id=request_id,
         frame=frame,
         op="worktree removal",
@@ -318,7 +320,7 @@ async def list_worktrees_on_host(
     result = await _await_host_worktree_result(
         host_registry=host_registry,
         host_conn=host_conn,
-        pending=host_conn.pending_list_worktrees,
+        pending="pending_list_worktrees",
         request_id=request_id,
         frame=frame,
         op="worktree listing",

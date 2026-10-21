@@ -648,6 +648,7 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
+        from omnigent.server.host_registry import HostOperationOutcomeUnknownError
         from omnigent.server.routes._host_launch import (
             LAUNCH_TIMEOUT_ENV_VAR,
             resolve_host_launch,
@@ -721,12 +722,18 @@ def register_core_routes(
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
+        launch_sent_at = time.monotonic()
         try:
             host_registry.send_text(conn, launch_frame)
-            launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
-        except ConnectionError as exc:
-            launch_result = {"status": "failed", "error": str(exc)}
-        except asyncio.TimeoutError:
+            launch_result = await host_registry.await_answer(
+                conn,
+                "pending_launches",
+                request_id,
+                launch_frame,
+                future,
+                timeout_s=launch_timeout_s,
+            )
+        except (asyncio.TimeoutError, HostOperationOutcomeUnknownError):
             # The result, or the launch itself, was lost: ask what happened. The
             # create stays lenient and keeps the binding either way; a runner
             # the host never received is relaunched by the first message.
@@ -736,6 +743,8 @@ def register_core_routes(
                 host_registry=host_registry,
                 tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                 runner_exit_reports=getattr(request.app.state, "runner_exit_reports", None),
+                sent_to=conn,
+                sent_at=launch_sent_at,
             )
             launch_result = (
                 {"status": "started"}
@@ -744,12 +753,16 @@ def register_core_routes(
                     "status": "failed",
                     "error": "the runner exited while starting"
                     if settled == "failed"
+                    else "the host did not receive the launch request"
+                    if settled == "not_received"
                     else (
                         f"host launch timed out after {launch_timeout_s:g}s "
                         f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
                     ),
                 }
             )
+        except ConnectionError as exc:
+            launch_result = {"status": "failed", "error": str(exc)}
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():

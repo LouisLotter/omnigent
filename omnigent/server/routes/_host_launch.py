@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -28,6 +29,7 @@ from fastapi import HTTPException
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import CAP_OPERATION_RECORDS, OPERATION_RECORD_RETENTION_S
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
@@ -328,7 +330,7 @@ def resolve_host_launch(
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
 
 
-LaunchSettlement = Literal["started", "failed", "unknown"]
+LaunchSettlement = Literal["started", "failed", "not_received", "unknown"]
 
 
 async def settle_unanswered_launch(
@@ -338,6 +340,8 @@ async def settle_unanswered_launch(
     host_registry: HostRegistry,
     tunnel_registry: TunnelRegistry | None,
     runner_exit_reports: RunnerExitReports | None = None,
+    sent_to: HostConnection | None = None,
+    sent_at: float | None = None,
 ) -> LaunchSettlement:
     """
     Find out what happened to a launch whose result never arrived.
@@ -346,17 +350,22 @@ async def settle_unanswered_launch(
     starts anyway. The runner's own tunnel registration, the host's
     ``host.runner_status`` answer (which waits for a launch still in progress),
     or the host's exit report tells a started runner from one that already
-    exited. A host with no record of the runner is not evidence that the launch
-    never arrived: its record goes when an exited runner is reaped, and with a
-    restarted host process. That stays unknown.
+    exited. A host that keeps operation records reports a runner it launched
+    and no longer tracks as dead. The process the launch was sent to, asked
+    within its record retention, knows nothing of a launch it never received.
+    Any other host without a record of the runner may have reaped it or
+    restarted, so that stays unknown.
 
     :param host_id: The host the launch was sent to, e.g. ``"host_a1b2..."``.
     :param runner_id: The runner the launch was for.
     :param host_registry: Registry holding the host's current connection.
     :param tunnel_registry: Registry of connected runners, if configured.
     :param runner_exit_reports: The hosts' runner exit reports, if configured.
+    :param sent_to: The connection the launch was first sent on.
+    :param sent_at: When it was sent, from :func:`time.monotonic`.
     :returns: ``"started"`` when the runner is up or starting, ``"failed"``
-        when its process exited, ``"unknown"`` otherwise.
+        when its process exited or the launch was refused, ``"not_received"``
+        when the host process never received it, ``"unknown"`` otherwise.
     """
     from omnigent.server.routes._sessions.helpers import _query_host_runner_status
 
@@ -377,4 +386,21 @@ async def settle_unanswered_launch(
         return "started"
     if status == "dead" or exited():
         return "failed"
+    if status == "unknown" and _asked_the_receiving_process(sent_to, conn, sent_at):
+        return "not_received"
     return "unknown"
+
+
+def _asked_the_receiving_process(
+    sent_to: HostConnection | None, asked: HostConnection, sent_at: float | None
+) -> bool:
+    """Whether *asked* is the host process the launch went to, and still remembers it."""
+    if sent_to is None or sent_at is None:
+        return False
+    incarnation = sent_to.hello.incarnation
+    return (
+        incarnation is not None
+        and CAP_OPERATION_RECORDS in sent_to.hello.capabilities
+        and asked.hello.incarnation == incarnation
+        and time.monotonic() - sent_at < OPERATION_RECORD_RETENTION_S
+    )
