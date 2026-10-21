@@ -2433,3 +2433,25 @@ def test_stale_request_cannot_reserve_a_managed_host(host_store: HostStore) -> N
                 host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
             )
     assert not host_store.registers_only_with_launch_token(_MANAGED_ID)
+
+
+def test_persistent_host_rows_register_only_with_their_launch_token(
+    host_store: HostStore,
+) -> None:
+    """A pending persistent row, and an orphan tombstone, refuse an owner bearer from creation."""
+    pending = _persistent(host_store, name="Pending computer")
+    assert pending.launch_token_only
+    with pytest.raises(HostRegistrationRefusedError):
+        host_store.upsert_on_connect(pending.host_id, pending.name, "alice@example.com")
+    armed = _armed_persistent(host_store, "launch-token")
+    assert armed.launch_token_only
+    connected = host_store.upsert_on_connect(
+        armed.host_id, armed.name, "alice@example.com", managed_token="launch-token"
+    )
+    assert connected.status == "online"
+
+    orphan_id = uuid.uuid4().hex
+    host_store.retain_orphan_sandbox(
+        host_id=orphan_id, user_id="alice@example.com", provider="cloud", sandbox_id="sb-orphan"
+    )
+    assert host_store.registers_only_with_launch_token(orphan_id)

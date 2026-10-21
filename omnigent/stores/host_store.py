@@ -1681,6 +1681,7 @@ class HostStore:
                 updated_at=now,
                 sandbox_provider=provider,
                 lifecycle=encode_host_lifecycle("persistent"),
+                launch_token_only=True,
             )
             session.add(row)
             return _row_to_host(row)
@@ -1708,6 +1709,7 @@ class HostStore:
                     SqlHost.host_id == host_id,
                     SqlHost.deleted_at.is_(None),
                     SqlHost.lifecycle == encode_host_lifecycle("persistent"),
+                    SqlHost.launch_token_only.is_(True),
                 )
                 .with_for_update()
             ).scalar_one_or_none()
@@ -1771,6 +1773,7 @@ class HostStore:
                     sandbox_provider=provider,
                     sandbox_id=sandbox_id,
                     lifecycle=encode_host_lifecycle("persistent"),
+                    launch_token_only=True,
                     deleted_at=now,
                 )
             )
