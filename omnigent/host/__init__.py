@@ -7,6 +7,12 @@
 # ``EX_CONFIG`` from sysexits.h.
 HOST_FATAL_EXIT_CODE = 78
 
+# Exit code of a managed host whose launch token the server kept refusing after
+# it had connected, e.g. a token revoked by a database restore. Its supervisor
+# reports it instead of restarting the host, since the same token never works
+# again; the server arms a new one on its next start. 77 is ``EX_NOPERM``.
+HOST_TOKEN_REFUSED_EXIT_CODE = 77
+
 # Exit code a shell reports for a SIGTERM-killed process (128 + 15). A
 # supervisor treats it as a deliberate stop, not a crash.
 HOST_SIGTERM_EXIT_CODE = 143

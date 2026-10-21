@@ -25,11 +25,12 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_TOKEN_REFUSED_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
+    HostTokenRefusedError,
     ModelOptionsResult,
     _build_runner_env,
     _runner_exit_error,
@@ -7947,6 +7948,91 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+def test_managed_host_gives_up_once_its_token_was_refused_for_the_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connected managed host stops retrying a refused launch token after a time.
+
+    Refusals shorter than the threshold, such as a drop during a sleep's
+    revocation window, keep it retrying; past the threshold it gives up with
+    the error that maps to the "token refused" exit code.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 1200.0)
+    host = _make_host_process()
+    host._ever_connected = True
+
+    assert host._classify_http_status(403) is None
+    assert host._token_refused_since is not None
+    host._token_refused_since -= 1199.0
+    assert host._classify_http_status(403) is None
+    host._token_refused_since -= 2.0
+    refused = host._classify_http_status(403)
+    assert isinstance(refused, HostTokenRefusedError)
+    assert "launch token" in str(refused)
+
+
+def test_unmanaged_or_fresh_host_never_counts_token_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a managed host that connected before exits on refusals by time."""
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 0.0)
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    laptop = _make_host_process()
+    laptop._ever_connected = True
+    assert laptop._classify_http_status(403) is None
+    assert laptop._token_refused_since is None
+
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    fresh = _make_host_process()
+    assert fresh._classify_http_status(403) is None
+    assert fresh._token_refused_since is None
+
+
+async def test_accepted_connect_restarts_the_token_refusal_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusals separated by a working connection never add up to an exit."""
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 3600.0)
+    refused = _invalid_status(403)
+    spy = _ConnectSpy([None, refused, refused, None, refused, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host("https://omnigent.example.com")
+
+    await host.run()
+
+    assert spy.call_count == 6
+    assert host._token_refused_since is not None  # only the last refusal counts
+
+
+def test_run_host_process_exits_with_token_refused_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A managed host whose token stays refused exits with its own code, not the fatal one.
+
+    Its supervisor reports "token refused" instead of restarting the host with a
+    token that never works again; the server arms a new one at the next start.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([None, _invalid_status(403)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://omnigent.example.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == HOST_TOKEN_REFUSED_EXIT_CODE
+    assert HOST_TOKEN_REFUSED_EXIT_CODE not in (0, HOST_FATAL_EXIT_CODE, 143)
+    assert "refused this host's launch token" in capsys.readouterr().err
 
 
 async def test_launch_harness_probe_runs_off_the_event_loop(

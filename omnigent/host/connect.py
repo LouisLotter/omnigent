@@ -58,7 +58,7 @@ from omnigent.errors import (
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_TOKEN_REFUSED_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -482,6 +482,15 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 # keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 
+# How long a managed host keeps retrying after the server started refusing its
+# launch token, before it exits with HOST_TOKEN_REFUSED_EXIT_CODE. Longer than
+# any persistent-host sleep, which revokes the token while the host may still
+# be reconnecting after a drop.
+try:
+    _TOKEN_REFUSED_EXIT_S = float(os.environ.get("OMNIGENT_HOST_TOKEN_REFUSED_EXIT_S", "1200"))
+except ValueError:
+    _TOKEN_REFUSED_EXIT_S = 1200.0
+
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
 # endpoint as unhealthy: it stops using the prompt "recycle" cadence and
@@ -840,6 +849,15 @@ class HostConnectError(Exception):
 
     The message is the full, user-facing explanation including the
     suggested fix; it is printed verbatim by :func:`run_host_process`.
+    """
+
+
+class HostTokenRefusedError(HostConnectError):
+    """The server kept refusing a managed host's launch token after it had connected.
+
+    Raised once refusals have lasted :data:`_TOKEN_REFUSED_EXIT_S`, so the host
+    exits with :data:`~omnigent.host.HOST_TOKEN_REFUSED_EXIT_CODE` instead of
+    retrying a token that will never be accepted again.
     """
 
 
@@ -1227,6 +1245,8 @@ class HostProcess:
         # server — where the same failures retry forever instead of killing a
         # host with running sessions.
         self._ever_connected = False
+        # When the server started refusing this managed host's launch token.
+        self._token_refused_since: float | None = None
         # Capability discovery belongs to daemon initialization, not the
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
@@ -1627,6 +1647,9 @@ class HostProcess:
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
+            refused = self._launch_token_refused()
+            if refused is not None:
+                return refused
             cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
             should_retry = self._ever_connected or (
                 self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
@@ -1778,6 +1801,30 @@ class HostProcess:
             status="failed",
             error=error,
             error_code=error_code,
+        )
+
+    def _launch_token_refused(self) -> HostTokenRefusedError | None:
+        """Give up on a managed host's launch token once refusals have lasted too long.
+
+        Only a host that connected before counts its refusals by time; a fresh
+        host keeps the short auth-retry window above.
+
+        :returns: The error to exit with, or ``None`` while still retrying.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if not self._ever_connected or not os.environ.get(HOST_TOKEN_ENV_VAR):
+            return None
+        now = time.monotonic()
+        if self._token_refused_since is None:
+            self._token_refused_since = now
+        refused_for = now - self._token_refused_since
+        if refused_for < _TOKEN_REFUSED_EXIT_S:
+            return None
+        return HostTokenRefusedError(
+            "Connection refused: the server has refused this managed host's launch "
+            f"token for {refused_for:.0f}s. The server arms a new token when it next "
+            "starts this host."
         )
 
     def _classify_transient_404(self) -> HostConnectError | None:
@@ -4468,6 +4515,7 @@ class HostProcess:
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
+        self._token_refused_since = None
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
@@ -5379,6 +5427,18 @@ def _serve_host_until_exit(
     )
     try:
         asyncio.run(host.run())
+    except HostTokenRefusedError as exc:
+        # Distinct from the fatal code so a supervisor reports "token refused"
+        # rather than restarting the host with a token that never works again.
+        crash_reporting.report_host_exit(
+            "fatal_connect", exit_code=HOST_TOKEN_REFUSED_EXIT_CODE, error=str(exc)
+        )
+        print(
+            f"\n✗ {display_server_url(server_url)} refused this host's launch token.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_TOKEN_REFUSED_EXIT_CODE) from exc
     except HostConnectError as exc:
         # Fail loud: a permanent connection failure must not look like the
         # process is still working. Print the cause + fix, then exit non-zero

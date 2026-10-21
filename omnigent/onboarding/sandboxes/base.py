@@ -33,7 +33,11 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
-from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_SIGTERM_EXIT_CODE
+from omnigent.host import (
+    HOST_FATAL_EXIT_CODE,
+    HOST_SIGTERM_EXIT_CODE,
+    HOST_TOKEN_REFUSED_EXIT_CODE,
+)
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
@@ -762,7 +766,9 @@ def supervise_host_command(command: str) -> str:
 
     The loop stands down on a clean exit, on
     :data:`~omnigent.host.HOST_FATAL_EXIT_CODE` (a credential / version failure
-    that can never succeed), and on SIGTERM (a deliberate stop). Anything else
+    that can never succeed), on :data:`~omnigent.host.HOST_TOKEN_REFUSED_EXIT_CODE`
+    (a launch token the server stopped accepting; restarting with the same token
+    cannot help), and on SIGTERM (a deliberate stop). Anything else
     is a crash, retried with a doubling delay. A signal-kill of the host alone
     (SIGKILL → 137) counts as a crash on purpose: that is what an OOM kill looks
     like, and restarting is the wanted response.
@@ -783,7 +789,9 @@ def supervise_host_command(command: str) -> str:
     :returns: A POSIX ``sh`` script ending in ``done``, so callers can append
         redirections to it directly.
     """
-    stop_codes = f"0|{HOST_FATAL_EXIT_CODE}|{HOST_SIGTERM_EXIT_CODE}"
+    stop_codes = (
+        f"0|{HOST_FATAL_EXIT_CODE}|{HOST_TOKEN_REFUSED_EXIT_CODE}|{HOST_SIGTERM_EXIT_CODE}"
+    )
     return (
         "delay=1\n"
         "attempt=0\n"
