@@ -9,7 +9,9 @@ and the runner applies it only to a turn that was already running then.
 The two sides share no clock: the runner places the press by subtracting that
 duration from its own time, which puts it late by the Stop's transit. A turn
 must therefore have started at least the longest transit before that, the
-server's timeout for the forward, to count.
+server's whole deadline for the forward, to count. A Stop the network delivers
+after the server already gave up on it is not covered; only a turn identity
+both sides know would cover it.
 """
 
 from __future__ import annotations
@@ -22,8 +24,8 @@ PRESSED_AGO_FIELD = "pressed_ago_s"
 # The runner's answer to a re-sent Stop whose turn has ended.
 TURN_ENDED_STATUS = "turn_ended"
 
-# The server gives up on a re-sent Stop's forward after this long, and so
-# bounds its transit.
+# The server gives up on a re-sent Stop's forward, queuing included, after
+# this long, and so bounds its transit.
 RESENT_STOP_TRANSIT_ALLOWANCE_S = 5.0
 
 

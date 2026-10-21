@@ -199,15 +199,17 @@ async def _send_interrupt(
     if client is None:
         return "lost"
     try:
-        response = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "interrupt",
-                PRESSED_AGO_FIELD: round(max(0.0, time.monotonic() - pressed_at), 3),
-            },
-            timeout=_INTERRUPT_FORWARD_TIMEOUT_S,
-        )
-    except (httpx.HTTPError, ConnectionError):
+        # One deadline over queuing and answer: the runner relies on it to bound transit.
+        async with asyncio.timeout(_INTERRUPT_FORWARD_TIMEOUT_S):
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "interrupt",
+                    PRESSED_AGO_FIELD: round(max(0.0, time.monotonic() - pressed_at), 3),
+                },
+                timeout=_INTERRUPT_FORWARD_TIMEOUT_S,
+            )
+    except (httpx.HTTPError, ConnectionError, TimeoutError):
         return "lost"
     if response.status_code < 400:
         return "delivered"

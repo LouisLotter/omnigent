@@ -279,3 +279,25 @@ async def test_a_superseded_stop_leaves_a_newer_stops_redelivery_alone(
     registry.register(_RUNNER, _NoopWS(), _hello())
     await _settled()
     assert len(interrupts) == 1
+
+
+@pytest.mark.asyncio
+async def test_resent_stop_forward_has_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner bounds a re-sent Stop's transit by this deadline, so it covers the whole send."""
+    monkeypatch.setattr(interrupt_delivery, "_INTERRUPT_FORWARD_TIMEOUT_S", 0.1)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(1.0)
+        return httpx.Response(204)
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(slow), base_url="http://runner")
+
+    async def get_runner_client(session_id: str, runner_router: Any, **_: Any) -> Any:
+        return runner
+
+    started = time.monotonic()
+    outcome = await interrupt_delivery._send_interrupt(
+        _SESSION, None, get_runner_client, pressed_at=started
+    )
+    assert outcome == "lost"
+    assert time.monotonic() - started < 0.5
