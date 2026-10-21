@@ -149,6 +149,34 @@ _harness_elicitation_deadlines: WorkspaceScopedCache[str, _HarnessElicitationDea
 )
 
 
+@dataclass(frozen=True)
+class _AnsweredHarnessElicitation:
+    """
+    The outcome an ASK gate reached for one question, kept for re-posts.
+
+    A host re-posts a poll whose answer was lost. The re-post must get the same
+    outcome without applying the approval's writes a second time.
+
+    :param session_id: Session that asked, e.g. ``"conv_abc123"``.
+    :param request_fingerprint: Digest of the question.
+    :param approved: Whether the person approved.
+    :param declined_reason: The decline reason when the person declined, else ``None``.
+    :param answered_at: ``time.monotonic()`` of the answer.
+    """
+
+    session_id: str
+    request_fingerprint: str
+    approved: bool
+    declined_reason: str | None
+    answered_at: float
+
+
+# Maps ``elicitation_id`` to its ASK gate's outcome for the retention period.
+_harness_elicitation_outcomes: WorkspaceScopedCache[str, _AnsweredHarnessElicitation] = (
+    WorkspaceScopedCache()
+)
+
+
 def reset_for_tests() -> None:
     """
     Clear every elicitation registry. For test isolation only.
@@ -165,13 +193,16 @@ def reset_for_tests() -> None:
     _harness_parked_elicitations.clear()
     _harness_pre_resolved_elicitations.clear()
     _harness_elicitation_deadlines.clear()
+    _harness_elicitation_outcomes.clear()
 
 
 __all__ = [
+    "_AnsweredHarnessElicitation",
     "_HarnessElicitationDeadline",
     "_ParkedHarnessElicitation",
     "_PreResolvedHarnessElicitation",
     "_harness_elicitation_deadlines",
+    "_harness_elicitation_outcomes",
     "_harness_elicitation_owners",
     "_harness_elicitation_registry",
     "_harness_parked_elicitations",

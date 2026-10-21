@@ -28,11 +28,34 @@ _INTERRUPT_FORWARD_TIMEOUT_S = 5.0
 
 # One pending redelivery per session; a newer Stop or message replaces it.
 _pending_interrupts: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
+# Counts each session's new messages, so a Stop pressed before one is never
+# redelivered after it, even when its first forward was still in flight.
+_input_generations: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
+def input_generation(session_id: str) -> int:
+    """
+    Return how many new messages *session_id* has had, as a Stop's reference point.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :returns: The current count.
+    """
+    return _input_generations.get(session_id, 0)
+
+
+def note_new_input(session_id: str) -> None:
+    """
+    Record a new message: an earlier Stop must not interrupt the turn it starts.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    """
+    _input_generations[session_id] = input_generation(session_id) + 1
+    cancel_pending_interrupt(session_id)
 
 
 def cancel_pending_interrupt(session_id: str) -> None:
     """
-    Drop a Stop still waiting for the runner, because the person acted again.
+    Drop a Stop still waiting for the runner.
 
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     """
@@ -61,7 +84,8 @@ def deliver_interrupt_after_reconnect(
     runner_router: Any,
     queued_pending_ids: list[str],
     wait_s: float,
-) -> None:
+    stop_generation: int,
+) -> bool:
     """
     Send a lost Stop again once the runner's tunnel is back.
 
@@ -75,8 +99,13 @@ def deliver_interrupt_after_reconnect(
         Stop, marked interrupted once the Stop lands.
     :param wait_s: How long to wait for the reconnect, e.g. the server's grace
         for a dropped runner.
+    :param stop_generation: :func:`input_generation` when the person pressed
+        Stop. A newer message means the Stop is not redelivered.
+    :returns: ``False`` when a newer message already superseded the Stop.
     """
     cancel_pending_interrupt(session_id)
+    if input_generation(session_id) != stop_generation:
+        return False
     task = asyncio.create_task(
         _deliver_after_reconnect(
             session_id,
@@ -86,6 +115,7 @@ def deliver_interrupt_after_reconnect(
             runner_router=runner_router,
             queued_pending_ids=queued_pending_ids,
             wait_s=wait_s,
+            stop_generation=stop_generation,
         ),
         name=f"interrupt-after-reconnect-{session_id}",
     )
@@ -96,6 +126,7 @@ def deliver_interrupt_after_reconnect(
             _pending_interrupts.pop(session_id, None)
 
     task.add_done_callback(_forget)
+    return True
 
 
 async def _deliver_after_reconnect(
@@ -107,6 +138,7 @@ async def _deliver_after_reconnect(
     runner_router: Any,
     queued_pending_ids: list[str],
     wait_s: float,
+    stop_generation: int,
 ) -> None:
     from omnigent.server.routes._sessions.common import (
         _interrupt_fenced_sessions,
@@ -120,7 +152,9 @@ async def _deliver_after_reconnect(
     outcome = "runner_not_back"
     if reconnected is not None:
         outcome = "turn_already_ended"
-        if _session_status_cache.get(session_id) in ("running", "waiting"):
+        if input_generation(session_id) != stop_generation:
+            outcome = "superseded_by_new_message"
+        elif _session_status_cache.get(session_id) in ("running", "waiting"):
             outcome = await _send_interrupt(session_id, runner_router, _get_runner_client)
             if outcome == "delivered":
                 _interrupt_fenced_sessions.add(session_id)

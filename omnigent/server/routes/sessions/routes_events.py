@@ -240,6 +240,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.interrupt_delivery import (
     cancel_pending_interrupt,
     deliver_interrupt_after_reconnect,
+    input_generation,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -1509,6 +1510,8 @@ def register_events_routes(
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
             queued_pending_ids: list[str] = []
+            # A later message must keep this Stop from being redelivered.
+            stop_generation = input_generation(session_id)
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -1597,7 +1600,7 @@ def register_events_routes(
                     # runner reconnects, if the turn is still running then.
                     from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
 
-                    deliver_interrupt_after_reconnect(
+                    if deliver_interrupt_after_reconnect(
                         session_id,
                         runner_id=conv.runner_id,
                         after_generation=(
@@ -1607,8 +1610,9 @@ def register_events_routes(
                         runner_router=runner_router,
                         queued_pending_ids=queued_pending_ids,
                         wait_s=RUNNER_DISCONNECT_GRACE_S,
-                    )
-                    interrupt_delivery = "pending"
+                        stop_generation=stop_generation,
+                    ):
+                        interrupt_delivery = "pending"
             elif not codex_child:
                 cancel_pending_interrupt(session_id)
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)

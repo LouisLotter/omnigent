@@ -128,7 +128,9 @@ from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import managed_host_checkpoints, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
+    _AnsweredHarnessElicitation,
     _harness_elicitation_deadlines,
+    _harness_elicitation_outcomes,
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -369,7 +371,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
-from omnigent.server.routes._sessions.interrupt_delivery import cancel_pending_interrupt
+from omnigent.server.routes._sessions.interrupt_delivery import note_new_input
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -548,7 +550,7 @@ async def _publish_and_wait_for_harness_elicitation(
             session_id, elicitation_id, request_fingerprint, timeout_s
         )
         if timeout_s <= 0:
-            _harness_elicitation_deadlines.pop(elicitation_id, None)
+            # The question already timed out; a re-post gets that answer at once.
             return None
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
@@ -615,9 +617,9 @@ async def _publish_and_wait_for_harness_elicitation(
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
-        # Only a wait severed before its deadline may be re-parked.
-        first_park = _harness_elicitation_deadlines.get(elicitation_id)
-        if first_park is not None and (settled or first_park.deadline <= time.monotonic()):
+        # A settled question is done; a timed-out one keeps its deadline so a
+        # re-post is answered at once (pruned after the retention period).
+        if settled and _harness_elicitation_deadlines.get(elicitation_id) is not None:
             _harness_elicitation_deadlines.pop(elicitation_id, None)
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
@@ -715,6 +717,58 @@ def _prune_harness_elicitation_deadlines(now: float) -> None:
         ]
         for elicitation_id, _first_park in oldest:
             _harness_elicitation_deadlines.pop(elicitation_id, None)
+
+
+def _answered_harness_elicitation(
+    session_id: str, elicitation_id: str, request_fingerprint: str
+) -> _AnsweredHarnessElicitation | None:
+    """
+    Return the outcome an ASK gate already reached for this exact question, if recent.
+
+    :param session_id: Session asking, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The question's stable id.
+    :param request_fingerprint: Digest of the question's params.
+    :returns: The remembered outcome, or ``None``.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    now = time.monotonic()
+    for stale_id, outcome in list(_harness_elicitation_outcomes.items()):
+        if now - outcome.answered_at > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S:
+            _harness_elicitation_outcomes.pop(stale_id, None)
+    outcome = _harness_elicitation_outcomes.get(elicitation_id)
+    if (
+        outcome is None
+        or outcome.session_id != session_id
+        or outcome.request_fingerprint != request_fingerprint
+    ):
+        return None
+    return outcome
+
+
+def _remember_answered_harness_elicitation(
+    session_id: str,
+    elicitation_id: str,
+    request_fingerprint: str,
+    *,
+    approved: bool,
+    declined_reason: str | None,
+) -> None:
+    """Remember an ASK gate's outcome, whose writes were applied once, for re-posts."""
+    from omnigent.server.routes import sessions as _facade
+
+    if len(_harness_elicitation_outcomes) >= _facade._HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES:
+        oldest = min(_harness_elicitation_outcomes.items(), key=lambda item: item[1].answered_at)[
+            0
+        ]
+        _harness_elicitation_outcomes.pop(oldest, None)
+    _harness_elicitation_outcomes[elicitation_id] = _AnsweredHarnessElicitation(
+        session_id=session_id,
+        request_fingerprint=request_fingerprint,
+        approved=approved,
+        declined_reason=declined_reason,
+        answered_at=time.monotonic(),
+    )
 
 
 def _schedule_deferred_elicitation_clear(
@@ -2655,6 +2709,16 @@ async def _hold_native_ask_gate_impl(
     # this ASK in the native terminal before parking on the web verdict.
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    fingerprint = _harness_elicitation_request_fingerprint(params)
+    answered = _answered_harness_elicitation(session_id, elicitation_id, fingerprint)
+    if answered is not None:
+        # A re-post of a question already answered (its reply was lost): hand
+        # back the same outcome without applying its writes or asking again.
+        if answered.declined_reason is not None:
+            raise ElicitationDeclinedError(
+                answered.declined_reason, policy_name=result.deciding_policy
+            )
+        return answered.approved
     if not _harness_elicitation_was_parked(session_id, elicitation_id):
         # A re-park of the same question keeps the popup it already raised.
         _spawn_native_approval_popup_forward(
@@ -2673,11 +2737,22 @@ async def _hold_native_ask_gate_impl(
     # Explicit user decline → raise so callers can abort the turn rather
     # than feeding a DENY message to the LLM and letting it continue.
     if verdict is not None and verdict.action == "decline":
+        _remember_answered_harness_elicitation(
+            session_id,
+            elicitation_id,
+            fingerprint,
+            approved=False,
+            declined_reason=result.reason or "",
+        )
         raise ElicitationDeclinedError(
             result.reason or "",
             policy_name=result.deciding_policy,
         )
     approved = verdict is not None and verdict.action == "accept"
+    if verdict is not None:
+        _remember_answered_harness_elicitation(
+            session_id, elicitation_id, fingerprint, approved=approved, declined_reason=None
+        )
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
         # land only on approve.
@@ -7830,7 +7905,7 @@ async def _dispatch_session_event_to_runner_impl(
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
         # A new message supersedes a Stop still waiting for the runner.
-        cancel_pending_interrupt(conv.id)
+        note_new_input(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

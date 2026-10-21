@@ -68,7 +68,8 @@ async def test_repark_waits_only_for_what_is_left_of_the_first_deadline() -> Non
     waited = time.monotonic() - started
 
     assert 0.2 < waited < 0.55, "a re-post must not restart the question's timeout"
-    assert eid not in _elicitation_registry._harness_elicitation_deadlines
+    # The expired deadline stays, so a later re-post is answered at once.
+    assert eid in _elicitation_registry._harness_elicitation_deadlines
 
 
 @pytest.mark.asyncio
@@ -131,4 +132,64 @@ async def test_native_popup_is_raised_once_per_question(monkeypatch: pytest.Monk
     assert await ask(0.05) is False
     assert await ask(0.05) is False
 
+    assert popups == [eid]
+
+
+@pytest.mark.asyncio
+async def test_repost_after_the_question_timed_out_is_answered_at_once() -> None:
+    """A waiter that reached its timeout leaves the timeout for its re-posts."""
+    eid = "elicit_evaluate_55555555555555555555555555555555"
+    assert await _park(eid, 0.2) is None
+
+    started = time.monotonic()
+    assert await _park(eid, 5.0) is None
+    assert time.monotonic() - started < 0.1
+
+
+@pytest.mark.asyncio
+async def test_repost_of_an_answered_question_reuses_its_outcome_without_reapplying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The approval's writes and the popup happen once, however often the poll is re-posted."""
+    popups: list[str] = []
+    monkeypatch.setattr(
+        orchestration,
+        "_spawn_native_approval_popup_forward",
+        lambda session_id, elicitation_id, message, policy_name=None: popups.append(
+            elicitation_id
+        ),
+    )
+    monkeypatch.setattr(orchestration, "resolve_ask_timeout", lambda engine, result: 5.0)
+    applied: list[object] = []
+    engine = SimpleNamespace(apply_label_writes=applied.append, apply_state_updates=applied.append)
+    result = SimpleNamespace(
+        reason="Approve?",
+        deciding_policy="ask-bash",
+        set_labels={"approved": "1"},
+        state_updates=["checkpoint"],
+    )
+    eid = "elicit_evaluate_66666666666666666666666666666666"
+
+    async def ask() -> bool:
+        return await S._hold_native_ask_gate(
+            _Request(),  # type: ignore[arg-type]
+            session_id="conv_repark",
+            phase=Phase.TOOL_CALL,
+            data={"name": "Bash", "arguments": {"command": "date"}},
+            engine=engine,  # type: ignore[arg-type]
+            result=result,  # type: ignore[arg-type]
+            conversation_store=None,  # type: ignore[arg-type]
+            elicitation_id=eid,
+        )
+
+    first = asyncio.create_task(ask())
+    while eid not in _elicitation_registry._harness_elicitation_registry:
+        await asyncio.sleep(0)
+    _elicitation_registry._harness_elicitation_registry[eid].set_result(
+        ElicitationResult(action="accept")
+    )
+    assert await asyncio.wait_for(first, timeout=2.0) is True
+
+    assert await asyncio.wait_for(ask(), timeout=2.0) is True
+    assert applied == [{"approved": "1"}, ["checkpoint"]], "writes applied once"
     assert popups == [eid]

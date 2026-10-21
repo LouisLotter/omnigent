@@ -59,7 +59,7 @@ def interrupts(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[httpx.Request]]
 
 
 async def _schedule(registry: TunnelRegistry, after_generation: int | None) -> None:
-    interrupt_delivery.deliver_interrupt_after_reconnect(
+    assert interrupt_delivery.deliver_interrupt_after_reconnect(
         _SESSION,
         runner_id=_RUNNER,
         after_generation=after_generation,
@@ -67,6 +67,7 @@ async def _schedule(registry: TunnelRegistry, after_generation: int | None) -> N
         runner_router=None,
         queued_pending_ids=[],
         wait_s=2.0,
+        stop_generation=interrupt_delivery.input_generation(_SESSION),
     )
     await asyncio.sleep(0)
 
@@ -112,6 +113,7 @@ async def test_stop_marks_the_messages_queued_when_it_was_pressed(
         runner_router=None,
         queued_pending_ids=[pending_id],
         wait_s=2.0,
+        stop_generation=interrupt_delivery.input_generation(_SESSION),
     )
     registry.register(_RUNNER, _NoopWS(), _hello())
     await _settled()
@@ -138,7 +140,7 @@ async def test_turn_that_ended_meanwhile_is_not_interrupted(
 async def test_new_message_cancels_a_pending_stop(interrupts: list[httpx.Request]) -> None:
     registry = TunnelRegistry()
     await _schedule(registry, None)
-    interrupt_delivery.cancel_pending_interrupt(_SESSION)
+    interrupt_delivery.note_new_input(_SESSION)
     registry.register(_RUNNER, _NoopWS(), _hello())
     await asyncio.sleep(0.05)
 
@@ -159,7 +161,38 @@ async def test_runner_that_never_returns_gets_no_stop(
         runner_router=None,
         queued_pending_ids=[],
         wait_s=0.05,
+        stop_generation=interrupt_delivery.input_generation(_SESSION),
     )
     await _settled()
 
+    assert interrupts == []
+
+
+@pytest.mark.asyncio
+async def test_message_during_the_first_forward_keeps_the_stop_from_being_redelivered(
+    interrupts: list[httpx.Request],
+) -> None:
+    """A Stop pressed before a new message must never interrupt that message's turn.
+
+    The message arrives while the Stop's first forward is still waiting, so no
+    redelivery exists yet for it to cancel.
+    """
+    stop_generation = interrupt_delivery.input_generation(_SESSION)
+    interrupt_delivery.note_new_input(_SESSION)
+    registry = TunnelRegistry()
+
+    scheduled = interrupt_delivery.deliver_interrupt_after_reconnect(
+        _SESSION,
+        runner_id=_RUNNER,
+        after_generation=None,
+        tunnel_registry=registry,
+        runner_router=None,
+        queued_pending_ids=[],
+        wait_s=2.0,
+        stop_generation=stop_generation,
+    )
+    registry.register(_RUNNER, _NoopWS(), _hello())
+    await asyncio.sleep(0.05)
+
+    assert scheduled is False
     assert interrupts == []

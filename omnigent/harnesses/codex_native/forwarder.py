@@ -4608,6 +4608,12 @@ async def _post_codex_elicitation_request(
         attempt_started = loop.time()
         try:
             response = await client.post(url, json=event, timeout=timeout)
+        except httpx.ReadTimeout:
+            # The poll period passed without an answer: re-post to re-park.
+            _logger.info(
+                "Codex elicitation hook poll unanswered; re-posting: method=%s",
+                event.get("method"),
+            )
         except httpx.HTTPError:
             _logger.warning(
                 "Codex elicitation hook POST failed; retrying: method=%s",
