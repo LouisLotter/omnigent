@@ -1314,6 +1314,11 @@ class SqlHost(OmnigentBase):
         active host generation and awaiting successful provider termination.
         A fresh generation may be registered in ``sandbox_id`` while this
         cleanup remains pending.
+    :param launch_token_only: ``True`` once the server has armed or reserved
+        the host as a managed host: its tunnel registers only with its launch
+        token, never with an owner's bearer. Nothing clears it, so a managed
+        host whose token was revoked, expired or detached fails closed.
+        ``False`` for user-connected hosts and self-registering sandboxes.
     :param deleted_at: Logical deletion timestamp for a managed host whose
         provider sandbox cleanup is still pending. The row is physically
         removed after every recorded sandbox id terminates successfully.
@@ -1352,6 +1357,10 @@ class SqlHost(OmnigentBase):
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # The server default keeps rows written by older application versions compatible.
+    launch_token_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
