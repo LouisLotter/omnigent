@@ -7,21 +7,34 @@ status → disconnect flow is exercised end-to-end without the network.
 
 from __future__ import annotations
 
+import logging
+from urllib.parse import parse_qs, urlsplit
+
 import httpx
 import jwt
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
 
 from omnigent.connections.github import GithubConnectionStore
+from omnigent.db.db_models import SqlConnection
+from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import OmnigentError
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.server.github_app import GitHubAppConfig, GitHubTokenSet
 from omnigent.server.routes.connections_base import sanitize_return_to
 from omnigent.server.routes.connections_github import (
     _derive_state_signing_key,
     create_connections_github_router,
 )
+from omnigent.server.routes.host_credentials import create_host_credentials_router
+from omnigent.stores.credential_store import SecretCipher, build_secret_cipher
+from omnigent.stores.credential_store.http_cipher import HttpSecretCipher
+from tests.server.fake_key_service import FakeKeyService
+from tests.server.routes.test_host_credentials import _FakeHostStore
 
 
 class SecretBox:  # test double for the KMS SecretCipher: key- and context-bound
@@ -104,11 +117,13 @@ def _config() -> GitHubAppConfig:
     )
 
 
-def _app(db_uri: str) -> tuple[TestClient, GithubConnectionStore, GitHubAppConfig, _FakeClient]:
+def _app(
+    db_uri: str, *, cipher: SecretCipher | None = None
+) -> tuple[TestClient, GithubConnectionStore, GitHubAppConfig, _FakeClient]:
     config = _config()
     # The store's cipher is the credential store's own (OMNIGENT_CREDENTIAL_CIPHER),
     # independent of the GitHub App config.
-    store = GithubConnectionStore(db_uri, SecretBox("store-enc-key"))
+    store = GithubConnectionStore(db_uri, cipher or SecretBox("store-enc-key"))
     client = _FakeClient()
     app = FastAPI()
 
@@ -346,3 +361,74 @@ def test_repo_branches_rejects_bad_name(db_uri: str) -> None:
     # A dot-run in a charset-valid segment is also rejected (no traversal).
     resp = tc.get("/v1/connections/github/repos/o..o/app/branches", headers=_USER)
     assert resp.status_code == 400
+
+
+def test_connect_flow_with_the_key_service_cipher(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Connect, store, use and vend GitHub tokens through the HTTP key-service cipher.
+
+    The cipher is selected from the environment, as a deployment does, and talks
+    to a reference key service over loopback HTTP.
+    """
+    caplog.set_level(logging.DEBUG)
+    signing_key = "test-signing-key-for-the-github-connect-flow"
+    service = FakeKeyService(
+        signing_keys={"signing-1": signing_key.encode()},
+        record_keys={("records-1", 1): bytes(range(32))},
+        current=("records-1", 1),
+    )
+    for name in ("OMNIGENT_CREDENTIAL_KMS_KEY_ID", "OMNIGENT_CREDENTIAL_VAULT_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    with service.serve() as url:
+        monkeypatch.setenv("OMNIGENT_CREDENTIAL_CIPHER", "http")
+        monkeypatch.setenv("OMNIGENT_CREDENTIAL_HTTP_URL", url)
+        monkeypatch.setenv("OMNIGENT_CREDENTIAL_HTTP_SIGNING_KEY", signing_key)
+        monkeypatch.setenv("OMNIGENT_CREDENTIAL_HTTP_SIGNING_KEY_ID", "signing-1")
+        cipher = build_secret_cipher()
+        assert isinstance(cipher, HttpSecretCipher)
+        tc, store, _config, client = _app(db_uri, cipher=cipher)
+        # The host-facing broker, as create_app wires it for a configured provider.
+        tc.app.state.github_store = store
+        tc.app.state.github_client = client
+        tc.app.include_router(
+            create_host_credentials_router(
+                _FakeHostStore("host1", "launch-tok", "alice@example.com")  # type: ignore[arg-type]
+            ),
+            prefix="/v1",
+        )
+        vend_headers = {MANAGED_HOST_TOKEN_HEADER: "launch-tok"}
+
+        connect = tc.get(
+            "/v1/connections/github/connect", params={"return_to": "/settings"}, headers=_USER
+        )
+        state = parse_qs(urlsplit(connect.headers["location"]).query)["state"][0]
+        callback = tc.get(
+            "/v1/connections/github/callback",
+            params={"code": "abc", "state": state},
+            headers=_USER,
+        )
+        assert callback.headers["location"] == "/settings?github=connected"
+        assert tc.get("/v1/connections/github/status", headers=_USER).json()["connected"] is True
+
+        # At rest the row holds only the key service's envelope.
+        engine = get_or_create_engine(db_uri)
+        with Session(engine) as session:
+            secret_enc = session.execute(select(SqlConnection.secret_enc)).scalar_one()
+        assert secret_enc.startswith("oshttp1:records-1:1:")
+        assert "ghu_new" not in secret_enc and "ghr_new" not in secret_enc
+
+        # Use: the repo picker and the host broker both decrypt through the service.
+        assert tc.get("/v1/connections/github/repos", headers=_USER).json()["connected"] is True
+        vended = tc.get("/v1/hosts/host1/credentials/github", headers=vend_headers).json()
+        assert vended["connected"] is True and vended["token"] == "ghu_new"
+
+        # A row moved under another identity no longer opens: it reads as not linked.
+        with Session(engine) as session, session.begin():
+            session.execute(update(SqlConnection).values(user_id="mallory@example.com"))
+        mallory = {"X-Test-User": "mallory@example.com"}
+        assert tc.get("/v1/connections/github/repos", headers=mallory).json()["connected"] is False
+
+    assert ("encrypt", 200) in service.served
+    assert ("decrypt", 422) in service.served
+    assert "ghu_new" not in caplog.text and signing_key not in caplog.text
