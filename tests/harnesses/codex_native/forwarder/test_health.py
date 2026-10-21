@@ -25,7 +25,7 @@ class _StatusClient:
         self.status_code = status_code
         self.posts = 0
 
-    async def post(self, url: str, *, json: dict) -> httpx.Response:
+    async def post(self, url: str, *, json: dict, **_options: object) -> httpx.Response:
         """Return the configured status; never raises."""
         del json
         self.posts += 1

@@ -10,6 +10,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -77,7 +78,7 @@ from omnigent.native._native_post_delivery import (
 )
 from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
+from omnigent.session_event_batch import IDEMPOTENCY_KEY_HEADER, MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -6924,6 +6925,8 @@ async def _post_status(
         session_id,
         event_type="external_session_status",
         data=data,
+        # One key for every retry below, so the server applies the edge once.
+        idempotency_key=uuid.uuid4().hex,
     )
     _log_failed_session_event_post("external_session_status", response)
 
@@ -7788,6 +7791,7 @@ async def _post_session_event(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    idempotency_key: str | None = None,
 ) -> httpx.Response | None:
     """
     Post one Omnigent session event, tracking forward-sync health (#1120).
@@ -7807,6 +7811,8 @@ async def _post_session_event(
     :param max_attempts: Maximum POST attempts, or ``None`` to retry transient
         failures until recovery for an idempotent durable item.
     :param timeout: Optional per-request timeout overriding the client default.
+    :param idempotency_key: Optional ``Idempotency-Key`` header sent on every
+        attempt, so the server applies the event once.
     :returns: The final HTTP response, or ``None`` (see
         :func:`_post_session_event_inner`).
     """
@@ -7817,6 +7823,7 @@ async def _post_session_event(
         data=data,
         max_attempts=max_attempts,
         timeout=timeout,
+        idempotency_key=idempotency_key,
     )
     response = result.response
     if response is not None and response.status_code < 400:
@@ -7855,6 +7862,7 @@ async def _post_session_event_inner(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    idempotency_key: str | None = None,
 ) -> _PostResult:
     """
     Post one Omnigent session event with bounded transient retries.
@@ -7873,6 +7881,8 @@ async def _post_session_event_inner(
     :param timeout: Optional per-request timeout in seconds overriding the
         client default, e.g. ``5.0``. Replay passes a short value so a hung
         server fails fast instead of stalling resume on the 30s client default.
+    :param idempotency_key: Optional ``Idempotency-Key`` header sent on every
+        attempt, e.g. ``"4f0c..."``.
     :returns: A :class:`_PostResult` carrying the final response, or — for a
         legacy conversation item without ``source_id`` — whether the POST was
         abandoned after an ambiguous transport failure versus a proven-
@@ -7912,7 +7922,14 @@ async def _post_session_event_inner(
     while max_attempts is None or attempt < max_attempts:
         attempt += 1
         try:
-            if timeout is None:
+            if idempotency_key is not None:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers={IDEMPOTENCY_KEY_HEADER: idempotency_key},
+                    timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+                )
+            elif timeout is None:
                 response = await client.post(url, json=payload)
             else:
                 response = await client.post(url, json=payload, timeout=timeout)

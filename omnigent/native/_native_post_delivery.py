@@ -33,6 +33,7 @@ from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
 from omnigent.native.failure_telemetry import normalize_failure_context
+from omnigent.session_event_batch import IDEMPOTENCY_KEY_HEADER
 
 _logger = logging.getLogger(__name__)
 
@@ -180,6 +181,7 @@ async def post_external_session_status(
     failure_detail: str | None = None,
     failure_context: object = None,
     turn_completed: bool | None = None,
+    idempotency_key: str | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -219,6 +221,9 @@ async def post_external_session_status(
         edge that cannot distinguish "finished" from "stopped early".
     :param failure_context: Optional bounded native error evidence, independent
         of display text. Older servers ignore this additive field.
+    :param idempotency_key: Optional id naming this edge on every retry of it,
+        sent as the ``Idempotency-Key`` header so the server applies the edge
+        once. Older servers ignore it.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -236,10 +241,14 @@ async def post_external_session_status(
         data["response_id"] = response_id
     if turn_completed is not None:
         data["turn_completed"] = turn_completed
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": data},
-    )
+    url = f"/v1/sessions/{session_id}/events"
+    payload = {"type": "external_session_status", "data": data}
+    if idempotency_key:
+        resp = await client.post(
+            url, json=payload, headers={IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        )
+    else:
+        resp = await client.post(url, json=payload)
     resp.raise_for_status()
 
 

@@ -289,6 +289,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_live_state import last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
+from omnigent.server.status_edges import StatusEdges, status_edge_id
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
@@ -973,7 +974,27 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    status_edges = StatusEdges()
+
     async def _post_event_impl(
+        request: Request | _RunnerEventContext,
+        session_id: str,
+        body: SessionEventInput,
+        in_flight: contextlib.ExitStack | None = None,
+    ) -> dict[str, bool | str]:
+        """Apply a session event; a status edge its sender retried is applied once."""
+        edge_id = (
+            status_edge_id(request.headers)
+            if body.type == _EXTERNAL_SESSION_STATUS_TYPE and isinstance(request, Request)
+            else None
+        )
+        if edge_id is None:
+            return await _apply_event(request, session_id, body, in_flight)
+        return await status_edges.apply_once(
+            session_id, edge_id, lambda: _apply_event(request, session_id, body, in_flight)
+        )
+
+    async def _apply_event(
         request: Request | _RunnerEventContext,
         session_id: str,
         body: SessionEventInput,

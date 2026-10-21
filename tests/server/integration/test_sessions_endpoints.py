@@ -5623,6 +5623,59 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     ]
 
 
+async def test_status_edge_retried_after_a_lost_answer_is_applied_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forwarder's retry of an idle edge whose answer it lost is not applied again.
+
+    Applied twice, a sub-agent's turn-end edge would forward its result to the
+    runner, and so to the parent, a second time.
+    """
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+        parent = await _create_session(client, agent["id"])
+        child_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent["id"],
+                "sub_agent_name": "worker",
+                "title": "worker:native",
+            },
+        )
+        assert child_resp.status_code == 201, child_resp.text
+        child_id = child_resp.json()["id"]
+        forwarded.clear()
+
+        async def post_idle(edge_key: str) -> httpx.Response:
+            return await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+                headers={"Idempotency-Key": edge_key},
+            )
+
+        first = await post_idle("edge-1")
+        retried = await post_idle("edge-1")
+        assert len(forwarded) == 1
+        # A later edge is a new one.
+        later = await post_idle("edge-2")
+
+    assert first.status_code == retried.status_code == later.status_code == 202
+    assert retried.json() == first.json()
+    assert len(forwarded) == 2
+
+
 async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

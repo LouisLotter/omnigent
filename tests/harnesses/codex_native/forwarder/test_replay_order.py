@@ -35,12 +35,13 @@ async def test_resume_replay_keeps_tool_pair_ahead_of_live_completion() -> None:
             url: str,
             *,
             json: dict,
-            timeout: float | None = None,
+            timeout: object = None,
+            headers: dict[str, str] | None = None,
         ) -> httpx.Response:
             if not self.posts:
                 self.entered.set()
                 await self.release.wait()
-            return await super().post(url, json=json, timeout=timeout)
+            return await super().post(url, json=json, timeout=timeout, headers=headers)
 
     client = _BlockingFirstPostClient()
     state = fwd._CodexForwarderState()
@@ -223,12 +224,13 @@ async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
             url: str,
             *,
             json: dict,
-            timeout: float | None = None,
+            timeout: object = None,
+            headers: dict[str, str] | None = None,
         ) -> httpx.Response:
             if not self.posts:
                 self.entered.set()
                 await self.release.wait()
-            return await super().post(url, json=json, timeout=timeout)
+            return await super().post(url, json=json, timeout=timeout, headers=headers)
 
     write_bridge_state(
         tmp_path,

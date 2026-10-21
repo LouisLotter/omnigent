@@ -10,6 +10,9 @@ from typing import Any
 # The count bound also keeps validation and dispatch work predictable.
 MAX_SESSION_EVENT_REQUEST_BYTES = 10 * 1024 * 1024
 MAX_SESSION_EVENT_BATCH_EVENTS = 100
+# Names a session status edge on every retry of its POST, so the server
+# applies the edge once.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
 
 def encode_session_event_batch(events: Sequence[dict[str, Any]]) -> bytes:
