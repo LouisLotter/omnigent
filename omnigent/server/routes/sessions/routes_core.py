@@ -198,6 +198,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    RunnerLaunchOutcome,
     SessionCreateRequest,
     SessionForkRequest,
     SessionLabelsResponse,
@@ -596,7 +597,7 @@ def register_core_routes(
         workspace: str | None,
         harness: str | None,
         conversation: Conversation | None = None,
-    ) -> tuple[str, bool] | None:
+    ) -> tuple[str, RunnerLaunchOutcome] | None:
         """
         Bind a just-created session to a caller-supplied host and launch.
 
@@ -632,9 +633,10 @@ def register_core_routes(
         :param conversation: Optional authoritative row already returned by
             session creation, used to avoid re-reading it during launch
             authorization. Its id must match ``session_id``.
-        :returns: ``(runner_id, launch_failed)`` after the bind, or
-            ``None`` when the server has no host registry/store wired
-            (minimal test wirings — nothing was attempted).
+        :returns: ``(runner_id, outcome)`` after the bind, the outcome
+            ``"started"``, ``"failed"`` or ``"unknown"``, or ``None`` when the
+            server has no host registry/store wired (minimal test wirings —
+            nothing was attempted).
         :raises OmnigentError: ``CONFLICT`` when a runner is already
             bound; ``INTERNAL_ERROR`` on a NULL workspace.
         :raises HTTPException: 403/404 from ``resolve_host_launch``.
@@ -723,6 +725,7 @@ def register_core_routes(
         )
         launch_timeout_s = resolve_launch_timeout_s()
         launch_sent_at = time.monotonic()
+        settled: str | None = None
         try:
             host_registry.send_text(conn, launch_frame)
             launch_result = await host_registry.await_answer(
@@ -789,7 +792,10 @@ def register_core_routes(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
-        return runner_id, launch_failed
+        outcome: RunnerLaunchOutcome = (
+            "unknown" if settled == "unknown" else "failed" if launch_failed else "started"
+        )
+        return runner_id, outcome
 
     @router.post(
         "/sessions",
@@ -1028,8 +1034,8 @@ def register_core_routes(
                 conversation=conv,
             )
             if launched is not None:
-                runner_id, launch_failed = launched
-                if launch_failed and _terminal_first_create:
+                runner_id, resp.runner_launch = launched
+                if resp.runner_launch != "started" and _terminal_first_create:
                     # The runner never booted, so its pending=False clear
                     # will never fire. Clear the spin-up flag here so a
                     # failed launch doesn't strand the Terminal-pill
@@ -1278,7 +1284,7 @@ def register_core_routes(
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
-            await _bind_and_launch_on_caller_host(
+            launched = await _bind_and_launch_on_caller_host(
                 request,
                 user_id=user_id,
                 session_id=result.session_id,
@@ -1286,6 +1292,8 @@ def register_core_routes(
                 workspace=parsed_metadata.workspace,
                 harness=canonicalize_harness(raw_harness) or raw_harness,
             )
+            if launched is not None:
+                result.runner_launch = launched[1]
         # Default-public grant only after the launch steps were accepted (see the
         # JSON path). Sub-agent children follow their parent's grants, whether or
         # not they inherited its runner.

@@ -1935,6 +1935,10 @@ class SessionCreateMetadata(BaseModel):
         return self
 
 
+# Outcome of the runner launch a session create started on a host.
+RunnerLaunchOutcome = Literal["started", "failed", "unknown"]
+
+
 class CreatedSessionResponse(BaseModel):
     """
     Response body for multipart ``POST /v1/sessions``.
@@ -1945,11 +1949,15 @@ class CreatedSessionResponse(BaseModel):
         from the uploaded bundle, e.g. ``"ag_abc123"``.
     :param agent_name: Agent name loaded from the uploaded bundle's
         spec, e.g. ``"code-assistant"``.
+    :param runner_launch: Outcome of the runner launch the create started on
+        ``metadata.host_id``, as on :class:`SessionResponse`; ``None`` when it
+        launched nothing.
     """
 
     session_id: str
     agent_id: str
     agent_name: str
+    runner_launch: RunnerLaunchOutcome | None = None
 
 
 class SessionLabelsResponse(BaseModel):
@@ -2110,6 +2118,12 @@ class SessionResponse(BaseModel):
     :param host_id: Host that launched (or should launch) the
         runner for this session, e.g. ``"host_a1b2c3d4..."``.
         ``None`` for CLI-initiated sessions.
+    :param runner_launch: Outcome of the runner launch a ``POST /v1/sessions``
+        started on a host: ``"started"``, ``"failed"`` (nothing runs; the
+        first message launches again), or ``"unknown"`` (the launch's answer
+        was lost and its outcome could not be established). The session is
+        created and keeps its runner binding either way. ``None`` on every
+        other response, and when the create launched nothing.
     :param runner_online: Strict runner liveness — ``True`` iff a
         runner tunnel is currently registered for this session.
         This is the sole reachability signal: ``True`` means the
@@ -2340,6 +2354,7 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    runner_launch: RunnerLaunchOutcome | None = None
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False

@@ -457,6 +457,10 @@ async def test_inline_launch_binds_runner_and_returns_host(
     )
     # Canonical workspace from host.stat is what gets stored/returned.
     assert body["workspace"] == _WORKSPACE
+    # The interface can show that the runner is on its way.
+    assert body["runner_launch"] == "started"
+    snapshot = await client.get(f"/v1/sessions/{body['id']}")
+    assert snapshot.json()["runner_launch"] is None, "only the create reports its launch"
 
     # The conversation row must reflect the same binding, proving the
     # atomic set_runner_id + host_id/workspace writes persisted.
@@ -665,6 +669,7 @@ async def test_inline_launch_failure_still_returns_bound_session(
     # Lenient: launch failure does NOT fail the create.
     assert resp.status_code == 201, f"expected 201 despite launch failure, got {resp.status_code}"
     body = resp.json()
+    assert body["runner_launch"] == "failed"
     assert body["host_id"] == _HOST_ID
     # The runner is bound even though the host declined: the session
     # row was atomically bound (with a real token-derived id) before
@@ -753,8 +758,12 @@ async def test_inline_launch_timeout_honors_the_configured_budget(
     elapsed = time.monotonic() - started
     await responder
 
-    # Lenient inline contract: the create still returns the bound session.
+    # Lenient inline contract: the create still returns the bound session, and
+    # says the launch's outcome is unknown: its answer never came, and the
+    # host gave no account of the runner.
     assert resp.status_code == 201, f"expected 201 despite launch timeout, got {resp.status_code}"
+    assert resp.json()["runner_launch"] == "unknown"
+    assert resp.json()["runner_id"].startswith("runner_token_")
     # The point of the test: it gave up at the configured 1s, so the
     # hard-coded 30s is no longer what bounds a launch. Unscaled on purpose:
     # a CI-scaled budget would exceed 30s and pass against the old wait.
@@ -815,6 +824,8 @@ async def test_inline_launch_connection_loss_still_returns_bound_session(
     body = response.json()
     assert body["host_id"] == _HOST_ID
     assert body["runner_id"].startswith("runner_token_")
+    # The launch frame was never sent.
+    assert body["runner_launch"] == "failed"
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(body["id"])
     assert conversation is not None
     assert conversation.runner_id == body["runner_id"]

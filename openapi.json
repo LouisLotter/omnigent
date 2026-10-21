@@ -8034,6 +8034,23 @@
             "description": "Runner currently bound to this session, e.g. `\"runner_abc123\"`. `None` until a client binds one via `PATCH /v1/sessions/{id}`.",
             "title": "Runner Id"
           },
+          "runner_launch": {
+            "anyOf": [
+              {
+                "enum": [
+                  "started",
+                  "failed",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Outcome of the runner launch a `POST /v1/sessions` started on a host: `\"started\"`, `\"failed\"` (nothing runs; the first message launches again), or `\"unknown\"` (the launch's answer was lost and its outcome could not be established). The session is created and keeps its runner binding either way. `None` on every other response, and when the create launched nothing.",
+            "title": "Runner Launch"
+          },
           "runner_online": {
             "anyOf": [
               {
