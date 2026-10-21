@@ -326,12 +326,12 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
     original_heartbeat = store.heartbeat
     calls = 0
 
-    def flaky_heartbeat(host_id: str) -> None:
+    def flaky_heartbeat(host_id: str, **kwargs: bool) -> bool:
         nonlocal calls
         calls += 1
         if calls <= failures:
             raise RuntimeError("private-store-error-detail")
-        original_heartbeat(host_id)
+        return original_heartbeat(host_id, **kwargs)
 
     monkeypatch.setattr(store, "heartbeat", flaky_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
@@ -389,13 +389,13 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     finished = threading.Event()
     calls = 0
 
-    def slow_heartbeat(host_id: str) -> None:
+    def slow_heartbeat(host_id: str, **kwargs: bool) -> bool:
         nonlocal calls
         calls += 1
         started.set()
         release.wait(timeout=budget(5.0))
         try:
-            original_heartbeat(host_id)
+            return original_heartbeat(host_id, **kwargs)
         finally:
             finished.set()
 
@@ -440,7 +440,7 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     caplog.set_level(logging.INFO, logger=tunnel_mod.__name__)
     app, registry, store = host_app
 
-    def fail_heartbeat(_host_id: str) -> None:
+    def fail_heartbeat(_host_id: str, **_kwargs: bool) -> bool:
         raise RuntimeError("temporary store failure")
 
     monkeypatch.setattr(store, "heartbeat", fail_heartbeat)
@@ -1761,11 +1761,16 @@ async def _refused_after_hello(
 
 
 async def _registration_refusal(communicator: ApplicationCommunicator) -> HostConnectionErrorFrame:
-    """Return the refusal frame the server sends before closing with 4009."""
-    sent = await communicator.receive_output(timeout=budget(2.0))
-    assert sent["type"] == "websocket.send", sent
-    refusal = decode_host_frame(sent["text"])
-    assert isinstance(refusal, HostConnectionErrorFrame)
+    """Return the refusal frame the server sends before closing with 4009, skipping pings."""
+    deadline = time.monotonic() + budget(2.0)
+    while True:
+        assert time.monotonic() < deadline, "no refusal frame"
+        sent = await communicator.receive_output(timeout=budget(2.0))
+        assert sent["type"] == "websocket.send", sent
+        with contextlib.suppress(ValueError):
+            refusal = decode_host_frame(sent["text"])
+            if isinstance(refusal, HostConnectionErrorFrame):
+                break
     closed = await communicator.receive_output(timeout=budget(1.0))
     assert (closed["type"], closed["code"]) == ("websocket.close", 4009)
     return refusal
@@ -1814,10 +1819,15 @@ async def test_refused_bearer_never_replaces_live_managed_connection(db_uri: str
     await managed.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+@pytest.mark.parametrize("host_still_connected", [True, False])
 async def test_bearer_that_raced_arming_never_displaces_the_launch_token_host(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, host_still_connected: bool
 ) -> None:
-    """A bearer stalled after registering an unmarked row loses to the host armed meanwhile."""
+    """A bearer stalled after registering an unmarked row loses to the host armed meanwhile.
+
+    It is refused whether the host's launch-token tunnel is still registered or
+    has already dropped by the time the bearer resumes.
+    """
     app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
     assert store.reserve_sandbox_host(
         host_id=_HOST_ID, name="sandbox", user_id="alice@example.com", provider="modal"
@@ -1853,6 +1863,10 @@ async def test_bearer_that_raced_arming_never_displaces_the_launch_token_host(
         await _send_hello_and_wait(managed, registry, name="sandbox")
         live = registry.get(_HOST_ID)
         assert live is not None and live.registered_with_managed_token
+        if not host_still_connected:
+            await managed.send_input({"type": "websocket.disconnect", "code": 1000})
+            await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), budget(2.0))
+            live = None
     finally:
         release.set()
 
@@ -1861,7 +1875,50 @@ async def test_bearer_that_raced_arming_never_displaces_the_launch_token_host(
     assert (refusal.stage, refusal.retryable) == ("registry", False)
     assert registry.get(_HOST_ID) is live
     host = store.get_host(_HOST_ID)
-    assert host is not None and host.status == "online"
+    assert host is not None
+    assert host.status == ("online" if host_still_connected else "offline")
+    if host_still_connected:
+        await managed.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_bearer_tunnel_ends_at_its_next_heartbeat_once_the_host_is_armed(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sandbox host connected by bearer is cut off once the server arms its row."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    assert store.reserve_sandbox_host(
+        host_id=_HOST_ID, name="sandbox", user_id="alice@example.com", provider="modal"
+    )
+    assert store.bind_sandbox(_HOST_ID, provider="modal", sandbox_id="sb-first")
+    bearer = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(bearer, registry, name="sandbox")
+
+    armed = store.replace_managed_host_sandbox(
+        host_id=_HOST_ID,
+        user_id="alice@example.com",
+        token="tunnel-token-armed",
+        provider="modal",
+        sandbox_id="sb-second",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert armed is not None
+    assert (armed.status, armed.launch_token_only) == ("offline", True)
+    refusal = await _registration_refusal(bearer)
+
+    assert (refusal.stage, refusal.retryable) == ("connected", False)
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), budget(2.0))
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "offline"
+    managed = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-armed"))
+    await managed.send_input({"type": "websocket.connect"})
+    assert (await managed.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    await _send_hello_and_wait(managed, registry, name="sandbox")
+    connection = registry.get(_HOST_ID)
+    assert connection is not None and connection.registered_with_managed_token
     await managed.send_input({"type": "websocket.disconnect", "code": 1000})
 
 

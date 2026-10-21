@@ -768,7 +768,7 @@ class HostStore:
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(self, host_id: str, *, by_bearer: bool = False) -> bool:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
@@ -782,24 +782,35 @@ class HostStore:
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param by_bearer: The tunnel registered with an owner's bearer, not a
+            launch token. Such a tunnel no longer refreshes a host that has
+            become launch-token-only.
+        :returns: ``False`` when *by_bearer* is set and the host has become
+            launch-token-only, so the tunnel must end; ``True`` otherwise.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
         updated_at = now_epoch()
 
-        def write(session: Session) -> None:
-            session.execute(
-                update(SqlHost)
-                .where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.host_id == host_id,
-                    SqlHost.deleted_at.is_(None),
-                )
-                .values(updated_at=updated_at)
+        def write(session: Session) -> bool:
+            statement = update(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+                SqlHost.deleted_at.is_(None),
             )
+            if by_bearer:
+                statement = statement.where(SqlHost.launch_token_only.is_(False))
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(statement.values(updated_at=updated_at)),
+            )
+            if not by_bearer or result.rowcount == 1:
+                return True
+            # Nothing matched: the host is gone, or it was armed since this tunnel registered.
+            return not self._launch_token_only(session, host_id)
 
-        run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
+        return run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
 
     def is_online(self, host_id: str) -> bool:
         """
@@ -1232,7 +1243,8 @@ class HostStore:
         The row lock serializes replacement with :meth:`delete_host`. A missing
         result means full teardown already removed the durable host, so the
         caller must clean up the unregistered sandbox instead of recreating it.
-        Arming makes the host launch-token-only in the same transaction.
+        Arming makes the host launch-token-only and offline in the same
+        transaction, so no earlier connection keeps it online.
 
         :param require_launch_token_only: Arm only a host that is already
             launch-token-only, such as one from :meth:`reserve_managed_host`;
@@ -1276,6 +1288,8 @@ class HostStore:
             existing.sandbox_provider = provider
             existing.sandbox_id = sandbox_id
             existing.launch_token_only = True
+            # Only the new generation's host, registering with this token, brings it online.
+            existing.status = encode_host_status("offline")
             existing.updated_at = now
             return _row_to_host(existing)
 
@@ -1346,12 +1360,17 @@ class HostStore:
         :returns: ``True`` when the host is marked launch-token-only.
         """
         with self._session("select_host_launch_token_only") as session:
-            marked = session.execute(
-                select(SqlHost.launch_token_only).where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.host_id == host_id,
-                )
-            ).scalar_one_or_none()
+            return self._launch_token_only(session, host_id)
+
+    @staticmethod
+    def _launch_token_only(session: Session, host_id: str) -> bool:
+        """Read *host_id*'s launch-token-only marker, deleted hosts included."""
+        marked = session.execute(
+            select(SqlHost.launch_token_only).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+            )
+        ).scalar_one_or_none()
         return bool(marked)
 
     def resolve_launch_token(self, host_id: str, token: str) -> Host | None:

@@ -2099,6 +2099,34 @@ def test_server_arming_marks_an_unclassified_sandbox_host(
     assert connected.status == "online"
 
 
+def test_bearer_heartbeat_reports_a_host_armed_since_it_registered(
+    host_store: HostStore, db_uri: str
+) -> None:
+    """A bearer tunnel learns from its heartbeat that the server armed its host."""
+    _reserve(host_store)
+    assert host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="sb-1")
+    host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
+    assert host_store.heartbeat(_RESERVED_HOST_ID, by_bearer=True)
+
+    armed = host_store.replace_managed_host_sandbox(
+        host_id=_RESERVED_HOST_ID,
+        user_id="alice@example.test",
+        token="armed-token",
+        provider="modal",
+        sandbox_id="sb-2",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert armed is not None
+    assert armed.status == "offline"
+    _set_updated_at(db_uri, _RESERVED_HOST_ID, 1)
+
+    assert host_store.heartbeat(_RESERVED_HOST_ID, by_bearer=True) is False
+    host = host_store.get_host(_RESERVED_HOST_ID)
+    assert host is not None and host.updated_at == 1
+    assert host_store.heartbeat(_RESERVED_HOST_ID) is True
+    assert host_store.heartbeat("00000000000000000000000000000000", by_bearer=True) is True
+
+
 def test_refused_arming_leaves_the_host_unmarked(host_store: HostStore) -> None:
     """The marker is written only by an arming that commits."""
     _reserve(host_store)

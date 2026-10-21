@@ -411,6 +411,12 @@ def create_host_tunnel_router(
                 # sandbox, not a user machine reconnecting on a managed host id.
                 registered_with_managed_token=managed_token is not None,
             )
+            # The server may arm a host while its bearer registration is in flight;
+            # once armed, a bearer tunnel ends here or at its next heartbeat.
+            if managed_token is None and await asyncio.to_thread(
+                host_store.registers_only_with_launch_token, host_id
+            ):
+                raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
@@ -454,6 +460,7 @@ def create_host_tunnel_router(
                         host_id=host_id,
                         host_store=host_store,
                         connection_id=frame.connection_id,
+                        by_bearer=managed_token is None,
                     ),
                     name=f"host-heartbeat:{host_id}",
                 )
@@ -494,7 +501,7 @@ def create_host_tunnel_router(
                             )
 
                     done, _pending = await asyncio.wait(
-                        {sender_task, ping_task, receive_task},
+                        {sender_task, ping_task, receive_task, heartbeat_task},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
@@ -576,8 +583,13 @@ def create_host_tunnel_router(
             disconnect_error = exc
             _logger.warning("Refusing host %s registration: %s", host_id, exc)
             await _send_connection_error(ws, stage=stage, error=str(exc), retryable=exc.retryable)
+            if conn is not None:
+                conn.close_requested_code = 4009
+                conn.close_requested_reason = "host registration refused"
             with contextlib.suppress(Exception):
                 await ws.close(code=4009, reason="host registration refused")
+            if conn is not None and host_registry.deregister(host_id, conn=conn):
+                await asyncio.to_thread(host_store.set_offline, host_id)
         except WebSocketDisconnect as exc:
             disconnect_error = exc
             # Only run disconnect cleanup if we actually registered this
@@ -1153,8 +1165,13 @@ async def _heartbeat_loop(
     host_id: str,
     host_store: HostStore,
     connection_id: str | None = None,
+    by_bearer: bool = False,
 ) -> None:
-    """Serialize host-liveness writes independently of socket pings."""
+    """Serialize host-liveness writes independently of socket pings.
+
+    :raises HostRegistrationRefusedError: When the tunnel registered *by_bearer*
+        and the host has since become launch-token-only.
+    """
     failure_count = 0
     last_failure_log_at = 0.0
     while True:
@@ -1164,7 +1181,7 @@ async def _heartbeat_loop(
         try:
             # Cancellation cannot stop the thread, but heartbeat only updates
             # last-seen; a late write cannot change an offline host's status.
-            await asyncio.to_thread(host_store.heartbeat, host_id)
+            kept = await asyncio.to_thread(host_store.heartbeat, host_id, by_bearer=by_bearer)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
@@ -1212,6 +1229,8 @@ async def _heartbeat_loop(
             )
             failure_count = 0
             last_failure_log_at = 0.0
+        if not kept:
+            raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
 
 
 async def _ping_loop(
