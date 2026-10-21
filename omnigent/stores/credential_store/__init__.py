@@ -12,6 +12,7 @@ from omnigent.stores.credential_store.secret_cipher import (
     SecretCipher,
     SecretContext,
     build_secret_cipher,
+    cipher_setup_hint,
 )
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
@@ -22,4 +23,5 @@ __all__ = [
     "SecretCipher",
     "SecretContext",
     "build_secret_cipher",
+    "cipher_setup_hint",
 ]

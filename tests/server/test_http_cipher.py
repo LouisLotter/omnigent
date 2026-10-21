@@ -34,6 +34,7 @@ from omnigent.stores.credential_store.secret_cipher import (
     SecretCipher,
     SecretTooLargeError,
     build_secret_cipher,
+    cipher_setup_hint,
 )
 from omnigent.stores.credential_store.vault_cipher import CREDENTIAL_VAULT_KEY_ENV_VAR
 from tests.server.fake_key_service import FakeKeyService, b64url, b64url_decode
@@ -404,6 +405,12 @@ def test_autodetected_alone_and_ambiguous_with_another(monkeypatch: pytest.Monke
     monkeypatch.setenv(CREDENTIAL_KMS_KEY_ENV_VAR, "alias/x")
     with pytest.raises(ValueError, match="multiple credential backends"):
         build_secret_cipher()
+
+
+def test_setup_hint_names_the_real_configuration() -> None:
+    hint = cipher_setup_hint()
+    assert "OMNIGENT_CREDENTIAL_CIPHER to one of http, kms, vault" in hint
+    assert "ENC_KEY" not in hint
 
 
 # ── the published protocol vectors ─────────────────────────────────────────

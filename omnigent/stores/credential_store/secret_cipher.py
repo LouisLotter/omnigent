@@ -101,6 +101,14 @@ def _cipher_builders() -> dict[str, Callable[[], SecretCipher | None]]:
     }
 
 
+def cipher_setup_hint() -> str:
+    """How to enable the credential store, for "integration disabled" messages."""
+    return (
+        f"set {CREDENTIAL_CIPHER_ENV_VAR} to one of {', '.join(sorted(_cipher_builders()))} "
+        "and configure that backend (see designs/CREDENTIAL_STORE.md)"
+    )
+
+
 def build_secret_cipher() -> SecretCipher | None:
     """Construct the credential store's cipher from deployment config, or ``None``.
 
