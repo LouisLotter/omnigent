@@ -282,10 +282,10 @@ passes without one (`reason="long_turn"`). A turn end counts only after it has
 held for ten seconds without the session running again, so a brief idle
 reported by a terminal watcher mid-turn does not trigger a save.
 
-The server never overlaps two calls for one sandbox: requests made while a call
-is in flight fold into one follow-up call. A provider must still accept a call
-while an earlier save is running, for example by folding it into a follow-up
-save. Providers that keep the default `checkpoint` are skipped, and the server
+Each server process sends one call at a time per sandbox: requests made while a
+call is in flight fold into one follow-up call. A provider must still accept a
+call while an earlier save is running, or from another server replica, for
+example by folding it into a follow-up save. Providers that keep the default `checkpoint` are skipped, and the server
 logs that once. A launcher that returns its own `SandboxCapabilities` must also
 set `checkpoint=True`.
 

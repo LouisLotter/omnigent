@@ -172,8 +172,13 @@ class _Harness:
         self.launchers_built = 0
         self.statuses: dict[str, str] = {}
 
+        self.factory_failures = 0
+
         def build() -> SandboxHostLauncher:
             self.launchers_built += 1
+            if self.factory_failures:
+                self.factory_failures -= 1
+                raise RuntimeError("provider SDK not ready")
             return self.launcher
 
         config = ManagedSandboxConfig(
@@ -195,12 +200,14 @@ class _Harness:
         self.scheduler.start()
 
     def publish(self, session_id: str, *statuses: str) -> None:
-        """Report each change as the status funnel would: only real changes."""
+        """Report each status as the funnel would, and persist it as live state does."""
         for status in statuses:
             previous = self.statuses.get(session_id)
-            if previous != status:
-                self.statuses[session_id] = status
-                self.scheduler.note_status(session_id, previous, status)
+            self.statuses[session_id] = status
+            conversation = self.stores.conversations.get(session_id)
+            if conversation is not None:
+                conversation.live_status = status
+            self.scheduler.note_status(session_id, previous, status)
 
     @property
     def reasons(self) -> list[str]:
@@ -295,6 +302,35 @@ async def test_spurious_idle_edges_from_a_terminal_watcher_are_debounced(
     harness.publish("conv1", "running", "idle")
     await harness.time.advance_to(200)
     assert harness.launcher.calls == [("sbx-1", "turn_completed", 70.5)]
+
+
+async def test_a_repeated_turn_end_does_not_restart_the_debounce(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    """The trailing idle a terminal watcher adds after a hook's idle changes nothing."""
+    harness = make_harness()
+    harness.stores.add_session("conv1")
+    harness.publish("conv1", "running", "idle")
+    await harness.time.advance_to(6)
+    harness.publish("conv1", "idle")
+    await harness.time.advance_to(100)
+    assert harness.call_times == [_DEBOUNCE_S]
+
+
+async def test_turn_edges_survive_other_writers_of_the_status_cache(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    """A runner status probe can write the cache between publishes."""
+    harness = make_harness()
+    harness.stores.add_session("conv1")
+    # The probe cached "running" before the relay's first running publish.
+    harness.scheduler.note_status("conv1", "running", "running")
+    await harness.time.advance_to(600)
+    assert harness.reasons == ["long_turn"]
+    # A stale probe answer cached "idle" before the relay's real idle.
+    harness.scheduler.note_status("conv1", "idle", "idle")
+    await harness.time.advance_to(700)
+    assert harness.reasons == ["long_turn", "turn_completed"]
 
 
 async def test_turn_ends_during_an_in_flight_request_fold_into_one_follow_up(
@@ -395,6 +431,22 @@ async def test_any_checkpoint_on_the_host_restarts_the_long_turn_interval(
     assert harness.call_times == [310, 910]
 
 
+async def test_long_turn_resumes_after_a_lull_seen_at_its_recheck(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    """An idle persisted just before the recheck must not end long-turn saves."""
+    harness = make_harness()
+    harness.stores.add_session("conv1")
+    harness.publish("conv1", "running")
+    await harness.time.advance_to(599)
+    harness.publish("conv1", "idle")
+    await harness.time.advance_to(605)
+    harness.publish("conv1", "running")
+    await harness.time.advance_to(1300)
+    assert harness.reasons == ["long_turn", "long_turn"]
+    assert harness.call_times == [605, 1205]
+
+
 @pytest.mark.parametrize("how", ["deleted", "ended-elsewhere"])
 async def test_long_turn_stops_for_a_session_that_is_gone_or_ended_elsewhere(
     make_harness: Callable[..., _Harness],
@@ -411,6 +463,36 @@ async def test_long_turn_stops_for_a_session_that_is_gone_or_ended_elsewhere(
 
     await harness.time.advance_to(5000)
     assert harness.launcher.calls == []
+
+
+async def test_a_failed_first_lookup_is_retried_while_the_turn_runs_and_at_its_end(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    harness = make_harness()
+    harness.stores.add_session("conv1")
+    harness.stores.fail_reads = True
+    harness.publish("conv1", "running")
+    await harness.time.advance_to(1)
+    harness.stores.fail_reads = False
+    await harness.time.advance_to(1250)
+    assert harness.call_times == [600, 1200]
+    harness.publish("conv1", "idle")
+    await harness.time.advance_to(1300)
+    assert harness.reasons == ["long_turn", "long_turn", "turn_completed"]
+
+
+async def test_a_failed_lookup_is_retried_when_a_short_turn_ends(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    harness = make_harness()
+    harness.stores.add_session("conv1")
+    harness.stores.fail_reads = True
+    harness.publish("conv1", "running")
+    await harness.time.advance_to(1)
+    harness.stores.fail_reads = False
+    harness.publish("conv1", "idle")
+    await harness.time.advance_to(100)
+    assert harness.call_times == [1 + _DEBOUNCE_S]
 
 
 # ── spacing ──────────────────────────────────────────────────────────────────
@@ -434,6 +516,23 @@ async def test_min_interval_spaces_checkpoint_calls(
     await harness.time.advance_to(500)
     # Both later turn ends fold into the one spaced call.
     assert harness.call_times == [10, 70]
+
+
+async def test_min_interval_is_measured_from_the_end_of_a_slow_call(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    harness = make_harness(policy=SandboxCheckpointPolicy(min_interval_s=60))
+    for session_id in ("conv1", "conv2"):
+        harness.stores.add_session(session_id)
+        harness.publish(session_id, "running")
+    harness.worker.hold = asyncio.Event()
+    harness.publish("conv1", "idle")
+    await harness.time.advance_to(20)
+    harness.publish("conv2", "idle")
+    await harness.time.advance_to(100)
+    harness.worker.hold.set()
+    await harness.time.advance_to(500)
+    assert harness.call_times == [100, 160]
 
 
 # ── providers and hosts that are skipped ─────────────────────────────────────
@@ -474,6 +573,22 @@ async def test_skipped_providers_change_nothing_and_are_logged_once(
     tasks_before = asyncio.all_tasks()
     harness.publish("conv1", "running", "idle")
     assert asyncio.all_tasks() == tasks_before
+
+
+async def test_a_launcher_that_fails_to_build_is_retried(
+    make_harness: Callable[..., _Harness], caplog: pytest.LogCaptureFixture
+) -> None:
+    harness = make_harness()
+    harness.factory_failures = 2
+    harness.stores.add_session("conv1")
+    with caplog.at_level(logging.WARNING, logger=managed_host_checkpoints.__name__):
+        for _ in range(3):
+            harness.publish("conv1", "running", "idle")
+            await harness.time.advance_to(harness.time.now + 100)
+    assert harness.reasons == ["turn_completed"]
+    assert harness.launchers_built >= 3
+    failures = [r for r in caplog.records if "could not build" in r.getMessage()]
+    assert len(failures) == 1
 
 
 @pytest.mark.parametrize(
@@ -644,6 +759,8 @@ async def test_publish_status_drives_a_real_checkpoint(
     try:
         helpers._publish_status("conv_wired", "running")
         helpers._publish_status("conv_wired", "running")
+        # A runner status probe writes the cache directly, outside the funnel.
+        helpers._session_status_cache["conv_wired"] = "idle"
         helpers._publish_status("conv_wired", "idle")
         await harness.time.advance_to(100)
     finally:
@@ -652,18 +769,23 @@ async def test_publish_status_drives_a_real_checkpoint(
     assert harness.reasons == ["turn_completed"]
 
 
-def test_publish_status_reports_each_real_change_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    edges: list[tuple[str, str | None, str]] = []
-    monkeypatch.setattr(managed_host_checkpoints, "note_status", lambda *edge: edges.append(edge))
+def test_publish_status_reports_every_publish_past_the_sticky_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, str | None, str]] = []
+    monkeypatch.setattr(
+        managed_host_checkpoints, "note_status", lambda *status: published.append(status)
+    )
     try:
-        for status in ("running", "running", "idle", "idle", "failed", "idle", "running"):
+        for status in ("running", "running", "idle", "failed", "idle", "running"):
             helpers._publish_status("conv_edges", status)
     finally:
         helpers._session_status_cache.pop("conv_edges", None)
         helpers._session_active_response_cache.pop("conv_edges", None)
     # The idle after failed is swallowed by the sticky-failed rule.
-    assert edges == [
+    assert published == [
         ("conv_edges", None, "running"),
+        ("conv_edges", "running", "running"),
         ("conv_edges", "running", "idle"),
         ("conv_edges", "idle", "failed"),
         ("conv_edges", "failed", "running"),

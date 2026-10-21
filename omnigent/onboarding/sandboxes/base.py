@@ -617,12 +617,12 @@ class SandboxLifecycle(ABC):
         Optional capability: the default raises :class:`SandboxCapabilityError`
         and the managed path (:mod:`omnigent.server.managed_host_checkpoints`)
         skips such providers. A provider that implements it is asked after each
-        completed turn on the host and periodically while a long turn runs. The
-        server never overlaps two calls for one sandbox, but a call may arrive
-        while an earlier save is still running; folding it into one follow-up
-        save is enough. A stopped sandbox has nothing new to save, so never
-        start one to take it. Any provider that can snapshot a sandbox or back
-        up its volume can implement it.
+        completed turn on the host and periodically while a long turn runs. One
+        server process sends one call at a time per sandbox, but a call may
+        still arrive while an earlier save runs, or from another server replica;
+        folding it into one follow-up save is enough. A stopped sandbox has
+        nothing new to save, so never start one to take it. Any provider that
+        can snapshot a sandbox or back up its volume can implement it.
 
         :param sandbox_id: The sandbox to save, e.g. ``"sb-a1b2c3"``.
         :param reason: Why the save is requested, e.g. ``"turn_completed"``.

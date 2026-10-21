@@ -4956,9 +4956,10 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    # Every publish, not only changes: other paths also write this cache.
+    managed_host_checkpoints.note_status(session_id, previous_status, status)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
-        managed_host_checkpoints.note_status(session_id, previous_status, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
