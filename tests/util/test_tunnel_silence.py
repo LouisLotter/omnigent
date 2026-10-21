@@ -136,6 +136,31 @@ async def test_half_open_peer_is_aborted_after_the_deadline_and_grace() -> None:
     assert str(raised.value) == "no message from the server for 0.3s; tunnel presumed dead"
 
 
+async def test_message_landing_as_the_grace_read_expires_is_too_late() -> None:
+    """Once the tunnel is aborted, the read reports silence, not a stray message."""
+    stalled = threading.Event()
+    sent = threading.Event()
+
+    def peer(ws: ThreadPeerConnection) -> None:
+        assert stalled.wait(timeout=budget(5))
+        ws.send("too late")
+        sent.set()
+        _hold_open(ws)
+
+    def stall_through_the_grace_read() -> None:
+        stalled.set()
+        assert sent.wait(timeout=budget(5))
+        time.sleep(_GRACE_S)
+
+    async with _client_for_thread_peer(peer) as ws:
+        asyncio.get_running_loop().call_later(
+            _DEADLINE_S + _GRACE_S / 4, stall_through_the_grace_read
+        )
+        with pytest.raises(TunnelSilenceTimeoutError):
+            await recv_within_silence_deadline(ws, _DEADLINE_S, grace_s=_GRACE_S)
+        assert ws.state is State.CLOSED
+
+
 async def test_message_queued_during_a_pause_is_read_by_the_grace_read() -> None:
     """Resume with the deadline expired and the message already in the socket."""
     paused = threading.Event()

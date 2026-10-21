@@ -52,7 +52,9 @@ and `error_type = TunnelSilenceTimeoutError`. This catches a path that keeps
 answering protocol pings while dropping data, which the protocol keepalive
 cannot see. The server's application ping keeps a healthy tunnel inside the
 deadline, and the extra read lets messages queued while the process was paused
-arrive first.
+arrive first. A server that cannot send for that long, for example because its
+event loop stalls or one very large message crawls over a slow link, now also
+loses the tunnel; the protocol keepalive alone allowed about 120 seconds.
 
 Both ends use the heartbeat/send timing fields below. Server pings retain
 local enqueue timing without changing their wire payload. All host application

@@ -82,11 +82,7 @@ class _Closed(Exception):
     [
         (None, {"local_shutdown": True}, "local_shutdown"),
         (_Closed(1006), {"resumed_from_suspend": True}, "suspend_resume"),
-        (
-            TunnelSilenceTimeoutError(ConnectionClosedError(None, None), 46.0),
-            {},
-            "silence_timeout",
-        ),
+        (TunnelSilenceTimeoutError(46.0), {}, "silence_timeout"),
         (_Closed(4003, "server reassigned; reconnecting"), {}, "server_rehome"),
         (_Closed(1012, "service restart"), {}, "server_restart"),
         (_Closed(4003, "ping timeout"), {}, "ping_timeout"),
