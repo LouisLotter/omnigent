@@ -176,12 +176,9 @@ def runner_lost_error(conversation_store: ConversationStore, session_id: str) ->
 def _naming_tool(error: ErrorDetail, tool: tuple[str, str] | None) -> ErrorDetail:
     if tool is None:
         return error
+    # First, so the label's truncation of a long runner-exit report keeps it.
     return error.model_copy(
-        update={
-            "message": (
-                f"{error.message} {tool[1]} was running and its outcome is unknown."
-            ).strip()
-        }
+        update={"message": f"{tool[1]} was running and its outcome is unknown. {error.message}"}
     )
 
 
