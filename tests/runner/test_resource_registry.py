@@ -1166,6 +1166,25 @@ async def test_required_terminal_exit_after_new_turn_is_failure(tmp_path: Path) 
     assert not registry.session_turn_is_active("conv_turn")
 
 
+def test_session_turn_start_is_when_a_turn_begins_not_each_activity_edge() -> None:
+    """A re-sent Stop compares against when the running turn began, whoever began it."""
+    registry = SessionResourceRegistry()
+    assert registry.session_turn_started_at("conv_turn") is None
+    registry.note_session_turn_started("conv_turn")
+    first = registry.session_turn_started_at("conv_turn")
+    assert first is not None
+    registry.note_external_session_status("conv_turn", "waiting")
+    registry.note_external_session_status("conv_turn", "running")
+    assert registry.session_turn_started_at("conv_turn") == first
+    registry.note_external_session_status("conv_turn", "idle")
+    assert not registry.session_turn_is_active("conv_turn")
+    # A turn typed into the terminal is reported by its status edge.
+    registry.note_external_session_status("conv_turn", "running")
+    later = registry.session_turn_started_at("conv_turn")
+    assert later is not None and later >= first
+    assert registry.session_turn_is_active("conv_turn")
+
+
 @pytest.mark.asyncio
 async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     """``cleanup_session`` drops the session's PTY-status memo.

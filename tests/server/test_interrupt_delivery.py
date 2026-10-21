@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -68,6 +70,7 @@ async def _schedule(registry: TunnelRegistry, after_generation: int | None) -> N
         queued_pending_ids=[],
         wait_s=2.0,
         stop_generation=interrupt_delivery.input_generation(_SESSION),
+        pressed_at=time.monotonic(),
     )
     await asyncio.sleep(0)
 
@@ -95,7 +98,55 @@ async def test_stop_is_sent_once_the_half_open_tunnel_is_replaced(
 
     assert len(interrupts) == 1
     assert interrupts[0].url.path == f"/v1/sessions/{_SESSION}/events"
+    # The runner applies it only to a turn already running when Stop was pressed.
+    body = json.loads(interrupts[0].content)
+    assert body["type"] == "interrupt" and body["pressed_ago_s"] >= 0.05
     assert _SESSION in _interrupt_fenced_sessions
+
+
+@pytest.mark.asyncio
+async def test_stop_whose_turn_ended_on_the_runner_is_not_counted_as_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner refuses a re-sent Stop for a turn that ended, so nothing is fenced or dropped."""
+    posted: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(request)
+        return httpx.Response(409, json={"status": "turn_ended"})
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://runner")
+
+    async def get_runner_client(session_id: str, runner_router: Any, **_: Any) -> Any:
+        del session_id, runner_router
+        return runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", get_runner_client)
+    pending_inputs.reset_for_tests()
+    pending_id = pending_inputs.record(_SESSION, [{"type": "input_text", "text": "queued"}])
+    _session_status_cache[_SESSION] = "running"
+    registry = TunnelRegistry()
+    try:
+        interrupt_delivery.deliver_interrupt_after_reconnect(
+            _SESSION,
+            runner_id=_RUNNER,
+            after_generation=None,
+            tunnel_registry=registry,
+            runner_router=None,
+            queued_pending_ids=[pending_id],
+            wait_s=2.0,
+            stop_generation=interrupt_delivery.input_generation(_SESSION),
+            pressed_at=time.monotonic(),
+        )
+        registry.register(_RUNNER, _NoopWS(), _hello())
+        await _settled()
+
+        assert len(posted) == 1
+        assert _SESSION not in _interrupt_fenced_sessions
+        assert pending_inputs.has_pending(_SESSION), "the queued message was not stopped"
+    finally:
+        _session_status_cache.pop(_SESSION, None)
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
@@ -114,6 +165,7 @@ async def test_stop_marks_the_messages_queued_when_it_was_pressed(
         queued_pending_ids=[pending_id],
         wait_s=2.0,
         stop_generation=interrupt_delivery.input_generation(_SESSION),
+        pressed_at=time.monotonic(),
     )
     registry.register(_RUNNER, _NoopWS(), _hello())
     await _settled()
@@ -162,6 +214,7 @@ async def test_runner_that_never_returns_gets_no_stop(
         queued_pending_ids=[],
         wait_s=0.05,
         stop_generation=interrupt_delivery.input_generation(_SESSION),
+        pressed_at=time.monotonic(),
     )
     await _settled()
 
@@ -190,6 +243,7 @@ async def test_message_during_the_first_forward_keeps_the_stop_from_being_redeli
         queued_pending_ids=[],
         wait_s=2.0,
         stop_generation=stop_generation,
+        pressed_at=time.monotonic(),
     )
     registry.register(_RUNNER, _NoopWS(), _hello())
     await asyncio.sleep(0.05)
@@ -217,6 +271,7 @@ async def test_a_superseded_stop_leaves_a_newer_stops_redelivery_alone(
         queued_pending_ids=[],
         wait_s=2.0,
         stop_generation=stop_a,
+        pressed_at=time.monotonic(),
     )
 
     assert superseded is False

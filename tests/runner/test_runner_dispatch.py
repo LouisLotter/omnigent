@@ -10962,6 +10962,48 @@ async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> No
     app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.parametrize(
+    ("pressed_ago_s", "turn_running", "applied"),
+    [(None, True, True), (0.0, True, True), (30.0, True, False), (0.0, False, False)],
+    ids=["first-delivery", "turn-pressed-for", "turn-began-after-the-press", "turn-ended"],
+)
+@pytest.mark.asyncio
+async def test_resent_stop_reaches_only_the_turn_it_was_pressed_for(
+    pressed_ago_s: float | None, turn_running: bool, applied: bool
+) -> None:
+    """A Stop sent again after a drop never interrupts a turn that began after it was pressed."""
+    conv = "conv_resent_stop"
+    turn = asyncio.create_task(asyncio.Event().wait())
+    harness = _RecoveryScriptedHarnessClient([])
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    if turn_running:
+        app.state.begin_turn_slot(conv)
+        app.state.active_turns[conv] = turn
+    event: dict[str, Any] = {"type": "interrupt"}
+    if pressed_ago_s is not None:
+        event["pressed_ago_s"] = pressed_ago_s
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json=event)
+
+        if applied:
+            assert response.status_code == 204, response.text
+            assert turn.cancelled() or turn.cancelling()
+        else:
+            assert response.status_code == 409, response.text
+            assert response.json()["status"] == "turn_ended"
+            assert not turn.done() and turn.cancelling() == 0
+            assert harness.patched_events == []
+    finally:
+        turn.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await turn
+        app.state.active_turns.pop(conv, None)
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("replaced", [False, True])
 @pytest.mark.asyncio

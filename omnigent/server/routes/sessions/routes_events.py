@@ -1512,6 +1512,7 @@ def register_events_routes(
             queued_pending_ids: list[str] = []
             # A later message must keep this Stop from being redelivered.
             stop_generation = input_generation(session_id)
+            stop_pressed_at = time.monotonic()
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -1618,6 +1619,7 @@ def register_events_routes(
                         queued_pending_ids=queued_pending_ids,
                         wait_s=RUNNER_DISCONNECT_GRACE_S,
                         stop_generation=stop_generation,
+                        pressed_at=stop_pressed_at,
                     ):
                         interrupt_delivery = "pending"
             elif not codex_child:
