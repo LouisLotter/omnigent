@@ -610,14 +610,24 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
+    from omnigent.server.interrupted_work import INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+
+    last_error = _last_task_error_from_labels(conv.labels)
+    # Retry is the person asking: a replacement runner may continue the work
+    # a dead one was doing, including work it declined to continue on its own.
+    continue_interrupted = (
+        last_error is not None and last_error.get("code") == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    )
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
         conv,
         runner_client,
         conversation_store,
         initializer=getattr(request.app.state, "runner_session_initializer", None),
-        suppress_recovery_turn=was_connected,
+        suppress_recovery_turn=was_connected and not continue_interrupted,
         require_success=True,
+        continuation_requested=not was_connected or continue_interrupted,
     )
 
     if _is_native_terminal_session(conv):

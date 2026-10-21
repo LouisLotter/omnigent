@@ -157,6 +157,8 @@ from omnigent.runner.resource_routes import register_resource_routes
 from omnigent.runner.session_history import build_session_history
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
+    automatic_continuation_allowed,
+    earlier_runner_incarnation,
     parse_runner_session_init_envelope,
 )
 from omnigent.runner.sign_in_watch import build_sign_in_watch
@@ -1403,6 +1405,10 @@ def create_runner_app(
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     # Messages this process accepted, so a resent one is answered as a duplicate.
     _accepted_messages = AcceptedMessages()
+    # This runner process's identity across tunnel reconnects. A session whose
+    # work another incarnation ran is never continued here on its own.
+    _runner_incarnation_id = uuid.uuid4().hex
+    app.state.runner_incarnation_id = _runner_incarnation_id
     app.state.session_message_buffers = _session_message_buffers
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
@@ -3021,11 +3027,20 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        # The incarnation check: work another runner process was doing may
+        # already have had effects, so it is not continued unless asked.
+        earlier_incarnation = earlier_runner_incarnation(
+            init_context.envelope, _runner_incarnation_id
+        )
+        continuation_blocked = not automatic_continuation_allowed(
+            init_context.envelope, _runner_incarnation_id
+        )
         recovery_id = (
             init_context.envelope.recovery_id
             if init_context.envelope is not None
             and init_context.envelope.resume_interrupted_turn
             and not _suppress_recovery
+            and not continuation_blocked
             else None
         )
         history: list[_JsonObject]
@@ -3063,6 +3078,7 @@ def create_runner_app(
                 needs_turn
                 and recovery_id is None
                 and not _suppress_recovery
+                and not continuation_blocked
                 and session_id not in _active_turns
             ):
                 recovery_turn = "history_resume"
@@ -3146,6 +3162,8 @@ def create_runner_app(
                     and init_context.envelope.resume_interrupted_turn
                 ),
                 suppress_recovery_turn=_suppress_recovery,
+                earlier_incarnation=earlier_incarnation,
+                continuation_blocked=continuation_blocked,
                 execution_seen=execution_seen,
                 forward_in_flight=forward_in_flight,
                 history_len=len(history),
@@ -3171,6 +3189,8 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                "runner_incarnation_id": _runner_incarnation_id,
+                "continuation_blocked": continuation_blocked,
                 **(
                     {"inference_config_verified": True}
                     if init_context.envelope is not None

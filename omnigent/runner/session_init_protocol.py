@@ -12,6 +12,9 @@ from omnigent.entities import Conversation
 SessionInitProtocolVersion: TypeAlias = Literal[2]
 SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
 SESSION_INIT_PAYLOAD_KEY = "session_init"
+# Conversation label naming the runner process (incarnation) that last
+# initialized the session, written by the server from the runner's answer.
+RUNNER_INCARNATION_LABEL_KEY = "omnigent.runner_incarnation"
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -54,6 +57,9 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # Resume an interrupted child task in its existing native session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
+    # The person asked to continue the session's interrupted work, so a runner
+    # that is not the one that ran it may still continue it.
+    continuation_requested: bool = False
 
 
 def build_runner_session_init_payload(
@@ -63,6 +69,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    continuation_requested: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -78,6 +85,7 @@ def build_runner_session_init_payload(
         suppress_recovery_turn=suppress_recovery_turn,
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
+        continuation_requested=continuation_requested,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
@@ -100,6 +108,48 @@ def build_runner_session_init_payload(
         "sub_agent_name": conversation.sub_agent_name,
         SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
     }
+
+
+def earlier_runner_incarnation(
+    envelope: RunnerSessionInitEnvelope | None, incarnation_id: str
+) -> str | None:
+    """
+    Return the other runner incarnation that last held this session, if any.
+
+    A transport reconnect of the same runner process keeps its incarnation; a
+    replacement process (after a crash, a host or computer restart, or a
+    rebind) has a new one. Every path that re-attaches a session to a runner
+    sends this envelope, so the runner can tell the two apart here.
+
+    :param envelope: The initialization envelope, or ``None`` for a legacy body.
+    :param incarnation_id: This runner process's incarnation id.
+    :returns: The earlier incarnation's id, or ``None`` for a session this
+        process already held, a fresh session, or a legacy body.
+    """
+    if envelope is None:
+        return None
+    earlier = envelope.snapshot.labels.get(RUNNER_INCARNATION_LABEL_KEY)
+    return earlier if earlier and earlier != incarnation_id else None
+
+
+def automatic_continuation_allowed(
+    envelope: RunnerSessionInitEnvelope | None, incarnation_id: str
+) -> bool:
+    """
+    Return whether this runner may continue the session's earlier work on its own.
+
+    Work interrupted in another runner process may already have had effects that
+    nothing recorded, so a new incarnation never re-runs a turn
+    (``history_resume``) or sends the recovery prompt unless the person asked.
+
+    :param envelope: The initialization envelope, or ``None`` for a legacy body.
+    :param incarnation_id: This runner process's incarnation id.
+    :returns: ``False`` when another incarnation held the session and the
+        person did not ask to continue.
+    """
+    if envelope is not None and envelope.continuation_requested:
+        return True
+    return earlier_runner_incarnation(envelope, incarnation_id) is None
 
 
 class RunnerInferenceConfigMismatch(ValueError):

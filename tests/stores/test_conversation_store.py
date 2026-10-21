@@ -5919,12 +5919,14 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     """
     from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
     from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
     from omnigent.stores.conversation_store import _INSTANCE_SCOPED_LABEL_KEYS
 
     # Each harness's canonical bridge-id key must be in the denylist; a
     # miss means a rename slipped past the store's hard-coded literal.
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert RUNNER_INCARNATION_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
 
 
 def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:

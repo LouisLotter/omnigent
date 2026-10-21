@@ -150,10 +150,17 @@ class RunnerSessionInitializer:
         timeout: float,
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
+        continuation_requested: bool = False,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
     ) -> httpx.Response:
-        """Initialize once for the current connection and persisted snapshot."""
+        """
+        Initialize once for the current connection and persisted snapshot.
+
+        ``continuation_requested`` marks an initialization the person asked
+        for to continue interrupted work; it is never shared with an earlier
+        one, which may have declined to continue.
+        """
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
@@ -187,7 +194,7 @@ class RunnerSessionInitializer:
             conversation.sub_agent_name,
             resume_interrupted_turn,
         )
-        task = self._tasks.get(key)
+        task = None if continuation_requested else self._tasks.get(key)
         if task is None and self._agent_store is not None:
             async with store_slots or nullcontext():
                 agent = await asyncio.to_thread(self._agent_store.get, agent_id)
@@ -209,7 +216,7 @@ class RunnerSessionInitializer:
                     request=httpx.Request("POST", "/v1/sessions"),
                 )
             # Another caller may have started this initialization during the lookup.
-            task = self._tasks.get(key)
+            task = None if continuation_requested else self._tasks.get(key)
         if task is None:
             recovery_id = (
                 self._recovery_ids.setdefault(key, uuid4().hex)
@@ -222,6 +229,7 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                continuation_requested=continuation_requested,
             )
 
             async def post_session_init() -> httpx.Response:
@@ -246,7 +254,7 @@ class RunnerSessionInitializer:
                             tunnel_registry=self._registry,
                         )
                 self.require_generation(runner_id, runner_client, generation)
-                return await self._post_initialize(
+                response = await self._post_initialize(
                     runner_client,
                     session_id=conversation.id,
                     runner_id=runner_id,
@@ -257,12 +265,20 @@ class RunnerSessionInitializer:
                     recovery_id=recovery_id,
                     generation=generation,
                 )
+                if self._conversation_store is not None:
+                    from omnigent.server.interrupted_work import record_runner_incarnation
+
+                    await record_runner_incarnation(
+                        conversation, response, self._conversation_store
+                    )
+                return response
 
             task = asyncio.create_task(
                 post_session_init(),
                 name=f"runner-session-init-{conversation.id}",
             )
-            self._tasks[key] = task
+            if not continuation_requested:
+                self._tasks[key] = task
 
             def _drop_failed(done: asyncio.Task[httpx.Response]) -> None:
                 failed = done.cancelled() or done.exception() is not None

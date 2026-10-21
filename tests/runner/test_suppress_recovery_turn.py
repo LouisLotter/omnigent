@@ -606,3 +606,77 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
         assert (await client.post("/v1/sessions", json=payload)).status_code == 201
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
+
+
+def _payload_held_by(
+    incarnation: str | None, *, continuation_requested: bool = False
+) -> dict[str, Any]:
+    """Init payload for a session whose label names the incarnation that held it."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
+
+    conv = Conversation(
+        id=SESSION_ID,
+        agent_id=AGENT_ID,
+        runner_id="runner_test",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=SESSION_ID,
+        labels={RUNNER_INCARNATION_LABEL_KEY: incarnation} if incarnation else {},
+    )
+    return build_runner_session_init_payload(
+        conv, server_version="0.0.0-test", continuation_requested=continuation_requested
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_interrupted_turn", [False, True])
+async def test_new_incarnation_does_not_continue_another_runners_turn(
+    caplog: pytest.LogCaptureFixture, resume_interrupted_turn: bool
+) -> None:
+    """A replacement runner neither re-runs the turn nor sends the recovery prompt.
+
+    The session's last turn ran in a runner process that died; its effects are
+    unknown. Re-attaching it to a new process without the person asking must
+    start nothing, on the ``history_resume`` path and the recovery-envelope path.
+    """
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    payload = _payload_held_by("a" * 32)
+    if resume_interrupted_turn:
+        payload["session_init"].update(resume_interrupted_turn=True, recovery_id="dead-runner")
+
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+        await asyncio.sleep(0.1)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["continuation_blocked"] is True
+    assert response.json()["runner_incarnation_id"] == app.state.runner_incarnation_id
+    assert harness.posted_bodies == []
+    (row,) = _init_rows(caplog)
+    assert row["recovery_turn"] == "none"
+    assert row["earlier_incarnation"] == "a" * 32
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held_here", [True, False])
+async def test_same_incarnation_or_a_request_still_continues(
+    caplog: pytest.LogCaptureFixture, held_here: bool
+) -> None:
+    """A reconnect of the same process, or the person's retry, keeps recovery working."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    incarnation = app.state.runner_incarnation_id if held_here else "b" * 32
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json=_payload_held_by(incarnation, continuation_requested=not held_here),
+        )
+        await asyncio.sleep(0.1)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["continuation_blocked"] is False
+    assert len(harness.posted_bodies) == 1
+    assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"

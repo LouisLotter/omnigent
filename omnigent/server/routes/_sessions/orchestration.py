@@ -155,6 +155,7 @@ from omnigent.server.bundles import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.interrupted_work import with_unanswered_tool
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -4087,12 +4088,14 @@ async def _mark_runner_sessions_offline_once(
         ):
             continue
         turn_id = _session_active_response_cache.get(conv.id)
-        _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        # Name the tool the lost runner left without a result.
+        session_error = await with_unanswered_tool(error, conversation_store, conv.id)
+        _publish_status(conv.id, "failed", session_error, failure_origin="runner_offline_sweep")
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(
-            conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+            conv.id, session_error, conversation_store, owner_runner_id=conv.runner_id
         )
     return retry
 
@@ -5613,6 +5616,7 @@ async def _ensure_runner_session_initialized(
     *,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
+    continuation_requested: bool = False,
 ) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -5663,6 +5667,8 @@ async def _ensure_runner_session_initialized(
         finishes.
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
+    :param continuation_requested: The person asked to continue interrupted
+        work, so a replacement runner may resume it.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -5673,8 +5679,10 @@ async def _ensure_runner_session_initialized(
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                 suppress_recovery_turn=suppress_recovery_turn,
+                continuation_requested=continuation_requested,
             )
         else:
+            from omnigent.server.interrupted_work import record_runner_incarnation
             from omnigent.version import VERSION
 
             resp = await runner_client.post(
@@ -5683,9 +5691,11 @@ async def _ensure_runner_session_initialized(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
+                    continuation_requested=continuation_requested,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
+            await record_runner_incarnation(conv, resp, conversation_store)
         from omnigent.server.runner_session_init import (
             is_session_agent_removed,
             runner_inference_verified,
@@ -8724,9 +8734,13 @@ async def _relay_runner_stream(
             else:
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
-                disconnect_error = ErrorDetail(
-                    code="runner_disconnected",
-                    message="Runner disconnected unexpectedly.",
+                disconnect_error = await with_unanswered_tool(
+                    ErrorDetail(
+                        code="runner_disconnected",
+                        message="Runner disconnected unexpectedly.",
+                    ),
+                    conversation_store,
+                    session_id,
                 )
                 turn_id = _session_active_response_cache.get(session_id)
                 _publish_status(

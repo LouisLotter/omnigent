@@ -5486,6 +5486,53 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert relay_bindings == [(sid, "runner_recovered")]
 
 
+async def test_patch_rebind_to_a_new_runner_keeps_an_interrupted_turns_unknown_outcome(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-attaching an interrupted session to a new runner process does not settle it.
+
+    The runner that ran the turn died; the rebound runner declines to continue
+    it. The rebind must leave the "interrupted, outcome unknown" failure for
+    the person instead of clearing it to idle.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201, json={"runner_incarnation_id": "e" * 32, "continuation_blocked": True}
+        )
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(_runner), base_url="http://runner")
+
+    async def _get_runner_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return runner
+
+    async def _no_relay(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        sessions_module, "_registered_runner_id", lambda _router, raw, **_: raw.strip()
+    )
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner_client)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _no_relay)
+    agent = await create_test_agent(client)
+    sid = (await _create_session(client, agent["id"]))["id"]
+    sessions_module._session_status_cache[sid] = "running"
+    try:
+        resp = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_new"})
+        cache_after = sessions_module._session_status_cache.get(sid)
+        snapshot = await client.get(f"/v1/sessions/{sid}")
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        await runner.aclose()
+
+    assert resp.status_code == 200, resp.text
+    assert cache_after == "failed"
+    assert snapshot.json()["last_task_error"]["code"] == "interrupted_outcome_unknown"
+
+
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -10164,6 +10211,38 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     get_runner.assert_awaited()
     after = await client.get(f"/v1/sessions/{session['id']}")
     assert after.json()["items"] == before_items
+
+
+async def test_retry_session_asks_to_continue_work_left_with_an_unknown_outcome(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry is the person asking: it lets a replacement runner continue the work."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"],
+        {
+            "omnigent.last_task_error_code": "interrupted_outcome_unknown",
+            "omnigent.last_task_error_message": "The runner stopped while Bash was running.",
+        },
+    )
+    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=object()))
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    initialize.assert_awaited_once()
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
+    assert initialize.await_args.kwargs["continuation_requested"] is True
 
 
 async def test_retry_session_ensures_dead_required_native_terminal_once(

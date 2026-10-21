@@ -180,8 +180,10 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 #     labels would route the new context's terminal + web injection to the
 #     SOURCE's claude/codex bridge (whose active-session marker isn't the
 #     clone → "session no longer active"); the context-size metrics would
-#     display the source's last usage. The bridge-id literals mirror the
-#     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
+#     display the source's last usage; the runner incarnation would name a
+#     runner process the new context never ran on. The bridge-id literals
+#     mirror the harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants, and the
+#     incarnation literal ``RUNNER_INCARNATION_LABEL_KEY``; a store test
 #     cross-checks them so a rename in those modules fails loudly here.
 #
 #   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
@@ -197,6 +199,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.runner_incarnation",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )

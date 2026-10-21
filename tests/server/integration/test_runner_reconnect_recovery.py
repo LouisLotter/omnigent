@@ -537,3 +537,61 @@ async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
             assert transport_warnings
         else:
             assert errors
+
+
+async def test_replacement_runner_keeps_a_dead_runners_unknown_outcome(
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner process that replaced a dead one leaves its turn's outcome unknown.
+
+    Both sessions were interrupted mid-turn. The first was held by the runner
+    process that reconnects, so its disconnect clears as before. The second
+    was held by a process that died: the replacement declines to continue it,
+    and the session keeps a named "interrupted, outcome unknown" failure
+    instead of reading idle.
+    """
+    from omnigent.entities import FunctionCallData, MessageData, NewConversationItem
+    from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+
+    store = app.state.runner_router._conversation_store
+    reconnected, replaced = [_create_session(app, agent.id) for _ in range(2)]
+    store.set_labels(reconnected.id, {RUNNER_INCARNATION_LABEL_KEY: "a" * 32})
+    store.set_labels(replaced.id, {RUNNER_INCARNATION_LABEL_KEY: "d" * 32})
+    store.append(
+        replaced.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "go"}]),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(agent="a", name="Bash", arguments="{}", call_id="call_1"),
+            ),
+        ],
+    )
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        envelope = json.loads(request.content)["session_init"]
+        earlier = envelope["snapshot"]["labels"].get(RUNNER_INCARNATION_LABEL_KEY)
+        return httpx.Response(
+            201,
+            json={
+                "runner_incarnation_id": "a" * 32,
+                "continuation_blocked": earlier not in (None, "a" * 32),
+            },
+        )
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert sessions._session_status_cache[reconnected.id] == "idle"
+        assert sessions._session_status_cache[replaced.id] == "failed"
+        replaced_now = store.get_conversation(replaced.id)
+        error = _last_task_error_from_labels(replaced_now.labels)
+        assert error is not None
+        assert error["code"] == "interrupted_outcome_unknown"
+        assert "Bash" in error["message"]
+        assert replaced_now.labels[RUNNER_INCARNATION_LABEL_KEY] == "a" * 32
