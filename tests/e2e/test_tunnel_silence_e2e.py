@@ -7,7 +7,7 @@ pings and forwards nothing. A capture pause is a SIGSTOP of the host's and the
 runner's process trees for 40 s, the hard budget a sandbox checkpoint may take.
 
 Everything runs at production timing: the server's 30 s application ping and
-the 45 s silence deadline. Each test takes one to two minutes.
+the 45 s silence deadline. Each test takes two to three minutes.
 
 Run::
 
@@ -16,7 +16,10 @@ Run::
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -27,18 +30,36 @@ import psutil
 import pytest
 
 from omnigent.server.routes._sessions.common import RUNNER_DISCONNECT_GRACE_ENV_VAR
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.util.tunnel_silence import TUNNEL_SILENCE_GRACE_S, TUNNEL_SILENCE_TIMEOUT_S
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.server_runner import ServerRunner, server_runner
+from tests.e2e.conftest import (
+    configure_mock_llm,
+    create_runner_bound_session,
+    register_inline_agent,
+    release_mock_gate,
+)
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.processes import frozen, process_tree
 from tests.e2e.resilience.lab.proxy import ConnectionInfo, FaultProxy, LoopThread, host_link
+from tests.e2e.test_runner_tunnel_mid_turn_reconnect_grace_e2e import (
+    _ANSWER,
+    _FAILURE_SIGNATURE,
+    _gate_pending,
+    _poll_until,
+    _send_user_message,
+    _session_blob,
+    _session_snapshot,
+)
 
 pytestmark = pytest.mark.timeout(300)
 
 _PAUSE_S = 40.0
 _SILENT_FOR_S = TUNNEL_SILENCE_TIMEOUT_S + TUNNEL_SILENCE_GRACE_S
 _RUNNER_GRACE_S = 150.0
+# RC-21: the host and runners are back within 100 s when a drop overlaps a pause.
+_RC21_OVERLAPPING_PAUSE_S = 100.0
 _TUNNELS = ("host.tunnel", "runner.tunnel")
 # Time for an aborted client to redial and register again.
 _RECONNECT_S = 15.0
@@ -52,6 +73,7 @@ class _Topology:
     proxy: FaultProxy
     events: EventLog
     client: httpx.Client
+    mock_llm_url: str
 
     def tunnel(self, tag: str) -> ConnectionInfo:
         [conn] = self.proxy.connections({tag})
@@ -122,12 +144,19 @@ class _Topology:
 
 
 @pytest.fixture
-def topology(tmp_path: Path) -> Iterator[_Topology]:
+def topology(tmp_path: Path, isolated_mock_llm_server_url: str) -> Iterator[_Topology]:
     events = EventLog(tmp_path / "events.jsonl")
+    # Nothing ambient (credentials, model endpoints) reaches the processes.
+    base_env = {key: value for key, value in os.environ.items() if key in {"PATH", "LANG"}}
+    model_env = {
+        "OPENAI_API_KEY": "mock-key",
+        "OPENAI_BASE_URL": f"{isolated_mock_llm_server_url}/v1",
+    }
     with ExitStack() as resources:
         stack = resources.enter_context(
             server_runner(
                 tmp_path / "stack",
+                base_env=base_env,
                 server_env={RUNNER_DISCONNECT_GRACE_ENV_VAR: str(_RUNNER_GRACE_S)},
             )
         )
@@ -139,13 +168,35 @@ def topology(tmp_path: Path) -> Iterator[_Topology]:
         )
         proxy.start()
         resources.callback(proxy.stop)
-        stack.start_runner(env={"RUNNER_SERVER_URL": proxy.url})
+        stack.start_runner(env={"RUNNER_SERVER_URL": proxy.url, **model_env})
         client = resources.enter_context(
             httpx.Client(base_url=stack.base_url, timeout=10, trust_env=False)
         )
-        host = resources.enter_context(isolated_host(tmp_path / "host", proxy.url))
+        host = resources.enter_context(
+            isolated_host(tmp_path / "host", proxy.url, base_env=base_env)
+        )
         host.wait_online(client, timeout=60, poll_interval=_POLL_S)
-        yield _Topology(stack, host, proxy, events, client)
+        yield _Topology(stack, host, proxy, events, client, isolated_mock_llm_server_url)
+
+
+def _drop_runner_then_pause(topology: _Topology, pause_s: float) -> float:
+    """Drop the runner's tunnel, then pause everything just before its deadline.
+
+    The drop comes right after a server ping, and the pause starts a second
+    before the deadline would fire: the latest a pause can push detection.
+
+    :returns: Seconds from the drop until the runner's new tunnel opened.
+    """
+    [runner] = topology.wait_for_server_messages(("runner.tunnel",), newer_than_s=1).values()
+    dropped_at, dropped_wall = time.monotonic(), time.time()
+    assert topology.proxy.ping_only({"runner.tunnel"}) == 1
+    time.sleep(TUNNEL_SILENCE_TIMEOUT_S - 1)
+    with frozen(topology.processes(), topology.events):
+        time.sleep(pause_s)
+    topology.wait_gave_up(runner, timeout=_RECONNECT_S)
+    outage_s = topology.wait_reconnected("runner.tunnel", after_wall=dropped_wall) - dropped_at
+    topology.events.emit("test", "recovered", pause_s=pause_s, outage_s=outage_s)
+    return outage_s
 
 
 def test_half_open_tunnels_are_redialed_after_the_deadline(topology: _Topology) -> None:
@@ -210,24 +261,51 @@ def test_a_loss_during_a_pause_is_detected_right_after_resume(topology: _Topolog
         topology.wait_reconnected(tag, after_wall=lost_wall)
 
 
-def test_a_drop_overlapping_a_pause_is_recovered_within_the_runner_grace(
-    topology: _Topology,
-) -> None:
-    """The longest outage a pause can add: the drop, then the pause at the deadline."""
-    [runner] = topology.wait_for_server_messages(("runner.tunnel",), newer_than_s=1).values()
-    dropped_at, dropped_wall = time.monotonic(), time.time()
-    assert topology.proxy.ping_only({"runner.tunnel"}) == 1
-    time.sleep(TUNNEL_SILENCE_TIMEOUT_S - 1)
-    with frozen(topology.processes(), topology.events):
-        time.sleep(_PAUSE_S)
-    topology.wait_gave_up(runner, timeout=_RECONNECT_S)
-    recovered_at = topology.wait_reconnected("runner.tunnel", after_wall=dropped_wall)
+def test_a_drop_overlapping_a_pause_is_recovered_within_rc21(topology: _Topology) -> None:
+    outage_s = _drop_runner_then_pause(topology, _PAUSE_S)
 
-    outage_s = recovered_at - dropped_at
-    topology.events.emit("test", "recovered", tag="runner.tunnel", outage_s=outage_s)
-    # Longer than upstream's 90 s grace leaves comfortable room for; inside 150 s.
-    assert TUNNEL_SILENCE_TIMEOUT_S - 1 + _PAUSE_S < outage_s < _RUNNER_GRACE_S
+    assert TUNNEL_SILENCE_TIMEOUT_S - 1 + _PAUSE_S < outage_s < _RC21_OVERLAPPING_PAUSE_S
     log = topology.server_log()
     runner_id = topology.stack.runner_id
     assert f"Runner {runner_id} reconnected within the liveness lease" in log
     assert f"Runner {runner_id} disconnected; reconciling" not in log
+
+
+def test_an_extended_runner_grace_keeps_a_turn_through_a_longer_outage(
+    topology: _Topology,
+) -> None:
+    """A mid-turn outage longer than upstream's 90 s grace, inside the 150 s setting."""
+    client, mock = topology.client, topology.mock_llm_url
+    model = f"tunnel-silence-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(mock, [{"text": _ANSWER, "block": True}], key=model)
+    agent_name = register_inline_agent(
+        client,
+        name=model,
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="Return the configured answer.",
+        mock_llm_base_url=f"{mock}/v1",
+    )
+    session_id = create_runner_bound_session(
+        client, agent_name=agent_name, runner_id=topology.stack.runner_id
+    )
+    _send_user_message(client, session_id)
+    _poll_until(lambda: _gate_pending(mock), timeout=60, what="the turn to reach the model")
+
+    # Ten seconds past the 40 s budget, so the outage crosses upstream's grace.
+    outage_s = _drop_runner_then_pause(topology, _PAUSE_S + 10)
+    assert RUNNER_LIVENESS_TTL_S < outage_s < _RUNNER_GRACE_S
+
+    release_mock_gate(mock)
+    _poll_until(
+        lambda: _ANSWER in _session_blob(client, session_id),
+        timeout=60,
+        what="the turn to finish after the runner reconnected",
+    )
+    # With upstream's 90 s grace the server fails the turn here, and the user sees
+    # it fail, even though the snapshot recovers once the runner is back.
+    assert _FAILURE_SIGNATURE.search(topology.server_log()) is None
+    snapshot = _session_snapshot(client, session_id)
+    assert snapshot.get("status") != "failed", json.dumps(snapshot)[:2000]
+    assert "runner_disconnected" not in json.dumps(snapshot)
