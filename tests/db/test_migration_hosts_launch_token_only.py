@@ -105,6 +105,22 @@ def test_upgrade_marks_only_armed_hosts_and_reports_the_rest(
     assert "2 sandbox hosts hold no launch token" in caplog.text
 
 
+def test_upgrade_below_one_page_runs_inside_a_caller_transaction(db_uri: str) -> None:
+    """Below one page the upgrade never commits, so it runs in a transaction the caller began."""
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name == "cockroachdb":
+        pytest.skip("CockroachDB publishes the new column only at commit")
+    _register(HostStore(db_uri), _ARMED)
+    _migrate(engine, _PREVIOUS, downgrade=True)
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, _REVISION)
+
+    assert _marked(engine) == {_ARMED: True}
+
+
 def test_backfill_commits_bounded_pages_and_resumes_after_an_interruption(db_uri: str) -> None:
     batch_size = import_module(_MIGRATION)._BATCH_SIZE
     engine = get_or_create_engine(db_uri)
