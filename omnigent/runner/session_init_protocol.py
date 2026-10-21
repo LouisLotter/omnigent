@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Literal, TypeAlias
 from uuid import uuid4
 
@@ -138,7 +139,10 @@ def earlier_runner_incarnation(
 
 
 def automatic_continuation_allowed(
-    envelope: RunnerSessionInitEnvelope | None, incarnation_id: str
+    envelope: RunnerSessionInitEnvelope | None,
+    incarnation_id: str,
+    *,
+    ran_before: bool = True,
 ) -> bool:
     """
     Return whether this runner may continue the session's earlier work on its own.
@@ -146,12 +150,18 @@ def automatic_continuation_allowed(
     Work interrupted in another runner process may already have had effects that
     nothing recorded, so a new incarnation never re-runs a turn
     (``history_resume``) or sends the recovery prompt unless the person asked.
+    Missing provenance fails closed: a session that already ran but carries no
+    incarnation (its record was lost, or predates it) is treated as another
+    runner's work.
 
     :param envelope: The initialization envelope, or ``None`` for a legacy body.
     :param incarnation_id: This runner process's incarnation id.
-    :returns: ``False`` when another incarnation held the session, or the
-        session still carries an unknown outcome, and the person did not ask
-        to continue.
+    :param ran_before: Whether an agent already worked on the session, e.g. its
+        history holds an assistant reply or a tool call. ``False`` only for work
+        nothing has started yet, such as a new session's seeded first message.
+    :returns: ``False`` when another or an unknown incarnation did the work, or
+        the session still carries an unknown outcome, and the person did not
+        ask to continue.
     """
     if envelope is None:
         return True
@@ -160,7 +170,30 @@ def automatic_continuation_allowed(
     labels = envelope.snapshot.labels
     if labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY) == INTERRUPTED_OUTCOME_UNKNOWN_CODE:
         return False
-    return earlier_runner_incarnation(envelope, incarnation_id) is None
+    holder = labels.get(RUNNER_INCARNATION_LABEL_KEY)
+    if not holder:
+        return not ran_before
+    return holder == incarnation_id
+
+
+_AGENT_WORK_ITEM_TYPES = frozenset(
+    {"function_call", "function_call_output", "reasoning", "compaction"}
+)
+
+
+def history_shows_agent_work(history: Sequence[Mapping[str, object]]) -> bool:
+    """
+    Return whether a session's history holds anything an agent produced.
+
+    :param history: History items in the runner's input shape, e.g.
+        ``[{"type": "message", "role": "user", "content": [...]}]``.
+    :returns: ``True`` once an assistant reply or a tool call is present.
+    """
+    return any(
+        item.get("type") in _AGENT_WORK_ITEM_TYPES
+        or (item.get("type") == "message" and item.get("role") == "assistant")
+        for item in history
+    )
 
 
 class RunnerInferenceConfigMismatch(ValueError):

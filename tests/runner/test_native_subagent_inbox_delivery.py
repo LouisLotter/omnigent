@@ -861,7 +861,10 @@ async def test_recovered_child_continues_same_dispatch_before_delivering_result(
     from unittest.mock import AsyncMock
 
     from omnigent.entities import Conversation
-    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from omnigent.runner.session_init_protocol import (
+        RUNNER_INCARNATION_LABEL_KEY,
+        build_runner_session_init_payload,
+    )
     from tests.runner.conftest import _sse
 
     monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
@@ -932,6 +935,11 @@ async def test_recovered_child_continues_same_dispatch_before_delivering_result(
             child,
             server_version="test",
             resume_interrupted_turn=True,
+        )
+        # Only the runner process recorded as holding the child continues it
+        # without being asked; another process's interrupted work is never resumed.
+        payload["session_init"]["snapshot"]["labels"][RUNNER_INCARNATION_LABEL_KEY] = (
+            app.state.runner_incarnation_id
         )
         if previous_execution in {"finished", "active"}:
             # Runner A retains its old turn epoch while this child ran on B.

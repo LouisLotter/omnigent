@@ -159,6 +159,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     automatic_continuation_allowed,
     earlier_runner_incarnation,
+    history_shows_agent_work,
     parse_runner_session_init_envelope,
 )
 from omnigent.runner.sign_in_watch import build_sign_in_watch
@@ -3032,8 +3033,9 @@ def create_runner_app(
         earlier_incarnation = earlier_runner_incarnation(
             init_context.envelope, _runner_incarnation_id
         )
+        # Reported to the server: whether earlier work here would be refused.
         continuation_blocked = not automatic_continuation_allowed(
-            init_context.envelope, _runner_incarnation_id
+            init_context.envelope, _runner_incarnation_id, ran_before=True
         )
         recovery_id = (
             init_context.envelope.recovery_id
@@ -3078,7 +3080,11 @@ def create_runner_app(
                 needs_turn
                 and recovery_id is None
                 and not _suppress_recovery
-                and not continuation_blocked
+                and automatic_continuation_allowed(
+                    init_context.envelope,
+                    _runner_incarnation_id,
+                    ran_before=history_shows_agent_work(history),
+                )
                 and session_id not in _active_turns
             ):
                 recovery_turn = "history_resume"

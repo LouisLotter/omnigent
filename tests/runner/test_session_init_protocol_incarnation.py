@@ -35,21 +35,39 @@ def _envelope(
 
 
 @pytest.mark.parametrize(
-    ("labels", "requested", "earlier", "allowed"),
+    ("labels", "requested", "ran_before", "earlier", "allowed"),
     [
-        ({}, False, None, True),
-        ({RUNNER_INCARNATION_LABEL_KEY: "me"}, False, None, True),
-        ({RUNNER_INCARNATION_LABEL_KEY: "dead"}, False, "dead", False),
-        ({RUNNER_INCARNATION_LABEL_KEY: "dead"}, True, "dead", True),
+        ({}, False, False, None, True),
+        ({}, False, True, None, False),
+        ({RUNNER_INCARNATION_LABEL_KEY: "me"}, False, True, None, True),
+        ({RUNNER_INCARNATION_LABEL_KEY: "dead"}, False, True, "dead", False),
+        ({RUNNER_INCARNATION_LABEL_KEY: "dead"}, True, True, "dead", True),
+        ({}, True, True, None, True),
     ],
-    ids=["fresh-session", "reconnect", "replacement", "person-asked"],
+    ids=[
+        "fresh-session",
+        "provenance-lost",
+        "reconnect",
+        "replacement",
+        "person-asked",
+        "person-asked-without-provenance",
+    ],
 )
 def test_incarnation_check(
-    labels: dict[str, str], requested: bool, earlier: str | None, allowed: bool
+    labels: dict[str, str], requested: bool, ran_before: bool, earlier: str | None, allowed: bool
 ) -> None:
     envelope = _envelope(labels, continuation_requested=requested)
     assert earlier_runner_incarnation(envelope, "me") == earlier
-    assert automatic_continuation_allowed(envelope, "me") is allowed
+    assert automatic_continuation_allowed(envelope, "me", ran_before=ran_before) is allowed
+
+
+def test_history_shows_agent_work() -> None:
+    from omnigent.runner.session_init_protocol import history_shows_agent_work
+
+    user = {"type": "message", "role": "user", "content": []}
+    assert not history_shows_agent_work([user])
+    assert history_shows_agent_work([user, {"type": "message", "role": "assistant"}])
+    assert history_shows_agent_work([user, {"type": "function_call", "name": "Bash"}])
 
 
 def test_legacy_body_keeps_its_behaviour() -> None:

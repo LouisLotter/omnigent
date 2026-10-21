@@ -158,6 +158,13 @@ def _session_init_payload(
     )
 
 
+def _mark_held_by(payload: dict[str, Any], incarnation: str) -> None:
+    """Record which runner process held the session in an init payload."""
+    from omnigent.runner.session_init_protocol import RUNNER_INCARNATION_LABEL_KEY
+
+    payload["session_init"]["snapshot"]["labels"][RUNNER_INCARNATION_LABEL_KEY] = incarnation
+
+
 def _assert_browser_tools_hidden(body: dict[str, Any]) -> None:
     tool_names = {
         function["name"]
@@ -396,6 +403,8 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="same-interruption")
+    # This runner process held the session, so continuing it is its own work.
+    _mark_held_by(payload, app.state.runner_incarnation_id)
     async with _runner_client(app) as client:
         for _ in range(2):
             response = await client.post("/v1/sessions", json=payload)
@@ -432,6 +441,8 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
     app, _pm, harness = _build_sdk_app(PausedHistoryServer())
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="interrupted-task")
+    # This runner process held the session, so continuing it is its own work.
+    _mark_held_by(payload, app.state.runner_incarnation_id)
     async with _runner_client(app) as client:
         recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
         await asyncio.wait_for(entered.wait(), timeout=5)
@@ -574,6 +585,8 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
     app, _pm, harness = _build_sdk_app(PausedSeedServer(), resources)
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="native-interrupted")
+    # This runner process held the session, so continuing it is its own work.
+    _mark_held_by(payload, app.state.runner_incarnation_id)
     payload["session_init"]["snapshot"]["harness_override"] = "cursor-native"
     async with _runner_client(app) as client:
         recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
@@ -680,3 +693,53 @@ async def test_same_incarnation_or_a_request_still_continues(
     assert response.json()["continuation_blocked"] is False
     assert len(harness.posted_bodies) == 1
     assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"
+
+
+class _RanBeforeServerClient(_HistoryServerClient):
+    """History in which an agent already worked: a reply, then a pending message."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp(
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "msg_000",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "appended a line"}],
+                        },
+                        _PENDING_USER_MESSAGE,
+                    ],
+                    "has_more": False,
+                }
+            )
+        return self._Resp({})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_interrupted_turn", [False, True])
+async def test_lost_incarnation_record_fails_closed_for_work_already_done(
+    caplog: pytest.LogCaptureFixture, resume_interrupted_turn: bool
+) -> None:
+    """A session that ran but carries no incarnation is not continued on its own.
+
+    Its record was lost (a failed write, a lost answer, a restore from before
+    it), so this runner cannot tell its own work from a dead runner's.
+    """
+    app, _pm, harness = _build_sdk_app(_RanBeforeServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    payload = _payload_held_by(None)
+    if resume_interrupted_turn:
+        payload["session_init"].update(resume_interrupted_turn=True, recovery_id="no-record")
+
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+        await asyncio.sleep(0.1)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["continuation_blocked"] is True
+    assert harness.posted_bodies == []
+    assert _init_rows(caplog)[0]["recovery_turn"] == "none"
