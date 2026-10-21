@@ -10,9 +10,11 @@ the KMS *encryption context*, so a ciphertext can only be decrypted by
 presenting the same identity. That is per-user encryption enforced by KMS, not
 by a key the server derives, and there is no global-key path.
 
-A deployment selects the key with ``OMNIGENT_CREDENTIAL_KMS_KEY_ID``; unset ⇒
-the credential store, and every integration built on it, is disabled. There is
-no non-KMS fallback. See ``designs/CREDENTIAL_STORE.md``.
+A deployment selects the KMS key with ``OMNIGENT_CREDENTIAL_KMS_KEY_ID``. Vault
+Transit and an HTTP key service are the other backends, chosen with
+``OMNIGENT_CREDENTIAL_CIPHER`` (:func:`build_secret_cipher`). With no backend
+configured, the credential store, and every integration built on it, is
+disabled; there is no local-key fallback. See ``designs/CREDENTIAL_STORE.md``.
 """
 
 from __future__ import annotations
@@ -35,9 +37,9 @@ SecretContext = Mapping[str, str]
 CREDENTIAL_KMS_KEY_ENV_VAR = "OMNIGENT_CREDENTIAL_KMS_KEY_ID"
 
 #: Optional explicit backend selector for the credential store's cipher
-#: (``kms`` | ``vault``). Set it to pick a backend per server; its key env var is
-#: then required. Unset ⇒ the single configured backend is auto-detected, and
-#: configuring more than one without this selector is an error.
+#: (``kms`` | ``vault`` | ``http``). Set it to pick a backend per server; that
+#: backend's settings are then required. Unset ⇒ the single configured backend is
+#: auto-detected, and configuring more than one without this selector is an error.
 CREDENTIAL_CIPHER_ENV_VAR = "OMNIGENT_CREDENTIAL_CIPHER"
 
 #: KMS error codes that mean "this ciphertext can't be read under this identity"
@@ -85,12 +87,27 @@ def build_kms_secret_cipher() -> KmsSecretCipher | None:
     return KmsSecretCipher(key_id) if key_id else None
 
 
+def _cipher_builders() -> dict[str, Callable[[], SecretCipher | None]]:
+    """The cipher backends, keyed by their ``OMNIGENT_CREDENTIAL_CIPHER`` name."""
+    # hvac / boto3 stay optional: each builder only reads env and constructs, so
+    # importing and calling them here pulls no SDK and makes no network call.
+    from omnigent.stores.credential_store.http_cipher import build_http_secret_cipher
+    from omnigent.stores.credential_store.vault_cipher import build_vault_secret_cipher
+
+    return {
+        "kms": build_kms_secret_cipher,
+        "vault": build_vault_secret_cipher,
+        "http": build_http_secret_cipher,
+    }
+
+
 def build_secret_cipher() -> SecretCipher | None:
     """Construct the credential store's cipher from deployment config, or ``None``.
 
     The backend is configurable per server. Set ``OMNIGENT_CREDENTIAL_CIPHER`` to
-    choose one explicitly (``kms`` or ``vault``); its key env var
-    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` / ``OMNIGENT_CREDENTIAL_VAULT_KEY``) is then
+    choose one explicitly (``kms``, ``vault`` or ``http``); that backend's settings
+    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID``, ``OMNIGENT_CREDENTIAL_VAULT_KEY``, or
+    ``OMNIGENT_CREDENTIAL_HTTP_URL`` with its signing key and key ID) are then
     required, and a mismatch raises rather than silently disabling the store. When
     the selector is unset, the single configured backend is auto-detected as a
     zero-config convenience; configuring more than one without a selector is an
@@ -98,14 +115,7 @@ def build_secret_cipher() -> SecretCipher | None:
     (``None`` — the caller decides how to surface that). Adding a backend is a new
     registry entry, not a new branch. See ``designs/CREDENTIAL_STORE.md``.
     """
-    # hvac / boto3 stay optional: each builder only reads env and constructs, so
-    # importing and calling them here pulls no SDK and makes no network call.
-    from omnigent.stores.credential_store.vault_cipher import build_vault_secret_cipher
-
-    builders: dict[str, Callable[[], SecretCipher | None]] = {
-        "kms": build_kms_secret_cipher,
-        "vault": build_vault_secret_cipher,
-    }
+    builders = _cipher_builders()
 
     selected = os.environ.get(CREDENTIAL_CIPHER_ENV_VAR, "").strip().lower()
     if selected:
@@ -118,8 +128,8 @@ def build_secret_cipher() -> SecretCipher | None:
         cipher = builder()
         if cipher is None:
             raise ValueError(
-                f"{CREDENTIAL_CIPHER_ENV_VAR}={selected!r} but its key is unset — "
-                "set the backend's key env var."
+                f"{CREDENTIAL_CIPHER_ENV_VAR}={selected!r} but that backend is not "
+                "configured — set its env vars (see designs/CREDENTIAL_STORE.md)."
             )
         return cipher
 

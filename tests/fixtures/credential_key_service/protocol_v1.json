@@ -1,0 +1,285 @@
+{
+  "protocol": "omnigent-key-service-v1",
+  "description": "Test vectors for the credential store's HTTP key service, specified in designs/CREDENTIAL_STORE.md. Every key here is a published example: never use one in a deployment.",
+  "signing_key": {
+    "key_id": "example-signing-1",
+    "key_utf8": "example-signing-key-0000000000000000"
+  },
+  "record_key": {
+    "key_id": "example-records",
+    "key_version": 1,
+    "key_base64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+  },
+  "timestamp": 1792584000,
+  "freshness_window_seconds": 300,
+  "exchanges": [
+    {
+      "operation": "encrypt",
+      "request": {
+        "path": "/encrypt",
+        "body": "{\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"plaintext\":\"{\\\"access_token\\\": \\\"ghu_example\\\", \\\"refresh_token\\\": \\\"ghr_example\\\"}\"}",
+        "string_to_sign": "omnigent-key-service-v1\nencrypt\nexample-signing-1\n1792584000\n75ad80414f0e3af089922e8f58cc71e07e17affb853dc0c8954ab2edd7f1e51a",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Omnigent-Signing-Key-Id": "example-signing-1",
+          "X-Omnigent-Timestamp": "1792584000",
+          "X-Omnigent-Signature": "b5dde64399a4984e919d33f5021cae0c4669380a65dfc59264c0b2836aadfeba"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "key_id": "example-records",
+          "key_version": 1,
+          "ciphertext": "AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg"
+        }
+      },
+      "stored_record": "oshttp1:example-records:1:AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg"
+    },
+    {
+      "operation": "decrypt",
+      "request": {
+        "path": "/decrypt",
+        "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+        "string_to_sign": "omnigent-key-service-v1\ndecrypt\nexample-signing-1\n1792584000\n1ccba0715522ed3fec27c955c05210a28df628720659a336b63c48cb2887606b",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Omnigent-Signing-Key-Id": "example-signing-1",
+          "X-Omnigent-Timestamp": "1792584000",
+          "X-Omnigent-Signature": "366a797e3138f511220d7c28ab8eb30613a6f8eb4827b029205c85f1015b886e"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "plaintext": "{\"access_token\": \"ghu_example\", \"refresh_token\": \"ghr_example\"}"
+        }
+      }
+    }
+  ],
+  "seal": {
+    "note": "The suggested construction, with a fixed IV so the encrypt reply above is reproducible; an endpoint draws a random IV for every encryption.",
+    "context": {
+      "provider": "github",
+      "user_id": "alice@example.com",
+      "workspace_id": "0"
+    },
+    "plaintext": "{\"access_token\": \"ghu_example\", \"refresh_token\": \"ghr_example\"}",
+    "hkdf_info": "{\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1,\"purpose\":\"omnigent-credential-record\"}",
+    "iv_base64url": "AAECAwQFBgcICQoL",
+    "ciphertext": "AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg"
+  },
+  "endpoint_cases": [
+    {
+      "name": "decrypt at the end of the freshness window",
+      "operation": "decrypt",
+      "now": 1792584300,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "366a797e3138f511220d7c28ab8eb30613a6f8eb4827b029205c85f1015b886e"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 200,
+        "body": {
+          "plaintext": "{\"access_token\": \"ghu_example\", \"refresh_token\": \"ghr_example\"}"
+        }
+      }
+    },
+    {
+      "name": "decrypt at the start of the freshness window",
+      "operation": "decrypt",
+      "now": 1792583700,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "366a797e3138f511220d7c28ab8eb30613a6f8eb4827b029205c85f1015b886e"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 200,
+        "body": {
+          "plaintext": "{\"access_token\": \"ghu_example\", \"refresh_token\": \"ghr_example\"}"
+        }
+      }
+    },
+    {
+      "name": "no signature",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "unauthenticated"
+      }
+    },
+    {
+      "name": "unknown signing key ID",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-9",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "d4669b2bf9f8e8623e89207b4ead701c3eac5ead362433c7a793afbef12fd728"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "unauthenticated"
+      }
+    },
+    {
+      "name": "signed with another key",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "625dd4f17bbc471403be934a59a96e18405478b40ab2d41d8bcb4260dbd47554"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "unauthenticated"
+      }
+    },
+    {
+      "name": "body changed after signing",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "366a797e3138f511220d7c28ab8eb30613a6f8eb4827b029205c85f1015b886e"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"bob@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "unauthenticated"
+      }
+    },
+    {
+      "name": "signed for the other operation",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "51927f5cb9e912343f67da9bfe21e795964c1682230d23e0c88ba7d97e3432e2"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "unauthenticated"
+      }
+    },
+    {
+      "name": "timestamp too old",
+      "operation": "decrypt",
+      "now": 1792584301,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "366a797e3138f511220d7c28ab8eb30613a6f8eb4827b029205c85f1015b886e"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "stale_request"
+      }
+    },
+    {
+      "name": "timestamp too far ahead",
+      "operation": "decrypt",
+      "now": 1792583699,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "366a797e3138f511220d7c28ab8eb30613a6f8eb4827b029205c85f1015b886e"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 401,
+        "code": "stale_request"
+      }
+    },
+    {
+      "name": "another record's context",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "7d176d5cbac592c507f97cd906b60637686f082f2fe3895a041035f492cec538"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"bob@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 422,
+        "code": "unusable"
+      }
+    },
+    {
+      "name": "tampered ciphertext",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "2cd7234c7b87c87877d133ac035974b3c34898d087f59d7752e6e2d5c8852983"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sA\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":1}",
+      "expect": {
+        "status": 422,
+        "code": "unusable"
+      }
+    },
+    {
+      "name": "record key version the endpoint does not hold",
+      "operation": "decrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "1c3f515c74d7a56c674b0c80a868dcd5af5ca5930ca62844e8cb67a7ae0f98f9"
+      },
+      "body": "{\"ciphertext\":\"AAECAwQFBgcICQoLKjsT4BBAbE-2avR8ibkdJCsiiiWB0vWPFk4aL4m74XML15mEOPqfcfFwoYLcJgbL8DiRaNzFlnF_etw0Il2gx8oZqAkuOmbKsPuNJko9sg\",\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"key_id\":\"example-records\",\"key_version\":2}",
+      "expect": {
+        "status": 409,
+        "code": "key_unavailable"
+      }
+    },
+    {
+      "name": "malformed request",
+      "operation": "encrypt",
+      "now": 1792584000,
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Omnigent-Signing-Key-Id": "example-signing-1",
+        "X-Omnigent-Timestamp": "1792584000",
+        "X-Omnigent-Signature": "55320f671b70cf61ceee8793184d5e5edb8d9209052295963a3483c3ffea86a7"
+      },
+      "body": "{\"context\":{\"provider\":\"github\",\"user_id\":\"alice@example.com\",\"workspace_id\":\"0\"},\"plaintext\":1}",
+      "expect": {
+        "status": 400,
+        "code": "invalid_request"
+      }
+    }
+  ]
+}
