@@ -10,7 +10,11 @@ import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import (
+    ConcurrentRegistrationError,
+    HostRegistry,
+    RunnerExitReports,
+)
 from omnigent.stores.host_store import HostRegistrationRefusedError
 
 
@@ -421,6 +425,56 @@ def test_bearer_connection_never_replaces_a_launch_token_connection(
     assert registry.get("host_eee") is old_conn
     assert old_conn.outbound_queue.empty()
     assert old_conn.retirement_reason is None
+
+
+@pytest.mark.parametrize("newer_connected", [True, False])
+def test_registration_since_the_epoch_refuses_a_conditional_registration(
+    newer_connected: bool,
+) -> None:
+    """A connection that registered after the epoch was read is never displaced, even once gone."""
+    registry = HostRegistry()
+    epoch = registry.registration_epoch("host_ggg")
+    newer = registry.register("host_ggg", FakeWebSocket(), _make_hello(), "gina")
+    if not newer_connected:
+        assert registry.deregister("host_ggg", conn=newer)
+
+    with pytest.raises(ConcurrentRegistrationError):
+        registry.register(
+            "host_ggg", FakeWebSocket(), _make_hello(), "gina", unless_registered_since=epoch
+        )
+
+    assert registry.get("host_ggg") is (newer if newer_connected else None)
+    if newer_connected:
+        assert newer.retirement_reason is None
+        assert newer.outbound_queue.empty()
+    assert registry.registration_epoch("host_ggg") == epoch + 1
+
+
+def test_conditional_registration_replaces_a_connection_from_before_the_epoch() -> None:
+    """With no registration since the epoch was read, newest wins as usual."""
+    registry = HostRegistry()
+    older = registry.register("host_hhh", FakeWebSocket(), _make_hello(), "hana")
+    epoch = registry.registration_epoch("host_hhh")
+
+    current = registry.register(
+        "host_hhh", FakeWebSocket(), _make_hello(), "hana", unless_registered_since=epoch
+    )
+
+    assert registry.get("host_hhh") is current
+    assert older.retirement_reason == "replaced"
+    assert registry.registration_epoch("host_hhh") == epoch + 1
+
+
+def test_registration_epoch_is_per_workspace_and_canonical_host_id() -> None:
+    """The epoch follows the registry key: every spelling of an id, in one workspace."""
+    host_id = uuid.uuid4().hex
+    registry = HostRegistry()
+
+    registry.register(f"host_{host_id}", FakeWebSocket(), _make_hello(), "ivy", workspace_id=1)
+
+    assert registry.registration_epoch(host_id, workspace_id=1) == 1
+    assert registry.registration_epoch(str(uuid.UUID(host_id)), workspace_id=1) == 1
+    assert registry.registration_epoch(host_id, workspace_id=2) == 0
 
 
 def test_send_text_enqueues_frame() -> None:

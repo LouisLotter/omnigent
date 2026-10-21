@@ -70,6 +70,10 @@ def host_owner_scope(user_id: str | None, generation: str | None) -> Iterator[No
         _expected_host_owner.reset(token)
 
 
+class ConcurrentRegistrationError(RuntimeError):
+    """Another connection registered the host after the caller read its registration epoch."""
+
+
 def _canonical_host_id(host_id: str) -> str:
     """Reduce a host id to the canonical bare-hex form used as the key.
 
@@ -532,6 +536,8 @@ class HostRegistry:
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
         self._hosts: dict[tuple[int, str], HostConnection] = {}
+        # Registrations per key, kept after a disconnect; see registration_epoch().
+        self._registration_epochs: dict[tuple[int, str], int] = {}
         # Last gateway-inference map each host reported, keyed by canonical
         # host_id alone: the map describes the machine's local config, so the
         # same machine connected to two workspaces reports the same answer.
@@ -556,6 +562,7 @@ class HostRegistry:
         owner: str | None,
         workspace_id: int | None = None,
         registered_with_managed_token: bool = False,
+        unless_registered_since: int | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -584,10 +591,16 @@ class HostRegistry:
         :param registered_with_managed_token: ``True`` when the tunnel
             authenticated with a valid managed-sandbox launch token, so
             the default-public policy can treat it as a genuine sandbox.
+        :param unless_registered_since: A :meth:`registration_epoch` read
+            before the connection's credential was checked. When given, the
+            connection is not registered if another one registered after
+            that read, because the other may hold a newer credential.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         :raises HostRegistrationRefusedError: When a connection without a
             launch token would replace one registered with it.
+        :raises ConcurrentRegistrationError: When another connection
+            registered after *unless_registered_since*.
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         host_id = _canonical_host_id(host_id)
@@ -607,6 +620,9 @@ class HostRegistry:
         )
         with self._lock:
             key = (ws_id, host_id)
+            epoch = self._registration_epochs.get(key, 0)
+            if unless_registered_since is not None and epoch != unless_registered_since:
+                raise ConcurrentRegistrationError(f"host {host_id!r} registered meanwhile")
             old = self._hosts.get(key)
             # A bearer registration that raced the host's arming must not displace it.
             displaces_launch_token = old is not None and old.registered_with_managed_token
@@ -628,6 +644,7 @@ class HostRegistry:
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
             self._hosts[key] = conn
+            self._registration_epochs[key] = epoch + 1
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
                     hello.interactive_shells
@@ -705,6 +722,23 @@ class HostRegistry:
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
             return self._hosts.get((ws_id, _canonical_host_id(host_id)))
+
+    def registration_epoch(self, host_id: str, workspace_id: int | None = None) -> int:
+        """Count the connections ever registered for a host on this replica.
+
+        A tunnel reads it before checking its credential and passes it to
+        :meth:`register` as ``unless_registered_since``. Disconnects leave the
+        count unchanged, so a connection that registered and left meanwhile
+        still counts.
+
+        :param host_id: Host identifier, in any accepted spelling.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: The number of registrations so far, ``0`` for a new host.
+        """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        with self._lock:
+            return self._registration_epochs.get((ws_id, _canonical_host_id(host_id)), 0)
 
     def online_host_ids(self, workspace_id: int | None = None) -> list[str]:
         """Return IDs of all hosts connected in one workspace.

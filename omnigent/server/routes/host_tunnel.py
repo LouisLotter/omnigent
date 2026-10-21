@@ -77,6 +77,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import (
+    ConcurrentRegistrationError,
     HostConnection,
     HostRegistry,
     RunnerExitReports,
@@ -84,6 +85,7 @@ from omnigent.server.host_registry import (
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import (
     LAUNCH_TOKEN_ONLY_REFUSAL,
+    SUPERSEDED_LAUNCH_TOKEN_REFUSAL,
     HostRegistrationRefusedError,
     HostStore,
 )
@@ -98,6 +100,9 @@ _HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
 _DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
 # WebSocket close codes a host sends on purpose: 1000 normal, 1001 going away.
 _CLEAN_CLOSE_CODES = frozenset({1000, 1001})
+# Rechecks a launch-token tunnel makes when other tunnels for its host register meanwhile.
+_LAUNCH_TOKEN_REGISTRATION_ATTEMPTS = 3
+_REPLACED_REFUSAL = "A newer connection for this host replaced this one."
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -387,6 +392,8 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
+            # Read before the token check: a tunnel registered later may hold a newer token.
+            registration_epoch = host_registry.registration_epoch(host_id)
             persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
@@ -403,21 +410,33 @@ def create_host_tunnel_router(
                 bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
-            conn = host_registry.register(
-                host_id,
-                ws,
-                frame,
-                owner=tunnel_owner,
-                # A resolved launch token is proof this is a server-provisioned
-                # sandbox, not a user machine reconnecting on a managed host id.
-                registered_with_managed_token=managed_token is not None,
-            )
-            # The server may arm a host while its bearer registration is in flight;
-            # once armed, a bearer tunnel ends here or at its next heartbeat.
-            if managed_token is None and await asyncio.to_thread(
-                host_store.registers_only_with_launch_token, host_id
+            if managed_token is None:
+                conn = host_registry.register(host_id, ws, frame, owner=tunnel_owner)
+            else:
+                conn = await _register_launch_token_tunnel(
+                    host_registry,
+                    host_store,
+                    host_id,
+                    ws,
+                    frame,
+                    owner=tunnel_owner,
+                    launch_token=managed_token,
+                    epoch=registration_epoch,
+                )
+            # The server may arm, re-arm, revoke or delete the host while this
+            # registration is in flight. A tunnel it no longer authorizes ends
+            # here, before it carries any frame, or at its next heartbeat.
+            if managed_token is None:
+                if await asyncio.to_thread(host_store.registers_only_with_launch_token, host_id):
+                    raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
+            elif (
+                await asyncio.to_thread(host_store.resolve_launch_token, host_id, managed_token)
+                is None
             ):
-                raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
+                raise HostRegistrationRefusedError(SUPERSEDED_LAUNCH_TOKEN_REFUSAL, retryable=True)
+            # A newer tunnel may have replaced this one during that check.
+            if conn.retirement_reason is not None:
+                raise HostRegistrationRefusedError(_REPLACED_REFUSAL, retryable=True)
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
@@ -462,6 +481,7 @@ def create_host_tunnel_router(
                         host_store=host_store,
                         connection_id=frame.connection_id,
                         by_bearer=managed_token is None,
+                        launch_token=managed_token,
                     ),
                     name=f"host-heartbeat:{host_id}",
                 )
@@ -532,20 +552,7 @@ def create_host_tunnel_router(
                             finally:
                                 # A replaced connection must not mark its successor offline.
                                 if host_registry.deregister(host_id, conn=conn):
-                                    offline_cancelled = threading.Event()
-                                    try:
-                                        await asyncio.to_thread(
-                                            host_store.set_offline,
-                                            host_id,
-                                            cancelled=offline_cancelled.is_set,
-                                        )
-                                    except Exception:
-                                        _logger.exception(
-                                            "Failed to mark host %s offline after disconnect",
-                                            host_id,
-                                        )
-                                    finally:
-                                        offline_cancelled.set()
+                                    await _mark_offline(host_store, host_id, managed_token)
                         if cleanup_scope.cancel_called:
                             # The row ages out via its liveness TTL if persistence stalls.
                             _logger.warning("Timed out cleaning up host %s", host_id)
@@ -578,6 +585,10 @@ def create_host_tunnel_router(
         except asyncio.CancelledError as exc:
             disconnect_error = exc
             ended_by = "handler_cancelled"
+            # Cancelled between registering and starting its tasks: no teardown ran.
+            if conn is not None and host_registry.deregister(host_id, conn=conn):
+                with anyio.move_on_after(_DISCONNECT_CLEANUP_TIMEOUT_S, shield=True):
+                    await _mark_offline(host_store, host_id, managed_token)
             raise
         except HostRegistrationRefusedError as exc:
             # An expected refusal, reported to the host's operator, not a server fault.
@@ -590,7 +601,9 @@ def create_host_tunnel_router(
             with contextlib.suppress(Exception):
                 await ws.close(code=4009, reason="host registration refused")
             if conn is not None and host_registry.deregister(host_id, conn=conn):
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                await asyncio.to_thread(
+                    host_store.set_offline, host_id, launch_token=managed_token
+                )
         except WebSocketDisconnect as exc:
             disconnect_error = exc
             # Only run disconnect cleanup if we actually registered this
@@ -600,7 +613,9 @@ def create_host_tunnel_router(
             # or flip that owner's host offline (cross-user DoS).
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await asyncio.to_thread(
+                        host_store.set_offline, host_id, launch_token=managed_token
+                    )
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -630,9 +645,13 @@ def create_host_tunnel_router(
                 await ws.close(code=4005, reason="host connection failed")
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
-                    await asyncio.to_thread(host_store.set_offline, host_id)
+                    await asyncio.to_thread(
+                        host_store.set_offline, host_id, launch_token=managed_token
+                    )
             elif host_persisted:
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                await asyncio.to_thread(
+                    host_store.set_offline, host_id, launch_token=managed_token
+                )
         finally:
             if conn is not None or disconnect_error is not None:
                 log = _logger.info
@@ -672,6 +691,70 @@ def create_host_tunnel_router(
                 )
 
     return router
+
+
+async def _mark_offline(host_store: HostStore, host_id: str, launch_token: str | None) -> None:
+    """Mark a disconnected host offline, skipping the write if this call is abandoned first.
+
+    :param launch_token: The token the tunnel registered with, ``None`` for a bearer.
+    """
+    abandoned = threading.Event()
+    try:
+        await asyncio.to_thread(
+            host_store.set_offline, host_id, cancelled=abandoned.is_set, launch_token=launch_token
+        )
+    except Exception:
+        _logger.exception("Failed to mark host %s offline after disconnect", host_id)
+    finally:
+        abandoned.set()
+
+
+async def _register_launch_token_tunnel(
+    host_registry: HostRegistry,
+    host_store: HostStore,
+    host_id: str,
+    ws: WebSocket,
+    hello: HostHelloFrame,
+    *,
+    owner: str,
+    launch_token: str,
+    epoch: int,
+) -> HostConnection:
+    """Register a launch-token tunnel without displacing one that holds a newer token.
+
+    The token was checked after *epoch* was read. A tunnel that registered since
+    may hold a token armed after that check, so this one rechecks its token
+    before it may replace that tunnel.
+
+    :param host_id: The host the tunnel's path names.
+    :param ws: The accepted WebSocket.
+    :param hello: The host's hello frame.
+    :param owner: The token's owner.
+    :param launch_token: The raw token the tunnel presented.
+    :param epoch: :meth:`HostRegistry.registration_epoch` read before the token check.
+    :returns: The registered connection.
+    :raises HostRegistrationRefusedError: When the token no longer registers the
+        host, or other tunnels kept registering meanwhile.
+    """
+    for _attempt in range(_LAUNCH_TOKEN_REGISTRATION_ATTEMPTS):
+        try:
+            return host_registry.register(
+                host_id,
+                ws,
+                hello,
+                owner=owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=True,
+                unless_registered_since=epoch,
+            )
+        except ConcurrentRegistrationError:
+            epoch = host_registry.registration_epoch(host_id)
+        if await asyncio.to_thread(host_store.resolve_launch_token, host_id, launch_token) is None:
+            raise HostRegistrationRefusedError(SUPERSEDED_LAUNCH_TOKEN_REFUSAL, retryable=True)
+    raise HostRegistrationRefusedError(
+        "Other connections for this host kept registering at the same time.", retryable=True
+    )
 
 
 async def _send_connection_error(
@@ -727,7 +810,8 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
     """
     while True:
         frame = await conn.outbound_queue.get()
-        if frame is None:
+        # A replaced or deregistered connection sends none of its queued frames.
+        if frame is None or conn.retirement_reason is not None:
             conn.sender_end_reason = "queue_retired"
             return
         conn.diagnostics.dequeued(frame)
@@ -1173,11 +1257,13 @@ async def _heartbeat_loop(
     host_store: HostStore,
     connection_id: str | None = None,
     by_bearer: bool = False,
+    launch_token: str | None = None,
 ) -> None:
     """Serialize host-liveness writes independently of socket pings.
 
     :raises HostRegistrationRefusedError: When the tunnel registered *by_bearer*
-        and the host has since become launch-token-only.
+        and the host has since become launch-token-only, or registered with
+        *launch_token* and that token has since been replaced or revoked.
     """
     failure_count = 0
     last_failure_log_at = 0.0
@@ -1188,7 +1274,9 @@ async def _heartbeat_loop(
         try:
             # Cancellation cannot stop the thread, but heartbeat only updates
             # last-seen; a late write cannot change an offline host's status.
-            kept = await asyncio.to_thread(host_store.heartbeat, host_id, by_bearer=by_bearer)
+            kept = await asyncio.to_thread(
+                host_store.heartbeat, host_id, by_bearer=by_bearer, launch_token=launch_token
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
@@ -1236,6 +1324,8 @@ async def _heartbeat_loop(
             )
             failure_count = 0
             last_failure_log_at = 0.0
+        if not kept and launch_token is not None:
+            raise HostRegistrationRefusedError(SUPERSEDED_LAUNCH_TOKEN_REFUSAL, retryable=True)
         if not kept:
             raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
 

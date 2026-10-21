@@ -2265,6 +2265,98 @@ def test_bearer_heartbeat_reports_a_host_armed_since_it_registered(
     assert host_store.heartbeat("00000000000000000000000000000000", by_bearer=True) is True
 
 
+def _end_managed_token(store: HostStore, change: str) -> None:
+    """End ``managed-token`` as ``_MANAGED_ID``'s launch token by *change*.
+
+    ``re-arm`` and ``replacement`` arm ``newer-token`` in its place.
+    """
+    host = store.get_host(_MANAGED_ID)
+    assert host is not None
+    if change == "re-arm":
+        assert store.rearm_managed_host(
+            _MANAGED_ID,
+            sandbox_id="sb-managed",
+            expected_updated_at=host.updated_at,
+            token="newer-token",
+            token_expires_at=now_epoch() + 3600,
+        )
+    elif change == "replacement":
+        assert store.replace_managed_host_sandbox(
+            host_id=_MANAGED_ID,
+            user_id=_OWNER,
+            token="newer-token",
+            provider="modal",
+            sandbox_id="sb-newer",
+            token_expires_at=now_epoch() + 3600,
+        )
+    elif change == "revocation":
+        store.revoke_launch_token(_MANAGED_ID)
+    elif change == "detach":
+        assert store.detach_stale_managed_sandbox(
+            _MANAGED_ID, sandbox_id="sb-managed", expected_updated_at=host.updated_at
+        )
+    else:
+        assert store.delete_host(_MANAGED_ID) is not None
+
+
+@pytest.mark.parametrize("change", ["re-arm", "replacement", "revocation", "detach", "deletion"])
+def test_launch_token_heartbeat_reports_a_token_the_server_ended(
+    host_store: HostStore, db_uri: str, change: str
+) -> None:
+    """A launch-token tunnel learns from its heartbeat that its token was replaced or revoked."""
+    _managed_host_in_state(host_store, "armed")
+    assert host_store.heartbeat(_MANAGED_ID, launch_token="managed-token")
+    _end_managed_token(host_store, change)
+    _set_updated_at(db_uri, _MANAGED_ID, 1)
+
+    assert host_store.heartbeat(_MANAGED_ID, launch_token="managed-token") is False
+    host = host_store.get_host(_MANAGED_ID)
+    assert host is None or host.updated_at == 1
+    if change in ("re-arm", "replacement"):
+        assert host_store.heartbeat(_MANAGED_ID, launch_token="newer-token") is True
+    assert host_store.heartbeat(_LAPTOP_ID, launch_token="managed-token") is False
+
+
+@pytest.mark.parametrize("state", ["expired", "sleeping"])
+def test_launch_token_heartbeat_outlives_expiry_and_a_pending_sleep(
+    host_store: HostStore, db_uri: str, state: str
+) -> None:
+    """Expiry and a pending sleep refuse new handshakes but leave a live tunnel's token current."""
+    _managed_host_in_state(host_store, "expired" if state == "expired" else "armed")
+    if state == "sleeping":
+        assert host_store.begin_host_sleep(_MANAGED_ID, operation_id="sleep-op")
+    assert host_store.resolve_launch_token(_MANAGED_ID, "managed-token") is None
+    _set_updated_at(db_uri, _MANAGED_ID, 1)
+
+    assert host_store.heartbeat(_MANAGED_ID, launch_token="managed-token") is True
+    host = host_store.get_host(_MANAGED_ID)
+    assert host is not None and host.updated_at > 1
+
+
+@pytest.mark.parametrize(
+    ("change", "marked_offline"),
+    [(None, True), ("revocation", True), ("re-arm", False), ("replacement", False)],
+)
+def test_ended_launch_token_tunnel_never_marks_its_successor_offline(
+    host_store: HostStore, change: str | None, marked_offline: bool
+) -> None:
+    """A tunnel's disconnect marks the host offline only while no other token has been armed."""
+    _managed_host_in_state(host_store, "armed")
+    host_store.upsert_on_connect(_MANAGED_ID, _MANAGED_NAME, _OWNER, managed_token="managed-token")
+    if change is not None:
+        _end_managed_token(host_store, change)
+    if change in ("re-arm", "replacement"):
+        host_store.upsert_on_connect(
+            _MANAGED_ID, _MANAGED_NAME, _OWNER, managed_token="newer-token"
+        )
+
+    host_store.set_offline(_MANAGED_ID, launch_token="managed-token")
+
+    host = host_store.get_host(_MANAGED_ID)
+    assert host is not None
+    assert host.status == ("offline" if marked_offline else "online")
+
+
 def test_refused_arming_leaves_the_host_unmarked(host_store: HostStore) -> None:
     """The marker is written only by an arming that commits."""
     _reserve(host_store)

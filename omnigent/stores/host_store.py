@@ -79,6 +79,7 @@ class HostRegistrationRefusedError(ValueError):
 
 
 LAUNCH_TOKEN_ONLY_REFUSAL = "This host is server-managed; it registers only with its launch token."
+SUPERSEDED_LAUNCH_TOKEN_REFUSAL = "This host's launch token has been replaced or revoked."
 
 
 @dataclass
@@ -730,7 +731,13 @@ class HostStore:
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
         )
 
-    def set_offline(self, host_id: str, *, cancelled: Callable[[], bool] | None = None) -> None:
+    def set_offline(
+        self,
+        host_id: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        launch_token: str | None = None,
+    ) -> None:
         """
         Mark a host as offline when its WebSocket disconnects.
 
@@ -740,19 +747,26 @@ class HostStore:
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         :param cancelled: Optional abandonment check after acquiring the row lock.
+        :param launch_token: The raw token a launch-token tunnel registered
+            with. Once the server has armed another token, the host's status
+            belongs to that token's tunnel, so this call leaves it unchanged.
         """
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
-            row = session.execute(
-                select(SqlHost)
-                .where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.host_id == host_id,
-                    SqlHost.deleted_at.is_(None),
+            statement = select(SqlHost).where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.host_id == host_id,
+                SqlHost.deleted_at.is_(None),
+            )
+            if launch_token is not None:
+                statement = statement.where(
+                    or_(
+                        SqlHost.token_hash.is_(None),
+                        SqlHost.token_hash == hash_host_launch_token(launch_token),
+                    )
                 )
-                .with_for_update()
-            ).scalar_one_or_none()
+            row = session.execute(statement.with_for_update()).scalar_one_or_none()
             # A timed-out worker must not write after a reconnect. Once locked,
             # any later reconnect waits for this transaction to finish.
             if row is not None and not (cancelled is not None and cancelled()):
@@ -790,7 +804,9 @@ class HostStore:
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
-    def heartbeat(self, host_id: str, *, by_bearer: bool = False) -> bool:
+    def heartbeat(
+        self, host_id: str, *, by_bearer: bool = False, launch_token: str | None = None
+    ) -> bool:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
@@ -807,8 +823,12 @@ class HostStore:
         :param by_bearer: The tunnel registered with an owner's bearer, not a
             launch token. Such a tunnel no longer refreshes a host that has
             become launch-token-only.
-        :returns: ``False`` when *by_bearer* is set and the host has become
-            launch-token-only, so the tunnel must end; ``True`` otherwise.
+        :param launch_token: The raw token the tunnel registered with. Such a
+            tunnel no longer refreshes a host once that token has been
+            replaced, revoked or deleted. Its expiry alone does not end it.
+        :returns: ``False`` when the tunnel must end: *by_bearer* is set and
+            the host has become launch-token-only, or *launch_token* is no
+            longer the host's token. ``True`` otherwise.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
@@ -823,12 +843,18 @@ class HostStore:
             )
             if by_bearer:
                 statement = statement.where(SqlHost.launch_token_only.is_(False))
+            if launch_token is not None:
+                statement = statement.where(
+                    SqlHost.token_hash == hash_host_launch_token(launch_token)
+                )
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(statement.values(updated_at=updated_at)),
             )
-            if not by_bearer or result.rowcount == 1:
+            if result.rowcount == 1 or not (by_bearer or launch_token is not None):
                 return True
+            if launch_token is not None:
+                return False
             # Nothing matched: the host is gone, or it was armed since this tunnel registered.
             return not self._launch_token_only(session, host_id)
 
