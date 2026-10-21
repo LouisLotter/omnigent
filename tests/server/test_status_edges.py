@@ -93,3 +93,28 @@ async def test_an_edge_is_remembered_for_its_ttl_and_within_the_bound() -> None:
     await edges.apply_once("conv", "c", applying("c"))
     await edges.apply_once("conv", "a", applying("a"))
     assert applied == ["a", "a", "b", "c", "a"]
+
+
+async def test_an_edge_still_applying_is_never_evicted() -> None:
+    """Under capacity pressure a retry of an edge in progress still waits for it."""
+    edges = StatusEdges(max_edges=1)
+    applied: list[str] = []
+    release = asyncio.Event()
+
+    def applying(name: str, gate: asyncio.Event | None = None):
+        async def apply() -> str:
+            applied.append(name)
+            if gate is not None:
+                await gate.wait()
+            return name
+
+        return apply
+
+    first = asyncio.create_task(edges.apply_once("conv", "a", applying("a", release)))
+    await asyncio.sleep(0)
+    await edges.apply_once("conv", "b", applying("b"))
+    retry = asyncio.create_task(edges.apply_once("conv", "a", applying("a")))
+    await asyncio.sleep(0)
+    release.set()
+    assert await first == await retry == "a"
+    assert applied == ["a", "b"]

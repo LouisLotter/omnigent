@@ -47,7 +47,8 @@ class StatusEdges:
     Used only on the server's event loop.
 
     :param ttl_s: How long an applied edge is remembered.
-    :param max_edges: How many are remembered at most.
+    :param max_edges: How many applied edges are remembered at most; edges
+        still being applied are always kept.
     :param clock: Monotonic clock, injectable for tests.
     """
 
@@ -92,8 +93,7 @@ class StatusEdges:
                     raise  # this repeat itself was cancelled
         outcome: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._edges[key] = (self._clock(), outcome)
-        while len(self._edges) > self._max_edges:
-            self._edges.popitem(last=False)
+        self._evict_applied()
         try:
             result = await apply()
         except BaseException:
@@ -103,6 +103,15 @@ class StatusEdges:
             raise
         outcome.set_result(result)
         return result
+
+    def _evict_applied(self) -> None:
+        """Forget the oldest applied edges beyond the bound; ones still applying stay."""
+        excess = len(self._edges) - self._max_edges
+        for key in [key for key, (_at, outcome) in self._edges.items() if outcome.done()]:
+            if excess <= 0:
+                return
+            del self._edges[key]
+            excess -= 1
 
     def _expire(self) -> None:
         horizon = self._clock() - self._ttl_s
