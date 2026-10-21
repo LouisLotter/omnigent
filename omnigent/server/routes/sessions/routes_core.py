@@ -652,6 +652,7 @@ def register_core_routes(
             LAUNCH_TIMEOUT_ENV_VAR,
             resolve_host_launch,
             resolve_launch_timeout_s,
+            settle_unanswered_launch,
         )
 
         with creation_stage("create_acl_ms"):
@@ -726,13 +727,28 @@ def register_core_routes(
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            launch_result = {
-                "status": "failed",
-                "error": (
-                    f"host launch timed out after {launch_timeout_s:g}s "
-                    f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
-                ),
-            }
+            # The result, or the launch itself, was lost: ask what happened. The
+            # create stays lenient and keeps the binding either way; a runner
+            # the host never received is relaunched by the first message.
+            settled = await settle_unanswered_launch(
+                host_id=host_id,
+                runner_id=runner_id,
+                host_registry=host_registry,
+                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            )
+            launch_result = (
+                {"status": "started"}
+                if settled == "started"
+                else {
+                    "status": "failed",
+                    "error": "host never received the launch"
+                    if settled == "not_received"
+                    else (
+                        f"host launch timed out after {launch_timeout_s:g}s "
+                        f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
+                    ),
+                }
+            )
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():

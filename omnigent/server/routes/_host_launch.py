@@ -22,6 +22,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException
 
@@ -35,6 +36,9 @@ from omnigent.server.persistent_hosts import ensure_host_ready
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 
 _logger = logging.getLogger(__name__)
 
@@ -322,3 +326,49 @@ def resolve_host_launch(
             raise HTTPException(status_code=404, detail="session not found")
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
+
+
+LaunchSettlement = Literal["started", "not_received", "failed", "unknown"]
+
+
+async def settle_unanswered_launch(
+    *,
+    host_id: str,
+    runner_id: str,
+    host_registry: HostRegistry,
+    tunnel_registry: TunnelRegistry | None,
+) -> LaunchSettlement:
+    """
+    Find out what happened to a launch whose result never arrived.
+
+    The result frame can be lost on a dropped host tunnel while the runner
+    starts anyway, or the launch frame itself can be lost so the host never
+    started anything. The runner's own tunnel registration, or the host's
+    ``host.runner_status`` answer (which waits for a launch still in
+    progress), tells the two apart.
+
+    :param host_id: The host the launch was sent to, e.g. ``"host_a1b2..."``.
+    :param runner_id: The runner the launch was for.
+    :param host_registry: Registry holding the host's current connection.
+    :param tunnel_registry: Registry of connected runners, if configured.
+    :returns: ``"started"`` when the runner is up or starting,
+        ``"not_received"`` when the host has no record of it, ``"failed"``
+        when its process already exited, ``"unknown"`` when nothing answered.
+    """
+    from omnigent.server.routes._sessions.helpers import _query_host_runner_status
+
+    if tunnel_registry is not None and tunnel_registry.get(runner_id) is not None:
+        return "started"
+    conn = host_registry.get(host_id)
+    if conn is None:
+        return "unknown"
+    status = await _query_host_runner_status(conn, host_registry, runner_id)
+    if tunnel_registry is not None and tunnel_registry.get(runner_id) is not None:
+        return "started"
+    if status in ("alive", "sign_in_pending"):
+        return "started"
+    if status == "dead":
+        return "failed"
+    if status == "unknown":
+        return "not_received"
+    return "unknown"

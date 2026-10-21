@@ -69,6 +69,7 @@ from omnigent.server.routes._host_launch import (
     resolve_host_launch,
     resolve_host_owner,
     resolve_launch_timeout_s,
+    settle_unanswered_launch,
 )
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
@@ -1158,15 +1159,30 @@ def create_hosts_router(
             )
         except asyncio.TimeoutError:
             conn.pending_launches.pop(request_id, None)
-            await _rollback_failed_launch()
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host did not respond to launch request within "
-                    f"{launch_timeout_s:g}s (raise {LAUNCH_TIMEOUT_ENV_VAR} "
-                    f"if this launch needs longer)"
-                ),
-            ) from None
+            # The result, or the launch itself, was lost: ask what happened
+            # before reporting a failure for a runner that may be starting.
+            settled = await settle_unanswered_launch(
+                host_id=host_id,
+                runner_id=runner_id,
+                host_registry=host_registry,
+                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            )
+            if settled == "started":
+                result = {"status": "started"}
+            else:
+                await _rollback_failed_launch()
+                raise HTTPException(
+                    status_code=502 if settled == "failed" else 504,
+                    detail=(
+                        "host never received the launch request"
+                        if settled == "not_received"
+                        else "the runner exited while starting"
+                        if settled == "failed"
+                        else f"host did not respond to launch request within "
+                        f"{launch_timeout_s:g}s (raise {LAUNCH_TIMEOUT_ENV_VAR} "
+                        f"if this launch needs longer)"
+                    ),
+                ) from None
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()

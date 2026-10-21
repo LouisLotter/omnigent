@@ -616,6 +616,82 @@ async def test_launch_runner_happy_path(
 
 
 @pytest.mark.parametrize(
+    ("runner_status", "expected_status"),
+    [("alive", 200), ("unknown", 504), ("dead", 502)],
+    ids=["result-lost-runner-up", "launch-never-received", "runner-exited"],
+)
+async def test_launch_runner_settles_a_launch_whose_result_was_lost(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: str,
+    expected_status: int,
+) -> None:
+    """
+    A launch whose result never arrived is resolved through ``host.runner_status``.
+
+    A runner the host started is reported as launching, not as a failure
+    whose rollback would strand it; a launch the host never received fails
+    without claiming a runner.
+    """
+    from omnigent.host.frames import (
+        HostLaunchRunnerFrame,
+        HostRunnerStatusFrame,
+        HostRunnerStatusResultFrame,
+        decode_host_frame,
+    )
+    from omnigent.server.routes._host_launch import (
+        LAUNCH_TIMEOUT_ENV_VAR,
+        resolve_launch_timeout_s,
+    )
+
+    monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "1")
+    resolve_launch_timeout_s.cache_clear()
+    app, registry, _hs, conv_store = host_api_app
+    comm = await _connect_host(app, registry)
+    conv = conv_store.create_conversation(agent_id=None)
+
+    async def _lose_the_launch_result() -> None:
+        for _ in range(20):
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                continue  # the result frame is lost on the way back
+            if isinstance(frame, HostRunnerStatusFrame):
+                answer = HostRunnerStatusResultFrame(
+                    request_id=frame.request_id, status=runner_status
+                )
+                await comm.send_input(
+                    {"type": "websocket.receive", "text": encode_host_frame(answer)}
+                )
+                return
+        raise AssertionError("the host was never asked for the runner's status")
+
+    responder = asyncio.create_task(_lose_the_launch_result())
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/v1/hosts/{_HOST_ID}/runners",
+                json={"session_id": conv.id, "workspace": "/tmp/test-workspace"},
+            )
+        await responder
+    finally:
+        resolve_launch_timeout_s.cache_clear()
+
+    assert resp.status_code == expected_status, resp.text
+    updated = conv_store.get_conversation(conv.id)
+    assert updated is not None
+    if expected_status == 200:
+        assert resp.json()["status"] == "launching"
+        assert updated.runner_id == resp.json()["runner_id"]
+    else:
+        assert updated.runner_id is None, "a failed launch must not leave a binding"
+        if runner_status == "unknown":
+            assert "never received" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
     (
         "wire_error_code",
         "launch_error",

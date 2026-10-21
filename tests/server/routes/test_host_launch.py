@@ -371,3 +371,77 @@ class TestResolveLaunchTimeout:
         assert resolve_launch_timeout_s() == 120.0
         monkeypatch.setenv(LAUNCH_TIMEOUT_ENV_VAR, "240")
         assert resolve_launch_timeout_s() == 120.0
+
+
+# ── settle_unanswered_launch ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registered", "has_conn", "status", "expected"),
+    [
+        (True, True, None, "started"),
+        (False, True, "alive", "started"),
+        (False, True, "sign_in_pending", "started"),
+        (False, True, "dead", "failed"),
+        (False, True, "unknown", "not_received"),
+        (False, True, None, "unknown"),
+        (False, False, None, "unknown"),
+    ],
+    ids=[
+        "registered",
+        "alive",
+        "sign-in",
+        "exited",
+        "never-received",
+        "no-answer",
+        "host-gone",
+    ],
+)
+async def test_settle_unanswered_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    registered: bool,
+    has_conn: bool,
+    status: str | None,
+    expected: str,
+) -> None:
+    """A lost launch result is resolved by registration or the host's runner status."""
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server.routes._host_launch import settle_unanswered_launch
+    from omnigent.server.routes._sessions import helpers
+
+    queried: list[str] = []
+
+    async def runner_status(_conn: object, _registry: object, runner_id: str) -> str | None:
+        queried.append(runner_id)
+        return status
+
+    monkeypatch.setattr(helpers, "_query_host_runner_status", runner_status)
+    tunnels = TunnelRegistry()
+    if registered:
+
+        class _NoopWS:
+            async def send_text(self, data: str) -> None:
+                del data
+
+            async def receive_text(self) -> str:
+                raise AssertionError("not read")
+
+        from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+
+        tunnels.register(
+            "runner_1",
+            _NoopWS(),
+            HelloFrame(runner_version="0", frame_protocol_version=1, harnesses=[], envs=[]),
+        )
+    registry = _FakeHostRegistry(conns={"host_1": object()} if has_conn else {})
+
+    settled = await settle_unanswered_launch(
+        host_id="host_1",
+        runner_id="runner_1",
+        host_registry=registry,  # type: ignore[arg-type]
+        tunnel_registry=tunnels,
+    )
+
+    assert settled == expected
+    assert queried == ([] if registered or not has_conn else ["runner_1"])
