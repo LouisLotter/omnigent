@@ -116,8 +116,8 @@ async def recv_within_silence_deadline(
 
     After *timeout_s* without a message, one more read of *grace_s* runs before
     the socket is aborted. Cancelling ``recv()`` loses no message in
-    ``websockets``, so a message that arrives as either read times out is
-    returned by the next one.
+    ``websockets``, so a message that arrives as the first read times out is
+    returned by the grace read.
 
     :param ws: An open ``websockets`` client connection.
     :param timeout_s: Seconds to wait for a message, e.g. ``45.0``, or ``None``
