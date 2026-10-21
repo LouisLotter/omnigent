@@ -25,14 +25,15 @@ RUNNER_TUNNEL_MAX_MESSAGE_BYTES = 100 * 1024 * 1024
 # (a synchronous/CPU-bound dispatch), pre-empting the deliberate 90 s policy and
 # triggering reconnect churn + relay-subscribe timeouts. See issue #1116.
 #
-# A PING every 30 s keeps the connection warm and is the runner's ONLY detector
-# of a silently-dead server (the app-level ``_ping_loop`` only runs server->client),
-# while the 90 s PONG timeout tolerates loop stalls up to the same window the
-# app-level loop already allows. A peer that dies right after a successful PONG is
-# detected at worst ~120 s later (30 s interval before the next PING + 90 s waiting
-# for its PONG) — the deliberate tradeoff for not false-dropping a busy-but-healthy
-# tunnel. ``test_tunnel_limits.py`` asserts the >= invariant so a future tightening
-# below the app-level budget fails CI.
+# A PING every 30 s keeps the connection warm and detects a silently-dead server
+# (the app-level ``_ping_loop`` only runs server->client); a path that answers the
+# PINGs itself is caught by the client-side silence deadline
+# (:mod:`omnigent.util.tunnel_silence`). The 90 s PONG timeout tolerates loop
+# stalls up to the same window the app-level loop already allows. A peer that dies
+# right after a successful PONG is detected at worst ~120 s later (30 s interval
+# before the next PING + 90 s waiting for its PONG) — the deliberate tradeoff for
+# not false-dropping a busy-but-healthy tunnel. ``test_tunnel_limits.py`` asserts
+# the >= invariant so a future tightening below the app-level budget fails CI.
 TUNNEL_KEEPALIVE_PING_INTERVAL_S = 30.0
 TUNNEL_KEEPALIVE_PING_TIMEOUT_S = 90.0
 

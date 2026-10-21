@@ -82,6 +82,10 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.util.tunnel_silence import (
+    recv_within_silence_deadline,
+    tunnel_silence_timeout_s,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -1156,7 +1160,8 @@ async def _serve_tunnel_once(
             ssl=ssl_ctx,
             # Protocol keepalive aligned to the server's 90 s app-level budget (not the
             # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
-            # Also the runner's only liveness probe for a silently-dead server.
+            # Detects a silently-dead server; a path that answers these pings itself is
+            # caught by the silence deadline on reads below.
             ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
             ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
         ) as ws,
@@ -1233,11 +1238,12 @@ async def _serve_tunnel_once(
             watch_for_resume(_on_resume_from_suspend),
             name=f"runner-suspend-watch:{runner_id}",
         )
+        silence_timeout_s = tunnel_silence_timeout_s()
         try:
             if shutdown_event is None:
                 while True:
                     try:
-                        raw = await ws.recv()
+                        raw = await recv_within_silence_deadline(ws, silence_timeout_s)
                     except ConnectionClosedOK as exc:
                         if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
                             # A server recycle (e.g. 1001) must reach
@@ -1263,7 +1269,9 @@ async def _serve_tunnel_once(
                 shutdown_wait = asyncio.create_task(shutdown_event.wait())
                 try:
                     while True:
-                        recv_task = asyncio.create_task(ws.recv())
+                        recv_task = asyncio.create_task(
+                            recv_within_silence_deadline(ws, silence_timeout_s)
+                        )
                         done, _pending = await asyncio.wait(
                             {recv_task, shutdown_wait},
                             return_when=asyncio.FIRST_COMPLETED,

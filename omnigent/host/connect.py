@@ -203,6 +203,11 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.util.tunnel_silence import (
+    TUNNEL_SILENCE_TIMEOUT_ENV_VAR,
+    recv_within_silence_deadline,
+    tunnel_silence_timeout_s,
+)
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
@@ -735,6 +740,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Runners apply the host's tunnel silence deadline.
+        TUNNEL_SILENCE_TIMEOUT_ENV_VAR,
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -4753,8 +4760,9 @@ class HostProcess:
             # status``) must not delay ``ws.recv()`` or the inline keepalive pong
             # the server's watchdog counts as liveness, or it closes the tunnel
             # with ``4003 ping timeout``.
+            silence_timeout_s = tunnel_silence_timeout_s()
             while True:
-                raw = await ws.recv()
+                raw = await recv_within_silence_deadline(ws, silence_timeout_s)
                 if (diagnostics := self._diagnostics_for(ws)) is not None:
                     diagnostics.frame_received()
                 self._conn_frame_received = True

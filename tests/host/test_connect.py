@@ -4056,6 +4056,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "OMNIGENT_LOG_TTY_FD": "9",
         "OMNIGENT_WRAPPER_COMMAND": "isaac omni",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND": "credential-helper --format raw",
+        "OMNIGENT_TUNNEL_SILENCE_TIMEOUT_S": "60",
     }
 
     env = _build_runner_env(
@@ -4126,6 +4127,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_LOG_TTY_FD"] == "9"
     # Runner-side CLI hints name the wrapper the user runs.
     assert env["OMNIGENT_WRAPPER_COMMAND"] == "isaac omni"
+    # Runners apply the host's tunnel silence deadline.
+    assert env["OMNIGENT_TUNNEL_SILENCE_TIMEOUT_S"] == "60"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -6289,6 +6292,137 @@ async def test_host_diagnostics_correlate_real_socket_closes_and_reset_on_reconn
         assert end["close_sent_code"] == (None if abrupt else 1000)
         assert end["sends_in_flight"] == 0
     assert not any(getattr(r, "event_name", None) == "host_tunnel_health" for r in caplog.records)
+
+
+def _short_silence_deadline(monkeypatch: pytest.MonkeyPatch, deadline_s: float) -> None:
+    """Shrink the tunnel silence deadline and its grace read for a real-socket test."""
+    from omnigent.util import tunnel_silence
+
+    monkeypatch.setattr("omnigent.host.connect.tunnel_silence_timeout_s", lambda: deadline_s)
+    monkeypatch.setattr(tunnel_silence, "TUNNEL_SILENCE_GRACE_S", deadline_s / 4)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+
+
+async def test_host_drops_a_tunnel_whose_server_falls_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A path that answers protocol pings but delivers nothing is abandoned."""
+    from websockets.asyncio.server import serve
+
+    from omnigent.util.tunnel_silence import TunnelSilenceTimeoutError
+    from tests.budgets import budget
+
+    _short_silence_deadline(monkeypatch, 0.2)
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    disconnected: list[BaseException | None] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.record_websocket_disconnected",
+        lambda kind, error, **_kwargs: disconnected.append(error),
+    )
+
+    async def peer(ws):
+        assert isinstance(decode_host_frame(await ws.recv()), HostHelloFrame)
+        # Silent from here on; the library still answers the host's pings.
+        await ws.wait_closed()
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        host = _host(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+        host._owner_user_id = "test-owner"
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        try:
+            with pytest.raises(TunnelSilenceTimeoutError):
+                await asyncio.wait_for(host._connect_and_serve(), timeout=budget(5))
+        finally:
+            await host._quiesce_frame_tasks()
+
+    assert [type(error) for error in disconnected] == [TunnelSilenceTimeoutError]
+    (end,) = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_tunnel"
+        and r.attributes.get("phase") == "disconnected"
+    ]
+    assert end["disconnect_reason"] == "silence_timeout"
+    assert end["error_type"] == "TunnelSilenceTimeoutError"
+
+
+async def test_host_tunnel_stays_open_while_the_server_pings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server's application pings, each inside the deadline, keep the tunnel."""
+    from websockets.asyncio.server import serve
+    from websockets.exceptions import ConnectionClosedOK
+
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+    from tests.budgets import budget
+
+    deadline_s = 0.3
+    _short_silence_deadline(monkeypatch, deadline_s)
+    pongs: list[object] = []
+
+    async def peer(ws):
+        assert isinstance(decode_host_frame(await ws.recv()), HostHelloFrame)
+        for ts in range(6):
+            await asyncio.sleep(deadline_s / 2)
+            await ws.send(encode_frame(PingFrame(ts=ts)))
+            pongs.append(decode_frame(await ws.recv()))
+        await ws.close(code=1000, reason="finished")
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        host = _host(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+        host._owner_user_id = "test-owner"
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        try:
+            with pytest.raises(ConnectionClosedOK):
+                await asyncio.wait_for(host._connect_and_serve(), timeout=budget(10))
+        finally:
+            await host._quiesce_frame_tasks()
+
+    assert pongs == [PongFrame(ts=ts) for ts in range(6)]
+
+
+async def test_run_reconnects_after_a_silent_tunnel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconnect loop treats a silence timeout as a drop and dials again."""
+    from websockets.asyncio.server import serve
+
+    from tests.budgets import budget
+
+    _short_silence_deadline(monkeypatch, 0.2)
+    monkeypatch.setenv("OMNIGENT_RUNNER_ZYGOTE", "0")
+    hellos: list[HostHelloFrame] = []
+    reconnected = asyncio.Event()
+
+    async def peer(ws):
+        hello = decode_host_frame(await ws.recv())
+        assert isinstance(hello, HostHelloFrame)
+        hellos.append(hello)
+        if len(hellos) > 1:
+            reconnected.set()
+        await ws.wait_closed()
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        host = _host(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+        host._owner_user_id = "test-owner"
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        run = asyncio.create_task(host.run())
+        try:
+            await asyncio.wait_for(reconnected.wait(), timeout=budget(10))
+        finally:
+            run.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run
+            await host._quiesce_frame_tasks()
+
+    assert hellos[0].connection_id != hellos[1].connection_id
 
 
 def _refused_exc() -> ConnectionRefusedError:
