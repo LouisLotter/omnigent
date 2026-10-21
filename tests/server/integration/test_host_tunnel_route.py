@@ -2343,6 +2343,67 @@ async def test_tunnel_cancelled_during_its_registration_recheck_is_deregistered(
     assert host is not None and host.status == "offline"
 
 
+@pytest.mark.parametrize("cancellation", ["task", "scope"])
+@pytest.mark.parametrize("stalled", ["refusal frame", "close"])
+async def test_tunnel_cancelled_while_reporting_its_refusal_is_deregistered(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, stalled: str, cancellation: str
+) -> None:
+    """A tunnel refused after registering leaves no registry entry, even if cancelled meanwhile."""
+    from starlette.websockets import WebSocket
+
+    from omnigent.server.routes import host_tunnel
+
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    cancel_scopes: list[anyio.CancelScope] = []
+
+    async def cancellable_app(scope, receive, send):
+        with anyio.CancelScope() as cancel_scope:
+            cancel_scopes.append(cancel_scope)
+            await app(scope, receive, send)
+
+    _register_managed(store, host_id=_HOST_ID, token="tunnel-token-current")
+    resolve = store.resolve_launch_token
+    checks = 0
+
+    def superseded_by_the_recheck(*args: object) -> object:
+        nonlocal checks
+        checks += 1
+        # The first check is the one before accept; the recheck refuses.
+        return resolve(*args) if checks == 1 else None
+
+    monkeypatch.setattr(store, "resolve_launch_token", superseded_by_the_recheck)
+    reporting = asyncio.Event()
+
+    async def stall(*_args: object, **_kwargs: object) -> None:
+        reporting.set()
+        await asyncio.Event().wait()
+
+    if stalled == "refusal frame":
+        monkeypatch.setattr(host_tunnel, "_send_connection_error", stall)
+    else:
+        monkeypatch.setattr(WebSocket, "close", stall)
+    communicator = ApplicationCommunicator(
+        cancellable_app, _managed_scope(_TUNNEL_PATH, "tunnel-token-current")
+    )
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    assert accepted["type"] == "websocket.accept"
+    hello = _make_hello(_MANAGED_NAME)
+    await communicator.send_input({"type": "websocket.receive", "text": hello})
+    await asyncio.wait_for(reporting.wait(), budget(5.0))
+    assert registry.get(_HOST_ID) is not None
+    if cancellation == "task":
+        communicator.future.cancel()
+    else:
+        cancel_scopes[0].cancel()
+    done, _pending = await asyncio.wait({communicator.future}, timeout=budget(2.0))
+    assert done
+
+    assert registry.get(_HOST_ID) is None
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "offline"
+
+
 @pytest.mark.parametrize("credential", ["launch token", "bearer"])
 async def test_delayed_handshake_with_a_current_credential_still_registers(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, credential: str
