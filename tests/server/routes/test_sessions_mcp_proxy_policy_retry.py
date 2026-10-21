@@ -1134,3 +1134,43 @@ async def test_answer_given_while_the_prompt_is_published_is_kept(
 
     assert "error" not in await approval_harness.call(retry)
     assert len(approval_harness.dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_external_input_continuation_stays_on_the_approved_connection(
+    approval_harness: _ApprovalHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call that pauses for an external MCP server's question resumes on the same connection."""
+    from omnigent.server.schemas import ElicitationResult
+
+    eid, retry = await approval_harness.ask()
+    orchestration._record_mcp_approval_verdict(_SESSION_ID, eid, "accept", "alice")
+    replies = iter(
+        [
+            {"result": {"input_required": {"inputRequests": {"q1": {}}, "requestState": "s"}}},
+            {"result": {"output": "posted"}},
+        ]
+    )
+
+    def execute(request: httpx.Request) -> httpx.Response:
+        approval_harness.dispatched.append(json.loads(request.content))
+        approval_harness.dispatch_generations.append(
+            request.extensions.get("runner_tunnel_generation")
+        )
+        return httpx.Response(200, json=next(replies))
+
+    async def person_answers(*args: Any, **kwargs: Any) -> ElicitationResult:
+        return ElicitationResult(action="accept")
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(execute), base_url="http://runner")
+
+    async def get_runner(*args: Any) -> httpx.AsyncClient:
+        return runner
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+    monkeypatch.setattr(orchestration, "_publish_and_wait_for_harness_elicitation", person_answers)
+
+    executed = await approval_harness.call(retry)
+
+    assert "error" not in executed, executed
+    assert approval_harness.dispatch_generations == [7, 7]

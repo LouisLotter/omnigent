@@ -226,8 +226,8 @@ adapter still requires a session**; calls without one return 422. This prototype
 does not expose a sessionless execution path with weaker policy enforcement.
 Delegated runner credentials can access `/v1/mcp`; this does not grant access to
 catalog/account-management endpoints. They carry a `delegated: "runner"` claim and
-cannot answer approvals, add, change or delete policies (a sub-agent cost budget
-excepted), replace agents, or use `/auth/*` and `/oauth/*`.
+cannot answer approvals, add, change or delete policies, replace agents, or use
+`/auth/*` and `/oauth/*`.
 
 | Method | Parameters | Result |
 | --- | --- | --- |

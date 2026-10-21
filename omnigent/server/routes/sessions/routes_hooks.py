@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from typing import Any, NamedTuple
 
@@ -67,6 +68,7 @@ from omnigent.server.routes._sessions.common import (
     _TURN_ACTOR_LABEL,
     _llm_response_denied_turns,
     _logger,
+    _pending_policy_ask_writes,
     _runner_relay_tasks,
     get_server_runner_router,
     set_server_runner_router,
@@ -149,6 +151,19 @@ def _invalid_evaluate_elicitation_id() -> OmnigentError:
         "32 hex chars, or name this tool call's pending MCP approval.",
         code=ErrorCode.INVALID_INPUT,
     )
+
+
+def _recorded_mcp_answer(elicitation_id: str) -> Response | None:
+    """Return the gate's answer from a person's recorded MCP verdict, if one exists."""
+    pending = _pending_policy_ask_writes.get(elicitation_id)
+    if pending is None or pending.verdict is None:
+        return None
+    body: dict[str, Any] = (
+        {"result": "POLICY_ACTION_ALLOW"}
+        if pending.verdict == "accept"
+        else {"result": "POLICY_ACTION_DENY", "reason": "Approval was declined."}
+    )
+    return Response(content=json.dumps(body), media_type="application/json")
 
 
 def register_hooks_routes(
@@ -796,14 +811,9 @@ def register_hooks_routes(
             )
             if mcp_approval is None:
                 raise _invalid_evaluate_elicitation_id()
-            if mcp_approval.verdict is not None:
-                # Answered before this gate waited: report that answer.
-                answered: dict[str, Any] = (
-                    {"result": "POLICY_ACTION_ALLOW"}
-                    if mcp_approval.verdict == "accept"
-                    else {"result": "POLICY_ACTION_DENY", "reason": "Approval was declined."}
-                )
-                return Response(content=json.dumps(answered), media_type="application/json")
+            answered = _recorded_mcp_answer(mcp_approval_id)
+            if answered is not None:
+                return answered
             hook_elicitation_id = mcp_approval_id
         raw_event_context = event.get("context")
         if raw_event_context is not None and not isinstance(raw_event_context, dict):
@@ -975,6 +985,18 @@ def register_hooks_routes(
                         Phase.LLM_REQUEST,
                         Phase.REQUEST,
                     ):
+                        gate_result = result
+                        if mcp_approval_id is not None:
+                            # Answered while this request evaluated: report it
+                            # rather than ask again. No await follows before the
+                            # gate registers its waiter, so no answer is missed.
+                            answered = _recorded_mcp_answer(mcp_approval_id)
+                            if answered is not None:
+                                return answered
+                            # The MCP retry applies the approval's writes, once.
+                            gate_result = dataclasses.replace(
+                                result, set_labels=None, state_updates=None
+                            )
                         try:
                             approved = await _hold_native_ask_gate(
                                 request,
@@ -982,7 +1004,7 @@ def register_hooks_routes(
                                 phase=phase,
                                 data=data,
                                 engine=engine,
-                                result=result,
+                                result=gate_result,
                                 conversation_store=conversation_store,
                                 elicitation_id=hook_elicitation_id,
                             )

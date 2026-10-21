@@ -73,6 +73,7 @@ def _new_child_handler(
     *,
     writes: list[tuple[str, dict[str, Any]]],
     child_id: str = _CHILD_SESSION,
+    policy_status: int = 201,
 ) -> Callable[[httpx.Request], httpx.Response]:
     """Serve the minimal parent/child REST exchange for a fresh send."""
 
@@ -91,7 +92,10 @@ def _new_child_handler(
             return httpx.Response(201, json={"id": child_id})
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/policies":
             writes.append((path, json.loads(request.content)))
-            return httpx.Response(201, json={"ok": True})
+            return httpx.Response(policy_status, json={"ok": policy_status < 400})
+        if request.method == "DELETE" and path == f"/v1/sessions/{child_id}":
+            writes.append((f"DELETE {path}", {}))
+            return httpx.Response(200, json={"deleted": True})
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             writes.append((path, json.loads(request.content)))
             return httpx.Response(202, json={"queued": True})
@@ -105,10 +109,11 @@ async def _send_new_child(
     spec: AgentSpec,
     args: dict[str, Any],
     writes: list[tuple[str, dict[str, Any]]],
+    policy_status: int = 201,
 ) -> str:
     """Dispatch one fresh named child through the real execute_tool path."""
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    handler = _new_child_handler(writes=writes)
+    handler = _new_child_handler(writes=writes, policy_status=policy_status)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://server",
@@ -179,6 +184,30 @@ async def test_cost_budget_is_normalized_and_attached_to_child_policy(
         }
     ]
     assert event_posts[0]["data"]["content"] == [{"type": "input_text", "text": "do work"}]
+
+
+@pytest.mark.asyncio
+async def test_child_that_cannot_get_its_cost_budget_is_not_started() -> None:
+    """A refused budget (e.g. a runner's delegated token) stops the send, never runs uncapped."""
+    writes: list[tuple[str, dict[str, Any]]] = []
+    output = await _send_new_child(
+        spec=_parent_spec(),
+        args={
+            "agent": "worker",
+            "title": "budgeted",
+            "args": {"input": "do work", "cost_budget": {"max_cost_usd": 1}},
+        },
+        writes=writes,
+        policy_status=403,
+    )
+
+    assert output.startswith("Error: sys_session_send could not attach 'cost_budget'"), output
+    assert "403" in output
+    assert [path for path, _body in writes] == [
+        "/v1/sessions",
+        f"/v1/sessions/{_CHILD_SESSION}/policies",
+        f"DELETE /v1/sessions/{_CHILD_SESSION}",
+    ]
 
 
 @pytest.mark.asyncio

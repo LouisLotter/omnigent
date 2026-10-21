@@ -14793,7 +14793,7 @@
         ]
       },
       "post": {
-        "description": "Create a new session policy.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode.\n\n**Parameters**\n\n- `body` \u2014 Policy payload including name, type, and handler.\n\n**Returns:** The created policy as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks edit permission, 404 if the session is not found, or 409 if a policy with the same name already exists; 403 for a delegated credential adding any policy but a cost budget.",
+        "description": "Create a new session policy.\n\nRequires `LEVEL_EDIT` on the session in multi-user mode.\n\n**Parameters**\n\n- `body` \u2014 Policy payload including name, type, and handler.\n\n**Returns:** The created policy as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks edit permission, 404 if the session is not found, or 409 if a policy with the same name already exists; 403 for a delegated credential such as a runner's token.",
         "operationId": "create_policy_v1_sessions__session_id__policies_post",
         "parameters": [
           {

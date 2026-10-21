@@ -12435,6 +12435,13 @@ async def _handle_mcp_tools_call(
             ),
             None,
         )
+    # An approved call runs only on its runner connection; the tunnel transport
+    # refuses every runner request of this call on any other one.
+    pinned: dict[str, Any] = (
+        {"extensions": {"runner_tunnel_generation": approved_runner_generation}}
+        if approved_runner_generation is not None
+        else {}
+    )
     if execute_tool is not None:
         exec_data = await execute_tool(arguments)
     elif registry_config is not None:
@@ -12462,12 +12469,6 @@ async def _handle_mcp_tools_call(
             return _mcp_error_response(
                 rpc_id, -32000, f"No runner bound for session {session_id!r}"
             )
-        # The tunnel transport refuses the request on any other connection.
-        pinned: dict[str, Any] = (
-            {"extensions": {"runner_tunnel_generation": approved_runner_generation}}
-            if approved_runner_generation is not None
-            else {}
-        )
         try:
             exec_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
@@ -12558,6 +12559,7 @@ async def _handle_mcp_tools_call(
                     step="elicitation-response",
                 ),
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,
+                **pinned,
             )
             retry_resp.raise_for_status()
             exec_data = retry_resp.json()

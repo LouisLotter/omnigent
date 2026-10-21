@@ -2958,7 +2958,8 @@ async def _execute_subagent_tool(
         created_child = True
 
         # Attach a subagent_cost_budget policy to the child when requested.
-        # Non-fatal: the child session is still usable without the budget.
+        # A child that cannot get its budget is not started: running it
+        # uncapped would silently drop the limit the caller asked for.
         if cost_budget is not None:
             policy_body = {
                 "name": "__subagent_cost_budget",
@@ -2973,19 +2974,24 @@ async def _execute_subagent_tool(
                     json=policy_body,
                     timeout=10.0,
                 )
-                if pol_resp.status_code >= 400:
-                    _logger.warning(
-                        "failed to set subagent_cost_budget policy on child %s: %s %s",
-                        child_session_id,
-                        pol_resp.status_code,
-                        pol_resp.text[:200],
-                    )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "failed to set subagent_cost_budget policy on child %s",
-                    child_session_id,
-                    exc_info=True,
+                budget_error = (
+                    f"{pol_resp.status_code} {pol_resp.text[:200]}"
+                    if pol_resp.status_code >= 400
+                    else None
                 )
+            except httpx.HTTPError as exc:
+                budget_error = f"{type(exc).__name__}: {exc}"
+            if budget_error is not None:
+                teardown_warning = await _teardown_failed_child(
+                    server_client, child_session_id, created_child=True
+                )
+                error = (
+                    f"Error: sys_session_send could not attach 'cost_budget' to the "
+                    f"sub-agent, so it was not started: {budget_error}"
+                )
+                if teardown_warning is not None:
+                    return f"{error}\n{teardown_warning}"
+                return error
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the

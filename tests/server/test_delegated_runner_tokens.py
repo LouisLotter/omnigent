@@ -23,8 +23,10 @@ from tests.server.test_account_revocation import create_session
 from tests.server.test_account_revocation import setup_app as setup_app
 
 _CEL_POLICY = "omnigent.policies.builtins.cel.cel_policy"
+# Asks before every tool call; an approval counts itself in session state.
 _ASK_ON_TOOL_CALL = (
-    'event.type == "tool_call" ? {"result": "ASK", "reason": "Post this?"} : {"result": "ALLOW"}'
+    'event.type == "tool_call" ? {"result": "ASK", "reason": "Post this?", "state_updates": '
+    '[{"key": "approved_posts", "action": "increment", "value": 1}]} : {"result": "ALLOW"}'
 )
 
 
@@ -129,6 +131,12 @@ def _resolve_url(session_id: str, elicitation_id: str) -> str:
     return f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve"
 
 
+def _approved_posts(stores: dict[str, Any], session_id: str) -> int | None:
+    """How many approvals the ASK policy has recorded in session state."""
+    state = stores["conversation_store"].get_conversation(session_id).session_state or {}
+    return state.get("approved_posts")
+
+
 def test_browser_approval_runs_the_runners_retry_once(setup_app: Any, tracker: AsyncMock) -> None:
     """The normal path: the person approves in the browser and the runner's retry executes."""
     _admin, alice, stores, _ = setup_app
@@ -146,6 +154,7 @@ def test_browser_approval_runs_the_runners_retry_once(setup_app: Any, tracker: A
     assert repeated["error"]["message"] == "Elicitation not found or already resolved"
     tracker.call_tool.assert_awaited_once()
     assert tracker.call_tool.await_args.args[2:] == ("post_update", {"text": "hello"})
+    assert _approved_posts(stores, session_id) == 1
 
 
 @pytest.mark.parametrize("route", ["resolve", "approval_event"])
@@ -202,11 +211,10 @@ def _policy_body(name: str) -> dict[str, Any]:
 
 
 def test_policy_changes_need_the_person(setup_app: Any) -> None:
-    """Only the person adds, changes or removes policies; a runner may cap a sub-agent.
+    """Only the person adds, changes or removes policies.
 
     A new policy can write session state that other policies read, so the
-    runner's token cannot add one, except the sub-agent cost budget
-    ``sys_session_send`` attaches, which only asks or denies.
+    runner's token cannot add one, not even a sub-agent cost budget.
     """
     admin, _alice, stores, _ = setup_app
     session_id = create_session(admin).json()["session_id"]
@@ -240,8 +248,7 @@ def test_policy_changes_need_the_person(setup_app: Any) -> None:
             "factory_params": {"max_cost_usd": 1.0},
         },
     )
-    assert budget.status_code == 200, budget.text
-    assert runner.delete(f"{session_policies}/{budget.json()['id']}").status_code == 403
+    assert budget.status_code == 403, budget.text
 
 
 def _bundle_upload(name: str) -> dict[str, Any]:
@@ -363,6 +370,7 @@ def test_native_gate_reports_an_mcp_approval_already_answered(
     assert "result" in _tools_call(runner, session_id, **retry)
     assert "error" in _tools_call(runner, session_id, **retry)
     tracker.call_tool.assert_awaited_once()
+    assert _approved_posts(stores, session_id) == 1
 
 
 @pytest.mark.asyncio
@@ -412,6 +420,45 @@ async def test_native_gate_waits_on_the_mcp_approval_itself(
     assert gate.json()["result"] == "POLICY_ACTION_ALLOW", gate.text
     assert executed.json()["result"]["content"][0]["text"] == "posted", executed.text
     tracker.call_tool.assert_awaited_once()
+    # The gate leaves the approval's writes to the retry, so one answer counts once.
+    assert _approved_posts(stores, session_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_gate_reports_an_answer_given_while_it_evaluates(
+    setup_app: Any, tracker: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An answer landing between the gate's first check and its wait is reported, not re-asked."""
+    import contextlib
+
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_hooks
+
+    _admin, alice, stores, _ = setup_app
+    session_id = _session_using_tracker(alice)
+    runner = _delegated_runner(alice, stores, session_id)
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    @contextlib.asynccontextmanager
+    async def answered_while_waiting_for_the_lock(*_args: Any):
+        orchestration._record_mcp_approval_verdict(session_id, elicitation_id, "accept", "alice")
+        yield
+
+    monkeypatch.setattr(routes_hooks, "_native_ask_gate_lock", answered_while_waiting_for_the_lock)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=alice.app),
+        base_url="http://testserver",
+        headers=dict(runner.headers),
+    ) as runner_http:
+        gate = await asyncio.wait_for(
+            runner_http.post(
+                f"/v1/sessions/{session_id}/policies/evaluate",
+                json=_evaluate_body(elicitation_id, "hello"),
+            ),
+            timeout=15,
+        )
+
+    assert gate.json()["result"] == "POLICY_ACTION_ALLOW", gate.text
 
 
 def test_native_gate_cannot_borrow_another_calls_approval(
