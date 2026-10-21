@@ -1178,7 +1178,8 @@ class HostStore:
         For a create flow that records the host before provisioning. The row is
         offline, holds no launch token or sandbox, and is launch-token-only from
         creation, so no owner bearer can register it while it is pending. Arm it
-        with :meth:`replace_managed_host_sandbox` once the sandbox exists.
+        with :meth:`replace_managed_host_sandbox` and ``require_launch_token_only``
+        once the sandbox exists.
 
         :param host_id: Server-generated host identifier, e.g.
             ``"host_a1b2c3d4..."``.
@@ -1224,6 +1225,7 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
+        require_launch_token_only: bool = False,
     ) -> Host | None:
         """Replace the sandbox generation backing an existing managed host.
 
@@ -1231,6 +1233,11 @@ class HostStore:
         result means full teardown already removed the durable host, so the
         caller must clean up the unregistered sandbox instead of recreating it.
         Arming makes the host launch-token-only in the same transaction.
+
+        :param require_launch_token_only: Arm only a host that is already
+            launch-token-only, such as one from :meth:`reserve_managed_host`;
+            otherwise return ``None``. A create flow sets it so that it never arms
+            a row an owner's bearer registered after the reservation was deleted.
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
@@ -1244,6 +1251,8 @@ class HostStore:
             if existing is None:
                 return None
             if existing.deleted_at is not None:
+                return None
+            if require_launch_token_only and not existing.launch_token_only:
                 return None
             require_active_account(session, user_id, generation=existing.account_generation)
             if existing.user_id != user_id:

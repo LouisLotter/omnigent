@@ -2167,6 +2167,7 @@ def test_reserved_managed_host_is_pending_and_launch_token_only(host_store: Host
         provider="modal",
         sandbox_id="sb-first",
         token_expires_at=now_epoch() + 3600,
+        require_launch_token_only=True,
     )
     assert armed is not None
     assert armed.created_at == pending.created_at
@@ -2174,6 +2175,31 @@ def test_reserved_managed_host_is_pending_and_launch_token_only(host_store: Host
         _MANAGED_ID, _MANAGED_NAME, _OWNER, managed_token="first-token"
     )
     assert (connected.status, connected.sandbox_id) == ("online", "sb-first")
+
+
+def test_create_flow_never_arms_a_bearer_row_that_replaced_its_reservation(
+    host_store: HostStore,
+) -> None:
+    """Deleting a pending host frees its id; a bearer row registered there is not armed."""
+    assert host_store.reserve_managed_host(
+        host_id=_MANAGED_ID, name=_MANAGED_NAME, user_id=_OWNER, provider="modal"
+    )
+    assert host_store.delete_host(_MANAGED_ID) is not None
+    squatter = host_store.upsert_on_connect(_MANAGED_ID, "squatter", _OWNER)
+
+    armed = host_store.replace_managed_host_sandbox(
+        host_id=_MANAGED_ID,
+        user_id=_OWNER,
+        token="first-token",
+        provider="modal",
+        sandbox_id="sb-first",
+        token_expires_at=now_epoch() + 3600,
+        require_launch_token_only=True,
+    )
+
+    assert armed is None
+    assert host_store.get_host(_MANAGED_ID) == squatter
+    assert host_store.resolve_launch_token(_MANAGED_ID, "first-token") is None
 
 
 @pytest.mark.parametrize("holder", ["host id", "name", "deleted name"])
