@@ -11,6 +11,7 @@ import {
 } from "@/lib/sessionCapabilities";
 import type { SandboxLaunchStage } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
+import { computerHost } from "@/test/hostFixtures";
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -51,6 +52,12 @@ describe("resolveHostBadge", () => {
         online: true,
       }),
     ).toEqual({ label: "Databricks Sandbox", status: "online" });
+  });
+
+  it("labels a computer by its own name, not its provider", () => {
+    expect(
+      resolveHostBadge({ hostId: "host_computer", host: computerHost(), online: false }),
+    ).toEqual({ label: "research-box", status: "offline" });
   });
 
   it("falls back to the raw host_id when the host record is unresolved", () => {
@@ -524,6 +531,33 @@ describe("HostBadge", () => {
     // reach reconnect — it opens the switch dialog like any non-reconnect host.
     fireEvent.click(badge);
     expect(onReconnect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ state: "asleep" as const }, "Asleep"],
+    [{ state: "waking" as const, wake_stage: "starting" as const }, "Waking… Starting Omnigent"],
+    [
+      { state: "failed" as const, failure: "Setup was interrupted." },
+      "Failed: Setup was interrupted.",
+    ],
+  ])("shows a computer's state %o instead of a reconnect", async (status, text) => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_computer" },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({ data: [computerHost(status)] });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={onReconnect} />);
+
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("research-box");
+    expect(tooltip).toHaveTextContent(text);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByTestId("composer-host-menu")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).toBeNull();
   });
 
   it("renders nothing when onReconnect is set but the session isn't host-bound", () => {

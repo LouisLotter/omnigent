@@ -19,6 +19,7 @@ import {
 } from "./CreateScheduledTaskDialog";
 import * as agentsHook from "@/hooks/useAvailableAgents";
 import * as hostsHook from "@/hooks/useHosts";
+import { computerHost } from "@/test/hostFixtures";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -509,6 +510,40 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     renderDialog();
     openHostSelect();
     expect(screen.queryByTestId("task-host-sandbox-option")).not.toBeInTheDocument();
+  });
+
+  it("never offers a provider that creates computers as the per-run sandbox", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "cloudflare",
+          sandbox_providers: ["cloudflare"],
+          persistent_host_providers: ["cloudflare"],
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    openHostSelect();
+    expect(screen.queryByTestId("task-host-sandbox-option")).not.toBeInTheDocument();
+  });
+
+  it("labels a computer by its state, so an asleep one reads as usable", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_2", name: "desktop", owner: "me", status: "offline" },
+        computerHost({ state: "asleep" }),
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+    openHostSelect();
+
+    expect(screen.getByRole("option", { name: "laptop" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "desktop (offline)" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "research-box (asleep)" })).toBeInTheDocument();
   });
 
   it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {

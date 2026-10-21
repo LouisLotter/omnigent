@@ -11,6 +11,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import { computerHost } from "@/test/hostFixtures";
 
 // Heavy children are exercised by their own tests; stub them so this
 // test focuses on the dialog's prefill + bind + fallback logic.
@@ -215,6 +216,28 @@ describe("ResumeWithDirectoryDialog", () => {
     expect(await screen.findByTestId("resume-dir-cli-fallback")).toBeTruthy();
     expect(screen.queryByTestId("resume-dir-host-select")).toBeNull();
     expect(launchRunnerMock).not.toHaveBeenCalled();
+  });
+
+  it("binds to an asleep source computer instead of the CLI reconnect", async () => {
+    useHostsMock.mockReturnValue({
+      data: [computerHost({ state: "asleep" }, { host_id: "host_src" })],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/home/me/repo" }));
+
+    renderDialog();
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    await waitFor(() => expect(bindBtn).toBeEnabled());
+    expect(screen.queryByTestId("resume-dir-cli-fallback")).toBeNull();
+    fireEvent.click(bindBtn);
+
+    await waitFor(() =>
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_src",
+        "conv_clone",
+        "/home/me/repo",
+        undefined,
+      ),
+    );
   });
 
   it("warns when the chosen directory differs from the source's", async () => {

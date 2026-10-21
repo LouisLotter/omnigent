@@ -29,7 +29,8 @@ import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { canLaunchManagedSandbox, sandboxOptionLabel } from "@/lib/capabilities";
+import { hostStatusWord } from "@/lib/persistentHosts";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
@@ -73,7 +74,7 @@ export function CreateScheduledTaskDialog({
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
-  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled = canLaunchManagedSandbox(info);
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
@@ -573,11 +574,15 @@ export function CreateScheduledTaskDialog({
                     {sandboxLabel}
                   </SelectItem>
                 )}
-                {hostOptions.map((host) => (
-                  <SelectItem key={host.host_id} value={host.host_id}>
-                    {host.name} {host.status === "offline" ? "(offline)" : ""}
-                  </SelectItem>
-                ))}
+                {hostOptions.map((host) => {
+                  // Offline hosts stay selectable; an asleep computer wakes for the run.
+                  const statusWord = hostStatusWord(host);
+                  return (
+                    <SelectItem key={host.host_id} value={host.host_id}>
+                      {host.name} {statusWord === "online" ? "" : `(${statusWord})`}
+                    </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground">

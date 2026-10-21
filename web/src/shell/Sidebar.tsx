@@ -176,7 +176,8 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import { hostDisplayLabel } from "@/lib/persistentHosts";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
@@ -4236,12 +4237,10 @@ function sessionLocationLabel(
 ): string {
   if (!conversation.host_id) return "Local machine";
   const host = hostsById.get(conversation.host_id);
-  return host?.sandbox_provider
-    ? sandboxOptionLabel(host.sandbox_provider)
-    : (host?.name ?? conversation.host_id);
+  return host ? hostDisplayLabel(host) : conversation.host_id;
 }
 
-/** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */
+/** A row's short environment: the sandbox type, a computer's name, this device, or "Remote"; the tooltip names the host. */
 function sessionEnvironmentLabel(
   conversation: Conversation,
   hostsById: ReadonlyMap<string, Host>,

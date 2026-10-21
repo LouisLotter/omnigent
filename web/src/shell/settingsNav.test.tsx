@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   customAgentsEnabled: false as boolean | undefined,
   agentInstall: false,
   enabledConnections: [] as string[],
+  persistentHostProviders: [] as string[],
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -37,6 +38,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     },
     agent_install: mocks.agentInstall,
     enabled_connections: mocks.enabledConnections,
+    persistent_host_providers: mocks.persistentHostProviders,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -73,6 +75,7 @@ beforeEach(() => {
   mocks.customAgentsEnabled = false;
   mocks.agentInstall = false;
   mocks.enabledConnections = [];
+  mocks.persistentHostProviders = [];
 });
 afterEach(cleanup);
 
@@ -191,6 +194,19 @@ describe("SettingsSidebarBody", () => {
         expect(screen.getByTestId("settings-nav-mcp")).toHaveAttribute("href", "/settings/mcp");
     },
   );
+
+  it("shows Computers only when a provider creates computers", () => {
+    renderBody();
+    expect(screen.queryByTestId("settings-nav-computers")).toBeNull();
+    cleanup();
+
+    mocks.persistentHostProviders = ["cloudflare"];
+    renderBody();
+    expect(screen.getByTestId("settings-nav-computers")).toHaveAttribute(
+      "href",
+      "/settings/computers",
+    );
+  });
 
   it("renders Back as a standard sidebar row without a collapse button", () => {
     renderBody();
@@ -358,6 +374,12 @@ describe("SettingsSidebarBody", () => {
 });
 
 describe("useSettingsRoute", () => {
+  it("opens Computers only when a provider creates computers", () => {
+    expect(routeHook("/settings/computers")).toEqual({ inSettings: true, section: "general" });
+    mocks.persistentHostProviders = ["cloudflare"];
+    expect(routeHook("/settings/computers")).toEqual({ inSettings: true, section: "computers" });
+  });
+
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
     // sidebar's `inSettings` gate stays true and the settings nav stays put —

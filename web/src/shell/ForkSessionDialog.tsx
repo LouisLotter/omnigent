@@ -79,7 +79,12 @@ import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesys
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { randomUUID } from "@/lib/randomUUID";
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  canLaunchManagedSandbox,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
+import { hostStatusWord, isHostAvailable, isPersistentHost } from "@/lib/persistentHosts";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -131,7 +136,7 @@ function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
+      {isPersistentHost(host) || host.name.toLowerCase().includes("cloud") ? (
         <MonitorCloudIcon className="size-4 text-muted-foreground" />
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
@@ -145,7 +150,7 @@ function HostLabel({ host }: { host: Host }) {
         <span
           className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
         />
-        {host.status}
+        {hostStatusWord(host)}
       </span>
     </span>
   );
@@ -827,7 +832,9 @@ function SupportedForkSessionForm({
   const { data: hosts } = useHosts({ enabled: isCodingSource });
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
-  const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
+  // Online hosts plus computers that wake on use; the rest are listed disabled.
+  const availableHosts = useMemo(() => (hosts ?? []).filter(isHostAvailable), [hosts]);
+  const unavailableHosts = useMemo(() => (hosts ?? []).filter((h) => !isHostAvailable(h)), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
   const serverUrl = getCliServerUrl();
 
@@ -836,8 +843,7 @@ function SupportedForkSessionForm({
   // fails closed (rows hidden) until the boot probe resolves. Same gate
   // NewChatDialog uses for its own sandbox option.
   const info = useServerInfo();
-  const managedSandboxesEnabled =
-    !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled = !workspaceRecovery && canLaunchManagedSandbox(info);
   // One picker row per configured provider; a single-provider server
   // yields exactly one.
   const sandboxProviderRows = useMemo(
@@ -1078,12 +1084,12 @@ function SupportedForkSessionForm({
   // Directory the clone will actually start in — feeds the conflict check,
   // the reuse-dir tooltip, the pre-flight, and the launch itself.
   const effectiveWorkspace = usingSourceWorktree ? (sourceWorkspaceNorm ?? "") : workspaceTrimmed;
-  // The picked host must still be ONLINE, not merely selected: hosts refetch
-  // periodically, so a previously-picked host can go offline while selected.
-  // Gating on online-ness keeps the button greyed (and avoids a launchRunner
-  // that would just fail server-side) until a live host is chosen.
-  const selectedHostOnline =
-    selectedHostId !== null && onlineHosts.some((h) => h.host_id === selectedHostId);
+  // The picked host must still be available, not merely selected: hosts
+  // refetch periodically, so a previously-picked host can go offline while
+  // selected. Gating keeps the button greyed (and avoids a launchRunner that
+  // would just fail server-side) until a live host or a computer is chosen.
+  const selectedHostAvailable =
+    selectedHostId !== null && availableHosts.some((h) => h.host_id === selectedHostId);
   // A blank repository is legal — the clone then gets an empty sandbox —
   // but a branch without one, or a malformed URL, greys the button instead
   // of surfacing as a 422. Mirrors NewChatDialog's sandbox validity rule.
@@ -1130,7 +1136,7 @@ function SupportedForkSessionForm({
           };
     }
     if (!isCodingSource) return null;
-    if (!selectedHostOnline) {
+    if (!selectedHostAvailable) {
       return {
         field: "host",
         message:
@@ -1461,7 +1467,7 @@ function SupportedForkSessionForm({
               <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…
               </p>
-            ) : onlineHosts.length === 0 && !managedSandboxesEnabled ? (
+            ) : availableHosts.length === 0 && !managedSandboxesEnabled ? (
               // Nothing usable (no hosts, or all offline) and no sandbox to
               // fall back on — show the connect command directly so the user
               // can unblock. The submit button stays greyed until a host is
@@ -1526,7 +1532,7 @@ function SupportedForkSessionForm({
                         </SelectItem>
                       ))}
                     {managedSandboxesEnabled && allHosts.length > 0 && <SelectSeparator />}
-                    {onlineHosts.map((host) => (
+                    {availableHosts.map((host) => (
                       <SelectItem
                         key={host.host_id}
                         value={host.host_id}
@@ -1535,7 +1541,7 @@ function SupportedForkSessionForm({
                         <HostLabel host={host} />
                       </SelectItem>
                     ))}
-                    {offlineHosts.map((host) => (
+                    {unavailableHosts.map((host) => (
                       <SelectItem
                         key={host.host_id}
                         value={host.host_id}
@@ -1562,7 +1568,7 @@ function SupportedForkSessionForm({
                     ) : (
                       <ChevronDownIcon className="size-3.5" />
                     )}
-                    {onlineHosts.length === 0
+                    {availableHosts.length === 0
                       ? "Connect a host from your terminal"
                       : "Connect another host from your terminal"}
                   </button>

@@ -23,6 +23,7 @@ import {
 import { parentOf, resolveWorkspacePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
+import { isHostAvailable } from "@/lib/persistentHosts";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
@@ -130,15 +131,13 @@ function SupportedSwitchHostDialog({
   // submit and blank the select, which renders the chosen item's label.
   const [originHostId] = useState(currentHostId);
 
-  // Only online hosts can accept a runner, and moving to the host the
-  // session is already on is a no-op — until a half-finished switch
-  // leaves it unbound, when the origin is a target like any other and
-  // moving back is the quickest way out.
+  // Only online hosts and computers that wake on use can accept a runner,
+  // and moving to the host the session is already on is a no-op — until a
+  // half-finished switch leaves it unbound, when the origin is a target like
+  // any other and moving back is the quickest way out.
   const targetHosts = useMemo(
     () =>
-      (hosts ?? []).filter(
-        (h) => h.status === "online" && (stranded || h.host_id !== originHostId),
-      ),
+      (hosts ?? []).filter((h) => isHostAvailable(h) && (stranded || h.host_id !== originHostId)),
     [hosts, originHostId, stranded],
   );
 
