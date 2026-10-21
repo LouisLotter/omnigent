@@ -20,18 +20,14 @@ import httpx
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event
-from omnigent.runner.resent_stop import (
-    PRESSED_AGO_FIELD,
-    RESENT_STOP_TRANSIT_ALLOWANCE_S,
-    TURN_ENDED_STATUS,
-)
+from omnigent.runner.resent_stop import PRESSED_AGO_FIELD, TURN_ENDED_STATUS
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import pending_inputs
 
 _logger = logging.getLogger(__name__)
 
-# Bound on the redelivered interrupt's own forward, and so on its transit.
-_INTERRUPT_FORWARD_TIMEOUT_S = RESENT_STOP_TRANSIT_ALLOWANCE_S
+# Bound on the redelivered interrupt's whole forward, queuing included.
+_INTERRUPT_FORWARD_TIMEOUT_S = 5.0
 
 # One pending redelivery per session; a newer Stop or message replaces it.
 _pending_interrupts: WorkspaceScopedCache[str, asyncio.Task[None]] = WorkspaceScopedCache()
@@ -199,7 +195,7 @@ async def _send_interrupt(
     if client is None:
         return "lost"
     try:
-        # One deadline over queuing and answer: the runner relies on it to bound transit.
+        # One deadline over queuing and answer, so a stale Stop is not sent late.
         async with asyncio.timeout(_INTERRUPT_FORWARD_TIMEOUT_S):
             response = await client.post(
                 f"/v1/sessions/{session_id}/events",

@@ -10967,13 +10967,15 @@ async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> No
     [
         (None, True, True),
         (30.0, True, True),
-        (58.0, True, False),
+        (58.0, True, True),
+        (59.8, True, False),
         (90.0, True, False),
         (0.0, False, False),
     ],
     ids=[
         "first-delivery",
         "turn-pressed-for",
+        "pressed-two-seconds-into-its-turn",
         "turn-may-have-begun-after-the-press",
         "turn-began-after-the-press",
         "turn-ended",

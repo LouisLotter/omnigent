@@ -15,9 +15,11 @@ from omnigent.runner.resent_stop import resent_stop_outlived_its_turn
         ({"type": "interrupt", "pressed_ago_s": -1}, True, 990.0, False),
         ({"type": "interrupt", "pressed_ago_s": 30}, True, 900.0, False),
         ({"type": "interrupt", "pressed_ago_s": 30.0}, True, 980.0, True),
-        # Began 1 s after the press as the runner places it, which is late by
-        # the Stop's transit: it may have begun after the actual press.
-        ({"type": "interrupt", "pressed_ago_s": 30.0}, True, 966.0, True),
+        # Began just before the press as the runner places it, which is late
+        # by the Stop's transit: it may have begun after the actual press.
+        ({"type": "interrupt", "pressed_ago_s": 30.0}, True, 969.8, True),
+        # Pressed two seconds into its turn, as people do.
+        ({"type": "interrupt", "pressed_ago_s": 30.0}, True, 968.0, False),
         ({"type": "interrupt", "pressed_ago_s": 30.0}, False, 900.0, True),
         ({"type": "interrupt", "pressed_ago_s": 30.0}, True, None, True),
     ],
@@ -28,6 +30,7 @@ from omnigent.runner.resent_stop import resent_stop_outlived_its_turn
         "turn-running-since-before-the-press",
         "turn-began-after-the-press",
         "turn-began-within-the-transit-allowance",
+        "pressed-soon-after-its-turn-began",
         "turn-ended",
         "turn-start-unknown",
     ],

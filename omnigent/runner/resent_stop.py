@@ -8,10 +8,11 @@ and the runner applies it only to a turn that was already running then.
 
 The two sides share no clock: the runner places the press by subtracting that
 duration from its own time, which puts it late by the Stop's transit. A turn
-must therefore have started at least the longest transit before that, the
-server's whole deadline for the forward, to count. A Stop the network delivers
-after the server already gave up on it is not covered; only a turn identity
-both sides know would cover it.
+must therefore have started a transit allowance before that to count. A
+reconnected tunnel delivers in milliseconds, so the allowance is small: a
+larger one also refuses the Stop for the turn it was pressed for whenever the
+person pressed it soon after the turn began. A slower delivery is not covered;
+only a turn identity both sides know would cover it.
 """
 
 from __future__ import annotations
@@ -24,9 +25,8 @@ PRESSED_AGO_FIELD = "pressed_ago_s"
 # The runner's answer to a re-sent Stop whose turn has ended.
 TURN_ENDED_STATUS = "turn_ended"
 
-# The server gives up on a re-sent Stop's forward, queuing included, after
-# this long, and so bounds its transit.
-RESENT_STOP_TRANSIT_ALLOWANCE_S = 5.0
+# How late the runner may place the press because of the re-sent Stop's transit.
+RESENT_STOP_TRANSIT_ALLOWANCE_S = 0.5
 
 
 def resent_stop_outlived_its_turn(
