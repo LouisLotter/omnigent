@@ -210,11 +210,13 @@ def _policy_body(name: str) -> dict[str, Any]:
     }
 
 
-def test_policy_changes_need_the_person(setup_app: Any) -> None:
-    """Only the person adds, changes or removes policies.
+def test_runner_adds_policies_but_only_the_person_changes_them(setup_app: Any) -> None:
+    """A runner may add session policies; changing or removing any policy needs the person.
 
-    A new policy can write session state that other policies read, so the
-    runner's token cannot add one, not even a sub-agent cost budget.
+    ``sys_add_policy`` and ``sys_session_send``'s sub-agent cost budget add
+    session policies with the runner's token (the owner accepted that a new
+    policy can write state other policies read). Default policies, which
+    ``sys_add_policy`` never creates, stay the person's alone.
     """
     admin, _alice, stores, _ = setup_app
     session_id = create_session(admin).json()["session_id"]
@@ -230,33 +232,40 @@ def test_policy_changes_need_the_person(setup_app: Any) -> None:
     assert admin.delete(default_url).status_code == 200
 
     session_policies = f"/v1/sessions/{session_id}/policies"
-    assert runner.post(session_policies, json=_policy_body("state-writer")).status_code == 403
-    added = admin.post(session_policies, json=_policy_body("person-gate"))
-    assert added.status_code == 200, added.text
-    session_url = f"{session_policies}/{added.json()['id']}"
-    assert runner.patch(session_url, json={"enabled": False}).status_code == 403
-    assert runner.delete(session_url).status_code == 403
-    assert admin.patch(session_url, json={"enabled": False}).status_code == 200
-    assert admin.delete(session_url).status_code == 200
-
+    added_by_tool = runner.post(session_policies, json=_policy_body("agent-proposed-gate"))
     budget = runner.post(
         session_policies,
+        # The body sys_session_send attaches to a new sub-agent.
         json={
             "name": "__subagent_cost_budget",
             "type": "python",
             "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
             "factory_params": {"max_cost_usd": 1.0},
+            "enabled": True,
         },
     )
-    assert budget.status_code == 403, budget.text
+    person_added = admin.post(session_policies, json=_policy_body("person-gate"))
+    assert added_by_tool.status_code == 200, added_by_tool.text
+    assert budget.status_code == 200, budget.text
+    assert person_added.status_code == 200, person_added.text
+    for created in (added_by_tool, budget, person_added):
+        policy_url = f"{session_policies}/{created.json()['id']}"
+        assert runner.patch(policy_url, json={"enabled": False}).status_code == 403
+        assert runner.delete(policy_url).status_code == 403
+        assert admin.patch(policy_url, json={"enabled": False}).status_code == 200
+        assert admin.delete(policy_url).status_code == 200
 
 
 def _bundle_upload(name: str) -> dict[str, Any]:
     return {"bundle": ("agent.tar.gz", build_agent_bundle(name=name), "application/gzip")}
 
 
-def test_agent_swaps_need_the_person(setup_app: Any) -> None:
-    """Replacing a session's agent or changing a user agent needs the person."""
+def test_session_agent_swap_needs_the_person_but_user_agents_do_not(setup_app: Any) -> None:
+    """Replacing a session's agent needs the person; a runner may manage user agents.
+
+    A user agent's bundle cannot drop installation-wide default or mandatory
+    policies: every engine appends them after the agent's own.
+    """
     _admin, alice, stores, _ = setup_app
     session_id = create_session(alice).json()["session_id"]
     runner = _delegated_runner(alice, stores, session_id)
@@ -265,13 +274,57 @@ def test_agent_swaps_need_the_person(setup_app: Any) -> None:
     assert runner.put(agent_url, files=_bundle_upload("review-agent")).status_code == 403
     assert alice.put(agent_url, files=_bundle_upload("review-agent")).status_code == 200
 
-    assert runner.post("/v1/agents", files=_bundle_upload("my-agent")).status_code == 403
-    installed = alice.post("/v1/agents", files=_bundle_upload("my-agent"))
+    installed = runner.post("/v1/agents", files=_bundle_upload("my-agent"))
     assert installed.status_code == 200, installed.text
     user_agent_url = f"/v1/agents/{installed.json()['id']}"
-    assert runner.patch(user_agent_url, json={"description": "changed"}).status_code == 403
-    assert runner.delete(user_agent_url).status_code == 403
-    assert alice.delete(user_agent_url).status_code == 200
+    config = runner.get(f"{user_agent_url}/config")
+    assert config.status_code == 200, config.text
+    edited = runner.patch(
+        user_agent_url,
+        json={"description": "changed"},
+        headers={"If-Match": config.headers["ETag"]},
+    )
+    assert edited.status_code == 200, edited.text
+    assert runner.delete(user_agent_url).status_code == 200
+
+
+def test_user_agent_from_a_runner_cannot_drop_default_policies(
+    setup_app: Any, tracker: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An installation-wide ASK still gates a session whose user agent a runner wrote."""
+    from omnigent.runtime import _globals
+
+    admin, _alice, stores, _ = setup_app
+    # Policy engines read stored default policies through the runtime's store.
+    monkeypatch.setattr(_globals, "_policy_store", stores["policy_store"])
+    home_session = create_session(admin).json()["session_id"]
+    runner = _delegated_runner(admin, stores, home_session)
+    default = admin.post(
+        "/v1/policies",
+        json={
+            "name": "approve-connected-accounts",
+            "type": "python",
+            "handler": _CEL_POLICY,
+            "factory_params": {"expression": _ASK_ON_TOOL_CALL},
+        },
+    )
+    assert default.status_code == 200, default.text
+
+    installed = runner.post("/v1/agents", files=_bundle_upload("runner-agent"))
+    assert installed.status_code == 200, installed.text
+    created = runner.post("/v1/sessions", json={"agent_id": installed.json()["id"]})
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    attached = runner.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "registry"},
+    )
+    assert attached.status_code == 200, attached.text
+
+    asked = _tools_call(runner, session_id)["result"]
+
+    assert asked["resultType"] == "input_required", asked
+    tracker.call_tool.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

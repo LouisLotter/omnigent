@@ -38,9 +38,6 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
-from omnigent.server.routes._auth_helpers import (
-    refuse_delegated_credential as _refuse_delegated_credential,
-)
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -409,7 +406,6 @@ def create_builtin_agents_router(
     ) -> AgentConfigObject | JSONResponse:
         """Patch only supplied fields; require the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
-        _refuse_delegated_credential(request, auth_provider, "change an agent")
         if if_match is None:
             return _config_error(428, "precondition_required", "If-Match is required")
         if len(request.headers.getlist("if-match")) != 1 or not (
@@ -532,8 +528,6 @@ def create_builtin_agents_router(
         :returns: The installed agent as an :class:`AgentObject`.
         """
         user_id = _require_user(request, auth_provider)
-        # A reinstall replaces the bundle, and its policies, of every session using the agent.
-        _refuse_delegated_credential(request, auth_provider, "change an agent")
         require_user_agents()
         if artifact_store is None:
             raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
@@ -582,7 +576,6 @@ def create_builtin_agents_router(
         :returns: ``{"id": agent_id, "deleted": True}``, or the 409 response.
         """
         user_id = _require_user(request, auth_provider)
-        _refuse_delegated_credential(request, auth_provider, "change an agent")
         require_user_agents()
         agent = await asyncio.to_thread(agent_store.get, agent_id)
         if agent is None or agent.operator_authored or agent.created_by != user_id:

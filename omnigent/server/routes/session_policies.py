@@ -178,12 +178,13 @@ def create_session_policies_router(
         :returns: The created policy as a serialized dict.
         :raises OmnigentError: 401/403 if the user lacks edit
             permission, 404 if the session is not found, or 409
-            if a policy with the same name already exists; 403 for a
-            delegated credential such as a runner's token.
+            if a policy with the same name already exists.
         """
         user_id = get_user_id(request, auth_provider)
-        # A new policy can write session state that other policies read.
-        refuse_delegated_credential(request, auth_provider, "change policies")
+        # Runners add policies (sys_add_policy, sub-agent cost budgets), so a
+        # delegated credential may create one. Accepted risk: a new policy can
+        # write session state that other policies read. Update and delete need
+        # the person.
         if permission_store is not None:
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
