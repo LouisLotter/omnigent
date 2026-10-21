@@ -6300,7 +6300,7 @@ async def _launch_runner_on_host_locked(
                 launch_future,
                 timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
             host_conn.pending_launches.pop(request_id, None)
@@ -7359,7 +7359,7 @@ async def _stop_session_host_runner(
                 future,
                 timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             _logger.warning(
                 "Host %s did not acknowledge stop of runner %s for session %s",
                 host_id,

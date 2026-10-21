@@ -213,6 +213,27 @@ async def _proxy_model_options(
         ) from exc
 
 
+def _unanswered_host_request(
+    host_id: str, operation: str, timeout_s: float, error: BaseException
+) -> HTTPException:
+    """
+    Report a host request that got no answer: a 504, since it may still have run.
+
+    :param host_id: The host, e.g. ``"host_a1b2..."``.
+    :param operation: The request, e.g. ``"install_harness"``.
+    :param timeout_s: The request's answer budget.
+    :param error: The timeout, or the disconnect that ended the wait early.
+    :returns: The exception to raise.
+    """
+    if isinstance(error, ConnectionError):
+        detail = (
+            f"host '{host_id}' disconnected before answering {operation}; it may have taken effect"
+        )
+    else:
+        detail = f"host '{host_id}' did not respond to {operation} within {timeout_s:.0f}s"
+    return HTTPException(status_code=504, detail=detail)
+
+
 async def _proxy_list_dir(
     *,
     host_registry: HostRegistry,
@@ -271,13 +292,9 @@ async def _proxy_list_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_LIST_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not respond to list_dir "
-                    f"within {_LIST_DIR_TIMEOUT_S:.0f}s"
-                ),
+        except (asyncio.TimeoutError, ConnectionError) as exc:
+            raise _unanswered_host_request(
+                host_conn.host_id, "list_dir", _LIST_DIR_TIMEOUT_S, exc
             ) from exc
     finally:
         # Cleanup runs on every path so a cancelled caller doesn't
@@ -331,13 +348,9 @@ async def _proxy_create_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not respond to create_dir "
-                    f"within {_CREATE_DIR_TIMEOUT_S:.0f}s"
-                ),
+        except (asyncio.TimeoutError, ConnectionError) as exc:
+            raise _unanswered_host_request(
+                host_conn.host_id, "create_dir", _CREATE_DIR_TIMEOUT_S, exc
             ) from exc
     finally:
         # Cleanup runs on every path so a cancelled caller doesn't
@@ -391,13 +404,9 @@ async def _proxy_install_harness(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_INSTALL_HARNESS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not respond to install_harness "
-                    f"within {_INSTALL_HARNESS_TIMEOUT_S:.0f}s"
-                ),
+        except (asyncio.TimeoutError, ConnectionError) as exc:
+            raise _unanswered_host_request(
+                host_conn.host_id, "install_harness", _INSTALL_HARNESS_TIMEOUT_S, exc
             ) from exc
     finally:
         # Cleanup runs on every path so a cancelled caller doesn't
@@ -445,13 +454,9 @@ async def _proxy_store_secret(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not respond to store_secret "
-                    f"within {_STORE_SECRET_TIMEOUT_S:.0f}s"
-                ),
+        except (asyncio.TimeoutError, ConnectionError) as exc:
+            raise _unanswered_host_request(
+                host_conn.host_id, "store_secret", _STORE_SECRET_TIMEOUT_S, exc
             ) from exc
     finally:
         host_conn.pending_secret_writes.pop(request_id, None)
@@ -487,13 +492,9 @@ async def _proxy_detect_credentials(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not respond to detect_credentials "
-                    f"within {_STORE_SECRET_TIMEOUT_S:.0f}s"
-                ),
+        except (asyncio.TimeoutError, ConnectionError) as exc:
+            raise _unanswered_host_request(
+                host_conn.host_id, "detect_credentials", _STORE_SECRET_TIMEOUT_S, exc
             ) from exc
     finally:
         host_conn.pending_credential_detects.pop(request_id, None)
@@ -1157,7 +1158,7 @@ def create_hosts_router(
                 future,
                 timeout=launch_timeout_s,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             conn.pending_launches.pop(request_id, None)
             # The result, or the launch itself, was lost: ask what happened
             # before reporting a failure for a runner that may be starting.

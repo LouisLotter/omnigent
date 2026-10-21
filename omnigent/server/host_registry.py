@@ -147,6 +147,64 @@ def _fail_pending_mcp_tools(conn: HostConnection) -> None:
 
 def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: str) -> None:
     """Fail inventory waiters on their owner loops and clear the retired map."""
+    _fail_pending_futures(pending, lambda: ConnectionError(f"host '{host_id}' disconnected"))
+
+
+class HostOperationOutcomeUnknownError(ConnectionError):
+    """The host may have carried out a request, but its tunnel closed before it answered."""
+
+
+# Requests that change something on the host: a lost answer leaves their
+# outcome unknown rather than failed.
+_MUTATING_PENDING_MAPS = (
+    "pending_launches",
+    "pending_stops",
+    "pending_create_worktrees",
+    "pending_remove_worktrees",
+    "pending_create_dirs",
+    "pending_installs",
+    "pending_secret_writes",
+    "pending_fs_requests",
+)
+# Requests that only read: a lost answer is a plain failure.
+_READ_PENDING_MAPS = (
+    "pending_runner_status",
+    "pending_quiesce",
+    "pending_stats",
+    "pending_list_dirs",
+    "pending_list_worktrees",
+    "pending_credential_detects",
+    "pending_model_options",
+)
+
+
+def _fail_pending_requests(conn: HostConnection) -> None:
+    """
+    Answer every request still waiting on a closed connection at once.
+
+    Without this, each waited out its own timeout (5 s to 420 s) for an
+    answer that can no longer arrive.
+
+    :param conn: The connection that was deregistered or replaced.
+    """
+    for name in _MUTATING_PENDING_MAPS:
+        _fail_pending_futures(
+            getattr(conn, name),
+            lambda: HostOperationOutcomeUnknownError(
+                f"host '{conn.host_id}' disconnected before answering; "
+                "the operation may have taken effect"
+            ),
+        )
+    for name in _READ_PENDING_MAPS:
+        _fail_pending_futures(
+            getattr(conn, name), lambda: ConnectionError(f"host '{conn.host_id}' disconnected")
+        )
+
+
+def _fail_pending_futures(
+    pending: dict[str, asyncio.Future[Any]], error: Callable[[], BaseException]
+) -> None:
+    """Fail waiters on their owner loops and clear the retired map."""
     try:
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -163,17 +221,16 @@ def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: st
             if owner_loop.is_closed():
                 continue
 
-            def settle(future: asyncio.Future[Any] = future, host_id: str = host_id) -> None:
+            def settle(future: asyncio.Future[Any] = future) -> None:
                 if not future.done():
-                    future.set_exception(ConnectionError(f"host '{host_id}' disconnected"))
+                    future.set_exception(error())
 
             if owner_loop is current_loop:
                 settle()
             else:
                 owner_loop.call_soon_threadsafe(settle)
         except RuntimeError:
-            # The owner loop can close between the check and scheduling. The
-            # pending map is already retired, so there is nothing to wake.
+            # The owner loop can close between the check and scheduling.
             continue
 
 
@@ -618,6 +675,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_requests(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -667,6 +725,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_requests(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:
