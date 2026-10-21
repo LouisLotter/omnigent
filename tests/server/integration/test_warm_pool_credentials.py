@@ -220,6 +220,7 @@ class _WarmCluster:
             host_id=host.host_id,
             name=host.name,
             user_id=host.user_id,
+            managed_token=payload["token"],
         )
         return ""
 

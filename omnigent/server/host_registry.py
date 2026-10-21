@@ -50,6 +50,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.stores.host_store import LAUNCH_TOKEN_ONLY_REFUSAL, HostRegistrationRefusedError
 
 _logger = logging.getLogger(__name__)
 
@@ -560,7 +561,9 @@ class HostRegistry:
 
         If ``(workspace_id, host_id)`` is already registered (stale
         connection), the old connection is replaced and its outbound
-        queue is poisoned with ``None`` so the sender loop exits.
+        queue is poisoned with ``None`` so the sender loop exits. A
+        connection without a launch token never replaces one that
+        registered with it.
 
         Scoping the key by workspace means the same stable ``host_id``
         (a laptop's config id) connecting to two workspaces is tracked
@@ -583,6 +586,8 @@ class HostRegistry:
             the default-public policy can treat it as a genuine sandbox.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
+        :raises HostRegistrationRefusedError: When a connection without a
+            launch token would replace one registered with it.
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         host_id = _canonical_host_id(host_id)
@@ -603,6 +608,10 @@ class HostRegistry:
         with self._lock:
             key = (ws_id, host_id)
             old = self._hosts.get(key)
+            # A bearer registration that raced the host's arming must not displace it.
+            displaces_launch_token = old is not None and old.registered_with_managed_token
+            if displaces_launch_token and not registered_with_managed_token:
+                raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
             if old is not None:
                 _logger.info(
                     "replacing stale host connection: ws=%s host=%s",

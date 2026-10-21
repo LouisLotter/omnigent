@@ -11,6 +11,7 @@ import pytest
 from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.stores.host_store import HostRegistrationRefusedError
 
 
 @dataclass
@@ -383,6 +384,43 @@ def test_register_replaces_stale_connection() -> None:
     # The None sentinel tells the sender loop to exit.
     poison = old_conn.outbound_queue.get_nowait()
     assert poison is None
+
+
+@pytest.mark.parametrize(
+    ("old_has_token", "new_has_token", "replaces"),
+    [(True, False, False), (True, True, True), (False, True, True), (False, False, True)],
+)
+def test_bearer_connection_never_replaces_a_launch_token_connection(
+    old_has_token: bool, new_has_token: bool, replaces: bool
+) -> None:
+    """Newest wins, except that a bearer connection cannot displace a launch-token one."""
+    registry = HostRegistry()
+    old_conn = registry.register(
+        "host_eee",
+        FakeWebSocket(),
+        _make_hello(),
+        "erin",
+        registered_with_managed_token=old_has_token,
+    )
+
+    def register_new() -> object:
+        return registry.register(
+            "host_eee",
+            FakeWebSocket(),
+            _make_hello(),
+            "erin",
+            registered_with_managed_token=new_has_token,
+        )
+
+    if replaces:
+        new_conn = register_new()
+        assert registry.get("host_eee") is new_conn
+        return
+    with pytest.raises(HostRegistrationRefusedError):
+        register_new()
+    assert registry.get("host_eee") is old_conn
+    assert old_conn.outbound_queue.empty()
+    assert old_conn.retirement_reason is None
 
 
 def test_send_text_enqueues_frame() -> None:

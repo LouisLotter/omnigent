@@ -2518,6 +2518,7 @@ async def test_launch_success_registers_host_and_returns_workspace(
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -2574,7 +2575,10 @@ async def test_launch_threads_agent_name_only_to_a_classifying_launcher(db_uri: 
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register)
@@ -2599,7 +2603,10 @@ async def test_launch_never_passes_agent_name_to_a_non_classifying_launcher(db_u
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -2624,7 +2631,10 @@ async def test_relaunch_threads_agent_name_to_classifying_start_host(db_uri: str
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register)
@@ -2686,6 +2696,7 @@ async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register, can_resume=True)
@@ -2729,6 +2740,7 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -2753,6 +2765,7 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     class _LegacySignatureLauncher(FakeSandboxLauncher):
@@ -2808,6 +2821,7 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _AcmeLauncher(on_host_start=_register)
@@ -2965,6 +2979,7 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -3075,7 +3090,9 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
             self._host_store.resolve_launch_token(host_id, token) is not None
         )
         # Simulate the host's entrypoint dialing back over the tunnel.
-        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, user_id=_OWNER)
+        self._host_store.upsert_on_connect(
+            host_id=host_id, name=host_name, user_id=_OWNER, managed_token=token
+        )
         # One repo → its clone dir; none or several → the workspace parent.
         return (
             f"/home/omnigent/workspace/{repos[0].repo_name}"
@@ -3160,6 +3177,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _ReusedIdFakeLauncher(on_host_start=_register)
@@ -3221,6 +3239,7 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -3274,6 +3293,7 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -3749,6 +3769,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _WorkspaceObservingIsloFake(on_host_start=_register, can_resume=True)
@@ -3800,6 +3821,7 @@ async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
@@ -3828,7 +3850,10 @@ async def test_resume_threads_agent_name_to_classifying_start_host(db_uri: str) 
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register, can_resume=True)
@@ -3858,7 +3883,10 @@ async def test_resume_never_passes_agent_name_to_a_non_classifying_launcher(
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
@@ -3880,7 +3908,10 @@ async def test_resume_without_a_classifier_leaves_the_woken_runner_unstamped(
 
     def _register(invocation: HostStartInvocation) -> None:
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     fake = _ClassifyingFakeSandboxLauncher(on_host_start=_register, can_resume=True)
@@ -3918,6 +3949,7 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
         host_id="62d4405ba38711fe34bebfeb5a7adaf2",
         name="managed-resume-force",
         user_id=_OWNER,
+        managed_token="tok-resume-force",
     )
     assert host_store.is_online("62d4405ba38711fe34bebfeb5a7adaf2") is True
     fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
@@ -4637,6 +4669,7 @@ async def test_launch_uses_requested_provider(db_uri: str) -> None:
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     alpha = _AlphaLauncher(on_host_start=_register)
@@ -4689,6 +4722,7 @@ async def test_launch_defaults_to_first_provider(db_uri: str) -> None:
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
+            managed_token=invocation.token,
         )
 
     alpha = _AlphaLauncher(on_host_start=_register)
@@ -5949,7 +5983,9 @@ async def test_account_deleted_after_provision_terminates_unregistered_sandbox(d
     hosts = HostStore(db_uri)
 
     def connect(invocation):
-        hosts.upsert_on_connect(invocation.host_id, invocation.host_name, _OWNER)
+        hosts.upsert_on_connect(
+            invocation.host_id, invocation.host_name, _OWNER, managed_token=invocation.token
+        )
 
     fake = FakeSandboxLauncher(on_host_start=connect)
     config = _injected_config(fake)

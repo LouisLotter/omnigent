@@ -1324,6 +1324,11 @@ class SqlHost(OmnigentBase):
     :param start_failure: Person-readable reason a persistent host's last
         start failed, e.g. ``"provider refused: capacity"``. ``NULL`` once a
         start succeeds.
+    :param launch_token_only: ``True`` once the server has armed or reserved
+        the host as a managed host: its tunnel registers only with its launch
+        token, never with an owner's bearer. Nothing clears it, so a managed
+        host whose token was revoked, expired or detached fails closed.
+        ``False`` for user-connected hosts and self-registering sandboxes.
     :param deleted_at: Logical deletion timestamp for a managed host whose
         provider sandbox cleanup is still pending. The row is physically
         removed after every recorded sandbox id terminates successfully.
@@ -1365,6 +1370,10 @@ class SqlHost(OmnigentBase):
     lifecycle: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     sleep_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     start_failure: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # The server default keeps rows written by older application versions compatible.
+    launch_token_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
