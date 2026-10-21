@@ -102,6 +102,46 @@ async def test_resent_message_is_answered_as_a_duplicate(harness: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_after_the_turn_ended_leaves_the_session_idle() -> None:
+    """A resend answered as a duplicate starts no turn bookkeeping."""
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = SessionResourceRegistry()
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=registry,
+    )
+    session_id = "c" * 32
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "once"}],
+        "harness": "openai-agents",
+        "stable_id": "e" * 32,
+    }
+    async with _runner_client(app) as client:
+        await client.post(f"/v1/sessions/{session_id}/events", json=body)
+        for _ in range(200):
+            if session_id not in app.state.active_turns:
+                break
+            await asyncio.sleep(0.01)
+        epoch = registry.session_activity_epoch(session_id)
+        resent = await client.post(f"/v1/sessions/{session_id}/events", json=body)
+
+    assert resent.json()["status"] == "duplicate"
+    assert registry.session_activity_epoch(session_id) == epoch
+    assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
 async def test_message_the_harness_refused_runs_when_resent() -> None:
     """A message that never reached the harness is not remembered as accepted."""
 

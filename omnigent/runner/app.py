@@ -6338,6 +6338,21 @@ def create_runner_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    def _duplicate_message_response(conversation_id: str) -> JSONResponse:
+        """Answer a message this runner already accepted, whose first answer was lost."""
+        _logger.info(
+            "post_session_events: duplicate message not run again conv=%s",
+            conversation_id,
+            extra={"session_id": conversation_id},
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": DUPLICATE_MESSAGE_STATUS,
+                "detail": "Message already accepted; not run again.",
+            },
+        )
+
     @app.post("/v1/sessions/{conversation_id}/events")
     async def post_session_events(
         conversation_id: str,
@@ -6506,6 +6521,9 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            if _accepted_messages.seen(conversation_id, message_body):
+                # Answered before any turn bookkeeping: nothing new starts.
+                return _duplicate_message_response(conversation_id)
 
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
@@ -6521,19 +6539,8 @@ def create_runner_app(
                     await _cond.wait()
             try:
                 if _accepted_messages.seen(conversation_id, message_body):
-                    # The first delivery's answer was lost and the server sent it again.
-                    _logger.info(
-                        "post_session_events: duplicate message not run again conv=%s",
-                        conversation_id,
-                        extra={"session_id": conversation_id},
-                    )
-                    return JSONResponse(
-                        status_code=202,
-                        content={
-                            "status": DUPLICATE_MESSAGE_STATUS,
-                            "detail": "Message already accepted; not run again.",
-                        },
-                    )
+                    # A concurrent delivery of the same message was accepted first.
+                    return _duplicate_message_response(conversation_id)
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
