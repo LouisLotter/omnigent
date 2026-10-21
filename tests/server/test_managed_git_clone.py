@@ -82,7 +82,10 @@ async def test_policy_reaches_launch_relaunch_and_missing_workspace_wake(db_uri:
 
     def connected(invocation: HostStartInvocation) -> None:
         store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id="alice"
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id="alice",
+            managed_token=invocation.token,
         )
 
     fake = FakeSandboxLauncher(on_host_start=connected, can_resume=True)
@@ -121,7 +124,10 @@ async def test_unsupported_policy_rejected_before_lifecycle_changes(
 
     def connected(invocation: HostStartInvocation) -> None:
         store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id="alice"
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id="alice",
+            managed_token=invocation.token,
         )
 
     fake = NativeLauncher(on_host_start=connected, can_resume=True)

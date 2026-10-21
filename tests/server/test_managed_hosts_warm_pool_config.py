@@ -159,7 +159,10 @@ async def test_request_context_precedes_launch_relaunch_and_resume(db_uri: str) 
         owner = host_store.resolve_launch_token(invocation.host_id, invocation.token)
         assert owner is not None and owner.user_id == "pool-user"
         host_store.upsert_on_connect(
-            host_id=invocation.host_id, name=invocation.host_name, user_id="pool-user"
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id="pool-user",
+            managed_token=invocation.token,
         )
 
     launcher = ContextLauncher(on_host_start=register, can_resume=True)

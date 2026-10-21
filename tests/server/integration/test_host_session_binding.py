@@ -1308,6 +1308,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
         host_id="40bb7200abc8ed27d5b2fcbfad8e89d2",
         name="managed-stale-live-islo",
         user_id=RESERVED_USER_LOCAL,
+        managed_token="tok-stale-live-islo",
     )
     conv = conv_store.create_conversation(
         agent_id=None,
@@ -1375,6 +1376,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         host_id="055e31f38d07908f171ebad4ff5cbe9c",
         name="managed-stale-tunnel-islo",
         user_id=RESERVED_USER_LOCAL,
+        managed_token="tok-stale-tunnel-islo",
     )
     conv = conv_store.create_conversation(
         agent_id=None,
