@@ -555,7 +555,11 @@ async def test_requests_on_a_superseded_connection_hold_the_sleep(
     assert host.connect()  # the host reconnects; the old connection is superseded
     assert host.registry.get(HOST_ID) is not old
     assert await persistent_hosts.sleep_if_idle(HOST_ID) == "abandoned"
-    old.pending_launches.clear()
+    # The launch's waiter was answered at once, but the host may still be
+    # launching: it keeps counting until its hold expires.
+    assert old.pending_launches == {}
+    assert "launch-1" in old.inflight_unanswered
+    old.inflight_unanswered.clear()
     assert await persistent_hosts.sleep_if_idle(HOST_ID) == "stopped"
 
 

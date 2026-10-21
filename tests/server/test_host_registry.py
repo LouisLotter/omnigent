@@ -682,3 +682,5 @@ async def test_closed_connection_answers_every_waiting_request_with_its_outcome(
             name in _MUTATING_PENDING_MAPS
         ), name
         assert getattr(conn, name) == {}
+    # A host-changing request may still be running there: it keeps counting.
+    assert set(conn.inflight_unanswered) == {"req_1"}

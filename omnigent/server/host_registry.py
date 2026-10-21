@@ -178,15 +178,23 @@ _READ_PENDING_MAPS = (
 )
 
 
+# How long an operation whose answer was lost keeps counting as in flight: the
+# longest host operation budget (a harness install, 420 s).
+UNANSWERED_OPERATION_HOLD_S = 420.0
+
+
 def _fail_pending_requests(conn: HostConnection) -> None:
     """
     Answer every request still waiting on a closed connection at once.
 
     Without this, each waited out its own timeout (5 s to 420 s) for an
-    answer that can no longer arrive.
+    answer that can no longer arrive. An operation that changes the host may
+    still be running there, so it stays in ``inflight_unanswered`` for
+    :data:`UNANSWERED_OPERATION_HOLD_S`.
 
     :param conn: The connection that was deregistered or replaced.
     """
+    _hold_unanswered_operations(conn)
     for name in _MUTATING_PENDING_MAPS:
         _fail_pending_futures(
             getattr(conn, name),
@@ -199,6 +207,23 @@ def _fail_pending_requests(conn: HostConnection) -> None:
         _fail_pending_futures(
             getattr(conn, name), lambda: ConnectionError(f"host '{conn.host_id}' disconnected")
         )
+
+
+def _hold_unanswered_operations(conn: HostConnection) -> None:
+    """Keep the closed connection's unanswered host-changing requests counted as in flight."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    now = time.monotonic()
+    for name in _MUTATING_PENDING_MAPS:
+        for request_id, future in getattr(conn, name).items():
+            if future.done() or request_id in conn.inflight_unanswered:
+                continue
+            conn.inflight_unanswered[request_id] = now
+            loop.call_later(
+                UNANSWERED_OPERATION_HOLD_S, conn.inflight_unanswered.pop, request_id, None
+            )
 
 
 def _fail_pending_futures(
@@ -444,6 +469,11 @@ class HostConnection:
         npm's non-race-safe global writes never run twice at once. Keyed by
         the resolved install key (not ``request_id``) and cleared when the
         install completes.
+    :param inflight_unanswered: Request ids of operations that changed the host
+        and lost their answer when this connection closed, mapped to when they
+        were given up. The host may still be carrying them out, so they keep
+        counting as in flight (a sleep fence waits for them) until the longest
+        operation budget has passed.
     :param pending_secret_writes: Per-``request_id`` futures for in-flight
         ``host.store_secret`` requests (a UI-driven harness credential write).
         Resolved when the host sends ``host.store_secret_result``. Values carry
@@ -525,6 +555,7 @@ class HostConnection:
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    inflight_unanswered: dict[str, float] = field(default_factory=dict)
     pending_secret_writes: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
