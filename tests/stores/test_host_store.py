@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,6 +16,7 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores import host_store as host_store_module
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
@@ -1958,8 +1960,74 @@ def test_laptop_named_like_a_managed_host_gets_a_clean_refusal(host_store: HostS
     assert "Rename this host" in str(refusal.value)
 
     assert host_store.upsert_on_connect(_LAPTOP_ID, "alices-laptop", _OWNER).status == "online"
-    other_owner = "e0d1c2b3a4954687a8b9c0d1e2f3a4b5"
-    assert host_store.upsert_on_connect(other_owner, _MANAGED_NAME, "bob@example.com")
+    bobs_host = "e0d1c2b3a4954687a8b9c0d1e2f3a4b5"
+    assert host_store.upsert_on_connect(bobs_host, _MANAGED_NAME, "bob@example.com")
+
+
+@pytest.mark.parametrize(("state", "retryable"), [("armed", False), ("deleted", True)])
+def test_known_laptop_renamed_like_a_managed_host_gets_a_clean_refusal(
+    host_store: HostStore, state: str, retryable: bool
+) -> None:
+    """A registered laptop reconnecting under a taken name keeps its row and is told why."""
+    laptop = host_store.upsert_on_connect(_LAPTOP_ID, "alices-laptop", _OWNER)
+    _managed_host_in_state(host_store, state)
+
+    with pytest.raises(HostRegistrationRefusedError) as refusal:
+        host_store.upsert_on_connect(_LAPTOP_ID, _MANAGED_NAME, _OWNER)
+
+    assert refusal.value.retryable is retryable
+    assert host_store.get_host(_LAPTOP_ID) == laptop
+
+
+def test_rotation_keeps_the_name_holder_locked_against_a_concurrent_arming(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An arming that races a bearer rotation waits for it, then finds no row to arm.
+
+    SQLite serializes writers anyway; on PostgreSQL and MySQL this relies on the row lock.
+    """
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="sb-1")
+    assert bound is not None
+    checked, release = threading.Event(), threading.Event()
+    refuse_name_takeover = host_store_module._refuse_name_takeover
+
+    def pause_after_check(row: SqlHost) -> None:
+        refuse_name_takeover(row)
+        checked.set()
+        release.wait(10)
+
+    monkeypatch.setattr(host_store_module, "_refuse_name_takeover", pause_after_check)
+    workspace_id = current_workspace_id()
+
+    def rotate() -> Host:
+        with workspace_scope(workspace_id):
+            return host_store.upsert_on_connect(_LAPTOP_ID, "managed-host", "alice@example.test")
+
+    def arm() -> Host | None:
+        with workspace_scope(workspace_id):
+            return host_store.rearm_managed_host(
+                _RESERVED_HOST_ID,
+                sandbox_id="sb-1",
+                expected_updated_at=bound.updated_at,
+                token="armed-token",
+                token_expires_at=now_epoch() + 3600,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rotation = executor.submit(rotate)
+        assert checked.wait(10)
+        arming = executor.submit(arm)
+        try:
+            time.sleep(0.5)
+            assert not arming.done()
+        finally:
+            release.set()
+        rotated = rotation.result(timeout=30)
+        assert arming.result(timeout=30) is None
+
+    assert (rotated.host_id, rotated.launch_token_only) == (_LAPTOP_ID, False)
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
 
 
 @pytest.mark.parametrize("deleted_kind", ["managed", "self-registering"])

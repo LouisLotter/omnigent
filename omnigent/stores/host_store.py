@@ -239,6 +239,24 @@ def _identity_holder(host_id: str, user_id: str, name: str) -> Select[tuple[str]
     )
 
 
+def _lock_name_holder(session: Session, user_id: str, name: str) -> SqlHost | None:
+    """Lock and freshly read the row holding *name* for *user_id*, deleted hosts included.
+
+    Names are unique per owner. The lock keeps a concurrent arming from changing
+    the row between this check and the caller's write.
+    """
+    return session.execute(
+        select(SqlHost)
+        .where(
+            SqlHost.workspace_id == current_workspace_id(),
+            SqlHost.user_id == user_id,
+            SqlHost.name == name,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+
+
 def _refuse_name_takeover(row: SqlHost) -> None:
     """Refuse a bearer registration under a name a deleted or managed host holds.
 
@@ -434,6 +452,10 @@ class HostStore:
                         params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
                     )
+                if (row.user_id, row.name) != (user_id, name):
+                    holder = _lock_name_holder(session, user_id, name)
+                    if holder is not None and holder is not row:
+                        _refuse_name_takeover(holder)
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
                 row.user_id = user_id
@@ -462,14 +484,7 @@ class HostStore:
                 if reowned is not None:
                     return reowned
 
-            # Names are unique per owner, deleted hosts included.
-            existing_by_name = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.user_id == user_id,
-                    SqlHost.name == name,
-                )
-            ).scalar_one_or_none()
+            existing_by_name = _lock_name_holder(session, user_id, name)
             if existing_by_name is not None:
                 _refuse_name_takeover(existing_by_name)
                 # Same (user_id, name), different host_id: identity rotation.
@@ -650,11 +665,14 @@ class HostStore:
             *host_id* (caller falls through to a normal insert).
         """
         existing = session.execute(
-            select(SqlHost).where(
+            select(SqlHost)
+            .where(
                 SqlHost.workspace_id == current_workspace_id(),
                 SqlHost.host_id == host_id,
                 SqlHost.deleted_at.is_(None),
             )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         ).scalar_one_or_none()
         if existing is None:
             return None

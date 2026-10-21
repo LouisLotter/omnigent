@@ -1757,7 +1757,12 @@ async def _refused_after_hello(
 ) -> HostConnectionErrorFrame:
     """Send a hello on an accepted tunnel and return the server's refusal frame."""
     await communicator.send_input({"type": "websocket.receive", "text": _make_hello(name=name)})
-    sent = await communicator.receive_output(timeout=budget(1.0))
+    return await _registration_refusal(communicator)
+
+
+async def _registration_refusal(communicator: ApplicationCommunicator) -> HostConnectionErrorFrame:
+    """Return the refusal frame the server sends before closing with 4009."""
+    sent = await communicator.receive_output(timeout=budget(2.0))
     assert sent["type"] == "websocket.send", sent
     refusal = decode_host_frame(sent["text"])
     assert isinstance(refusal, HostConnectionErrorFrame)
@@ -1809,13 +1814,69 @@ async def test_refused_bearer_never_replaces_live_managed_connection(db_uri: str
     await managed.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+async def test_bearer_that_raced_arming_never_displaces_the_launch_token_host(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bearer stalled after registering an unmarked row loses to the host armed meanwhile."""
+    app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
+    assert store.reserve_sandbox_host(
+        host_id=_HOST_ID, name="sandbox", user_id="alice@example.com", provider="modal"
+    )
+    assert store.bind_sandbox(_HOST_ID, provider="modal", sandbox_id="sb-first")
+    stored, release = threading.Event(), threading.Event()
+    upsert_on_connect = store.upsert_on_connect
+
+    def stall_bearer_after_store(*args: object, **kwargs: object) -> object:
+        host = upsert_on_connect(*args, **kwargs)
+        if kwargs.get("managed_token") is None:
+            stored.set()
+            release.wait(budget(5.0))
+        return host
+
+    monkeypatch.setattr(store, "upsert_on_connect", stall_bearer_after_store)
+    try:
+        bearer = await _connect_route(app, _TUNNEL_PATH)
+        await bearer.send_input({"type": "websocket.receive", "text": _make_hello(name="sandbox")})
+        assert await asyncio.to_thread(stored.wait, budget(5.0))
+        armed = store.replace_managed_host_sandbox(
+            host_id=_HOST_ID,
+            user_id="alice@example.com",
+            token="tunnel-token-armed",
+            provider="modal",
+            sandbox_id="sb-second",
+            token_expires_at=now_epoch() + 3600,
+        )
+        assert armed is not None and armed.launch_token_only
+        managed = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, "tunnel-token-armed"))
+        await managed.send_input({"type": "websocket.connect"})
+        assert (await managed.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+        await _send_hello_and_wait(managed, registry, name="sandbox")
+        live = registry.get(_HOST_ID)
+        assert live is not None and live.registered_with_managed_token
+    finally:
+        release.set()
+
+    refusal = await _registration_refusal(bearer)
+
+    assert (refusal.stage, refusal.retryable) == ("registry", False)
+    assert registry.get(_HOST_ID) is live
+    host = store.get_host(_HOST_ID)
+    assert host is not None and host.status == "online"
+    await managed.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("known_laptop", [False, True])
 @pytest.mark.parametrize(("state", "retryable"), [("armed", False), ("deleted", True)])
 async def test_laptop_named_like_a_managed_host_gets_a_clean_refusal(
-    db_uri: str, caplog: pytest.LogCaptureFixture, state: str, retryable: bool
+    db_uri: str, caplog: pytest.LogCaptureFixture, state: str, retryable: bool, known_laptop: bool
 ) -> None:
     """A colliding name is reported to the laptop's operator, not raised as a server fault."""
     app, registry, store = _owned_app(db_uri, authed_user="alice@example.com")
     _managed_host_in_state(store, state)
+    if known_laptop:
+        store.upsert_on_connect(_OTHER_HOST_ID, "alices-laptop", "alice@example.com")
+        store.set_offline(_OTHER_HOST_ID)
+    before = store.get_host(_OTHER_HOST_ID)
     caplog.set_level(logging.WARNING, logger="omnigent.server.routes.host_tunnel")
 
     laptop = await _connect_route(app, f"/v1/hosts/{_OTHER_HOST_ID}/tunnel")
@@ -1825,7 +1886,7 @@ async def test_laptop_named_like_a_managed_host_gets_a_clean_refusal(
     assert refusal.retryable is retryable
     assert _MANAGED_NAME in refusal.error
     assert registry.get(_OTHER_HOST_ID) is None
-    assert store.get_host(_OTHER_HOST_ID) is None
+    assert store.get_host(_OTHER_HOST_ID) == before
     assert not [record for record in caplog.records if record.exc_info]
 
 
