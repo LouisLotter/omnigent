@@ -22,7 +22,6 @@ it raise the deadline or disable it.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import logging
 import math
@@ -57,14 +56,16 @@ class _TunnelSocket(Protocol):
 class TunnelSilenceTimeoutError(ConnectionClosedError):
     """No message arrived within the silence deadline, so the socket was aborted.
 
-    A :class:`~websockets.exceptions.ConnectionClosedError` with no close frame
-    either way, so reconnect paths treat it like any other abnormal drop.
+    A :class:`~websockets.exceptions.ConnectionClosedError` carrying whatever
+    close frames the aborted connection saw, so reconnect paths treat it like
+    any other abnormal drop and still see a server's close code.
 
     :param silent_s: Seconds without a message, deadline plus grace, e.g. ``46.0``.
+    :param closed: The error the aborted connection raised.
     """
 
-    def __init__(self, silent_s: float) -> None:
-        super().__init__(None, None)
+    def __init__(self, silent_s: float, closed: ConnectionClosed) -> None:
+        super().__init__(closed.rcvd, closed.sent, closed.rcvd_then_sent)
         self.silent_s = silent_s
 
     def __str__(self) -> str:
@@ -141,7 +142,8 @@ async def recv_within_silence_deadline(
     ws.transport.abort()
     # Let the aborted connection close; a message queued in the last loop pass
     # is dropped with it.
-    with contextlib.suppress(ConnectionClosed):
-        while True:
+    while True:
+        try:
             await ws.recv()
-    raise TunnelSilenceTimeoutError(timeout_s + grace)
+        except ConnectionClosed as exc:
+            raise TunnelSilenceTimeoutError(timeout_s + grace, exc) from exc

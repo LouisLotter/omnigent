@@ -13,12 +13,14 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, suppress
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import ServerConnection, serve
-from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+from websockets.frames import Close
 from websockets.protocol import State
 from websockets.sync.server import ServerConnection as ThreadPeerConnection
 from websockets.sync.server import serve as serve_in_thread
@@ -255,6 +257,24 @@ async def test_message_queued_before_a_loss_restarts_the_deadline() -> None:
         with pytest.raises(TunnelSilenceTimeoutError):
             await recv_within_silence_deadline(ws, _DEADLINE_S, grace_s=_GRACE_S)
         assert time.monotonic() - read_at >= _DEADLINE_S + _GRACE_S
+
+
+async def test_silence_error_keeps_the_close_the_server_sent() -> None:
+    """A close whose TCP shutdown stalls past the grace read keeps its code for the caller."""
+    rejected = Close(4002, "unsupported frame protocol")
+
+    class _ClosingSocket:
+        def __init__(self) -> None:
+            self.aborted = asyncio.Event()
+            self.transport = SimpleNamespace(abort=self.aborted.set)
+
+        async def recv(self) -> Data:
+            await self.aborted.wait()
+            raise ConnectionClosedError(rejected, None)
+
+    with pytest.raises(TunnelSilenceTimeoutError) as raised:
+        await recv_within_silence_deadline(_ClosingSocket(), _DEADLINE_S, grace_s=_GRACE_S)
+    assert raised.value.rcvd == rejected
 
 
 async def test_disabled_deadline_waits_like_recv() -> None:
