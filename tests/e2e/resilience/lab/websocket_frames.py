@@ -40,7 +40,7 @@ class FrameSplitter:
     :param response_head: Whether the stream starts with the server's response
         head. It is held until complete, then passed through; frames follow only
         if it accepted a WebSocket upgrade, and otherwise every later byte
-        passes through as it is.
+        passes through as it is. A head over 16 KiB is never treated as one.
     """
 
     def __init__(self, *, response_head: bool) -> None:
@@ -69,7 +69,7 @@ class FrameSplitter:
             if end < 0 and len(self._buffer) <= _HEAD_LIMIT:
                 return b"", []
             self._in_head = False
-            if end >= 0:
+            if 0 <= end <= _HEAD_LIMIT - 4:
                 head = bytes(self._buffer[: end + 4])
                 del self._buffer[: end + 4]
                 self.upgraded = _SWITCHING_PROTOCOLS.match(head) is not None
@@ -82,6 +82,19 @@ class FrameSplitter:
         while (frame := self._next_frame()) is not None:
             frames.append(frame)
         return head, frames
+
+    def flush_head(self) -> bytes:
+        """Give up on an unfinished response head, for example at end of stream.
+
+        :returns: The buffered head bytes, to forward as they are; from now on
+            everything passes through.
+        """
+        if not self._in_head:
+            return b""
+        self._in_head = False
+        self._passthrough = True
+        pending, self._buffer = bytes(self._buffer), bytearray()
+        return pending
 
     def _next_frame(self) -> Frame | None:
         buffer = self._buffer

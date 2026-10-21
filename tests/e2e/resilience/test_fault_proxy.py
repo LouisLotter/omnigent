@@ -552,32 +552,28 @@ def test_frame_splitter_finds_a_head_cut_anywhere() -> None:
     [
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
         b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n",
+        _UPGRADE_HEAD.replace(b"\r\n\r\n", b"\r\nX-Padding: " + b"p" * 17_000 + b"\r\n\r\n"),
     ],
-    ids=["plain-response", "other-upgrade"],
+    ids=["plain-response", "other-upgrade", "oversized-upgrade"],
 )
 def test_frame_splitter_passes_other_responses_through(head: bytes) -> None:
-    splitter = FrameSplitter(response_head=True)
     body = b"\x81\x7fnot a frame"
-    passthrough, frames = _split_feed(splitter, head + body, [5, len(head) + 2])
-    assert (passthrough, frames) == (head + body, [])
-    assert not splitter.websocket
-    assert splitter.upgraded == head.startswith(b"HTTP/1.1 101")
+    for cuts in ([], [5, len(head) + 2], [16_385]):
+        splitter = FrameSplitter(response_head=True)
+        passthrough, frames = _split_feed(splitter, head + body, cuts)
+        assert (passthrough, frames) == (head + body, []), cuts
+        assert not splitter.websocket, cuts
 
 
-def test_ping_only_catches_a_websocket_whose_response_head_was_split(
-    loop_thread: LoopThread,
-) -> None:
-    """The upgrade is recognised however the server's response is segmented."""
-    received: list[bytes] = []
+def _start_scripted_upstream(loop: LoopThread, reply: list[bytes], received: list[bytes]) -> int:
+    """Answer the first request with *reply*, one write per piece, then record the rest."""
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.readuntil(b"\r\n\r\n")
-        cut = _UPGRADE_HEAD.index(b"Upgrade")
-        writer.write(_UPGRADE_HEAD[:cut])
-        await writer.drain()
-        await asyncio.sleep(0.05)
-        writer.write(_UPGRADE_HEAD[cut:] + encode_frame(OP_TEXT, b"hello", masked=False))
-        await writer.drain()
+        for piece in reply:
+            writer.write(piece)
+            await writer.drain()
+            await asyncio.sleep(0.05)
         while data := await reader.read(65536):
             received.append(data)
         writer.close()
@@ -586,19 +582,46 @@ def test_ping_only_catches_a_websocket_whose_response_head_was_split(
         server = await asyncio.start_server(_handle, "127.0.0.1", 0)
         return int(server.sockets[0].getsockname()[1])
 
-    proxy = _proxy_to(loop_thread, loop_thread.run(_start()))
-    request = (
-        b"GET /v1/hosts/h1/tunnel HTTP/1.1\r\nHost: x\r\n"
-        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    return loop.run(_start())
+
+
+def _recv_exactly(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = _recv(sock)
+        assert chunk, f"connection ended after {data!r}"
+        data += chunk
+    return data
+
+
+@pytest.mark.parametrize(
+    "cut", [10, _UPGRADE_HEAD.index(b"Upgrade")], ids=["in-status-line", "in-headers"]
+)
+def test_ping_only_catches_a_websocket_however_its_handshake_is_segmented(
+    loop_thread: LoopThread, cut: int
+) -> None:
+    received: list[bytes] = []
+    hello = encode_frame(OP_TEXT, b"hello", masked=False)
+    port = _start_scripted_upstream(
+        loop_thread, [_UPGRADE_HEAD[:cut], _UPGRADE_HEAD[cut:] + hello], received
     )
-    with contextlib.closing(_connect(proxy, request)) as sock:
-        expected = _UPGRADE_HEAD + encode_frame(OP_TEXT, b"hello", masked=False)
-        reply = b""
-        while len(reply) < len(expected):
-            reply += _recv(sock)
-        assert reply == expected
+    proxy = _proxy_to(loop_thread, port)
+    with contextlib.closing(_connect(proxy, b"GET /v1/hosts/h1/tunnel HTTP/1.1\r\n")) as sock:
+        time.sleep(0.05)
+        sock.sendall(b"Host: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        assert _recv_exactly(sock, len(_UPGRADE_HEAD + hello)) == _UPGRADE_HEAD + hello
         assert proxy.ping_only({"host.tunnel"}) == 1
         sock.sendall(encode_frame(OP_TEXT, b"dropped", masked=True))
         sock.sendall(encode_frame(OP_PING, b"are you there", masked=True))
         assert _recv(sock) == encode_frame(OP_PONG, b"are you there", masked=False)
     assert received == []
+
+
+def test_response_head_cut_short_still_reaches_the_client(loop_thread: LoopThread) -> None:
+    partial = b"HTTP/1.1 200 OK\r\nContent-Ty"
+    port = _start_scripted_upstream(loop_thread, [partial], [])
+    proxy = _proxy_to(loop_thread, port)
+    with contextlib.closing(_connect(proxy, _HTTP.replace(b"POST", b"GET"))) as sock:
+        sock.shutdown(socket.SHUT_WR)
+        assert _recv_exactly(sock, len(partial)) == partial
+        assert _recv(sock) == b""

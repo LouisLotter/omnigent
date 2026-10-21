@@ -967,6 +967,10 @@ class FaultProxy:
                     self._end(conn, rst=True, reason="peer_reset")
                     return
                 if not data:
+                    if not upstream and conn.frames_s2c is not None:
+                        # A response cut short still reaches the client as it was.
+                        with contextlib.suppress(Exception):
+                            writer.write(conn.frames_s2c.flush_head())
                     # Propagate a half-close; a TLS-intercepted client cannot
                     # half-close, so end the whole connection instead of leaving
                     # it open with no upstream behind it.
