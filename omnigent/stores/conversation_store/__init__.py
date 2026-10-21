@@ -1176,7 +1176,8 @@ class ConversationStore(ABC):
 
         The comparison and the write are one transaction, so a concurrent
         writer that changed an expected label makes this call a no-op
-        instead of being overwritten.
+        instead of being overwritten, and one that writes an expected label
+        meanwhile lands after it.
 
         :param conversation_id: The conversation to update, e.g. ``"conv_abc123"``.
         :param updates: Mapping from label key to new value, as for

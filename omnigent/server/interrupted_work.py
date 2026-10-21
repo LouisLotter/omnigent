@@ -33,6 +33,9 @@ _logger = logging.getLogger(__name__)
 # How far back the current turn's unanswered tool call is looked for.
 _TOOL_CALL_LOOKBACK_ITEMS = 200
 
+# Settlement passes before giving up on a record that keeps changing.
+_SETTLEMENT_ATTEMPTS = 5
+
 
 def _init_answer(response: httpx.Response) -> dict[str, object]:
     """Return a runner's session-initialization answer, or ``{}`` when unreadable."""
@@ -319,14 +322,28 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
     Only the recorded call's result, found in the transcript, settles it; the
     write is conditional on the record being unchanged, so a record the person
     cleared, or another settlement changed, is never overwritten and a settled
-    record never goes back to unknown.
+    record never goes back to unknown. A record another settlement changed is
+    read again and reconciled.
 
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :param conversation_store: Store for the transcript and failure labels.
     """
+    for _attempt in range(_SETTLEMENT_ATTEMPTS):
+        if not await _settle_once(session_id, conversation_store):
+            return
+
+
+async def _settle_once(session_id: str, conversation_store: ConversationStore) -> bool:
+    """
+    Make one settlement pass.
+
+    :returns: ``True`` when the record changed, by this pass or a concurrent
+        one, and should be reconciled again.
+    """
     from omnigent.server.routes._sessions.common import (
         _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY,
         _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY,
+        _session_status_cache,
     )
     from omnigent.server.routes._sessions.helpers import (
         _publish_status,
@@ -347,11 +364,11 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
 
     recorded = await asyncio.to_thread(recorded_call)
     if recorded is None:
-        return
+        return False
     item_id, owner_runner_id = recorded
     tool_name = await asyncio.to_thread(_answered_call, conversation_store, session_id, item_id)
     if tool_name is None:
-        return
+        return False
     try:
         complete, unanswered = await asyncio.to_thread(
             _scan_current_turn, conversation_store, session_id
@@ -363,9 +380,9 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return
+        return False
     if not complete or (unanswered is not None and unanswered[0] == item_id):
-        return
+        return False
     error = (
         interrupted_outcome_error(unanswered)
         if unanswered is not None
@@ -391,12 +408,16 @@ async def settle_late_tool_result(session_id: str, conversation_store: Conversat
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return
+        return False
     if not written:
-        return
+        return True
     _logger.info(
         "Session %s: the interrupted call's result arrived; its outcome is known",
         session_id,
         extra={"session_id": session_id},
     )
-    _publish_status(session_id, "failed", error, failure_origin="interrupted_call_answered")
+    # Newer activity published while the write ran wins: it also cleared the record.
+    if _session_status_cache.get(session_id) in (None, "failed"):
+        _publish_status(session_id, "failed", error, failure_origin="interrupted_call_answered")
+    # A renamed call's result may have arrived meanwhile.
+    return unanswered is not None

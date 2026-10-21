@@ -311,3 +311,60 @@ async def test_a_record_cleared_during_settlement_is_not_resurrected(
 
     assert _last_task_error_from_labels(_labels(store, session_id)) is None
     assert _session_status_cache[session_id] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_a_record_another_settlement_changed_is_reconciled_again(
+    store: SqlAlchemyConversationStore, session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both results arrived: a settlement that lost its conditional write still ends known."""
+    from omnigent.server.routes._sessions.common import _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY
+
+    first_id, _second_id = _append(
+        store, session_id, _user("two effects"), _call("call_1", "Read"), _call("call_2", "Bash")
+    )[1:]
+    _session_status_cache[session_id] = "running"
+    answer = _init_answer(continuation_blocked=True)
+    assert await keep_interrupted_outcome(session_id, answer, store, runner_id="runner_new")
+    _append(store, session_id, _output("call_2"), _output("call_1"))
+    real_write = store.set_labels_if
+    writes: list[bool] = []
+
+    def concurrent_rename_first(
+        conversation_id: str, updates: dict[str, str], expected: dict[str, str]
+    ) -> bool:
+        if not writes:
+            # Another settlement renamed the record to the older call meanwhile.
+            store.set_labels(conversation_id, {_LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: first_id})
+        writes.append(real_write(conversation_id, updates, expected))
+        return writes[-1]
+
+    monkeypatch.setattr(store, "set_labels_if", concurrent_rename_first)
+    await settle_late_tool_result(session_id, store)
+
+    assert writes == [False, True]
+    error = _last_task_error_from_labels(_labels(store, session_id))
+    assert error is not None and error["code"] == INTERRUPTED_OUTCOME_KNOWN_CODE
+    assert "Read" in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_settlement_never_publishes_over_newer_activity(
+    store: SqlAlchemyConversationStore, session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New activity that started while the settlement wrote keeps its live status."""
+    await _record_unknown_outcome(store, session_id)
+    _append(store, session_id, _output("call_1"))
+    real_write = store.set_labels_if
+
+    def write_then_the_person_acts(
+        conversation_id: str, updates: dict[str, str], expected: dict[str, str]
+    ) -> bool:
+        written = real_write(conversation_id, updates, expected)
+        _session_status_cache[conversation_id] = "running"
+        return written
+
+    monkeypatch.setattr(store, "set_labels_if", write_then_the_person_acts)
+    await settle_late_tool_result(session_id, store)
+
+    assert _session_status_cache[session_id] == "running"
