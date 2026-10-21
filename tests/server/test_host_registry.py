@@ -839,12 +839,17 @@ async def test_request_is_sent_again_to_the_same_host_process_after_its_tunnel_c
 
 
 @pytest.mark.parametrize(
-    ("first", "after_restart", "reconnects"),
-    [("inc-1", "inc-2", True), (None, None, True), ("inc-1", "inc-1", False)],
-    ids=["host-restarted", "older-host", "no-reconnect-in-time"],
+    ("first", "after_restart", "reconnects", "new_owner"),
+    [
+        ("inc-1", "inc-2", True, "bob"),
+        (None, None, True, "bob"),
+        ("inc-1", "inc-1", False, "bob"),
+        ("inc-1", "inc-1", True, "carol"),
+    ],
+    ids=["host-restarted", "older-host", "no-reconnect-in-time", "owner-changed"],
 )
 async def test_request_whose_tunnel_closed_stays_unknown_without_the_same_host_process(
-    first: str | None, after_restart: str | None, reconnects: bool
+    first: str | None, after_restart: str | None, reconnects: bool, new_owner: str
 ) -> None:
     """A restarted or older host may have acted already, so the request is never sent again."""
     from omnigent.server.host_registry import HostOperationOutcomeUnknownError
@@ -862,7 +867,7 @@ async def test_request_whose_tunnel_closed_stays_unknown_without_the_same_host_p
     registry.deregister("host_rep")
     if reconnects:
         new = registry.register(
-            "host_rep", FakeWebSocket(), _records_hello(after_restart), owner="bob"
+            "host_rep", FakeWebSocket(), _records_hello(after_restart), owner=new_owner
         )
     with pytest.raises(HostOperationOutcomeUnknownError):
         await asyncio.wait_for(waiter, 2.0)

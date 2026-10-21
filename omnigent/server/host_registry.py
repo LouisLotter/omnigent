@@ -1050,7 +1050,16 @@ class HostRegistry:
         while time.monotonic() - sent_at < OPERATION_RECORD_RETENTION_S:
             current = self.get(closed.host_id, closed.workspace_id)
             if current is not None and current is not closed:
-                return current if current.hello.incarnation == incarnation else None
+                same_process = (
+                    current.hello.incarnation == incarnation
+                    and CAP_OPERATION_RECORDS in current.hello.capabilities
+                )
+                # Owned as when the request was sent: an owner change ends the request.
+                same_owner = (current.owner, current.account_generation) == (
+                    closed.owner,
+                    closed.account_generation,
+                )
+                return current if same_process and same_owner else None
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return None
