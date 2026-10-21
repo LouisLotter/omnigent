@@ -774,6 +774,10 @@ class _PendingPolicyAskWrites:
     call. The native-harness path (:func:`_hold_native_ask_gate`) parks
     server-side and applies these inline, so it does not need this.
 
+    An MCP entry is also the approval record: the server stores the
+    person's verdict on it, and the caller's own ``inputResponses`` never
+    stand in for that verdict. The retry consumes the entry once.
+
     :param state_updates: Deferred :class:`StateUpdate` ops to apply on
         approve, or ``None``.
     :param set_labels: Deferred label writes to apply on approve, or ``None``.
@@ -785,6 +789,13 @@ class _PendingPolicyAskWrites:
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
     :param mcp_call_identity: Session, tool, policy actor and credential user.
+    :param mcp_operation_id: The runner's operation id for the asking call,
+        or ``None`` when the caller sent none.
+    :param runner_generation: Tunnel connection generation of the session's
+        runner when the call asked, or ``None`` when no runner was connected.
+    :param verdict: The person's recorded answer, e.g. ``"accept"``; ``None``
+        until someone answers. The MCP retry executes only on ``"accept"``.
+    :param decided_by: Who recorded :attr:`verdict`, or ``None`` with auth off.
     """
 
     state_updates: list[StateUpdate] | None
@@ -793,6 +804,10 @@ class _PendingPolicyAskWrites:
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
     mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
+    mcp_operation_id: str | None = None
+    runner_generation: int | None = None
+    verdict: str | None = None
+    decided_by: str | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be

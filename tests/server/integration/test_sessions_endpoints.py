@@ -8008,6 +8008,13 @@ async def test_mcp_relay_tool_call_ask_approval_persists_checkpoint(
     # Not recorded until approve.
     assert (store.get_conversation(sid).session_state or {}).get(_ASK_APPROVED_KEY) is None
 
+    # The person approves; the retry executes against that recorded verdict.
+    resp = await client.post(
+        f"/v1/sessions/{sid}/elicitations/{eid}/resolve", json={"action": "accept"}
+    )
+    assert resp.status_code == 202, resp.text
+    assert (store.get_conversation(sid).session_state or {}).get(_ASK_APPROVED_KEY) is None
+
     # Retry carrying the approval → the deferred checkpoint must persist
     # (the subsequent tool exec errors for lack of a runner, after the write).
     await client.post(

@@ -139,6 +139,11 @@ async def test_gateway_approval_preserves_transformed_arguments(
     backend.call_tool.assert_not_awaited()
     eid = next(iter(initial["inputRequests"]))
     try:
+        # The person answers through the resolve URL; the caller's answer alone never counts.
+        resolved = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{eid}/resolve", json={"action": decision}
+        )
+        assert resolved.status_code == 202, resolved.text
         response = await rpc(
             client,
             session_id,
