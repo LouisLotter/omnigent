@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,7 +58,7 @@ from omnigent.errors import (
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_TOKEN_REFUSED_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -101,6 +101,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostQuiesceFrame,
+    HostQuiesceResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -485,6 +487,15 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 # keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 
+# How long a managed host keeps retrying after the server started refusing its
+# launch token, before it exits with HOST_TOKEN_REFUSED_EXIT_CODE. Longer than
+# any persistent-host sleep, which revokes the token while the host may still
+# be reconnecting after a drop.
+try:
+    _TOKEN_REFUSED_EXIT_S = float(os.environ.get("OMNIGENT_HOST_TOKEN_REFUSED_EXIT_S", "1200"))
+except ValueError:
+    _TOKEN_REFUSED_EXIT_S = 1200.0
+
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
 # endpoint as unhealthy: it stops using the prompt "recycle" cadence and
@@ -494,6 +505,19 @@ _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
+
+# Host operations that change the machine, by request frame. ``host.quiesce``
+# reports them while in flight so a sandbox stop never cuts one off; runner
+# launches are reported separately.
+_MUTATING_HOST_OPERATIONS: dict[type, str] = {
+    HostStopRunnerFrame: "stop_runner",
+    HostCreateDirFrame: "create_dir",
+    HostInstallHarnessFrame: "install_harness",
+    HostStoreSecretFrame: "store_secret",
+    HostCreateWorktreeFrame: "create_worktree",
+    HostRemoveWorktreeFrame: "remove_worktree",
+    HostFsWriteFrame: "fs_write",
+}
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -848,6 +872,15 @@ class HostConnectError(Exception):
 
     The message is the full, user-facing explanation including the
     suggested fix; it is printed verbatim by :func:`run_host_process`.
+    """
+
+
+class HostTokenRefusedError(HostConnectError):
+    """The server kept refusing a managed host's launch token after it had connected.
+
+    Raised once refusals have lasted :data:`_TOKEN_REFUSED_EXIT_S`, so the host
+    exits with :data:`~omnigent.host.HOST_TOKEN_REFUSED_EXIT_CODE` instead of
+    retrying a token that will never be accepted again.
     """
 
 
@@ -1235,6 +1268,8 @@ class HostProcess:
         # server — where the same failures retry forever instead of killing a
         # host with running sessions.
         self._ever_connected = False
+        # When the server started refusing this managed host's launch token.
+        self._token_refused_since: float | None = None
         # Capability discovery belongs to daemon initialization, not the
         # connection handshake. Reconnects reuse this snapshot while the live
         # refresh task keeps it current.
@@ -1332,6 +1367,9 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
+        # Mutating host operations in flight by kind, reported by host.quiesce.
+        # Counted by frame task, which outlives a dropped tunnel's request.
+        self._host_operations: Counter[str] = Counter()
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -1635,6 +1673,9 @@ class HostProcess:
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
+            refused = self._launch_token_refused()
+            if refused is not None:
+                return refused
             cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
             should_retry = self._ever_connected or (
                 self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
@@ -1786,6 +1827,30 @@ class HostProcess:
             status="failed",
             error=error,
             error_code=error_code,
+        )
+
+    def _launch_token_refused(self) -> HostTokenRefusedError | None:
+        """Give up on a managed host's launch token once refusals have lasted too long.
+
+        Only a host that connected before counts its refusals by time; a fresh
+        host keeps the short auth-retry window above.
+
+        :returns: The error to exit with, or ``None`` while still retrying.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if not self._ever_connected or not os.environ.get(HOST_TOKEN_ENV_VAR):
+            return None
+        now = time.monotonic()
+        if self._token_refused_since is None:
+            self._token_refused_since = now
+        refused_for = now - self._token_refused_since
+        if refused_for < _TOKEN_REFUSED_EXIT_S:
+            return None
+        return HostTokenRefusedError(
+            "Connection refused: the server has refused this managed host's launch "
+            f"token for {refused_for:.0f}s. The server arms a new token when it next "
+            "starts this host."
         )
 
     def _classify_transient_404(self) -> HostConnectError | None:
@@ -2439,6 +2504,46 @@ class HostProcess:
             request_id=frame.request_id,
             status=status,
         )
+
+    async def _handle_quiesce(self, frame: HostQuiesceFrame) -> HostQuiesceResultFrame:
+        """Report live runners, runner launches and mutating host operations.
+
+        The persistent-host sleep fence asks this before the sandbox stops,
+        because stopping the host ends every runner and operation on it. The
+        process polls await, so launches and operations are read both before
+        and after them, and a runner registered meanwhile counts as live.
+        """
+        launching = len(self._pending_runner_launches)
+        operations = set(self._host_operations)
+        polled = list(self._runners.items())
+        live = []
+        for runner_id, handle in polled:
+            if await asyncio.to_thread(handle.proc.poll) is None:
+                live.append(runner_id)
+        seen = {runner_id for runner_id, _handle in polled}
+        live.extend(runner_id for runner_id in list(self._runners) if runner_id not in seen)
+        operations.update(self._host_operations)
+        return HostQuiesceResultFrame(
+            request_id=frame.request_id,
+            runners=live,
+            launching=max(launching, len(self._pending_runner_launches)),
+            operations=sorted(operations),
+        )
+
+    @contextlib.contextmanager
+    def _track_host_operation(self, frame: object) -> Iterator[None]:
+        """Count a mutating host operation for ``host.quiesce`` until it finishes."""
+        kind = _MUTATING_HOST_OPERATIONS.get(type(frame))
+        if kind is None:
+            yield
+            return
+        self._host_operations[kind] += 1
+        try:
+            yield
+        finally:
+            self._host_operations[kind] -= 1
+            if self._host_operations[kind] <= 0:
+                del self._host_operations[kind]
 
     async def _watch_runner(self, runner_id: str) -> None:
         """Watch a spawned runner and report an unexpected exit.
@@ -4458,6 +4563,7 @@ class HostProcess:
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
+        self._token_refused_since = None
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
@@ -4974,7 +5080,7 @@ class HostProcess:
             carrier = {}
         raw_kind = carrier.get("kind")
         kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
-        with telemetry.consume_frame_span(kind, carrier):
+        with telemetry.consume_frame_span(kind, carrier), self._track_host_operation(frame):
             await self._dispatch_host_frame(ws, frame)
 
     async def _dispatch_host_frame(
@@ -5014,6 +5120,8 @@ class HostProcess:
             await self._send_text(ws, encode_host_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
+        elif isinstance(frame, HostQuiesceFrame):
+            await self._send_text(ws, encode_host_frame(await self._handle_quiesce(frame)))
         elif isinstance(frame, HostStatFrame):
             await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
@@ -5356,6 +5464,18 @@ def _serve_host_until_exit(
     )
     try:
         asyncio.run(host.run())
+    except HostTokenRefusedError as exc:
+        # Distinct from the fatal code so a supervisor reports "token refused"
+        # rather than restarting the host with a token that never works again.
+        crash_reporting.report_host_exit(
+            "fatal_connect", exit_code=HOST_TOKEN_REFUSED_EXIT_CODE, error=str(exc)
+        )
+        print(
+            f"\n✗ {display_server_url(server_url)} refused this host's launch token.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_TOKEN_REFUSED_EXIT_CODE) from exc
     except HostConnectError as exc:
         # Fail loud: a permanent connection failure must not look like the
         # process is still working. Print the cause + fix, then exit non-zero

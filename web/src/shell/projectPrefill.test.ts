@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import { computerHost } from "@/test/hostFixtures";
 import { initialPrefillState, projectPrefillStep } from "./projectPrefill";
 
 const hosts: Host[] = [
@@ -88,6 +89,18 @@ describe("projectPrefill config seeding", () => {
     // path, possibly another project's, would fill the field.
     expect(writes.hostId).toBeUndefined();
     expect(writes.workspace).toBe("/x");
+  });
+
+  it("seeds an asleep configured computer, which wakes on use, but not a failed one", () => {
+    const seeded = (state: "asleep" | "failed") =>
+      runToDone(
+        inputs({
+          hosts: [...hosts, computerHost({ state })],
+          config: { hostId: "host_computer", workspace: "/x" },
+        }),
+      ).writes.hostId;
+    expect(seeded("asleep")).toBe("host_computer");
+    expect(seeded("failed")).toBeUndefined();
   });
 
   it("seeds a configured workspace even when the config names no host", () => {

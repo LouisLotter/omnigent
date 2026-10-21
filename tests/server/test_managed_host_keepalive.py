@@ -36,6 +36,7 @@ def _wire(
     launcher: _Launcher,
     host: object | None,
     host_id: str | None = "host1",
+    keepalive_interval_s: float | None = None,
 ) -> None:
     """Point the module at stub stores returning one session on *host_id*."""
     conversations = SimpleNamespace(
@@ -43,7 +44,9 @@ def _wire(
     )
     hosts = SimpleNamespace(get_host=lambda _hid: host)
     deployment = SimpleNamespace(
-        for_provider=lambda _provider: SimpleNamespace(launcher_factory=lambda: launcher)
+        for_provider=lambda _provider: SimpleNamespace(
+            launcher_factory=lambda: launcher, keepalive_interval_s=keepalive_interval_s
+        )
     )
     monkeypatch.setattr(managed_host_keepalive, "_conversation_store", conversations)
     monkeypatch.setattr(managed_host_keepalive, "_host_store", hosts)
@@ -313,3 +316,23 @@ def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.Monk
     managed_host_keepalive._keep_alive_for_runner("r1")
     # now cached at modal's slower cadence
     assert managed_host_keepalive.keepalive_interval_s("r1") == 600.0
+
+
+def test_keepalive_interval_is_a_provider_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A provider entry's interval replaces the built-in cadence; the env override wins."""
+    from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
+
+    monkeypatch.delenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", raising=False)
+    assert resolve_managed_keepalive_interval_s("cloud", configured_s=120.0) == 120.0
+    assert resolve_managed_keepalive_interval_s("agent_sandbox", configured_s=120.0) == 120.0
+    monkeypatch.setattr(managed_host_keepalive, "_runner_interval_s", {})
+    _wire(
+        monkeypatch,
+        launcher=_Launcher(),
+        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="cloud"),
+        keepalive_interval_s=120.0,
+    )
+    managed_host_keepalive._keep_alive_for_runner("r1")
+    assert managed_host_keepalive.keepalive_interval_s("r1") == 120.0
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "30")
+    assert resolve_managed_keepalive_interval_s("cloud", configured_s=120.0) == 30.0

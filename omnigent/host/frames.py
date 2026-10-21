@@ -63,6 +63,8 @@ CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_MCP_REGISTRY = "mcp_registry"
+# The host answers ``host.quiesce`` with its live runners and host operations:
+CAP_QUIESCE = "quiesce"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -74,6 +76,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_QUIESCE,
 ]
 
 
@@ -134,6 +137,8 @@ class HostFrameKind(str, Enum):
     RUNNER_EXITED = "host.runner_exited"
     RUNNER_STATUS = "host.runner_status"
     RUNNER_STATUS_RESULT = "host.runner_status_result"
+    QUIESCE = "host.quiesce"
+    QUIESCE_RESULT = "host.quiesce_result"
     STAT = "host.stat"
     STAT_RESULT = "host.stat_result"
     LIST_DIR = "host.list_dir"
@@ -420,6 +425,40 @@ class HostRunnerStatusResultFrame:
 
     request_id: str
     status: str
+
+
+@dataclass
+class HostQuiesceFrame:
+    """Server → host: is anything live that a sandbox stop would cut off?
+
+    Asked by the persistent-host sleep fence after it closed the host's
+    admission and before the provider stops the sandbox, because stopping
+    the host ends every runner and host operation on it.
+
+    :param request_id: Unique id for correlating the result.
+    """
+
+    request_id: str
+
+
+@dataclass
+class HostQuiesceResultFrame:
+    """Host → server: live runners, launches and host operations in flight.
+
+    Operations are tracked on the host, so work that outlived its request
+    (an install whose reply timed out, a request from a superseded tunnel)
+    still counts.
+
+    :param request_id: Correlates to the :class:`HostQuiesceFrame`.
+    :param runners: Runner IDs whose process has not exited.
+    :param launching: Number of runner launches queued or spawning.
+    :param operations: Host operations in flight, e.g. ``["install_harness"]``.
+    """
+
+    request_id: str
+    runners: list[str] = field(default_factory=list)
+    launching: int = 0
+    operations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1278,6 +1317,8 @@ HostFrame = (
     | HostRunnerExitedFrame
     | HostRunnerStatusFrame
     | HostRunnerStatusResultFrame
+    | HostQuiesceFrame
+    | HostQuiesceResultFrame
     | HostStatFrame
     | HostStatResultFrame
     | HostListDirFrame
@@ -1446,6 +1487,20 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_STATUS.value,
                 "request_id": frame.request_id,
                 "runner_id": frame.runner_id,
+            }
+        )
+    if isinstance(frame, HostQuiesceFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.QUIESCE.value, "request_id": frame.request_id}
+        )
+    if isinstance(frame, HostQuiesceResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.QUIESCE_RESULT.value,
+                "request_id": frame.request_id,
+                "runners": list(frame.runners),
+                "launching": frame.launching,
+                "operations": list(frame.operations),
             }
         )
     if isinstance(frame, HostRunnerStatusResultFrame):
@@ -2117,6 +2172,18 @@ def _decode_known_host_frame(
             return _decode_runner_status(msg)
         case HostFrameKind.RUNNER_STATUS_RESULT:
             return _decode_runner_status_result(msg)
+        case HostFrameKind.QUIESCE:
+            return HostQuiesceFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.QUIESCE_RESULT:
+            launching = msg.get("launching", 0)
+            if not isinstance(launching, int) or isinstance(launching, bool):
+                raise ValueError("host.quiesce_result launching must be an integer")
+            return HostQuiesceResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                runners=_optional_str_list(msg, "runners"),
+                launching=launching,
+                operations=_optional_str_list(msg, "operations"),
+            )
         case HostFrameKind.STAT:
             return _decode_stat(msg)
         case HostFrameKind.STAT_RESULT:

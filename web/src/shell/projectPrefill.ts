@@ -1,5 +1,6 @@
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import { isHostAvailable } from "@/lib/persistentHosts";
 
 type ProjectPrefillPhase = "location" | "settled";
 
@@ -155,14 +156,14 @@ function locationStep(
   // The online check needs the host list — wait for it.
   if (hosts === undefined) return null;
 
-  // Seed the configured host only when it's online (silently dropped
-  // otherwise, so an offline default can't set up a create that only fails),
-  // and only when the user hasn't already picked a different host / the sandbox.
-  const configHostOnline =
-    config?.hostId != null &&
-    hosts.some((h) => h.host_id === config.hostId && h.status === "online");
+  // Seed the configured host only when it's online or a computer that wakes on
+  // use (silently dropped otherwise, so an offline default can't set up a
+  // create that only fails), and only when the user hasn't already picked a
+  // different host / the sandbox.
+  const configHostAvailable =
+    config?.hostId != null && hosts.some((h) => h.host_id === config.hostId && isHostAvailable(h));
   const configHostUsable =
-    configHostOnline &&
+    configHostAvailable &&
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
   if (configHostUsable) writes.hostId = config!.hostId;

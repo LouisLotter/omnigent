@@ -7,8 +7,35 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { isPersistentHostChanging } from "@/lib/persistentHosts";
 import { ApiError } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
+
+/** Lifecycle state of a persistent managed host (a "computer"). */
+export type PersistentHostState = "awake" | "asleep" | "waking" | "sleeping" | "failed";
+
+/** Progress while a computer wakes: the machine, then Omnigent's host, then its connection. */
+export type PersistentHostWakeStage = "provisioning" | "starting" | "connecting";
+
+/** The provider's last answer on whether a computer takes new work. */
+export interface PersistentHostAdmission {
+  admitting: boolean;
+  /** Typed reason code, e.g. "needs_sign_in" or "not_saved". */
+  reason: string | null;
+  /** Person-readable detail from the provider. */
+  message: string | null;
+}
+
+export interface PersistentHostStatus {
+  state: PersistentHostState;
+  wake_stage: PersistentHostWakeStage | null;
+  /** Person-readable reason when `state` is "failed". */
+  failure: string | null;
+  admission: PersistentHostAdmission | null;
+  /** Provider setup page for this computer ("Set up / manage"). */
+  manage_url: string | null;
+  provider: string;
+}
 
 export interface Host {
   host_id: string;
@@ -21,6 +48,13 @@ export interface Host {
    * omit the field entirely.
    */
   sandbox_provider?: string | null;
+  /**
+   * "persistent" for a server-managed computer that outlives sessions and
+   * sleeps when idle; null or absent for laptops and per-session sandboxes.
+   */
+  lifecycle?: "persistent" | null;
+  /** Lifecycle details, non-null exactly when `lifecycle` is "persistent". */
+  persistent_status?: PersistentHostStatus | null;
   /**
    * Per-harness readiness reported by the host's last connect, e.g.
    * `{"claude-sdk": true, "codex": "needs-auth"}`. `null`/absent means the
@@ -53,8 +87,13 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // field and are kept. `includeSandbox` opts a caller (the chat-header
   // HostBadge) back into seeing them so it can label sandbox sessions.
   if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  // Persistent managed hosts are long-lived computers, listed like any host.
+  return body.hosts.filter((h) => !h.sandbox_provider || h.lifecycle === "persistent");
 }
+
+/** Poll quickly while a computer wakes or sleeps so its progress moves. */
+const CHANGING_HOSTS_REFRESH_MS = 2_000;
+const HOSTS_REFRESH_MS = 60_000;
 
 interface UseHostsOptions {
   enabled?: boolean;
@@ -89,7 +128,12 @@ export function useHosts(options: UseHostsOptions = {}) {
     // interval remains the in-tab fallback.
     staleTime: refetchOnFocus ? 0 : 30_000,
     refetchOnWindowFocus: refetchOnFocus,
-    refetchInterval: enabled ? 60_000 : false,
+    refetchInterval: (query) => {
+      if (!enabled) return false;
+      return query.state.data?.some(isPersistentHostChanging)
+        ? CHANGING_HOSTS_REFRESH_MS
+        : HOSTS_REFRESH_MS;
+    },
   });
 }
 

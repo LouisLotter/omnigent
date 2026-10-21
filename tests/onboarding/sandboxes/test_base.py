@@ -19,7 +19,7 @@ from typing import ClassVar
 import pytest
 import yaml
 
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_TOKEN_REFUSED_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxCapabilityError,
@@ -95,6 +95,7 @@ def test_run_background_wraps_command_in_sh_c() -> None:
         ([143], 1, 143),
         ([1, 9, 0], 3, 0),
         ([1, HOST_FATAL_EXIT_CODE], 2, HOST_FATAL_EXIT_CODE),
+        ([1, HOST_TOKEN_REFUSED_EXIT_CODE], 2, HOST_TOKEN_REFUSED_EXIT_CODE),
     ],
 )
 def test_supervise_host_command_restarts_only_on_crash(

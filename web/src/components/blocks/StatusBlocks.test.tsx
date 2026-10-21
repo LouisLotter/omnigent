@@ -67,6 +67,26 @@ describe("ErrorBanner", () => {
     expect(message).not.toHaveTextContent("terminal: claude:main");
   });
 
+  it("says a computer is refusing new work, with the provider's reason and no retry", () => {
+    render(
+      <ErrorBanner
+        message="Sign in to Claude on this computer before sending it work."
+        source=""
+        code="host_not_admitting"
+        onRetry={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "This computer isn't accepting new work right now.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /isn't accepting new work/ }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "Sign in to Claude on this computer before sending it work.",
+    );
+    expect(screen.queryByRole("button", { name: /Retry|Resume session/ })).toBeNull();
+  });
+
   it("disclosure chevron is always visible and rotates when expanded", () => {
     render(
       <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,

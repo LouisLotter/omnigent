@@ -29,7 +29,9 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 from omnigent.server.permissions import check_session_access
+from omnigent.server.persistent_hosts import ensure_host_ready
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -204,6 +206,43 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     if sharded and host_is_live(host):
         return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+
+
+async def ready_host_connection(
+    host_id: str,
+    host: Host,
+    host_registry: HostRegistry,
+    *,
+    operation: str,
+    renews_idle: bool = True,
+) -> HostConnection:
+    """Return the host's live connection on this replica, waking a persistent host first.
+
+    For a persistent managed host this is its readiness step: it waits out a
+    sleep, wakes the host, and admits the request only while the host admits
+    new work. Other hosts are looked up as before.
+
+    :param host_id: The host the request names, e.g. ``"host_a1b2c3d4..."``.
+    :param host: Its owner-checked record.
+    :param host_registry: Live host tunnels on this replica.
+    :param operation: What the request does, e.g. ``"install_harness"``.
+    :param renews_idle: ``False`` for reads, which never keep a host awake.
+    :returns: The host's connection.
+    :raises OmnigentError: When the host cannot be made ready, or is offline
+        or on another replica (see :func:`host_absent_error`).
+    """
+    await ensure_host_ready(
+        host_id,
+        operation=operation,
+        timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+        owner=host.user_id,
+        host=host,
+        renews_idle=renews_idle,
+    )
+    conn = host_registry.get(host_id)
+    if conn is None:
+        raise host_absent_error(host)
+    return conn
 
 
 def resolve_host_launch(

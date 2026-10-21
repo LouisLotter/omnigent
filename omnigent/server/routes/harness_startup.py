@@ -13,7 +13,7 @@ from omnigent.host.harness_startup import SUPPORTED_HARNESSES, HarnessStartup
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import ready_host_connection, resolve_host_owner
 from omnigent.stores.host_store import HostStore
 
 _STARTUP_TIMEOUT_S = 15.0
@@ -38,9 +38,9 @@ def create_harness_startup_router(
         harness = canonicalize_harness(harness) or harness
         if harness not in SUPPORTED_HARNESSES:
             raise HTTPException(404, "launch settings are not reported for this harness")
-        conn = host_registry.get(host_id)
-        if conn is None:
-            raise host_absent_error(host)
+        conn = await ready_host_connection(
+            host_id, host, host_registry, operation="harness_startup", renews_idle=False
+        )
         if CAP_HARNESS_STARTUP not in conn.hello.capabilities:
             raise HTTPException(501, "update the host to read launch settings")
         request_id = secrets.token_hex(8)

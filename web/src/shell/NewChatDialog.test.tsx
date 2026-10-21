@@ -103,6 +103,8 @@ import {
   readNewChatWorkspaceCache,
 } from "@/lib/newChatPickerCache";
 import { setPendingInitialPrompt } from "@/store/chatStore";
+import { SIGN_IN_NEEDED_MESSAGE } from "@/lib/persistentHosts";
+import { computerHost } from "@/test/hostFixtures";
 import { clearSessionDrafts } from "@/lib/sessionDrafts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -11428,5 +11430,189 @@ describe("managed sandbox gateway preview", () => {
     expect(
       screen.getByTestId(`new-chat-landing-agent-model-${CODEX_MODEL_OPTIONS_RESULT.data[0].id}`),
     ).toBeVisible();
+  });
+});
+
+describe("persistent computers in the host picker", () => {
+  beforeEach(setupLandingMocks);
+
+  const MANAGE_URL = "https://computers.example.test/manage/host_computer";
+
+  function openHostMenu() {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+  }
+
+  function createdSessionBody(): Record<string, unknown> {
+    const [path, init] = authenticatedFetchMock.mock.calls[0];
+    expect(path).toBe("/v1/sessions");
+    return JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+  }
+
+  it("lists an asleep computer under Cloud and starts a session on it", async () => {
+    mockHosts([host("online", 1), computerHost({ state: "asleep" })]);
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/repo"], host_computer: ["/home/me/repo"] }),
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    openHostMenu();
+    const row = screen.getByTestId("new-chat-landing-host-host_computer");
+    expect(row).toHaveTextContent("Asleep");
+    expect(row).not.toHaveAttribute("aria-disabled");
+    // Asleep is not offline: the computer is not tucked into the offline group.
+    expect(screen.queryByRole("menuitem", { name: /Offline hosts/ })).toBeNull();
+    fireEvent.click(row);
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip).toHaveAccessibleName("Host: research-box, Asleep"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the tests" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(createdSessionBody()).toMatchObject({
+      host_id: "host_computer",
+      workspace: "/home/me/repo",
+    });
+  });
+
+  it.each([
+    [
+      { state: "waking" as const, wake_stage: "provisioning" as const },
+      "Waking… Starting the computer",
+    ],
+    [{ state: "waking" as const, wake_stage: "connecting" as const }, "Waking… Connecting"],
+    [{ state: "sleeping" as const }, "Going to sleep"],
+  ])("shows a computer's progress in its row: %o", (status, text) => {
+    mockHosts([host("online", 1), computerHost(status)]);
+    renderLanding();
+
+    openHostMenu();
+    const row = screen.getByTestId("new-chat-landing-host-host_computer");
+    expect(row).toHaveTextContent(text);
+    expect(row).not.toHaveAttribute("aria-disabled");
+  });
+
+  it("starts a failed computer again from its row and explains the failure", async () => {
+    mockHosts([
+      host("online", 1),
+      computerHost({ state: "failed", failure: "Setup was interrupted." }),
+    ]);
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify(computerHost({ state: "waking" })), { status: 202 }),
+    );
+    renderLanding();
+
+    openHostMenu();
+    const row = screen.getByTestId("new-chat-landing-host-host_computer");
+    expect(row).toHaveTextContent("Failed: Setup was interrupted.");
+    expect(row).toHaveTextContent("Start again");
+    fireEvent.click(row);
+
+    await waitFor(() =>
+      expect(authenticatedFetchMock).toHaveBeenCalledWith("/v1/hosts/host_computer/start", {
+        method: "POST",
+      }),
+    );
+    expect(await screen.findByTestId("computer-attention")).toHaveTextContent(
+      "research-box failed to start: Setup was interrupted.",
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the tests" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
+
+  it("shows a refused start again under the composer", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_computer");
+    mockHosts([computerHost({ state: "failed", failure: null })]);
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "The provider is unavailable." }), { status: 400 }),
+    );
+    renderLanding();
+
+    const notice = await screen.findByTestId("computer-attention");
+    expect(notice).toHaveTextContent("research-box failed to start.");
+    fireEvent.click(within(notice).getByRole("button", { name: "Start again" }));
+
+    await waitFor(() => expect(notice).toHaveTextContent("The provider is unavailable."));
+  });
+
+  it("asks for a sign-in on a selected computer, linking its setup page", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_computer");
+    mockHosts([
+      computerHost({
+        state: "awake",
+        manage_url: MANAGE_URL,
+        admission: { admitting: false, reason: "needs_sign_in", message: null },
+      }),
+    ]);
+    renderLanding();
+
+    const notice = await screen.findByTestId("computer-attention");
+    expect(notice).toHaveTextContent(SIGN_IN_NEEDED_MESSAGE);
+    const link = within(notice).getByRole("link", { name: "Set up / manage" });
+    expect(link).toHaveAttribute("href", MANAGE_URL);
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("offers Add computer only when a provider creates computers, selecting the new one", async () => {
+    renderLanding();
+    openHostMenu();
+    expect(screen.getByTestId("new-chat-landing-connect-host")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-add-computer")).toBeNull();
+    cleanup();
+    resetLandingDraft();
+
+    authenticatedFetchMock.mockResolvedValue(
+      new Response(JSON.stringify(computerHost({ state: "waking" }, { host_id: "host_new" })), {
+        status: 201,
+      }),
+    );
+    renderLanding({ persistent_host_providers: ["cloudflare"] });
+    openHostMenu();
+    fireEvent.click(screen.getByTestId("new-chat-landing-add-computer"));
+    fireEvent.change(screen.getByTestId("add-computer-name"), {
+      target: { value: "Research box" },
+    });
+    fireEvent.click(screen.getByTestId("add-computer-submit"));
+
+    await waitFor(() => expect(screen.queryByTestId("add-computer-dialog")).toBeNull());
+    const [path, init] = authenticatedFetchMock.mock.calls[0];
+    expect(path).toBe("/v1/hosts");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      name: "Research box",
+      provider: "cloudflare",
+    });
+    expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_new");
+  });
+
+  it.each([
+    [["modal", "cloudflare"], ["new-chat-landing-sandbox-option"]],
+    [["cloudflare"], []],
+  ])("never offers a persistent provider as a new sandbox: %o", (providers, rows) => {
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: providers[0],
+      sandbox_providers: providers,
+      persistent_host_providers: ["cloudflare"],
+    });
+    openHostMenu();
+
+    const menu = screen.getByTestId("new-chat-landing-host-menu");
+    expect(
+      within(menu)
+        .queryAllByTestId(/^new-chat-landing-sandbox-option/)
+        .map((row) => row.getAttribute("data-testid")),
+    ).toEqual(rows);
+    expect(menu).not.toHaveTextContent("Cloudflare Sandbox");
   });
 });

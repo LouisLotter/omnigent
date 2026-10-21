@@ -37,7 +37,7 @@ import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversatio
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { selectableSessionAgents } from "@/lib/agentGrouping";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { canLaunchManagedSandbox, sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
@@ -119,7 +119,7 @@ export function ProjectSettingsDialog({
   // Sandbox is only a real default when the server can provision managed
   // sandbox hosts — mirror the composer's gate so we don't offer a target that
   // can only fail on create.
-  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled = canLaunchManagedSandbox(info);
   const sandboxProvider = info !== "loading" ? info.sandbox_provider : null;
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or

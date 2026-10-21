@@ -21,6 +21,7 @@ import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
+import { isHostAvailable } from "@/lib/persistentHosts";
 import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
 import { normalizeWorkspacePath, sessionsSharingDirectory } from "./NewChatDialog";
@@ -105,21 +106,22 @@ export function ResumeWithDirectoryDialog({
     () => hosts?.find((h) => h.host_id === sourceHostId) ?? null,
     [hosts, sourceHostId],
   );
-  const sourceHostOnline = sourceHost?.status === "online";
-  const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
+  // Online hosts and computers that wake on use can take the runner.
+  const sourceHostAvailable = sourceHost != null && isHostAvailable(sourceHost);
+  const availableHosts = useMemo(() => (hosts ?? []).filter(isHostAvailable), [hosts]);
 
   // Unified prefill: a fork reads its source session; a host-less session
   // reads the ``prefill`` its own snapshot supplied.
   const prefillWorkspace = hasSource ? source?.workspace : prefill?.workspace;
   const prefillBranch = hasSource ? source?.gitBranch : prefill?.gitBranch;
-  // Default host: the source's host (fork, only if online — otherwise the CLI
-  // fallback fires) or, for a host-less session, its own recorded host when
-  // still online, else the caller's current (most-recent) online machine.
+  // Default host: the source's host (fork, only if available — otherwise the
+  // CLI fallback fires) or, for a host-less session, its own recorded host when
+  // still available, else the caller's current (most-recent) online machine.
   const defaultHostId = useMemo(() => {
-    if (hasSource) return sourceHostOnline ? sourceHostId : null;
-    const preferred = onlineHosts.find((h) => h.host_id === prefill?.hostId);
-    return (preferred ?? onlineHosts[0])?.host_id ?? null;
-  }, [hasSource, sourceHostOnline, sourceHostId, onlineHosts, prefill?.hostId]);
+    if (hasSource) return sourceHostAvailable ? sourceHostId : null;
+    const preferred = availableHosts.find((h) => h.host_id === prefill?.hostId);
+    return (preferred ?? availableHosts.find((h) => h.status === "online"))?.host_id ?? null;
+  }, [hasSource, sourceHostAvailable, sourceHostId, availableHosts, prefill?.hostId]);
 
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
@@ -249,15 +251,15 @@ export function ResumeWithDirectoryDialog({
   // No runner can be launched when the source's host is offline (CUJ 1
   // same-user resumes on the original host). Surface the reconnect
   // command instead — once the host is back, retrying opens the picker.
-  // Gate on the hosts list having loaded: until then `sourceHostOnline`
+  // Gate on the hosts list having loaded: until then `sourceHostAvailable`
   // is falsy only because we don't KNOW the host's status yet, and
   // flashing the CLI fallback for an online source host would be wrong.
   const hostsLoaded = hosts !== undefined;
-  const showCliFallback = !sourceLoading && hostsLoaded && source != null && !sourceHostOnline;
+  const showCliFallback = !sourceLoading && hostsLoaded && source != null && !sourceHostAvailable;
   const loading = (hasSource && sourceLoading) || !hostsLoaded;
   // Host-less sessions have no source host to reconnect, so there's no CLI
   // fallback: when the caller owns no online machine, say so plainly.
-  const noOnlineHosts = !hasSource && hostsLoaded && onlineHosts.length === 0;
+  const noAvailableHosts = !hasSource && hostsLoaded && availableHosts.length === 0;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -275,7 +277,7 @@ export function ResumeWithDirectoryDialog({
           <p className="text-sm text-muted-foreground" data-testid="resume-dir-loading">
             {hasSource ? "Loading the original session's directory…" : "Loading your machines…"}
           </p>
-        ) : noOnlineHosts ? (
+        ) : noAvailableHosts ? (
           <p className="text-sm text-muted-foreground" data-testid="resume-dir-no-hosts">
             None of your machines are online. Start one with{" "}
             <code className="rounded bg-muted px-1 py-0.5 font-mono">omnigent host</code> from your
@@ -311,7 +313,7 @@ export function ResumeWithDirectoryDialog({
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>
                 <SelectContent>
-                  {onlineHosts.map((host) => (
+                  {availableHosts.map((host) => (
                     <SelectItem
                       key={host.host_id}
                       value={host.host_id}

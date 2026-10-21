@@ -15,6 +15,7 @@ import {
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
+  MonitorCloudIcon,
   PaletteIcon,
   PlugIcon,
   SettingsIcon,
@@ -28,7 +29,11 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
+import {
+  customAgentsSettingsEnabled,
+  isSingleUserMode,
+  persistentHostProviders,
+} from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -38,6 +43,7 @@ export type SettingsSectionId =
   | "appearance"
   | "harnesses"
   | "custom-agents"
+  | "computers"
   | "general"
   | "git"
   | "integrations"
@@ -56,6 +62,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "harnesses",
   "custom-agents",
+  "computers",
   "general",
   "git",
   "integrations",
@@ -101,6 +108,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
+  computersEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -115,6 +123,9 @@ export function settingsNavGroups(
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
   if (!customAgentsEnabled) general.splice(2, 0, harnesses);
+  if (computersEnabled) {
+    general.splice(2, 0, { id: "computers", label: "Computers", icon: MonitorCloudIcon });
+  }
   // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(2, 0, {
@@ -203,7 +214,8 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
+    !(next === "custom-agents" && !customAgentsSettingsEnabled(info)) &&
+    !(next === "computers" && persistentHostProviders(info).length === 0);
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
   if (section === "custom-agents" && segments[idx + 2]) {
@@ -266,6 +278,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
+    persistentHostProviders(info).length > 0,
   );
 
   return (

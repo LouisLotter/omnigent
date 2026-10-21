@@ -25,11 +25,12 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_TOKEN_REFUSED_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
+    HostTokenRefusedError,
     ModelOptionsResult,
     _build_runner_env,
     _runner_exit_error,
@@ -65,6 +66,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostQuiesceFrame,
+    HostQuiesceResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -8087,6 +8090,165 @@ def test_post_connect_auth_rejection_escalates_without_going_fatal(
     assert "omnigent login http://localhost:8000" in escalated
     assert "no longer a transient network blip" in escalated
     assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
+def test_managed_host_gives_up_once_its_token_was_refused_for_the_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connected managed host stops retrying a refused launch token after a time.
+
+    Refusals shorter than the threshold, such as a drop during a sleep's
+    revocation window, keep it retrying; past the threshold it gives up with
+    the error that maps to the "token refused" exit code.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 1200.0)
+    host = _make_host_process()
+    host._ever_connected = True
+
+    assert host._classify_http_status(403) is None
+    assert host._token_refused_since is not None
+    host._token_refused_since -= 1199.0
+    assert host._classify_http_status(403) is None
+    host._token_refused_since -= 2.0
+    refused = host._classify_http_status(403)
+    assert isinstance(refused, HostTokenRefusedError)
+    assert "launch token" in str(refused)
+
+
+def test_unmanaged_or_fresh_host_never_counts_token_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a managed host that connected before exits on refusals by time."""
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 0.0)
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    laptop = _make_host_process()
+    laptop._ever_connected = True
+    assert laptop._classify_http_status(403) is None
+    assert laptop._token_refused_since is None
+
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    fresh = _make_host_process()
+    assert fresh._classify_http_status(403) is None
+    assert fresh._token_refused_since is None
+
+
+async def test_accepted_connect_restarts_the_token_refusal_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusals separated by a working connection never add up to an exit."""
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 3600.0)
+    refused = _invalid_status(403)
+    spy = _ConnectSpy([None, refused, refused, None, refused, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host("https://omnigent.example.com")
+
+    await host.run()
+
+    assert spy.call_count == 6
+    assert host._token_refused_since is not None  # only the last refusal counts
+
+
+def test_run_host_process_exits_with_token_refused_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A managed host whose token stays refused exits with its own code, not the fatal one.
+
+    Its supervisor reports "token refused" instead of restarting the host with a
+    token that never works again; the server arms a new one at the next start.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_REFUSED_EXIT_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([None, _invalid_status(403)]))
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_host_process(
+            server_url="https://omnigent.example.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert excinfo.value.code == HOST_TOKEN_REFUSED_EXIT_CODE
+    assert HOST_TOKEN_REFUSED_EXIT_CODE not in (0, HOST_FATAL_EXIT_CODE, 143)
+    assert "refused this host's launch token" in capsys.readouterr().err
+
+
+async def test_quiesce_reports_live_runners_launches_and_host_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``host.quiesce`` lists what a stop would cut off, tracked on the host's side.
+
+    An install whose request was dispatched still counts until its work ends,
+    even after the tunnel that asked for it has gone.
+    """
+    host = _make_host_process()
+    alive = SimpleNamespace(proc=SimpleNamespace(poll=lambda: None))
+    exited = SimpleNamespace(proc=SimpleNamespace(poll=lambda: 0))
+    host._runners.update({"runner-live": alive, "runner-done": exited})  # type: ignore[dict-item]
+    host._pending_runner_launches["runner-next"] = {asyncio.get_running_loop().create_future()}
+    started, release = threading.Event(), threading.Event()
+
+    def blocking_install(frame: HostInstallHarnessFrame) -> HostInstallHarnessResultFrame:
+        started.set()
+        release.wait(10)
+        return HostInstallHarnessResultFrame(request_id=frame.request_id, status="failed")
+
+    monkeypatch.setattr(host, "_handle_install_harness", blocking_install)
+
+    class _GoneWs:
+        async def send(self, data: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    install = encode_host_frame(HostInstallHarnessFrame(request_id="install", harness="codex"))
+    task = asyncio.create_task(host._run_frame_handler(_GoneWs(), install))  # type: ignore[arg-type]
+    assert await asyncio.to_thread(started.wait, 5)
+
+    report = await host._handle_quiesce(HostQuiesceFrame(request_id="q1"))
+    assert report == HostQuiesceResultFrame(
+        request_id="q1", runners=["runner-live"], launching=1, operations=["install_harness"]
+    )
+    release.set()
+    await asyncio.wait_for(task, 5)
+    host._pending_runner_launches.clear()
+    host._runners.clear()
+    report = await host._handle_quiesce(HostQuiesceFrame(request_id="q2"))
+    assert report == HostQuiesceResultFrame(request_id="q2")
+
+
+async def test_quiesce_counts_a_launch_that_completes_while_it_polls() -> None:
+    """A launch that turns into a runner during the process polls is still reported."""
+    host = _make_host_process()
+    host._pending_runner_launches["runner-next"] = {asyncio.get_running_loop().create_future()}
+    started = SimpleNamespace(proc=SimpleNamespace(poll=lambda: None))
+
+    def exited_while_the_launch_completes() -> int:
+        host._runners["runner-next"] = started  # type: ignore[assignment]
+        host._pending_runner_launches.pop("runner-next")
+        return 0
+
+    host._runners["runner-old"] = SimpleNamespace(  # type: ignore[assignment]
+        proc=SimpleNamespace(poll=exited_while_the_launch_completes)
+    )
+    report = await host._handle_quiesce(HostQuiesceFrame(request_id="q"))
+    assert report.runners == ["runner-next"]
+    assert report.launching == 1
+
+
+async def test_read_only_host_requests_are_not_host_operations() -> None:
+    """Reads are safe to cut off, so ``host.quiesce`` does not count them."""
+    host = _make_host_process()
+    with host._track_host_operation(HostStatFrame(request_id="s", path="~")):
+        report = await host._handle_quiesce(HostQuiesceFrame(request_id="q"))
+    assert report.operations == []
+    with host._track_host_operation(
+        HostStoreSecretFrame(request_id="w", harness="codex", kind="api_key")
+    ):
+        report = await host._handle_quiesce(HostQuiesceFrame(request_id="q"))
+    assert report.operations == ["store_secret"]
 
 
 async def test_launch_harness_probe_runs_off_the_event_loop(

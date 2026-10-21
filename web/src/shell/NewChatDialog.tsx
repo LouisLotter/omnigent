@@ -128,7 +128,20 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  canLaunchManagedSandbox,
+  isFeatureEnabled,
+  persistentHostProviders,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
+import {
+  hostStatusWord,
+  isHostAvailable,
+  isPersistentHost,
+  isPersistentHostFailed,
+  persistentHostStateText,
+} from "@/lib/persistentHosts";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -256,6 +269,9 @@ import {
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { useStartPersistentHost } from "@/hooks/usePersistentHosts";
+import { AddComputerDialog } from "@/components/computers/AddComputerDialog";
+import { ComputerAttentionNotice } from "@/components/computers/ComputerStatus";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
@@ -484,7 +500,7 @@ function HostOption({
         {subtitle && <span className="text-xs text-muted-foreground"> • {subtitle}</span>}
       </span>
       {action}
-      <span className="sr-only">{host.status}</span>
+      <span className="sr-only">{hostStatusWord(host)}</span>
     </span>
   );
 }
@@ -2326,7 +2342,7 @@ export function NewChatLandingScreen() {
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
-  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const managedSandboxesEnabled = canLaunchManagedSandbox(info);
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
     selected: mcpRegistryServices,
@@ -2627,6 +2643,10 @@ export function NewChatLandingScreen() {
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+  const [addComputerOpen, setAddComputerOpen] = useState(false);
+  const computerProviders = persistentHostProviders(info);
+  // "Start again" for a computer that failed to start, from its menu row or notice.
+  const startComputer = useStartPersistentHost();
   const [offlineHostLimit, setOfflineHostLimit] = useState(0);
   // Harness "Set up" dialog target, opened from the composer notice or a picker
   // row; null when closed. One dialog serves every entry point.
@@ -2706,7 +2726,8 @@ export function NewChatLandingScreen() {
   const thisMachineHostId = resolveThisMachineHostId(
     desktopHost?.hostId ?? null,
     isCurrentServerLocal(),
-    onlineHosts.map((host) => host.host_id),
+    // A cloud computer is never the machine running this browser.
+    onlineHosts.filter((host) => !isPersistentHost(host)).map((host) => host.host_id),
   );
   // When it's already in the host list (online or offline) we connect via that
   // row. With another live host there is already a valid place to run, so do
@@ -4451,7 +4472,9 @@ export function NewChatLandingScreen() {
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
-    sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
+    sandboxSelected ||
+    (selectedHost !== undefined && isPersistentHost(selectedHost)) ||
+    (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
   // Only register loaded owned sessions on the selected host with a workspace
   // for live directory-conflict checks.
@@ -4995,7 +5018,9 @@ export function NewChatLandingScreen() {
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
+    (sandboxSelected
+      ? sandboxRepoValid
+      : selectedHost !== undefined && isHostAvailable(selectedHost) && workspaceValid) &&
     !creating;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
@@ -5018,15 +5043,19 @@ export function NewChatLandingScreen() {
                 } — remove the extras`
               : sandboxSelected && !sandboxRepoValid
                 ? "Please enter a valid repository URL"
-                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                  ? "Selected host is unavailable. Reconnect it or choose another host."
-                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                    ? "Please choose a host and working directory"
-                    : configuredAgentUnavailable && selectedAgent == null
-                      ? "This project's configured agent is unavailable — pick an agent to continue"
-                      : message.trim().length === 0 && files.length === 0
-                        ? "Enter a message to get started"
-                        : null;
+                : !sandboxSelected && selectedHost && isPersistentHostFailed(selectedHost)
+                  ? "This computer failed to start. Start it again or choose another host."
+                  : !sandboxSelected &&
+                      selectedHostId &&
+                      !(selectedHost && isHostAvailable(selectedHost))
+                    ? "Selected host is unavailable. Reconnect it or choose another host."
+                    : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                      ? "Please choose a host and working directory"
+                      : configuredAgentUnavailable && selectedAgent == null
+                        ? "This project's configured agent is unavailable — pick an agent to continue"
+                        : message.trim().length === 0 && files.length === 0
+                          ? "Enter a message to get started"
+                          : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5034,6 +5063,7 @@ export function NewChatLandingScreen() {
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
+  const selectedComputerState = selectedHost ? persistentHostStateText(selectedHost) : null;
   // The Arca row is remembered by host ID, never inferred from its machine hostname.
   // A recovery-capable desktop restores preview identity on demand. Older
   // shells keep Run on Arca visible because reconnecting is their only recovery.
@@ -5066,7 +5096,9 @@ export function NewChatLandingScreen() {
               { label: "Host", value: selectedHostDisplayName },
               {
                 label: "Status",
-                value: selectedHost?.status === "online" ? "Connected" : "Disconnected",
+                value:
+                  selectedComputerState ??
+                  (selectedHost?.status === "online" ? "Connected" : "Disconnected"),
               },
             ]
           : [{ label: "Host", value: "None" }];
@@ -5946,15 +5978,13 @@ export function NewChatLandingScreen() {
     host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
-  // Keep the selected host and this machine's reconnect action above the fold.
-  const listedHosts = [
-    ...onlineHosts,
-    ...offlineHosts.filter((host) => host.host_id === selectedHostId || isReconnectRow(host)),
-  ];
+  // Keep the selected host, this machine's reconnect action and computers
+  // (asleep ones wake on use) above the fold.
+  const listedOfflineHost = (host: Host) =>
+    host.host_id === selectedHostId || isReconnectRow(host) || isPersistentHost(host);
+  const listedHosts = [...onlineHosts, ...offlineHosts.filter(listedOfflineHost)];
   // Preserve /v1/hosts order: most recently updated first.
-  const otherOfflineHosts = offlineHosts.filter(
-    (host) => host.host_id !== selectedHostId && !isReconnectRow(host),
-  );
+  const otherOfflineHosts = offlineHosts.filter((host) => !listedOfflineHost(host));
   const cloudHosts = listedHosts.filter(isCloudHostEntry);
   const localHosts = listedHosts.filter((host) => !isCloudHostEntry(host));
   const myMachines = allHosts.filter((host) => !isCloudHostEntry(host));
@@ -5971,36 +6001,50 @@ export function NewChatLandingScreen() {
     showArcaOption;
   const renderHostMenuItem = (host: Host) => {
     const reconnect = isReconnectRow(host);
+    // A computer that failed to start: choosing it starts it again.
+    const restart = isPersistentHostFailed(host);
+    const stateText = persistentHostStateText(host);
+    const actionClassName =
+      "inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground";
     return (
       <DropdownMenuItem
         key={host.host_id}
         onSelect={() => {
-          if (reconnect) pendingConnectRef.current = true;
-          else selectHost(host.host_id);
+          if (reconnect) {
+            pendingConnectRef.current = true;
+            return;
+          }
+          selectHost(host.host_id);
+          if (restart) startComputer.mutate(host.host_id);
         }}
-        disabled={reconnect ? connectingThisMachine : host.status !== "online"}
+        disabled={
+          reconnect
+            ? connectingThisMachine
+            : restart
+              ? startComputer.isPending
+              : !isHostAvailable(host)
+        }
         data-testid={
           reconnect
             ? "new-chat-landing-run-on-this-machine"
             : `new-chat-landing-host-${host.host_id}`
         }
         data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
-        title={`${host.name} — ${host.status}`}
-        className={reconnect ? "group" : undefined}
+        title={`${host.name} — ${stateText ?? host.status}`}
+        className={reconnect || restart ? "group" : undefined}
       >
         <HostOption
           host={host}
           cloud={isCloudHostEntry(host)}
           displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
-          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+          subtitle={host.host_id === arcaHostId ? "Arca instance" : (stateText ?? undefined)}
           action={
             reconnect ? (
-              <span
-                className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
-                data-testid="new-chat-landing-use-this-machine"
-              >
+              <span className={actionClassName} data-testid="new-chat-landing-use-this-machine">
                 {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
               </span>
+            ) : restart ? (
+              <span className={actionClassName}>Start again</span>
             ) : undefined
           }
         />
@@ -6784,7 +6828,7 @@ export function NewChatLandingScreen() {
                             label={
                               sandboxSelected
                                 ? `Host: ${hostLabel}`
-                                : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
+                                : `Host: ${hostLabel}, ${selectedComputerState ?? (selectedHost?.status === "online" ? "Online" : "Offline")}`
                             }
                             status={
                               sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
@@ -6986,6 +7030,16 @@ export function NewChatLandingScreen() {
                           <PlusIcon className="size-4" />
                           Connect new host
                         </DropdownMenuItem>
+                        {computerProviders.length > 0 && (
+                          <DropdownMenuItem
+                            onSelect={() => setAddComputerOpen(true)}
+                            data-testid="new-chat-landing-add-computer"
+                            className="text-muted-foreground"
+                          >
+                            <MonitorCloudIcon className="size-4" />
+                            Add computer…
+                          </DropdownMenuItem>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
 
@@ -7198,6 +7252,19 @@ export function NewChatLandingScreen() {
             />
           )}
 
+          {!sandboxSelected && selectedHost && (
+            <ComputerAttentionNotice
+              host={selectedHost}
+              onStartAgain={() => startComputer.mutate(selectedHost.host_id)}
+              starting={startComputer.isPending}
+              startError={
+                startComputer.variables === selectedHost.host_id
+                  ? (startComputer.error?.message ?? null)
+                  : null
+              }
+            />
+          )}
+
           {/* Same slot, same styling as the readiness notice above: the host
               switch took Smart Routing away, so say so instead of quietly
               leaving a different agent selected. Suppressed while the
@@ -7332,6 +7399,15 @@ export function NewChatLandingScreen() {
           />
         </DialogContent>
       </Dialog>
+
+      {computerProviders.length > 0 && (
+        <AddComputerDialog
+          open={addComputerOpen}
+          onOpenChange={setAddComputerOpen}
+          providers={computerProviders}
+          onCreated={(host) => selectHost(host.host_id)}
+        />
+      )}
 
       {/* Harness "Set up" dialog — the single home for install/login (and later
           API key / gateway) setup, opened from the composer notice or a picker

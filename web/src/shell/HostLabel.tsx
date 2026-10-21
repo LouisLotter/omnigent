@@ -1,10 +1,11 @@
 import { MonitorCloudIcon, MonitorIcon } from "lucide-react";
 
 import type { Host } from "@/hooks/useHosts";
+import { hostStatusWord, isPersistentHost } from "@/lib/persistentHosts";
 
 /**
  * Compact host row for a `<Select>` item — icon, name, and an
- * online/offline pill.
+ * online/offline pill (a computer's state while it is not awake).
  *
  * Its own module rather than a sibling dialog's export: the dialogs that
  * render host pickers also reference each other (``ResumeWithDirectoryDialog``
@@ -19,7 +20,7 @@ export function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
+      {isPersistentHost(host) || host.name.toLowerCase().includes("cloud") ? (
         <MonitorCloudIcon className="size-4 text-muted-foreground" />
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
@@ -33,7 +34,7 @@ export function HostLabel({ host }: { host: Host }) {
         <span
           className={`inline-block size-1.5 rounded-full ${isOnline ? "bg-green-500" : "bg-muted-foreground"}`}
         />
-        {host.status}
+        {hostStatusWord(host)}
       </span>
     </span>
   );

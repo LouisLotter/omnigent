@@ -14,7 +14,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import ready_host_connection, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
 from omnigent.spec.types import AgentSpec
@@ -124,12 +124,13 @@ def create_skills_router(
                 )
                 spec, agent_version = loaded.spec, str(agent.version)
 
-        conn = host_registry.get(host_id)
-        if conn is None:
-            if host is None:
-                host = await asyncio.to_thread(host_store.get_host, host_id)
-            if host is not None:
-                raise host_absent_error(host)
+        if host is None:
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is not None:
+            conn = await ready_host_connection(
+                host_id, host, host_registry, operation="skills", renews_idle=False
+            )
+        elif (conn := host_registry.get(host_id)) is None:
             raise HTTPException(status_code=503, detail="session host is offline")
         result = await request_host_skills(
             host_registry=host_registry,

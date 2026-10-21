@@ -44,6 +44,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostQuiesceFrame,
+    HostQuiesceResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -1244,6 +1246,39 @@ def test_runner_status_result_frame_round_trip() -> None:
         assert isinstance(decoded, HostRunnerStatusResultFrame)
         assert decoded.request_id == "req_rs_1"
         assert decoded.status == status
+
+
+def test_quiesce_frames_round_trip() -> None:
+    """``host.quiesce`` and its result survive encode → decode.
+
+    The sleep fence stops a sandbox only on an empty result, so a lossy
+    round-trip of the runners or operations would cut off live work.
+    """
+    request = decode_host_frame(encode_host_frame(HostQuiesceFrame(request_id="q1")))
+    assert request == HostQuiesceFrame(request_id="q1")
+    original = HostQuiesceResultFrame(
+        request_id="q1",
+        runners=["runner_a"],
+        launching=2,
+        operations=["install_harness", "fs_write"],
+    )
+    assert decode_host_frame(encode_host_frame(original)) == original
+    empty = decode_host_frame('{"kind": "host.quiesce_result", "request_id": "q2"}')
+    assert empty == HostQuiesceResultFrame(request_id="q2")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"kind": "host.quiesce_result", "request_id": "q", "launching": true}',
+        '{"kind": "host.quiesce_result", "request_id": "q", "operations": "fs_write"}',
+        '{"kind": "host.quiesce"}',
+    ],
+)
+def test_malformed_quiesce_frames_are_rejected(payload: str) -> None:
+    """A malformed quiesce frame fails to decode instead of reading as "quiescent"."""
+    with pytest.raises(ValueError):
+        decode_host_frame(payload)
 
 
 def test_decode_unknown_kind_raises() -> None:

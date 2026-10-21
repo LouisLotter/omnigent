@@ -6,6 +6,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { hostDisplayLabel, isPersistentHost, persistentHostStateText } from "@/lib/persistentHosts";
 import { SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
@@ -36,8 +37,8 @@ export interface HostBadgeInfo {
  * Compute the host badge's label + status from a session's host binding.
  *
  * - Not host-bound (`hostId` null/absent) → `null` (render nothing).
- * - Sandbox-backed host → the provider label ("Databricks Sandbox").
- * - Connected host → its friendly `name`.
+ * - Per-session sandbox host → the provider label ("Databricks Sandbox").
+ * - Connected host or computer → its friendly `name`.
  * - Host-bound but record unresolved (shared session / not yet loaded)
  *   → the raw `hostId`, so the badge always answers "which host".
  *
@@ -52,11 +53,7 @@ export function resolveHostBadge(args: {
 }): HostBadgeInfo | null {
   const { hostId, host, online } = args;
   if (!hostId) return null;
-  const label = host
-    ? host.sandbox_provider
-      ? sandboxOptionLabel(host.sandbox_provider)
-      : host.name
-    : hostId;
+  const label = host ? hostDisplayLabel(host) : hostId;
   const status: HostBadgeStatus =
     online === true ? "online" : online === false ? "offline" : "unknown";
   return { label, status };
@@ -153,6 +150,10 @@ export function HostBadge({
       : liveOnline;
 
   const badge = resolveHostBadge({ hostId, host, online });
+  // The server wakes a dormant resumable host or a computer itself, so neither
+  // is disconnected and `omnigent host` (the reconnect instruction) does not apply.
+  const serverManaged = !!session?.hostResumable || (host !== undefined && isPersistentHost(host));
+  const computerState = host ? persistentHostStateText(host) : null;
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
   const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
   useEffect(() => {
@@ -162,16 +163,17 @@ export function HostBadge({
     // A launching sandbox has no host record yet: show the launch, not a missing host.
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
     const reconnectable =
-      !launchStatus && badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
+      !launchStatus && badge?.status === "offline" && !serverManaged && !!onReconnect;
     let label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
-    // A dormant resumable host wakes on the next message; it isn't disconnected.
-    const asleep = badge?.status === "offline" && !!session?.hostResumable;
+    const asleep = badge?.status === "offline" && serverManaged;
     let tooltipRows = badge
       ? [
           { label: "Host", value: badge.label },
           {
             label: "Status",
-            value: asleep ? "Asleep — wakes on next message" : CONNECTION_WORD[badge.status],
+            value:
+              computerState ??
+              (asleep ? "Asleep — wakes on next message" : CONNECTION_WORD[badge.status]),
           },
         ]
       : [{ label: "Host", value: "None" }];
@@ -255,10 +257,7 @@ export function HostBadge({
   }
   if (!badge) return null;
 
-  // A resumable managed host that reports offline is idle-stopped, not
-  // disconnected — the next message resumes it, and `omnigent host` (what the
-  // reconnect dialog hands out) is the wrong instruction for it.
-  const reconnectable = badge.status === "offline" && !session?.hostResumable && !!onReconnect;
+  const reconnectable = badge.status === "offline" && !serverManaged && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
   const title = `Host ${badge.label}, ${statusWord}`;
   // The dot is decorative (aria-hidden), so the status would otherwise be

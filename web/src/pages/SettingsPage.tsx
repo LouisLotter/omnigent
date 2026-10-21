@@ -16,6 +16,8 @@
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
+ * - **Computers** — only when the server has a provider that creates
+ *   persistent cloud computers: add, start again, set up and delete them.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
  *   sign out.
@@ -263,6 +265,7 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { SettingsComputersSection } from "./settings/SettingsComputersSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -339,6 +342,7 @@ export function SettingsPage() {
       {section === "general" && <GeneralSection />}
       {section === "harnesses" && <SettingsHarnessesSection />}
       {section === "custom-agents" && <SettingsCustomAgentsSection />}
+      {section === "computers" && <SettingsComputersSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "mcp" && (

@@ -23,7 +23,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -44,6 +44,7 @@ from omnigent.host.frames import (
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
+    HostQuiesceResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
 )
@@ -440,6 +441,9 @@ class HostConnection:
     pending_runner_status: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
+    pending_quiesce: dict[str, asyncio.Future[HostQuiesceResultFrame]] = field(
+        default_factory=dict,
+    )
     pending_stats: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
@@ -538,6 +542,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+        # Optional host admission check (persistent managed hosts); may wait or refuse.
+        self.admission_gate: Callable[[str, str], Awaitable[None]] | None = None
+        # Optional check on every server-to-host request; raises ConnectionError to refuse.
+        self.send_guard: Callable[[HostConnection], None] | None = None
 
     def register(
         self,
@@ -802,6 +810,8 @@ class HostRegistry:
         transfer_from_host_id: str | None = None,
     ) -> None:
         """Reauthorize immediately before a new runner binding is created."""
+        if self.admission_gate is not None:
+            await self.admission_gate(conn.host_id, "runner_launch")
         if self.launch_authorizer is not None:
             await asyncio.to_thread(
                 self.launch_authorizer,
@@ -848,5 +858,7 @@ class HostRegistry:
             current = self._hosts.get((conn.workspace_id, conn.host_id))
             if current is not conn:
                 raise ConnectionError(f"host {conn.host_id!r} connection was replaced")
+        if self.send_guard is not None:
+            self.send_guard(conn)
 
         conn.enqueue(data)

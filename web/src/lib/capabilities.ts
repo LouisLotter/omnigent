@@ -132,6 +132,12 @@ export interface ServerInfo {
     { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
   >;
   /**
+   * Providers that create persistent computers (``POST /v1/hosts``) rather
+   * than per-session sandboxes. Non-empty shows the add-computer action; these
+   * providers are never offered as "New sandbox". Absent on older servers.
+   */
+  persistent_host_providers?: string[];
+  /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
@@ -273,6 +279,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_provider: null,
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
+  persistent_host_providers: [],
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -377,6 +384,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             !Array.isArray(data.sandbox_provider_capabilities)
               ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
               : {},
+          persistent_host_providers: Array.isArray(data.persistent_host_providers)
+            ? data.persistent_host_providers.filter((p): p is string => typeof p === "string")
+            : [],
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -454,6 +464,11 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   e2b: "E2B",
 };
 
+/** Display name for a sandbox provider id, e.g. "Modal" for ``"modal"``. */
+export function sandboxProviderName(provider: string): string {
+  return SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
 /**
  * Label for the new-session sandbox option, named per provider.
  *
@@ -464,9 +479,7 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
  */
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
-  const name =
-    SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-  return `${name} Sandbox`;
+  return `${sandboxProviderName(provider)} Sandbox`;
 }
 
 /**
@@ -475,9 +488,23 @@ export function sandboxOptionLabel(provider: string | null): string {
  * Falls back to the single ``sandbox_provider`` when the server reports
  * no list; ``[null]`` yields one row with the generic label. Tolerates a
  * missing list (a hand-built ServerInfo) rather than throwing on render.
+ * Providers that create persistent computers are never offered here.
  */
 export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
-  const offered = info.sandbox_providers;
-  if (Array.isArray(offered) && offered.length > 0) return offered;
-  return [info.sandbox_provider];
+  const listed = info.sandbox_providers;
+  const offered = Array.isArray(listed) && listed.length > 0 ? listed : [info.sandbox_provider];
+  const persistent = info.persistent_host_providers ?? [];
+  return offered.filter((provider) => provider === null || !persistent.includes(provider));
+}
+
+/** Providers that create computers; empty hides the add-computer action. */
+export function persistentHostProviders(info: ServerInfo | "loading"): string[] {
+  return info === "loading" ? [] : (info.persistent_host_providers ?? []);
+}
+
+/** Whether "New sandbox" can be offered: the server launches per-session sandboxes. */
+export function canLaunchManagedSandbox(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" && info.managed_sandboxes_enabled && sandboxProviderOptions(info).length > 0
+  );
 }

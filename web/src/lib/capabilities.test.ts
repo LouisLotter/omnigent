@@ -7,7 +7,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import {
+  canLaunchManagedSandbox,
+  persistentHostProviders,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -87,6 +92,51 @@ describe("sandboxProviderOptions", () => {
     expect(options).toEqual([null]);
     expect(sandboxOptionLabel(options[0])).toBe("New Sandbox");
   });
+
+  it("never offers a provider that creates persistent computers", () => {
+    const persistent = { persistent_host_providers: ["cloudflare"] };
+    expect(
+      sandboxProviderOptions(
+        info({ ...persistent, sandbox_providers: ["modal", "cloudflare", "e2b"] }),
+      ),
+    ).toEqual(["modal", "e2b"]);
+    expect(
+      sandboxProviderOptions(
+        info({ ...persistent, sandbox_provider: "cloudflare", sandbox_providers: [] }),
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("canLaunchManagedSandbox", () => {
+  it("needs managed sandboxes and a provider that is not persistent", () => {
+    expect(canLaunchManagedSandbox("loading")).toBe(false);
+    expect(canLaunchManagedSandbox(info({ sandbox_provider: "modal" }))).toBe(true);
+    expect(
+      canLaunchManagedSandbox(
+        info({ managed_sandboxes_enabled: false, sandbox_provider: "modal" }),
+      ),
+    ).toBe(false);
+    expect(
+      canLaunchManagedSandbox(
+        info({
+          sandbox_provider: "cloudflare",
+          sandbox_providers: ["cloudflare"],
+          persistent_host_providers: ["cloudflare"],
+        }),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("persistentHostProviders", () => {
+  it("lists the providers that create computers, empty while loading or absent", () => {
+    expect(persistentHostProviders("loading")).toEqual([]);
+    expect(persistentHostProviders(info({}))).toEqual([]);
+    expect(persistentHostProviders(info({ persistent_host_providers: ["cloudflare"] }))).toEqual([
+      "cloudflare",
+    ]);
+  });
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
@@ -124,6 +174,15 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
     expect(resolved.sandbox_providers).toEqual([]);
     expect(sandboxProviderOptions(resolved)).toEqual(["modal"]);
+  });
+
+  it("keeps the persistent host providers, dropping malformed entries", async () => {
+    const resolved = await probe({ persistent_host_providers: ["cloudflare", 3, null] });
+    expect(resolved.persistent_host_providers).toEqual(["cloudflare"]);
+  });
+
+  it("defaults the persistent host providers to empty on an older server", async () => {
+    expect((await probe({})).persistent_host_providers).toEqual([]);
   });
 
   it("drops non-string entries from the provider list", async () => {

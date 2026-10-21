@@ -204,7 +204,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             # Cache the provider's cadence so the loop sleep and throttle settle
             # onto it (agent_sandbox stays fast; others fall back to the default).
             _runner_interval_s[runner_id] = resolve_managed_keepalive_interval_s(
-                host.sandbox_provider
+                host.sandbox_provider, configured_s=config.keepalive_interval_s
             )
             try:
                 extended = config.launcher_factory().keep_alive(host.sandbox_id)

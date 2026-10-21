@@ -752,6 +752,16 @@ class ManagedSandboxConfig:
         Supplies choices without selecting a default or provisioning a host.
     :param checkpoint: When to ask this provider to checkpoint a sandbox. Has
         no effect unless the launcher implements ``checkpoint``.
+    :param persistent: Lifecycle policy that makes this provider's hosts
+        persistent (see :mod:`omnigent.server.persistent_hosts`), or ``None``
+        for hosts that belong to one session. A persistent provider creates
+        hosts only through ``POST /v1/hosts`` and refuses one-session launches.
+    :param online_timeout_s: How long a launch or wake waits for the host to
+        come online, in seconds. ``None`` uses
+        :data:`MANAGED_HOST_ONLINE_TIMEOUT_S`.
+    :param keepalive_interval_s: Seconds between ``keep_alive`` calls while a
+        runner tunnel is live. ``None`` uses the provider's built-in cadence
+        (see :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`).
     """
 
     server_url: str
@@ -766,6 +776,45 @@ class ManagedSandboxConfig:
         None
     )
     checkpoint: SandboxCheckpointPolicy = dataclass_field(default_factory=SandboxCheckpointPolicy)
+    persistent: PersistentHostPolicy | None = None
+    online_timeout_s: float | None = None
+    keepalive_interval_s: float | None = None
+
+    @property
+    def session_launch_supported(self) -> bool:
+        """Whether this provider can launch a sandbox for one session."""
+        return self.managed_launch_supported and self.persistent is None
+
+    @property
+    def host_online_timeout_s(self) -> float:
+        """Seconds a launch or wake waits for the host to come online."""
+        if self.online_timeout_s is None:
+            return MANAGED_HOST_ONLINE_TIMEOUT_S
+        return self.online_timeout_s
+
+
+@dataclass(frozen=True)
+class PersistentHostPolicy:
+    """Lifecycle of hosts that outlive sessions and sleep when idle.
+
+    :param idle_sleep_s: Seconds without a live runner, runner launch or host
+        operation before the host's sandbox is suspended.
+    :param admission_max_age_s: Oldest provider admission report readiness
+        uses, measured from the provider's reply.
+    :param sweep_interval_s: Seconds between idle checks on this replica.
+    :param token_refresh_margin_s: A host whose launch token expires within
+        this many seconds sleeps at its next idle moment, so its next wake
+        arms a fresh token before the old one lapses.
+    :param manage_url: Provider page where the person sets up or manages one
+        host, e.g. ``"https://computers.example.com/c/{sandbox_id}"``.
+        ``{host_id}`` and ``{sandbox_id}`` are substituted; ``None`` shows no link.
+    """
+
+    idle_sleep_s: float = 300.0
+    admission_max_age_s: float = 60.0
+    sweep_interval_s: float = 30.0
+    token_refresh_margin_s: float = 24 * 3600.0
+    manage_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -855,14 +904,27 @@ class ManagedSandboxDeployment:
         :returns: The default single-provider config.
         """
         for config in self.configs:
+            if config.session_launch_supported:
+                return config
+        for config in self.configs:
             if config.managed_launch_supported:
                 return config
         return self.configs[0]
 
     @property
     def managed_launch_supported(self) -> bool:
-        """Whether ANY offered provider can serve a managed launch."""
-        return any(config.managed_launch_supported for config in self.configs)
+        """Whether ANY offered provider can launch a sandbox for one session."""
+        return any(config.session_launch_supported for config in self.configs)
+
+    def persistent_providers(self) -> tuple[str, ...]:
+        """Names of every offered provider that creates persistent hosts, in configured order."""
+        return tuple(
+            config.provider
+            for config in self.configs
+            if config.persistent is not None
+            and config.managed_launch_supported
+            and config.provider is not None
+        )
 
     def offered(self) -> tuple[ManagedSandboxConfig, ...]:
         """Every provider config this deployment offers, in configured order."""
@@ -903,16 +965,17 @@ class ManagedSandboxDeployment:
         """
         Names of every offered provider that can actually serve a launch.
 
-        Excludes staged providers (parse-but-reject, e.g. ``lakebox``) and
-        configs naming no provider, so this is exactly what a client may
-        choose from.
+        Excludes staged providers (parse-but-reject, e.g. ``lakebox``),
+        persistent providers (see :meth:`persistent_providers`) and configs
+        naming no provider, so this is exactly what a client may choose from
+        for a new session's sandbox.
 
         :returns: Provider short names, in configured order.
         """
         return tuple(
             config.provider
             for config in self.configs
-            if config.managed_launch_supported and config.provider is not None
+            if config.session_launch_supported and config.provider is not None
         )
 
     def provider_ui_capabilities(self) -> dict[str, dict[str, bool]]:
@@ -931,7 +994,7 @@ class ManagedSandboxDeployment:
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
-            if config.managed_launch_supported and config.provider is not None:
+            if config.session_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
                 from omnigent.inference_config import parse_inference_config
@@ -3650,11 +3713,12 @@ async def launch_managed_host(
         host route by it (see :func:`host_slice_key_enabled`).
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
-    :raises HTTPException: 400 when *provider* is not configured or the
-        selected provider lacks managed-launch support; 502 when
+    :raises HTTPException: 400 when *provider* is not configured, creates
+        persistent hosts only, or lacks managed-launch support; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
+    _refuse_persistent_provider(entry)
     launcher = entry.launcher_factory()
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
@@ -3683,6 +3747,18 @@ async def launch_managed_host(
         slice_key_enabled=slice_key_enabled,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+
+
+def _refuse_persistent_provider(entry: ManagedSandboxConfig) -> None:
+    """Refuse a one-session launch on a provider that creates persistent hosts only."""
+    if entry.persistent is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"sandbox provider '{entry.provider}' creates persistent hosts only; "
+                "add one as a computer and choose it as the host"
+            ),
+        )
 
 
 async def relaunch_managed_host(
@@ -3733,6 +3809,12 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
+    if host.lifecycle == "persistent":
+        # A fresh sandbox would hand the person a blank computer; never replace one.
+        raise HTTPException(
+            status_code=409,
+            detail=f"{host.name} is a persistent host; its sandbox is never replaced",
+        )
     launcher = _launcher_for_teardown(host, config)
     if launcher is None:
         raise HTTPException(
@@ -3819,6 +3901,7 @@ async def _start_sandbox_host(
     host_config: dict[str, object] | None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    start_attempt: int | None = None,
 ) -> str:
     """Start a host without sending absent optional arguments to legacy launchers."""
     # Gated on the capability, not on the value: start_host is side-effecting and
@@ -3829,6 +3912,22 @@ async def _start_sandbox_host(
     # launcher declaring it is in-tree and current, so it also takes
     # `host_config`/`on_stage`, keeping the legacy-omission fan-out below
     # one-dimensional.
+    if start_attempt is not None and launcher.capabilities.start_claims:
+        # Only a launcher with start claims takes the claimed attempt (see
+        # SandboxLifecycle.claim_start); like the classifier below it is current.
+        start_claimed = cast(Callable[..., str], launcher.start_host)
+        return await asyncio.to_thread(
+            start_claimed,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repos=repos,
+            host_config=host_config,
+            on_stage=on_stage,
+            start_attempt=start_attempt,
+        )
     if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
         start_classified = cast(Callable[..., str], launcher.start_host)
         return await asyncio.to_thread(
@@ -3987,7 +4086,7 @@ async def _register_and_start_host(
             agent_name=agent_name,
             on_stage=on_stage,
         )
-        await _wait_for_host_online(host_store, host_id)
+        await _wait_for_host_online(host_store, host_id, timeout_s=config.host_online_timeout_s)
     except Exception as exc:
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
@@ -4036,16 +4135,21 @@ async def _register_and_start_host(
     return workspace
 
 
-async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
+async def _wait_for_host_online(
+    host_store: HostStore,
+    host_id: str,
+    *,
+    timeout_s: float = MANAGED_HOST_ONLINE_TIMEOUT_S,
+) -> None:
     """
     Poll the hosts table until the sandbox host registers, or time out.
 
     :param host_store: Persistent host registrations.
     :param host_id: The launched host's identifier.
-    :raises HTTPException: 502 when the host does not come online
-        within :data:`MANAGED_HOST_ONLINE_TIMEOUT_S`.
+    :param timeout_s: The provider's online wait, in seconds.
+    :raises HTTPException: 502 when the host does not come online in time.
     """
-    deadline = time.monotonic() + MANAGED_HOST_ONLINE_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if await asyncio.to_thread(host_store.is_online, host_id):
             return
@@ -4054,7 +4158,7 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
         status_code=502,
         detail=(
             f"managed host did not come online within "
-            f"{MANAGED_HOST_ONLINE_TIMEOUT_S}s — check {_HOST_LOG_PATH} "
+            f"{timeout_s:g}s — check {_HOST_LOG_PATH} "
             "inside the sandbox"
         ),
     )
@@ -4213,6 +4317,11 @@ async def resume_managed_host(
     """
     if config is None:
         return
+    from omnigent.server import persistent_hosts
+
+    # A persistent host wakes through its lifecycle, which never re-arms a live one.
+    if await persistent_hosts.wake_if_persistent(host_id, host_store):
+        return
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.
     if not force and await asyncio.to_thread(host_store.is_online, host_id):
@@ -4294,7 +4403,9 @@ async def resume_managed_host(
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
-            await _wait_for_host_online(host_store, host.host_id)
+            await _wait_for_host_online(
+                host_store, host.host_id, timeout_s=entry.host_online_timeout_s
+            )
         except SandboxGoneError:
             raise
         except Exception as exc:

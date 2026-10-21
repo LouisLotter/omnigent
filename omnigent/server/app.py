@@ -80,6 +80,7 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_checkpoints,
     managed_host_keepalive,
+    persistent_hosts,
     session_live_state,
     shutdown_state,
 )
@@ -192,6 +193,9 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    # Providers whose hosts are persistent computers created through
+    # ``POST /v1/hosts``; never offered for a new session's sandbox.
+    persistent_host_providers: list[str] = []
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -1830,10 +1834,12 @@ def create_app(
                 )
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
+        await persistent_host_monitor.start()
 
         try:
             yield
         finally:
+            await persistent_host_monitor.shutdown()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             if turn_checkpoints is not None:
@@ -1930,6 +1936,11 @@ def create_app(
                 )
 
     host_registry.launch_authorizer = _admit_host_launch
+    persistent_hosts.configure(host_store, host_registry, sandbox_config)
+    host_registry.admission_gate = persistent_hosts.admit_host_work
+    host_registry.send_guard = persistent_hosts.guard_host_request
+    persistent_host_monitor = persistent_hosts.PersistentHostIdleMonitor()
+    app.state.persistent_host_monitor = persistent_host_monitor
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
@@ -2346,7 +2357,7 @@ def create_app(
             error_impact=exc.impact.value,
             error_phase=exc.phase.value,
         )
-        if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+        if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.HOST_NOT_ADMITTING):
             # A session state, not a fault: the user's machine is asleep or
             # the host disconnected, and clients render it as a reconnect
             # affordance. Through the 5xx arm every poll of an offline
@@ -3081,6 +3092,9 @@ def create_app(
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+        persistent_host_providers = (
+            list(sandbox_config.persistent_providers()) if sandbox_config is not None else []
+        )
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3158,6 +3172,7 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "persistent_host_providers": persistent_host_providers,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -4185,6 +4200,13 @@ def create_app(
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
             ),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        from omnigent.server.routes.persistent_hosts import create_persistent_hosts_router
+
+        app.include_router(
+            create_persistent_hosts_router(host_store, host_registry, auth_provider=auth_provider),
             prefix="/v1",
             tags=["hosts"],
         )

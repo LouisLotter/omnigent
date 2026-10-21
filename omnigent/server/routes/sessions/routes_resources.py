@@ -54,6 +54,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
+from omnigent.server.persistent_hosts import admit_host_work
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -2234,6 +2235,10 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, required_level)
         if method == "GET":
             return await _proxy_get_to_runner(session_id, path, conv)
+        if method != "PUT" and conv.host_id is not None:
+            # A write or command is new work: a persistent host must admit it.
+            # Writes reach a live runner only, so this never wakes the host.
+            await admit_host_work(conv.host_id, "shell" if method == "POST" else "file_write")
         if method == "PUT":
             # Reads can use the host tunnel, but saving needs a runner to
             # enforce the environment's write policy. Reconnect before saving

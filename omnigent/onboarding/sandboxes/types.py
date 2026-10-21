@@ -98,6 +98,14 @@ class SandboxCapabilities:
         :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.checkpoint`,
         so the server asks it to save a managed sandbox when a turn on that
         host ends and periodically during a long turn.
+    :param suspend: Provider can stop a quiescent sandbox for a persistent
+        host's sleep (:meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.suspend`).
+    :param admission: Provider reports whether a sandbox admits new work, with
+        its typed status
+        (:meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.admission`).
+    :param start_claims: Provider fences host starts with start claims
+        (:meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.claim_start`),
+        and its ``start_host`` accepts the claimed ``start_attempt``.
     """
 
     cli_bootstrap: bool = False
@@ -115,12 +123,99 @@ class SandboxCapabilities:
     multi_repo: bool = False
     git_clone_options: bool = False
     checkpoint: bool = False
+    suspend: bool = False
+    admission: bool = False
+    start_claims: bool = False
 
 
 CheckpointReason = Literal["turn_completed", "long_turn"]
 """Why the server asks a provider to save a sandbox: a turn on its host ended
 (``"turn_completed"``), or a turn has run for the policy's ``max_interval_s``
 without a save (``"long_turn"``)."""
+
+
+HostSandboxStatus = Literal[
+    "stopped",
+    "started_no_host",
+    "start_claimed",
+    "host_running",
+    "host_refused",
+    "stopping",
+]
+"""A persistent host's sandbox as its provider sees it.
+
+``stopped``: no sandbox runs. ``started_no_host``: a sandbox runs but no start
+attempt holds it. ``start_claimed``: a start attempt is claimed and its host has
+not taken the start parameters yet. ``host_running``: the host process took an
+attempt's parameters and is starting, live, or being restarted in place by the
+provider's supervisor. ``host_refused``: the host exited because the server
+refused its launch token, and nothing restarts it. ``stopping``: a stop or
+sleep is in progress.
+"""
+
+ADMISSION_NOT_SAVED = "not_saved"
+"""Admission reason: the sandbox's files have not been saved recently enough."""
+
+ADMISSION_NEEDS_SIGN_IN = "needs_sign_in"
+"""Admission reason: the person must sign in on the provider's setup page."""
+
+
+@dataclass(frozen=True)
+class AdmissionReport:
+    """Whether a sandbox currently accepts new work, as its provider reports it.
+
+    :param admitting: ``False`` refuses new work; work already admitted continues.
+    :param reason: Typed reason code when not admitting, e.g.
+        :data:`ADMISSION_NOT_SAVED` or :data:`ADMISSION_NEEDS_SIGN_IN`.
+    :param message: Person-readable detail, e.g.
+        ``"the last save is 35 minutes old"``.
+    :param generation: Provider runtime generation the report describes. A new
+        generation invalidates every earlier report.
+    :param status: The sandbox's typed status, when the provider tracks it.
+    :param observed_at: Unix time of the provider reply the report comes from,
+        when the launcher answers from a cached reply; ``None`` means now.
+    """
+
+    admitting: bool
+    reason: str | None = None
+    message: str | None = None
+    generation: str | None = None
+    status: HostSandboxStatus | None = None
+    observed_at: float | None = None
+
+
+@dataclass(frozen=True)
+class StartClaim:
+    """Outcome of :meth:`SandboxLifecycle.claim_start`.
+
+    :param granted: ``True`` when the provider recorded a new start attempt.
+        Only a granted claim authorises re-arming the host and starting it.
+    :param attempt: The claimed start attempt, passed to ``start_host``.
+    :param status: The sandbox's status when the claim was refused, e.g.
+        ``"host_running"``.
+    """
+
+    granted: bool
+    attempt: int | None = None
+    status: HostSandboxStatus | None = None
+
+
+SuspendOutcome = Literal["refused", "stopped", "unknown"]
+
+
+@dataclass(frozen=True)
+class SuspendResult:
+    """Outcome of :meth:`SandboxLifecycle.suspend`.
+
+    :param outcome: ``"refused"`` before any stop (the sandbox keeps running),
+        ``"stopped"`` once the stop is confirmed, or ``"unknown"`` when the stop
+        may have begun but is not confirmed. Repeating the call with the same
+        operation id reports the recorded outcome.
+    :param reason: Person-readable detail for a refusal, e.g. ``"saving"``.
+    """
+
+    outcome: SuspendOutcome
+    reason: str | None = None
 
 
 @dataclass(frozen=True)

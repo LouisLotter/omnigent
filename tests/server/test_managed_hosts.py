@@ -4869,6 +4869,78 @@ async def test_info_lists_every_offered_provider(db_uri: str, tmp_path: Path) ->
     assert body["sandbox_providers"] == ["modal", "e2b"]
 
 
+def _persistent_entry(provider: str = "cloud") -> ManagedSandboxConfig:
+    from omnigent.server.managed_hosts import PersistentHostPolicy
+
+    return ManagedSandboxConfig(
+        server_url="https://s.example.com",
+        launcher_factory=lambda: _ProvisionRecordingLauncher(),
+        token_ttl_s=3600,
+        provider=provider,
+        persistent=PersistentHostPolicy(),
+    )
+
+
+class _ProvisionRecordingLauncher(SandboxHostLauncher):
+    """Records provisions; a persistent provider must never reach one per session."""
+
+    provider: ClassVar[str] = "cloud"
+    provisioned: ClassVar[list[str]] = []
+
+    def prepare(self) -> None:
+        return None
+
+    def provision(self, name: str) -> str:
+        self.provisioned.append(name)
+        return "sb-1"
+
+    def start_host(self, sandbox_id: str, **kwargs: object) -> str:  # type: ignore[override]
+        del sandbox_id, kwargs
+        return "/root/workspace"
+
+    def terminate(self, sandbox_id: str) -> None:
+        del sandbox_id
+
+
+@pytest.mark.parametrize("with_session_provider", [True, False])
+async def test_info_never_offers_persistent_providers_for_new_sessions(
+    db_uri: str, tmp_path: Path, with_session_provider: bool
+) -> None:
+    """Persistent providers are listed for adding computers, never as "New sandbox"."""
+    from omnigent.server import persistent_hosts
+
+    modal = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert modal is not None
+    configs = (
+        (modal.default, _persistent_entry()) if with_session_provider else (_persistent_entry(),)
+    )
+    app = _capability_probe_app(db_uri, tmp_path, ManagedSandboxDeployment(configs=configs))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body = (await client.get("/v1/info")).json()
+    finally:
+        persistent_hosts.configure(None, None, None)
+    assert body["persistent_host_providers"] == ["cloud"]
+    assert body["managed_sandboxes_enabled"] is with_session_provider
+    assert body["sandbox_providers"] == (["modal"] if with_session_provider else [])
+    assert "cloud" not in body["sandbox_provider_capabilities"]
+
+
+async def test_persistent_provider_refuses_one_session_launches(db_uri: str) -> None:
+    """A persistent-only provider never provisions a sandbox for one session."""
+    deployment = ManagedSandboxDeployment(configs=(_persistent_entry(),))
+    assert deployment.default.provider == "cloud"
+    assert deployment.managed_launch_supported is False
+    for provider in (None, "cloud"):
+        with pytest.raises(HTTPException) as raised:
+            await launch_managed_host(
+                config=deployment, owner="alice", host_store=HostStore(db_uri), provider=provider
+            )
+        assert raised.value.status_code == 400
+        assert "persistent hosts only" in str(raised.value.detail)
+    assert _ProvisionRecordingLauncher.provisioned == []
+
+
 async def test_info_lists_single_provider(db_uri: str, tmp_path: Path) -> None:
     """
     A single-provider server reports its one provider in the list too, so

@@ -42,9 +42,11 @@ from omnigent.onboarding.sandboxes.registry import (
     reset_plugin_state_for_tests,
 )
 from omnigent.onboarding.sandboxes.types import (
+    AdmissionReport,
     CheckpointReason,
     GitCloneOptions,
     HostContext,
+    HostSandboxStatus,
     RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
@@ -52,15 +54,19 @@ from omnigent.onboarding.sandboxes.types import (
     SandboxError,
     SandboxInfo,
     SandboxSpec,
+    StartClaim,
+    SuspendResult,
 )
 
 __all__ = [
     "COMMUNITY_MODULE_PREFIX",
     "DEFAULT_SANDBOX_NAME",
+    "AdmissionReport",
     "CheckpointReason",
     "DerivedWorkspace",
     "GitCloneOptions",
     "HostContext",
+    "HostSandboxStatus",
     "RemoteCommandResult",
     "RemoteProcess",
     "RepoWorkspace",
@@ -78,6 +84,8 @@ __all__ = [
     "SandboxProviderPluginState",
     "SandboxRegistryError",
     "SandboxSpec",
+    "StartClaim",
+    "SuspendResult",
     "available_providers",
     "bootstrap_sandbox_host",
     "build_wheels",

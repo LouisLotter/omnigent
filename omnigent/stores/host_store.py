@@ -32,7 +32,12 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import decode_host_status, encode_host_status
+from omnigent.db.enum_codecs import (
+    decode_host_lifecycle,
+    decode_host_status,
+    encode_host_lifecycle,
+    encode_host_status,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -93,6 +98,13 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param lifecycle: ``"persistent"`` for a managed host that outlives
+        sessions and sleeps when idle; ``None`` otherwise.
+    :param sleep_operation_id: Operation id of a persistent host's sleep whose
+        outcome is not yet known; its launch token is refused meanwhile.
+    :param start_failure: Why a persistent host's last start failed, or ``None``.
+    :param token_expires_at: Unix epoch seconds after which the launch token
+        stops authenticating; ``None`` for hosts without one.
     """
 
     host_id: str
@@ -107,6 +119,10 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
+    lifecycle: str | None = None
+    sleep_operation_id: str | None = None
+    start_failure: str | None = None
+    token_expires_at: int | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -182,6 +198,10 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        lifecycle=decode_host_lifecycle(row.lifecycle) if row.lifecycle is not None else None,
+        sleep_operation_id=row.sleep_operation_id,
+        start_failure=row.start_failure,
+        token_expires_at=row.token_expires_at,
     )
 
 
@@ -337,6 +357,8 @@ class HostStore:
                             SqlHost.token_expires_at >= now,
                             SqlHost.sandbox_id.is_not(None),
                             SqlHost.deleted_at.is_(None),
+                            # A sleep in progress has revoked the token.
+                            SqlHost.sleep_operation_id.is_(None),
                         )
                         .values(
                             name=name,
@@ -1228,6 +1250,9 @@ class HostStore:
             # authenticates.
             if row is None or row.token_hash is None or row.token_expires_at is None:
                 return None
+            # A persistent host's sleep revokes its token until the outcome is known.
+            if row.sleep_operation_id is not None:
+                return None
             if not hmac.compare_digest(row.token_hash, hash_host_launch_token(token)):
                 return None
             if row.token_expires_at < now_epoch():
@@ -1431,6 +1456,250 @@ class HostStore:
             if row.sandbox_id is None and row.terminating_sandbox_id is None:
                 session.delete(row)
             return True
+
+    def create_persistent_host(
+        self, *, host_id: str, name: str, user_id: str, provider: str
+    ) -> Host:
+        """
+        Write a persistent managed host's pending row, before its sandbox exists.
+
+        Written before the provider provisions anything, so a crash between
+        the two never leaves a sandbox Omnigent does not know about. The row
+        has no launch token and no sandbox until :meth:`attach_persistent_sandbox`
+        and the first start arm them.
+
+        :param host_id: Server-minted host identifier.
+        :param name: Caller-chosen display name, e.g. ``"Work computer"``.
+        :param user_id: Owner, e.g. ``"alice@example.com"``.
+        :param provider: Persistent sandbox provider name, e.g. ``"cloudflare"``.
+        :returns: The pending :class:`Host`.
+        :raises ValueError: When the owner already has a host with *name*,
+            including a deleted one awaiting cleanup.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> Host:
+            generation = require_active_account(session, user_id)
+            taken = session.execute(
+                select(SqlHost.host_id).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    or_(
+                        SqlHost.host_id == host_id,
+                        (SqlHost.user_id == user_id) & (SqlHost.name == name),
+                    ),
+                )
+            ).first()
+            if taken is not None:
+                raise ValueError(f"a host named {name!r} already exists")
+            row = SqlHost(
+                account_generation=generation,
+                user_id=user_id,
+                name=name,
+                host_id=host_id,
+                status=encode_host_status("offline"),
+                created_at=now,
+                updated_at=now,
+                sandbox_provider=provider,
+                lifecycle=encode_host_lifecycle("persistent"),
+            )
+            session.add(row)
+            return _row_to_host(row)
+
+        try:
+            return run_write_transaction(self._lifecycle_session, "create_persistent_host", write)
+        except IntegrityError as exc:
+            raise ValueError(f"a host named {name!r} already exists") from exc
+
+    def attach_persistent_sandbox(self, host_id: str, *, sandbox_id: str) -> Host | None:
+        """
+        Record the sandbox provisioned for a pending persistent host.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param sandbox_id: Provider-assigned sandbox id, e.g. ``"sb-a1b2c3"``.
+        :returns: The updated host, or ``None`` when the host was deleted or
+            already has a sandbox; the caller then owns the new sandbox.
+        """
+
+        def write(session: Session) -> Host | None:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
+                    SqlHost.lifecycle == encode_host_lifecycle("persistent"),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or row.sandbox_id is not None:
+                return None
+            row.sandbox_id = sandbox_id
+            row.updated_at = now_epoch()
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "attach_persistent_sandbox", write)
+
+    def record_start_failure(self, host_id: str, failure: str | None) -> None:
+        """
+        Record why a persistent host's start failed, or clear it after a success.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param failure: Person-readable reason, truncated to the column, or
+            ``None`` to clear it.
+        """
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
+                )
+                .values(start_failure=failure[:512] if failure is not None else None)
+            )
+
+        run_write_transaction(self._session_immediate, "record_host_start_failure", write)
+
+    def retain_orphan_sandbox(
+        self, *, host_id: str, user_id: str, provider: str, sandbox_id: str
+    ) -> None:
+        """
+        Keep a tombstone for a sandbox whose host was deleted while it was provisioned.
+
+        Written only when removing the new sandbox right away failed, so the
+        managed-sandbox reaper retries its removal like any deleted host's. The
+        tombstone is named after the host id, so a new host that took the
+        deleted one's display name never blocks it.
+
+        :param host_id: The deleted host's identifier.
+        :param user_id: Its owner.
+        :param provider: Sandbox provider name, e.g. ``"cloudflare"``.
+        :param sandbox_id: The provisioned sandbox awaiting removal.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> None:
+            session.add(
+                SqlHost(
+                    user_id=user_id,
+                    name=f"deleted-{host_id}",
+                    host_id=host_id,
+                    status=encode_host_status("offline"),
+                    created_at=now,
+                    updated_at=now,
+                    sandbox_provider=provider,
+                    sandbox_id=sandbox_id,
+                    lifecycle=encode_host_lifecycle("persistent"),
+                    deleted_at=now,
+                )
+            )
+
+        run_write_transaction(self._lifecycle_session, "retain_orphan_sandbox", write)
+
+    def list_deleted_persistent_hosts(self, user_id: str) -> list[Host]:
+        """
+        List *user_id*'s deleted persistent hosts whose sandboxes still need removal.
+
+        :param user_id: Owner, e.g. ``"alice@example.com"``.
+        :returns: Tombstoned hosts with a recorded sandbox id.
+        """
+        with self._session("list_deleted_persistent_hosts") as session:
+            rows = (
+                session.execute(
+                    select(SqlHost).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.user_id == user_id,
+                        SqlHost.deleted_at.is_not(None),
+                        SqlHost.lifecycle == encode_host_lifecycle("persistent"),
+                        or_(
+                            SqlHost.sandbox_id.is_not(None),
+                            SqlHost.terminating_sandbox_id.is_not(None),
+                        ),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
+
+    def begin_host_sleep(self, host_id: str, *, operation_id: str) -> bool:
+        """Record a persistent host's sleep, revoking its launch token, before any stop.
+
+        Persist-before-effect for the sleep fence: while the operation is
+        recorded the token no longer authenticates (see
+        :meth:`resolve_launch_token`), and a restart before the outcome is
+        known finds the operation and keeps admission closed. An open tunnel
+        is unaffected because tokens are checked at the handshake.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param operation_id: Idempotency key the provider's stop is asked with.
+        :returns: ``False`` when the host is gone or another sleep is pending.
+        """
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                        SqlHost.token_hash.is_not(None),
+                        SqlHost.sleep_operation_id.is_(None),
+                        SqlHost.deleted_at.is_(None),
+                    )
+                    .values(sleep_operation_id=operation_id)
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(self._session_immediate, "begin_host_sleep", write)
+
+    def end_host_sleep(self, host_id: str, *, operation_id: str, stopped: bool) -> None:
+        """Record a sleep's known outcome.
+
+        A stopped sandbox leaves the host offline with its token expired. A
+        refused sleep clears the operation, which restores the same token
+        exactly as it was.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param operation_id: The operation recorded by :meth:`begin_host_sleep`.
+        :param stopped: ``True`` when the provider confirmed the stop.
+        """
+        now = now_epoch()
+
+        def write(session: Session) -> None:
+            values: dict[str, object] = {"sleep_operation_id": None}
+            if stopped:
+                values.update(
+                    status=encode_host_status("offline"),
+                    updated_at=now,
+                    token_expires_at=now - 1,
+                )
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.sleep_operation_id == operation_id,
+                )
+                .values(**values)
+            )
+
+        run_write_transaction(self._session_immediate, "end_host_sleep", write)
+
+    def list_pending_host_sleeps(self) -> list[tuple[str, str]]:
+        """Return ``(host_id, operation_id)`` for every sleep with an unknown outcome."""
+        with self._session("list_pending_host_sleeps") as session:
+            rows = session.execute(
+                select(SqlHost.host_id, SqlHost.sleep_operation_id).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.sleep_operation_id.is_not(None),
+                    SqlHost.deleted_at.is_(None),
+                )
+            ).all()
+        return [(str(row.host_id), str(row.sleep_operation_id)) for row in rows]
 
     def revoke_launch_token(self, host_id: str) -> None:
         """

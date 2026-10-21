@@ -627,3 +627,20 @@ async def test_goal_routes_refuse_non_codex_and_missing_sessions(
     resp = await client.delete("/v1/sessions/conv_does_not_exist/codex_goal")
     assert resp.status_code == 404
     assert staged.events == []
+
+
+@pytest.mark.parametrize(
+    ("event", "starts_work"),
+    [
+        ({"type": "goal_get"}, False),
+        ({"type": "goal_clear"}, False),
+        ({"type": "goal_status", "status": "paused"}, False),
+        ({"type": "goal_status", "status": "active"}, True),
+        ({"type": "goal_set", "objective": "ship it"}, True),
+    ],
+)
+def test_only_goal_events_that_start_work_need_host_admission(
+    event: dict[str, Any], starts_work: bool
+) -> None:
+    """Reading, pausing or clearing a goal stays possible while a computer refuses new work."""
+    assert codex._goal_event_starts_work(event) is starts_work

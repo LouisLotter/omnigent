@@ -11,6 +11,7 @@ import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import { computerHost } from "@/test/hostFixtures";
 
 // Heavy children have their own suites; stub them so this one stays on the
 // dialog's two-call move and its recovery from a half-finished switch.
@@ -286,6 +287,22 @@ describe("SwitchHostDialog", () => {
     );
     // …and the list is refetched so the new host's shells replace it.
     expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_1") });
+  });
+
+  it("offers an asleep computer, which wakes on use, but not a failed one or an offline host", () => {
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_old", name: "mac-laptop", owner: "alice", status: "online" },
+        { host_id: "host_offline", name: "linux-box", owner: "alice", status: "offline" },
+        computerHost({ state: "asleep" }),
+        computerHost({ state: "failed" }, { host_id: "host_failed", name: "broken-box" }),
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderDialog();
+
+    expect(screen.getByTestId("switch-host-option-host_computer")).toBeInTheDocument();
+    expect(screen.queryByTestId("switch-host-option-host_failed")).toBeNull();
+    expect(screen.queryByTestId("switch-host-option-host_offline")).toBeNull();
   });
 
   it("offers the origin host again when the launch fails after the release", async () => {

@@ -13,6 +13,12 @@ and steers messages while the agent is busy.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
+- `cloud-computers`: when the server offers persistent hosts ("computers"), the
+  new-session host picker lists them under Cloud with their state: asleep (still
+  selectable; work wakes it), waking with its progress stage, going to sleep, and
+  failed with "Start again". **Add computer…** opens the add dialog. A selected
+  computer that refuses new work, such as one that needs sign-in, shows the reason
+  under the composer with its "Set up / manage" link.
 - `pill-tooltip`: hovering the pill shows one tooltip with Harness, Model, and
   Connection rows (plus effort when the harness has it).
 - `pill-tooltip-suppressed`: the tooltip stays hidden while the model picker is
@@ -116,6 +122,9 @@ and steers messages while the agent is busy.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
+- With a persistent host provider configured, open the host chip and choose a
+  computer under Cloud, or **Add computer…**; manage computers in
+  **Settings → Computers** (add, "Start again", "Set up / manage", delete).
 - From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
   composer.
 - Hover the model/effort pill to see the tooltip.
@@ -183,6 +192,13 @@ Other connection providers alone do not enable the managed MCP picker.
   covers the connected-host and managed-sandbox variants with stubbed host responses.
   Repeat at a phone viewport; desktop reconnect exceptions also have component
   coverage in `web/src/shell/NewChatDialog.test.tsx`.
+- **`cloud-computers`:** no browser-level coverage. Component tests in
+  `web/src/shell/NewChatDialog.test.tsx`,
+  `web/src/pages/settings/SettingsComputersSection.test.tsx` and
+  `web/src/components/computers/AddComputerDialog.test.tsx`; the server routes in
+  `tests/server/integration/test_persistent_hosts_api.py`. A live run needs a server
+  built with `create_app(sandbox_config=…)` whose provider entry carries a
+  `PersistentHostPolicy`; the repro environment has none.
 - **`pill-tooltip`, `pill-tooltip-suppressed`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open`
   (runs with zero and one turn).

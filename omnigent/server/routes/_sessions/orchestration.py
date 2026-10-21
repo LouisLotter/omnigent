@@ -4596,6 +4596,11 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
+    from omnigent.server.persistent_hosts import is_persistent_host
+
+    if is_persistent_host(host):
+        # Readiness owns persistent hosts: a quiet tunnel is not a reason to re-arm.
+        return False
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -4710,6 +4715,18 @@ async def ensure_runner_connected(
     async def _reread() -> Conversation:
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         return refreshed if refreshed is not None else conv
+
+    if conv.host_id is not None:
+        from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+        from omnigent.server.persistent_hosts import ensure_host_ready, session_progress
+
+        # A persistent host may be asleep or going to sleep: hold, wake, admit.
+        await ensure_host_ready(
+            conv.host_id,
+            operation="resource_access",
+            timeout_s=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+            progress=session_progress(session_id),
+        )
 
     # Fast path: a live runner tunnel is already reachable.
     runner_client = await _get_runner_client(

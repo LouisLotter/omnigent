@@ -11,6 +11,7 @@ import {
   useInstallingHarnesses,
   useStoreCredential,
 } from "./useHosts";
+import { computerHost } from "@/test/hostFixtures";
 
 const fetchMock = vi.fn();
 
@@ -123,6 +124,54 @@ describe("useHosts", () => {
     // sandbox filter regressed; if host_legacy disappears, the filter
     // broke old-server compatibility.
     expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
+  });
+
+  it("keeps persistent computers while hiding per-session sandbox hosts", async () => {
+    const computer = computerHost({ state: "asleep" });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        hosts: [
+          {
+            host_id: "host_sandbox",
+            name: "sandbox-abc123",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: "cloudflare",
+            lifecycle: null,
+          },
+          computer,
+        ],
+      }),
+    );
+
+    const { result } = renderHook(() => useHosts(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([computer]);
+  });
+
+  it("polls every 2 s while a computer wakes, then returns to the slow poll", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ hosts: [computerHost({ state: "waking" })] }))
+      .mockResolvedValue(mockResponse({ hosts: [computerHost({ state: "awake" })] }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useHosts(), { wrapper });
+      await waitFor(() => expect(result.current.data?.[0].persistent_status?.state).toBe("waking"));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.data?.[0].persistent_status?.state).toBe("awake");
+
+      // Awake now: no more 2 s refreshes until the 60 s poll.
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await act(() => vi.advanceTimersByTimeAsync(50_000));
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retains sandbox hosts when includeSandbox is set", async () => {

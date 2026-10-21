@@ -58,14 +58,16 @@ from omnigent.onboarding.harness_install import (
 )
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server import persistent_hosts
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
-    host_absent_error,
+    ready_host_connection,
     resolve_host_launch,
+    resolve_host_owner,
     resolve_launch_timeout_s,
 )
 from omnigent.server.routes._workspace_validation import (
@@ -74,7 +76,7 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -124,12 +126,6 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
-
-
-# ``/v1/hosts/{id}/*`` routes share the wrong-replica-vs-offline classification
-# with the runner-launch and import paths; the one implementation lives in
-# ``_host_launch`` so the sites can't drift.
-_host_absent_error = host_absent_error
 
 
 # The harness-setup frames (install_harness, store_secret, detect_credentials,
@@ -633,6 +629,40 @@ async def _resolve_agent_harness(
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
+def host_payload(
+    host: Host, host_registry: HostRegistry, *, now: int | None = None
+) -> dict[str, Any]:
+    """Serialize a host for ``GET /v1/hosts`` and the routes that return one host.
+
+    :param host: The host record.
+    :param host_registry: Live host tunnels on this replica.
+    :param now: One clock for a batch of hosts; defaults to the current time.
+    :returns: The host's API fields.
+    """
+    online = host_is_live(host, now=now)
+    return {
+        "host_id": host.host_id,
+        "name": host.name,
+        "owner": host.user_id,
+        "status": "online" if online else "offline",
+        # Non-None marks a server-managed sandbox host (e.g. "modal").
+        # Clients hide sandbox-backed hosts from manual host pickers — they
+        # are launch targets the server creates on demand — except persistent
+        # ones, which are long-lived computers listed like any host.
+        "sandbox_provider": host.sandbox_provider,
+        # "persistent" for a managed host that outlives sessions, else None.
+        "lifecycle": host.lifecycle,
+        # Asleep / waking / awake / sleeping / failed state of a persistent host.
+        "persistent_status": persistent_hosts.persistent_status(host, online=online),
+        "configured_harnesses": host.configured_harnesses,
+        # Held in memory from the host's connect handshake, not the hosts
+        # row. ``None`` means this replica has no report yet — emitted as-is
+        # so a client can tell "unknown" from "not gateway-backed".
+        "gateway_inference": host_registry.gateway_inference(host.host_id),
+        "interactive_shells": host_registry.interactive_shells(host.host_id),
+    }
+
+
 def create_hosts_router(
     host_registry: HostRegistry,
     host_store: HostStore,
@@ -706,27 +736,7 @@ def create_hosts_router(
             # A stored "online" is only trusted if the host was seen
             # recently: a crashed host never runs set_offline and would
             # otherwise show as online forever in the picker.
-            result.append(
-                {
-                    "host_id": host.host_id,
-                    "name": host.name,
-                    "owner": host.user_id,
-                    "status": "online" if host_is_live(host, now=now) else "offline",
-                    # Non-None marks a server-managed sandbox host (e.g.
-                    # "modal"). Clients use it to hide sandbox-backed
-                    # hosts from manual host pickers — they are launch
-                    # targets the server creates on demand, not
-                    # user-connectable machines.
-                    "sandbox_provider": host.sandbox_provider,
-                    "configured_harnesses": host.configured_harnesses,
-                    # Held in memory from the host's connect handshake, not the
-                    # hosts row. ``None`` means this replica has no report yet —
-                    # emitted as-is so a client can tell "unknown" from "not
-                    # gateway-backed".
-                    "gateway_inference": host_registry.gateway_inference(host.host_id),
-                    "interactive_shells": host_registry.interactive_shells(host.host_id),
-                }
-            )
+            result.append(host_payload(host, host_registry, now=now))
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")
@@ -755,21 +765,7 @@ def create_hosts_router(
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
-        return {
-            "host_id": host.host_id,
-            "name": host.name,
-            "owner": host.user_id,
-            "status": "online" if host_is_live(host) else "offline",
-            # Same semantics as list_hosts: non-None marks a
-            # server-managed sandbox host (e.g. "modal").
-            "sandbox_provider": host.sandbox_provider,
-            "configured_harnesses": host.configured_harnesses,
-            # Same semantics as list_hosts: reported on connect and held in
-            # memory, so ``None`` is "no report on this replica yet".
-            "gateway_inference": host_registry.gateway_inference(host.host_id),
-            "interactive_shells": host_registry.interactive_shells(host.host_id),
-            "runners": [],
-        }
+        return {**host_payload(host, host_registry), "runners": []}
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(
@@ -793,9 +789,9 @@ def create_hosts_router(
             raise HTTPException(status_code=404, detail="host not found")
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="model_options", renews_idle=False
+        )
         _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
@@ -851,6 +847,12 @@ def create_hosts_router(
         # unauthenticated caller slipping through as None could launch
         # a runner on another user's host. 401 instead.
         user_id = require_user(request, auth_provider)
+        if persistent_hosts.enabled():
+            # A persistent host is woken for the launch, which it then admits.
+            owned = await asyncio.to_thread(
+                resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+            )
+            await ready_host_connection(host_id, owned, host_registry, operation="runner_launch")
 
         # Authorize against BOTH the host and the session before
         # spawning anything (see _host_launch for the threat model).
@@ -1334,9 +1336,9 @@ def create_hosts_router(
                 detail="path must not contain NUL bytes",
             )
 
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="list_dir", renews_idle=False
+        )
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
@@ -1425,9 +1427,9 @@ def create_hosts_router(
                 detail="path must be absolute or tilde-prefixed",
             )
 
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="create_dir"
+        )
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1514,9 +1516,9 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="install_harness"
+        )
         _require_harness_setup_support(conn, "UI-driven harness installs")
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
@@ -1631,9 +1633,9 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="store_secret"
+        )
         _require_harness_setup_support(conn, "storing harness credentials")
 
         frame = HostStoreSecretFrame(
@@ -1713,9 +1715,9 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="detect_credentials", renews_idle=False
+        )
         _require_harness_setup_support(conn, "detecting existing credentials")
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
@@ -1770,9 +1772,9 @@ def create_hosts_router(
         if "\x00" in path:
             raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
 
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation="list_worktrees", renews_idle=False
+        )
 
         try:
             worktrees = await list_worktrees_on_host(

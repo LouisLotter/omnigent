@@ -480,6 +480,14 @@ def register_core_routes(
                 f"on this server — available: {offered}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        selected = sandbox_config.for_provider(sandbox_provider)
+        if selected is not None and selected.persistent is not None:
+            # Its hosts are long-lived computers; a session picks one as its host.
+            raise OmnigentError(
+                f"sandbox provider '{selected.provider}' creates persistent hosts only; "
+                "add one as a computer and choose it as the host",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # Reject several repos on a provider that clones only one, with a clear
         # 4xx (the web picker already caps this per provider; this guards direct
         # API callers). Resolve the provider the launch will actually use.

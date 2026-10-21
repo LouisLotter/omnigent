@@ -1,4 +1,5 @@
 import { testAgent } from "@/test/agentFixtures";
+import { computerHost } from "@/test/hostFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -1385,6 +1386,46 @@ describe("ForkSessionDialog", () => {
       openHostSelect();
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
     }
+
+    it("offers per-session providers only, never one that creates computers", () => {
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_providers: ["modal", "cloudflare"],
+          persistent_host_providers: ["cloudflare"],
+        },
+      });
+
+      openHostSelect();
+      expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Modal Sandbox");
+      expect(screen.queryByTestId("fork-session-sandbox-option-cloudflare")).toBeNull();
+      expect(screen.queryByText("Cloudflare Sandbox")).toBeNull();
+    });
+
+    it("lets an asleep computer take the clone, unlike a failed one", () => {
+      setHosts([
+        host({ status: "offline" }),
+        computerHost({ state: "asleep" }),
+        computerHost({ state: "failed" }, { host_id: "host_failed", name: "broken-box" }),
+      ]);
+      renderDialog(CODING);
+
+      openHostSelect();
+      expect(screen.getByTestId("fork-session-host-option-host_computer")).not.toHaveAttribute(
+        "data-disabled",
+      );
+      expect(screen.getByTestId("fork-session-host-option-host_computer")).toHaveTextContent(
+        "asleep",
+      );
+      expect(screen.getByTestId("fork-session-host-option-host_failed")).toHaveAttribute(
+        "data-disabled",
+      );
+      expect(screen.getByTestId("fork-session-host-option-host_1")).toHaveAttribute(
+        "data-disabled",
+      );
+    });
 
     it("hides the sandbox option on a server that can't provision one", () => {
       // Fails closed, mirroring the new-session picker: a server with no
