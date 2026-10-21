@@ -38,13 +38,14 @@ def setup_app(tmp_path, monkeypatch):
     original = app_module.create_app
 
     def capture(**kwargs):
+        from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
         from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
             SqlAlchemyScheduledTaskStore,
         )
 
-        kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(
-            str(kwargs["account_store"]._engine.url)
-        )
+        db_url = str(kwargs["account_store"]._engine.url)
+        kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(db_url)
+        kwargs["policy_store"] = SqlAlchemyPolicyStore(db_url)
         captured.update(kwargs)
         return original(**kwargs)
 

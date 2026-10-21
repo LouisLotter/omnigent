@@ -29,7 +29,7 @@ from omnigent.policies.registry import is_registered_handler, validate_factory_p
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
 from omnigent.server.auth import AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id
+from omnigent.server.routes._auth_helpers import get_user_id, refuse_delegated_credential
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
     CreateDefaultPolicyRequest,
@@ -191,6 +191,7 @@ def create_default_policies_router(
             already exists.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
+        refuse_delegated_credential(request, auth_provider, "change policies")
         if body.type != "python":
             raise OmnigentError(
                 f"Default policies only support type='python'; type={body.type!r} "
@@ -328,6 +329,7 @@ def create_default_policies_router(
             privileges, or 404 if the policy is not found.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
+        refuse_delegated_credential(request, auth_provider, "change policies")
         # Validate handler against the existing policy's type.
         if body.handler is not None:
             existing = store.get_default(policy_id)
@@ -393,6 +395,7 @@ def create_default_policies_router(
             privileges.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
+        refuse_delegated_credential(request, auth_provider, "change policies")
         store.delete_default(policy_id)
         invalidate_default_policy_specs_cache()
         _logger.info(

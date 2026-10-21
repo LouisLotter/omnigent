@@ -45,6 +45,9 @@ from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
 from omnigent.server.routes._auth_helpers import (
+    refuse_delegated_credential as _refuse_delegated_credential,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -306,12 +309,15 @@ def register_agent_routes(
         :param bundle: Uploaded ``.tar.gz`` agent bundle file.
         :returns: The updated :class:`AgentObject`.
         :raises OmnigentError: If the session or agent is not found,
-            the bundle is invalid, or the spec name doesn't match.
+            the bundle is invalid, or the spec name doesn't match; 403 for
+            a delegated credential such as a runner's token.
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
         )
+        # The bundle carries the agent's policies, so swapping it is the person's call.
+        _refuse_delegated_credential(request, auth_provider, "replace a session's agent")
         conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)

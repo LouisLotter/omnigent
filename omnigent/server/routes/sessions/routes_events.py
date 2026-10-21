@@ -105,6 +105,9 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
+    refuse_delegated_credential as _refuse_delegated_credential,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -1692,13 +1695,22 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            # An approval is a person's decision: runner tunnels and
+            # delegated runner tokens share this route but cannot answer.
+            if not isinstance(request, Request):
+                raise OmnigentError(
+                    "A runner tunnel cannot answer approvals", code=ErrorCode.FORBIDDEN
+                )
+            _refuse_delegated_credential(request, auth_provider, "answer approvals")
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id, body.data, runner_router, conversation_store, decided_by=user_id
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
