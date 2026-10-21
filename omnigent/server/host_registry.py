@@ -152,6 +152,94 @@ def _fail_pending_mcp_tools(conn: HostConnection) -> None:
 
 def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: str) -> None:
     """Fail inventory waiters on their owner loops and clear the retired map."""
+    _fail_pending_futures(pending, lambda: ConnectionError(f"host '{host_id}' disconnected"))
+
+
+class HostOperationOutcomeUnknownError(ConnectionError):
+    """The host may have carried out a request, but its tunnel closed before it answered."""
+
+
+# Requests that change something on the host: a lost answer leaves their
+# outcome unknown rather than failed.
+_MUTATING_PENDING_MAPS = (
+    "pending_launches",
+    "pending_stops",
+    "pending_create_worktrees",
+    "pending_remove_worktrees",
+    "pending_create_dirs",
+    "pending_installs",
+    "pending_secret_writes",
+    "pending_fs_requests",
+)
+# Requests that only read: a lost answer is a plain failure.
+_READ_PENDING_MAPS = (
+    "pending_runner_status",
+    "pending_quiesce",
+    "pending_stats",
+    "pending_list_dirs",
+    "pending_list_worktrees",
+    "pending_credential_detects",
+    "pending_model_options",
+)
+
+
+# How long an operation whose answer was lost keeps counting as in flight: the
+# longest host operation budget (a harness install, 420 s).
+UNANSWERED_OPERATION_HOLD_S = 420.0
+
+
+def _fail_pending_requests(conn: HostConnection) -> None:
+    """
+    Answer every request still waiting on a closed connection at once.
+
+    Without this, each waited out its own timeout (5 s to 420 s) for an
+    answer that can no longer arrive. An operation that changes the host may
+    still be running there, so it stays in ``inflight_unanswered`` for
+    :data:`UNANSWERED_OPERATION_HOLD_S`.
+
+    :param conn: The connection that was deregistered or replaced.
+    """
+    _hold_unanswered_operations(conn)
+    for name in _MUTATING_PENDING_MAPS:
+        _fail_pending_futures(
+            getattr(conn, name),
+            lambda: HostOperationOutcomeUnknownError(
+                f"host '{conn.host_id}' disconnected before answering; "
+                "the operation may have taken effect"
+            ),
+        )
+    for name in _READ_PENDING_MAPS:
+        _fail_pending_futures(
+            getattr(conn, name), lambda: ConnectionError(f"host '{conn.host_id}' disconnected")
+        )
+
+
+def _hold_unanswered_operations(conn: HostConnection) -> None:
+    """Keep the closed connection's unanswered host-changing requests counted as in flight."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    now = time.monotonic()
+    for name in _MUTATING_PENDING_MAPS:
+        for request_id, future in getattr(conn, name).items():
+            if future.done() or request_id in conn.inflight_unanswered:
+                continue
+            conn.inflight_unanswered[request_id] = now
+            # The callback holds the connection itself, so a fence that tracks
+            # connections weakly keeps seeing the hold until it expires.
+            loop.call_later(UNANSWERED_OPERATION_HOLD_S, _release_unanswered, conn, request_id)
+
+
+def _release_unanswered(conn: HostConnection, request_id: str) -> None:
+    """End one unanswered operation's hold."""
+    conn.inflight_unanswered.pop(request_id, None)
+
+
+def _fail_pending_futures(
+    pending: dict[str, asyncio.Future[Any]], error: Callable[[], BaseException]
+) -> None:
+    """Fail waiters on their owner loops and clear the retired map."""
     try:
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -168,17 +256,16 @@ def _fail_pending_inventory(pending: dict[str, asyncio.Future[Any]], host_id: st
             if owner_loop.is_closed():
                 continue
 
-            def settle(future: asyncio.Future[Any] = future, host_id: str = host_id) -> None:
+            def settle(future: asyncio.Future[Any] = future) -> None:
                 if not future.done():
-                    future.set_exception(ConnectionError(f"host '{host_id}' disconnected"))
+                    future.set_exception(error())
 
             if owner_loop is current_loop:
                 settle()
             else:
                 owner_loop.call_soon_threadsafe(settle)
         except RuntimeError:
-            # The owner loop can close between the check and scheduling. The
-            # pending map is already retired, so there is nothing to wake.
+            # The owner loop can close between the check and scheduling.
             continue
 
 
@@ -392,6 +479,11 @@ class HostConnection:
         npm's non-race-safe global writes never run twice at once. Keyed by
         the resolved install key (not ``request_id``) and cleared when the
         install completes.
+    :param inflight_unanswered: Request ids of operations that changed the host
+        and lost their answer when this connection closed, mapped to when they
+        were given up. The host may still be carrying them out, so they keep
+        counting as in flight (a sleep fence waits for them) until the longest
+        operation budget has passed.
     :param pending_secret_writes: Per-``request_id`` futures for in-flight
         ``host.store_secret`` requests (a UI-driven harness credential write).
         Resolved when the host sends ``host.store_secret_result``. Values carry
@@ -473,6 +565,7 @@ class HostConnection:
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    inflight_unanswered: dict[str, float] = field(default_factory=dict)
     pending_secret_writes: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
@@ -643,6 +736,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_requests(old)
             self._hosts[key] = conn
             self._registration_epochs[key] = epoch + 1
             if hello.interactive_shells is not None:
@@ -693,6 +787,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_requests(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

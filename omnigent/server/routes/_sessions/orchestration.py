@@ -105,6 +105,7 @@ from omnigent.runner.subagent_routing import (
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import runner_request_may_have_been_delivered
 from omnigent.runtime import (
     disconnect_outcome,
     get_policy_store,
@@ -127,10 +128,14 @@ from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import managed_host_checkpoints, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
+    _AnsweredHarnessElicitation,
+    _harness_elicitation_deadlines,
+    _harness_elicitation_outcomes,
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
     _harness_pre_resolved_elicitations,
+    _HarnessElicitationDeadline,
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
@@ -152,6 +157,7 @@ from omnigent.server.bundles import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.interrupted_work import with_unanswered_tool
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
     REQUESTED_HOST_ID_LABEL_KEY,
@@ -365,6 +371,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
+from omnigent.server.routes._sessions.interrupt_delivery import note_new_input
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -536,7 +543,15 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
             return tombstone.result
+        # A re-park keeps the first park's deadline, so re-posts never extend it.
+        timeout_s = _remaining_harness_elicitation_wait(
+            session_id, elicitation_id, request_fingerprint, timeout_s
+        )
+        if timeout_s <= 0:
+            # The question already timed out; a re-post gets that answer at once.
+            return None
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
             elicitation_id=elicitation_id,
@@ -602,6 +617,10 @@ async def _publish_and_wait_for_harness_elicitation(
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
+        # A settled question is done; a timed-out one keeps its deadline so a
+        # re-post is answered at once (pruned after the retention period).
+        if settled and _harness_elicitation_deadlines.get(elicitation_id) is not None:
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:
@@ -627,6 +646,163 @@ async def _publish_and_wait_for_harness_elicitation(
                     elicitation_id,
                     settled_action,
                 )
+
+
+def _remaining_harness_elicitation_wait(
+    session_id: str, elicitation_id: str, request_fingerprint: str, timeout_s: float
+) -> float:
+    """
+    Return how long this park of *elicitation_id* may still wait.
+
+    The first park records its deadline. A host re-posts a poll that went
+    unanswered with the same id, and that re-park waits only for what is left,
+    so a per-policy ``ask_timeout`` still ends the question on time.
+
+    :param session_id: Session parking the elicitation, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The elicitation's id, e.g. ``"elicit_claude_0f3a..."``.
+    :param request_fingerprint: Digest of the question's params.
+    :param timeout_s: This park's own timeout, e.g. ``300.0``.
+    :returns: Seconds left, ``0.0`` once the first park's deadline has passed.
+    """
+    now = time.monotonic()
+    _prune_harness_elicitation_deadlines(now)
+    first_park = _harness_elicitation_deadlines.get(elicitation_id)
+    if (
+        first_park is None
+        or first_park.session_id != session_id
+        or first_park.request_fingerprint != request_fingerprint
+    ):
+        first_park = _HarnessElicitationDeadline(
+            session_id=session_id,
+            request_fingerprint=request_fingerprint,
+            deadline=now + timeout_s,
+        )
+        _harness_elicitation_deadlines[elicitation_id] = first_park
+    return max(0.0, first_park.deadline - now)
+
+
+def _harness_elicitation_was_parked(session_id: str, elicitation_id: str) -> bool:
+    """
+    Return whether *elicitation_id* is a re-park of a question still waiting.
+
+    :param session_id: Session asking, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The elicitation's id, e.g. ``"elicit_evaluate_0f3a..."``.
+    :returns: ``True`` when an earlier park of this id has not settled yet.
+    """
+    first_park = _harness_elicitation_deadlines.get(elicitation_id)
+    return first_park is not None and first_park.session_id == session_id
+
+
+def _prune_harness_elicitation_deadlines(now: float) -> None:
+    """
+    Drop deadlines of waits that were severed and never re-parked.
+
+    :param now: ``time.monotonic()`` reading.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    expired = [
+        elicitation_id
+        for elicitation_id, first_park in _harness_elicitation_deadlines.items()
+        if now - first_park.deadline > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
+    ]
+    for elicitation_id in expired:
+        _harness_elicitation_deadlines.pop(elicitation_id, None)
+    overflow = (
+        len(_harness_elicitation_deadlines) - _facade._HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES
+    )
+    if overflow > 0:
+        oldest = sorted(_harness_elicitation_deadlines.items(), key=lambda item: item[1].deadline)[
+            :overflow
+        ]
+        for elicitation_id, _first_park in oldest:
+            _harness_elicitation_deadlines.pop(elicitation_id, None)
+
+
+def ask_request_fingerprint(phase: Phase, data: object) -> str:
+    """
+    Digest the whole request an ASK gate answers, not its truncated preview.
+
+    :param phase: The gated phase, e.g. :attr:`Phase.TOOL_CALL`.
+    :param data: The request's event data, e.g. a tool call's name and arguments.
+    :returns: A sha256 hex digest.
+    """
+    canonical = json.dumps(
+        {"phase": phase.value, "data": data}, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def answered_ask_verdict(
+    session_id: str, elicitation_id: str, phase: Phase, data: object
+) -> _AnsweredHarnessElicitation | None:
+    """
+    Return the outcome a re-posted question already reached, before anything evaluates it.
+
+    Evaluating it again would apply the policy's writes a second time, and an
+    approval can change the policy's answer from ask to allow.
+
+    :param session_id: Session asking, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The question's stable id.
+    :param phase: The gated phase.
+    :param data: The request's event data.
+    :returns: The remembered outcome, or ``None``.
+    """
+    return _answered_harness_elicitation(
+        session_id, elicitation_id, ask_request_fingerprint(phase, data)
+    )
+
+
+def _answered_harness_elicitation(
+    session_id: str, elicitation_id: str, request_fingerprint: str
+) -> _AnsweredHarnessElicitation | None:
+    """
+    Return the outcome an ASK gate already reached for this exact question, if recent.
+
+    :param session_id: Session asking, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The question's stable id.
+    :param request_fingerprint: Digest of the question's params.
+    :returns: The remembered outcome, or ``None``.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    now = time.monotonic()
+    for stale_id, outcome in list(_harness_elicitation_outcomes.items()):
+        if now - outcome.answered_at > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S:
+            _harness_elicitation_outcomes.pop(stale_id, None)
+    outcome = _harness_elicitation_outcomes.get(elicitation_id)
+    if (
+        outcome is None
+        or outcome.session_id != session_id
+        or outcome.request_fingerprint != request_fingerprint
+    ):
+        return None
+    return outcome
+
+
+def _remember_answered_harness_elicitation(
+    session_id: str,
+    elicitation_id: str,
+    request_fingerprint: str,
+    *,
+    approved: bool,
+    declined_reason: str | None,
+) -> None:
+    """Remember an ASK gate's outcome, whose writes were applied once, for re-posts."""
+    from omnigent.server.routes import sessions as _facade
+
+    if len(_harness_elicitation_outcomes) >= _facade._HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES:
+        oldest = min(_harness_elicitation_outcomes.items(), key=lambda item: item[1].answered_at)[
+            0
+        ]
+        _harness_elicitation_outcomes.pop(oldest, None)
+    _harness_elicitation_outcomes[elicitation_id] = _AnsweredHarnessElicitation(
+        session_id=session_id,
+        request_fingerprint=request_fingerprint,
+        approved=approved,
+        declined_reason=declined_reason,
+        answered_at=time.monotonic(),
+    )
 
 
 def _schedule_deferred_elicitation_clear(
@@ -2567,9 +2743,21 @@ async def _hold_native_ask_gate_impl(
     # this ASK in the native terminal before parking on the web verdict.
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
-    _spawn_native_approval_popup_forward(
-        session_id, elicitation_id, params.message, result.deciding_policy
-    )
+    fingerprint = ask_request_fingerprint(phase, data)
+    answered = _answered_harness_elicitation(session_id, elicitation_id, fingerprint)
+    if answered is not None:
+        # A re-post of a question already answered (its reply was lost): hand
+        # back the same outcome without applying its writes or asking again.
+        if answered.declined_reason is not None:
+            raise ElicitationDeclinedError(
+                answered.declined_reason, policy_name=result.deciding_policy
+            )
+        return answered.approved
+    if not _harness_elicitation_was_parked(session_id, elicitation_id):
+        # A re-park of the same question keeps the popup it already raised.
+        _spawn_native_approval_popup_forward(
+            session_id, elicitation_id, params.message, result.deciding_policy
+        )
     verdict = await _publish_and_wait_for_harness_elicitation(
         request,
         session_id=session_id,
@@ -2583,6 +2771,13 @@ async def _hold_native_ask_gate_impl(
     # Explicit user decline → raise so callers can abort the turn rather
     # than feeding a DENY message to the LLM and letting it continue.
     if verdict is not None and verdict.action == "decline":
+        _remember_answered_harness_elicitation(
+            session_id,
+            elicitation_id,
+            fingerprint,
+            approved=False,
+            declined_reason=result.reason or "",
+        )
         raise ElicitationDeclinedError(
             result.reason or "",
             policy_name=result.deciding_policy,
@@ -2596,6 +2791,11 @@ async def _hold_native_ask_gate_impl(
         if result.state_updates:
             with contextlib.suppress(ConversationNotFoundError):
                 engine.apply_state_updates(result.state_updates)
+    if verdict is not None:
+        # Remembered only once its writes landed, so a re-post never skips them.
+        _remember_answered_harness_elicitation(
+            session_id, elicitation_id, fingerprint, approved=approved, declined_reason=None
+        )
     return approved
 
 
@@ -3998,12 +4198,14 @@ async def _mark_runner_sessions_offline_once(
         ):
             continue
         turn_id = _session_active_response_cache.get(conv.id)
-        _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        # Name the tool the lost runner left without a result.
+        session_error = await with_unanswered_tool(error, conversation_store, conv.id)
+        _publish_status(conv.id, "failed", session_error, failure_origin="runner_offline_sweep")
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
         await _persist_session_status_error_labels(
-            conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+            conv.id, session_error, conversation_store, owner_runner_id=conv.runner_id
         )
     return retry
 
@@ -5524,6 +5726,7 @@ async def _ensure_runner_session_initialized(
     *,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
+    continuation_requested: bool = False,
 ) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -5574,6 +5777,8 @@ async def _ensure_runner_session_initialized(
         finishes.
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
+    :param continuation_requested: The person asked to continue interrupted
+        work, so a replacement runner may resume it.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -5584,8 +5789,10 @@ async def _ensure_runner_session_initialized(
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                 suppress_recovery_turn=suppress_recovery_turn,
+                continuation_requested=continuation_requested,
             )
         else:
+            from omnigent.server.interrupted_work import record_runner_incarnation
             from omnigent.version import VERSION
 
             resp = await runner_client.post(
@@ -5594,9 +5801,11 @@ async def _ensure_runner_session_initialized(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
+                    continuation_requested=continuation_requested,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
+            await record_runner_incarnation(conv, resp, conversation_store)
         from omnigent.server.runner_session_init import (
             is_session_agent_removed,
             runner_inference_verified,
@@ -6123,6 +6332,10 @@ def _build_native_terminal_message_event(
     return event
 
 
+class _NativeMessageDeliveryUnknownError(Exception):
+    """The runner may have taken a native message, but its answer was lost."""
+
+
 async def _forward_native_terminal_message(
     runner_client: httpx.AsyncClient,
     session_id: str,
@@ -6133,7 +6346,7 @@ async def _forward_native_terminal_message(
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
-) -> None:
+) -> Literal["accepted", "duplicate"]:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
 
@@ -6158,9 +6371,12 @@ async def _forward_native_terminal_message(
         ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
-    :returns: None.
+    :returns: ``"duplicate"`` when the runner had already accepted this
+        message, else ``"accepted"``.
     :raises HTTPException: 502 when the runner or harness rejects
-        the injection request.
+        the injection request, or the request never reached the runner.
+    :raises _NativeMessageDeliveryUnknownError: When the request may have
+        reached the runner but no answer came back.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(
@@ -6237,6 +6453,8 @@ async def _forward_native_terminal_message(
             exc_info=True,
             extra={"session_id": session_id},
         )
+        if runner_request_may_have_been_delivered(exc):
+            raise _NativeMessageDeliveryUnknownError(str(exc)) from exc
         raise HTTPException(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed",
@@ -6284,6 +6502,23 @@ async def _forward_native_terminal_message(
             input_delivery,
         ),
     )
+    return "duplicate" if _runner_reported_duplicate(resp) else "accepted"
+
+
+def _runner_reported_duplicate(resp: httpx.Response) -> bool:
+    """
+    Return whether the runner answered that it had already accepted this message.
+
+    :param resp: The runner's answer to a forwarded message.
+    :returns: ``True`` for the runner's duplicate-message answer.
+    """
+    from omnigent.runner.message_acceptance import DUPLICATE_MESSAGE_STATUS
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("status") == DUPLICATE_MESSAGE_STATUS
 
 
 async def _persist_session_event(
@@ -7704,6 +7939,8 @@ async def _dispatch_session_event_to_runner_impl(
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
+        # A new message supersedes a Stop still waiting for the runner.
+        note_new_input(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
@@ -7815,7 +8052,9 @@ async def _dispatch_session_event_to_runner_impl(
                         session_id, repeated_pending_id
                     ),
                 )
-                return _SessionEventDispatchResult(item_id=None, pending_id=repeated_pending_id)
+                return _SessionEventDispatchResult(
+                    item_id=None, pending_id=repeated_pending_id, delivery="duplicate"
+                )
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -7956,10 +8195,11 @@ async def _dispatch_session_event_to_runner_impl(
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
         forwarded = False
+        delivery: Literal["accepted", "duplicate", "unknown"] = "accepted"
         try:
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
-            await _forward_native_terminal_message(
+            delivery = await _forward_native_terminal_message(
                 runner_client,
                 session_id,
                 conv,
@@ -7984,6 +8224,21 @@ async def _dispatch_session_event_to_runner_impl(
                 attributes=input_attributes(input_delivery),
                 outcome="forward_accepted",
             )
+        except _NativeMessageDeliveryUnknownError as exc:
+            # The runner may be running it. Keep the pending entry, so a resend
+            # with the same stable id is answered from it instead of run twice;
+            # the transcript mirror drains it, or a later mirror reports it as
+            # undelivered.
+            forwarded = True
+            delivery = "unknown"
+            log_input_event(
+                _logger,
+                "native_input_forward_finished",
+                session_id=session_id,
+                attributes=input_attributes(input_delivery),
+                outcome="delivery_unknown",
+                exception_type=type(exc.__cause__ or exc).__name__,
+            )
         except BaseException as exc:
             log_input_event(
                 _logger,
@@ -7997,6 +8252,10 @@ async def _dispatch_session_event_to_runner_impl(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        if delivery == "duplicate" and pending_id is not None:
+            # The runner already took this message; its mirror drains the first entry.
+            pending_inputs.resolve(session_id, pending_id)
+            pending_id = None
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
@@ -8029,7 +8288,7 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id, delivery=delivery)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -8585,9 +8844,13 @@ async def _relay_runner_stream(
             else:
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
-                disconnect_error = ErrorDetail(
-                    code="runner_disconnected",
-                    message="Runner disconnected unexpectedly.",
+                disconnect_error = await with_unanswered_tool(
+                    ErrorDetail(
+                        code="runner_disconnected",
+                        message="Runner disconnected unexpectedly.",
+                    ),
+                    conversation_store,
+                    session_id,
                 )
                 turn_id = _session_active_response_cache.get(session_id)
                 _publish_status(

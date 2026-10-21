@@ -237,6 +237,11 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
     require_filesystem_attachment_runtime,
 )
+from omnigent.server.routes._sessions.interrupt_delivery import (
+    cancel_pending_interrupt,
+    deliver_interrupt_after_reconnect,
+    input_generation,
+)
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _cancel_runner_relays,
@@ -606,14 +611,24 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
+    from omnigent.server.interrupted_work import INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
+
+    last_error = _last_task_error_from_labels(conv.labels)
+    # Retry is the person asking: a replacement runner may continue the work
+    # a dead one was doing, including work it declined to continue on its own.
+    continue_interrupted = (
+        last_error is not None and last_error.get("code") == INTERRUPTED_OUTCOME_UNKNOWN_CODE
+    )
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
         conv,
         runner_client,
         conversation_store,
         initializer=getattr(request.app.state, "runner_session_initializer", None),
-        suppress_recovery_turn=was_connected,
+        suppress_recovery_turn=was_connected and not continue_interrupted,
         require_success=True,
+        continuation_requested=not was_connected or continue_interrupted,
     )
 
     if _is_native_terminal_session(conv):
@@ -1495,6 +1510,8 @@ def register_events_routes(
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
             queued_pending_ids: list[str] = []
+            # A later message must keep this Stop from being redelivered.
+            stop_generation = input_generation(session_id)
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -1544,8 +1561,21 @@ def register_events_routes(
                 target_session_id,
                 runner_router,
             )
+            # Which tunnel carries this Stop, so a lost one waits for the reconnect.
+            interrupt_tunnels = getattr(request.app.state, "tunnel_registry", None)
+            interrupt_tunnel = (
+                interrupt_tunnels.get(conv.runner_id)
+                if interrupt_tunnels is not None and conv.runner_id is not None
+                else None
+            )
             interrupt_delivered = False
-            if runner_client is not None:
+            interrupt_lost = runner_client is None
+            superseded = not codex_child and input_generation(session_id) != stop_generation
+            if superseded:
+                # A message sent while this Stop looked up its runner started a
+                # newer turn, which an older Stop must not interrupt.
+                interrupt_lost = False
+            elif runner_client is not None:
                 try:
                     interrupt_resp = await runner_client.post(
                         f"/v1/sessions/{target_session_id}/events",
@@ -1555,10 +1585,14 @@ def register_events_routes(
                     interrupt_delivered = interrupt_resp.status_code < 400
                 except (httpx.HTTPError, ConnectionError):
                     # WSTunnelTransport raises bare ConnectionError on tunnel close.
+                    interrupt_lost = True
                     _logger.exception(
                         "Interrupt forward failed for %r",
                         session_id,
                     )
+            interrupt_delivery = (
+                "delivered" if interrupt_delivered else "superseded" if superseded else "failed"
+            )
             if not interrupt_delivered:
                 if codex_child:
                     raise OmnigentError(
@@ -1568,7 +1602,26 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                if interrupt_lost and conv.runner_id is not None and interrupt_tunnels is not None:
+                    # The tunnel dropped or went silent: send it again once the
+                    # runner reconnects, if the turn is still running then.
+                    from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
+
+                    if deliver_interrupt_after_reconnect(
+                        session_id,
+                        runner_id=conv.runner_id,
+                        after_generation=(
+                            interrupt_tunnel.generation if interrupt_tunnel is not None else None
+                        ),
+                        tunnel_registry=interrupt_tunnels,
+                        runner_router=runner_router,
+                        queued_pending_ids=queued_pending_ids,
+                        wait_s=RUNNER_DISCONNECT_GRACE_S,
+                        stop_generation=stop_generation,
+                    ):
+                        interrupt_delivery = "pending"
             elif not codex_child:
+                cancel_pending_interrupt(session_id)
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if stop_codex_side_chat:
                 await asyncio.to_thread(
@@ -1576,7 +1629,13 @@ def register_events_routes(
                     session_id,
                     {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                 )
-            return {"queued": False}
+            if runner_client is None and conv.runner_id is None:
+                # No runner holds this session, so there is nothing to deliver to.
+                return {"queued": False}
+            # "pending": the runner was unreachable, and the Stop is sent again
+            # when it reconnects; "failed": the runner refused it; "superseded":
+            # a newer message arrived first, so it was not sent.
+            return {"queued": False, "delivery": interrupt_delivery}
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
@@ -3103,6 +3162,10 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if dispatch.delivery != "accepted":
+            # "unknown": the runner may be running it, so the client must not
+            # resend it; "duplicate": it was already accepted and nothing new runs.
+            response["delivery"] = dispatch.delivery
         return response
 
     # ── GET /sessions/{session_id}/stream ────────────────────────

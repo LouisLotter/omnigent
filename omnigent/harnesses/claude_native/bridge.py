@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import functools
 import hashlib
@@ -80,6 +81,7 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -6694,6 +6696,70 @@ def _handler_factory(
 # never cut mid-reason by the truncation.
 _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 
+# A policy check the relay forwards waits this long for the server's answer
+# before it re-posts the same elicitation id (see ``omnigent.native.long_poll``).
+# A parked ASK re-parks; a check stuck on a half-open connection gets a new one.
+_RELAY_POLICY_POLL_READ_TIMEOUT_S = LONG_POLL_READ_TIMEOUT_S
+# Total wait for one hook's verdict across re-parked polls, as before.
+_RELAY_POLICY_ANSWER_BUDGET_S = 86400.0
+# A poll held at least this long before failing was parked, not refused.
+_RELAY_POLICY_HELD_POLL_FLOOR_S = 10.0
+# Backstop on the relay thread's wait, past the poll's own read timeout.
+_RELAY_POLICY_FUTURE_TIMEOUT_S = _RELAY_POLICY_POLL_READ_TIMEOUT_S + 15.0
+
+
+def _relay_policy_post(
+    policy_client: httpx.AsyncClient,
+    loop: asyncio.AbstractEventLoop,
+    url: str,
+    body: _JsonObject,
+) -> httpx.Response:
+    """
+    Post one policy check to the server from a relay thread, bounded by one poll.
+
+    :param policy_client: The runner's server client.
+    :param loop: Event loop that owns *policy_client*.
+    :param url: Server-relative evaluate path, e.g.
+        ``"/v1/sessions/conv_abc/policies/evaluate"``.
+    :param body: Evaluation request, carrying its ``_omnigent_elicitation_id``.
+    :returns: The server's response.
+    :raises httpx.HTTPError: On a transport failure, including a poll left
+        unanswered for :data:`_RELAY_POLICY_POLL_READ_TIMEOUT_S`.
+    :raises TimeoutError: When the loop never ran the post within the backstop.
+    """
+    import httpx
+
+    future = asyncio.run_coroutine_threadsafe(
+        policy_client.post(
+            url,
+            json=body,
+            timeout=httpx.Timeout(5.0, read=_RELAY_POLICY_POLL_READ_TIMEOUT_S),
+        ),
+        loop,
+    )
+    try:
+        return future.result(timeout=_RELAY_POLICY_FUTURE_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise
+
+
+def _relay_poll_went_unanswered(error: BaseException, held_s: float) -> bool:
+    """
+    Return whether a relayed policy poll was held and then ended without an answer.
+
+    :param error: Exception from :func:`_relay_policy_post`.
+    :param held_s: Seconds the attempt was outstanding.
+    :returns: ``True`` when re-posting the same id should re-park it.
+    """
+    import httpx
+
+    return held_s >= _RELAY_POLICY_HELD_POLL_FLOOR_S and isinstance(
+        error,
+        httpx.ReadTimeout | httpx.ReadError | httpx.RemoteProtocolError | TimeoutError,
+    )
+
+
 # How long /hook/observe-tool waits for the file-change observer before
 # answering. Generous enough for a first-call registry resolution (one server
 # round trip); each request runs on its own ThreadingHTTPServer thread, so
@@ -6864,16 +6930,15 @@ def _tool_relay_handler_factory(
             deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
+            answer_deadline = time.monotonic() + _RELAY_POLICY_ANSWER_BUDGET_S
             while non_connect_failures < 3:
                 if attempts:
                     time.sleep(retry_delay)
                 attempts += 1
                 retry_delay = 0.4
-                future = asyncio.run_coroutine_threadsafe(
-                    policy_client.post(url, json=request_body), loop
-                )
+                attempt_started = time.monotonic()
                 try:
-                    resp = future.result(timeout=86400.0)
+                    resp = _relay_policy_post(policy_client, loop, url, request_body)
                 except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
                     last_error = str(exc).strip() or type(exc).__name__
                     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
@@ -6882,6 +6947,19 @@ def _tool_relay_handler_factory(
                             break
                         retry_delay = backoff_s
                         backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                    elif (
+                        _relay_poll_went_unanswered(exc, time.monotonic() - attempt_started)
+                        and time.monotonic() < answer_deadline
+                    ):
+                        # Parked for a person, or stuck on a half-open connection:
+                        # the same id re-parks, so this is not a failure.
+                        _logger.info(
+                            "policy_eval_relay_repark: session=%s hook_event=%s error=%s",
+                            session_id,
+                            hook_event,
+                            type(exc).__name__,
+                            extra={"session_id": session_id},
+                        )
                     else:
                         non_connect_failures += 1
                     continue
@@ -6934,9 +7012,10 @@ def _tool_relay_handler_factory(
 
             session_component = _up.quote(session_id, safe="")
             url = f"/v1/sessions/{session_component}/policies/evaluate"
-            future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
+            # A poll that goes unanswered answers 502; the calling hook re-posts
+            # its elicitation id, which re-parks a pending approval.
             try:
-                resp = future.result(timeout=86400.0)
+                resp = _relay_policy_post(policy_client, loop, url, payload)
             except Exception as exc:  # noqa: BLE001
                 self._send_policy_proxy_error(exc)
                 return

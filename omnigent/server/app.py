@@ -3812,7 +3812,9 @@ def create_app(
             is_parent_owned_subagent,
             restore_active_children,
         )
+        from omnigent.server.interrupted_work import keep_interrupted_outcome
         from omnigent.server.routes._sessions.common import (
+            _RUNNER_SESSION_INIT_TIMEOUT_S,
             _session_sandbox_status_cache,
             _session_status_cache,
         )
@@ -4036,11 +4038,12 @@ def create_app(
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
                     # Idle trees reinitialize on demand; active trees recover now.
+                    outcome_kept = False
                     if initialize_runtime:
                         response = await runner_session_initializer.initialize(
                             conv,
                             client,
-                            timeout=10.0,
+                            timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
@@ -4048,13 +4051,20 @@ def create_app(
                         if is_session_agent_removed(response):
                             return
                         response.raise_for_status()
+                        # A new runner process does not continue a dead one's
+                        # turn; its unknown outcome stays until the person acts.
+                        async with store_slots:
+                            outcome_kept = await keep_interrupted_outcome(
+                                conv.id, response, conversation_store, runner_id=runner_id
+                            )
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.
                     # Children retain interruption evidence until continuation runs.
-                    async with store_slots:
-                        await _publish_runner_recovered_status(
-                            conv.id, conversation_store, require_disconnect_code=True
-                        )
+                    if not outcome_kept:
+                        async with store_slots:
+                            await _publish_runner_recovered_status(
+                                conv.id, conversation_store, require_disconnect_code=True
+                            )
                     if initialize_runtime:
                         await restore_active_children(
                             conv,

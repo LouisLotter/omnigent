@@ -109,6 +109,7 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_routes import register_mcp_routes
+from omnigent.runner.message_acceptance import DUPLICATE_MESSAGE_STATUS, AcceptedMessages
 from omnigent.runner.model_option_routes import register_model_option_routes
 from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
@@ -156,6 +157,9 @@ from omnigent.runner.resource_routes import register_resource_routes
 from omnigent.runner.session_history import build_session_history
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
+    automatic_continuation_allowed,
+    earlier_runner_incarnation,
+    history_shows_agent_work,
     parse_runner_session_init_envelope,
 )
 from omnigent.runner.sign_in_watch import build_sign_in_watch
@@ -1400,6 +1404,12 @@ def create_runner_app(
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    # Messages this process accepted, so a resent one is answered as a duplicate.
+    _accepted_messages = AcceptedMessages()
+    # This runner process's identity across tunnel reconnects. A session whose
+    # work another incarnation ran is never continued here on its own.
+    _runner_incarnation_id = uuid.uuid4().hex
+    app.state.runner_incarnation_id = _runner_incarnation_id
     app.state.session_message_buffers = _session_message_buffers
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
@@ -1493,6 +1503,14 @@ def create_runner_app(
             queue = asyncio.Queue()
             _session_event_queues[session_id] = queue
         queue.put_nowait(event_body)
+        failure = event_body.get("error")
+        if (
+            event_body.get("type") == "response.failed"
+            and isinstance(failure, dict)
+            and failure.get("undelivered") is True
+        ):
+            # The harness never took this message, so a resend must run it.
+            _accepted_messages.forget(session_id, event_body)
         if event_body.get("type") == "session.status":
             _status_value = event_body.get("status")
             if isinstance(_status_value, str):
@@ -3010,11 +3028,21 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        # The incarnation check: work another runner process was doing may
+        # already have had effects, so it is not continued unless asked.
+        earlier_incarnation = earlier_runner_incarnation(
+            init_context.envelope, _runner_incarnation_id
+        )
+        # Reported to the server: whether earlier work here would be refused.
+        continuation_blocked = not automatic_continuation_allowed(
+            init_context.envelope, _runner_incarnation_id, ran_before=True
+        )
         recovery_id = (
             init_context.envelope.recovery_id
             if init_context.envelope is not None
             and init_context.envelope.resume_interrupted_turn
             and not _suppress_recovery
+            and not continuation_blocked
             else None
         )
         history: list[_JsonObject]
@@ -3052,6 +3080,11 @@ def create_runner_app(
                 needs_turn
                 and recovery_id is None
                 and not _suppress_recovery
+                and automatic_continuation_allowed(
+                    init_context.envelope,
+                    _runner_incarnation_id,
+                    ran_before=history_shows_agent_work(history),
+                )
                 and session_id not in _active_turns
             ):
                 recovery_turn = "history_resume"
@@ -3135,6 +3168,8 @@ def create_runner_app(
                     and init_context.envelope.resume_interrupted_turn
                 ),
                 suppress_recovery_turn=_suppress_recovery,
+                earlier_incarnation=earlier_incarnation,
+                continuation_blocked=continuation_blocked,
                 execution_seen=execution_seen,
                 forward_in_flight=forward_in_flight,
                 history_len=len(history),
@@ -3160,6 +3195,8 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                "runner_incarnation_id": _runner_incarnation_id,
+                "continuation_blocked": continuation_blocked,
                 **(
                     {"inference_config_verified": True}
                     if init_context.envelope is not None
@@ -3367,6 +3404,7 @@ def create_runner_app(
                 await turn_task
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
+        _accepted_messages.forget_session(session_id)
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
@@ -6306,6 +6344,21 @@ def create_runner_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    def _duplicate_message_response(conversation_id: str) -> JSONResponse:
+        """Answer a message this runner already accepted, whose first answer was lost."""
+        _logger.info(
+            "post_session_events: duplicate message not run again conv=%s",
+            conversation_id,
+            extra={"session_id": conversation_id},
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": DUPLICATE_MESSAGE_STATUS,
+                "detail": "Message already accepted; not run again.",
+            },
+        )
+
     @app.post("/v1/sessions/{conversation_id}/events")
     async def post_session_events(
         conversation_id: str,
@@ -6474,6 +6527,9 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            if _accepted_messages.seen(conversation_id, message_body):
+                # Answered before any turn bookkeeping: nothing new starts.
+                return _duplicate_message_response(conversation_id)
 
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
@@ -6488,6 +6544,9 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
+                if _accepted_messages.seen(conversation_id, message_body):
+                    # A concurrent delivery of the same message was accepted first.
+                    return _duplicate_message_response(conversation_id)
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -6518,6 +6577,7 @@ def create_runner_app(
                         conversation_id,
                         [],
                     ).append(message_body)
+                    _accepted_messages.remember(conversation_id, message_body)
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
@@ -6575,6 +6635,7 @@ def create_runner_app(
                         _session_message_buffers.setdefault(conversation_id, []).append(
                             message_body
                         )
+                        _accepted_messages.remember(conversation_id, message_body)
                         _start_claude_prompt_waiter(conversation_id, pending_bridge_dir)
                         _logger.info(
                             "post_session_events: buffering message for pending Claude prompt "
@@ -6607,6 +6668,7 @@ def create_runner_app(
                     _session_histories[conversation_id] = loaded
 
                 _begin_turn_slot(conversation_id)
+                _accepted_messages.remember(conversation_id, message_body)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,

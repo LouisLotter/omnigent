@@ -76,6 +76,7 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.interrupted_work import keep_interrupted_outcome, record_runner_incarnation
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -113,6 +114,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _RUNNER_SESSION_INIT_TIMEOUT_S,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -650,6 +652,7 @@ def register_core_routes(
             LAUNCH_TIMEOUT_ENV_VAR,
             resolve_host_launch,
             resolve_launch_timeout_s,
+            settle_unanswered_launch,
         )
 
         with creation_stage("create_acl_ms"):
@@ -724,13 +727,29 @@ def register_core_routes(
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
         except asyncio.TimeoutError:
-            launch_result = {
-                "status": "failed",
-                "error": (
-                    f"host launch timed out after {launch_timeout_s:g}s "
-                    f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
-                ),
-            }
+            # The result, or the launch itself, was lost: ask what happened. The
+            # create stays lenient and keeps the binding either way; a runner
+            # the host never received is relaunched by the first message.
+            settled = await settle_unanswered_launch(
+                host_id=host_id,
+                runner_id=runner_id,
+                host_registry=host_registry,
+                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                runner_exit_reports=getattr(request.app.state, "runner_exit_reports", None),
+            )
+            launch_result = (
+                {"status": "started"}
+                if settled == "started"
+                else {
+                    "status": "failed",
+                    "error": "the runner exited while starting"
+                    if settled == "failed"
+                    else (
+                        f"host launch timed out after {launch_timeout_s:g}s "
+                        f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
+                    ),
+                }
+            )
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():
@@ -923,13 +942,17 @@ def register_core_routes(
                         exc_info=True,
                     )
             try:
-                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+                init_resp = await _rc.post(
+                    "/v1/sessions", json=init_body, timeout=_RUNNER_SESSION_INIT_TIMEOUT_S
+                )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
                     resp.id,
                     exc_info=True,
                 )
+            else:
+                await record_runner_incarnation(conv, init_resp, conversation_store)
         # Grant the creator ownership BEFORE any host launch so the
         # launch's session-ownership check (shared with
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
@@ -1753,6 +1776,7 @@ def register_core_routes(
                             conv.id,
                             conversation_store,
                             int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                            as_interrupted=True,
                         )
         # Build items after reconciliation so each settled row reads its new
         # status straight from the (now-updated) cache.
@@ -2776,6 +2800,7 @@ def register_core_routes(
                     session_id,
                 )
                 parent_initialized = False
+                runner_init_resp: httpx.Response | None = None
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
                     # The versioned payload's snapshot carries harness_override,
                     # so a rebind after a cross-harness create initializes the
@@ -2790,7 +2815,7 @@ def register_core_routes(
                                 conv,
                                 server_version=VERSION,
                             ),
-                            timeout=10.0,
+                            timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                         )
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
@@ -2807,6 +2832,7 @@ def register_core_routes(
                             runner_init_resp.status_code < 400
                             and runner_inference_verified(conv, runner_init_resp)
                         )
+                        await record_runner_incarnation(conv, runner_init_resp, conversation_store)
                 if (
                     conv is not None
                     and conv.inference_snapshot is not None
@@ -2843,7 +2869,13 @@ def register_core_routes(
                 )
                 if parent_initialized:
                     assert conv is not None and _runner_client is not None
-                    await _publish_runner_recovered_status(session_id, conversation_store)
+                    assert runner_init_resp is not None
+                    # A rebind to a new runner process does not settle work a dead
+                    # one left with an unknown outcome; the person does.
+                    if not await keep_interrupted_outcome(
+                        session_id, runner_init_resp, conversation_store, runner_id=runner_id
+                    ):
+                        await _publish_runner_recovered_status(session_id, conversation_store)
                     from omnigent.server.child_session_recovery import restore_active_children
 
                     await restore_active_children(

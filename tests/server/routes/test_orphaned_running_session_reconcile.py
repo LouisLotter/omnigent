@@ -123,14 +123,17 @@ async def test_list_reconciles_orphaned_running_session(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A persisted-running session whose runner is confirmed gone reads
-    "idle" in the list, not a phantom "running"."""
+    """A persisted-running session whose runner is confirmed gone reads as an
+    interrupted turn in the list, not a phantom "running" and not a quiet
+    "idle" that would hide the interruption."""
     session_id = _seed_running_session(db_uri, runner_fresh=False)
 
     resp = await client.get("/v1/sessions")
     assert resp.status_code == 200
     item = next(s for s in resp.json()["data"] if s["id"] == session_id)
-    assert item["status"] == "idle"
+    assert item["status"] == "failed"
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.json()["last_task_error"]["code"] == "runner_disconnected"
 
 
 async def test_list_leaves_running_session_with_fresh_runner(

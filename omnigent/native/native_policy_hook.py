@@ -31,6 +31,7 @@ from typing import NotRequired, TypedDict
 
 import httpx
 
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from omnigent.util.http_retry import bounded_retry_after_seconds
 
 # How long to keep retrying transient 429 / 5xx / connect errors on the
@@ -52,8 +53,8 @@ _EVALUATE_POLICY_CONNECT_TIMEOUT_S = 5.0
 # Mirrors the PermissionRequest hook's held-poll floor.
 _EVALUATE_POLICY_HELD_POLL_FLOOR_S = 10.0
 # Transport errors that mean an established connection was torn down
-# mid-poll. A timeout is deliberately absent: a ReadTimeout fires only
-# after the server held the poll for the whole read budget.
+# mid-poll. A poll that stays silent for its whole period re-parks too (see
+# :func:`post_evaluate_with_retry`), until the caller's read budget runs out.
 _HELD_POLL_SEVER_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError)
 
 # Hook event names that gate tool execution and therefore carry policy
@@ -620,16 +621,19 @@ def post_evaluate_with_retry(
     second approval card from appearing when the first was already
     published before the error.
 
-    Other 4xx responses are final — a bad request won't succeed on retry. A
-    :class:`httpx.ReadTimeout` is final too: it fires only after the server
-    held the poll for the whole read budget, i.e. the ask itself timed out.
-    The caller is responsible for fail-closed handling on ``None``.
+    Other 4xx responses are final — a bad request won't succeed on retry. Each
+    attempt waits at most :data:`LONG_POLL_READ_TIMEOUT_S` for an answer: a
+    poll that stays silent that long (a half-open connection, or a person who
+    has not answered yet) re-POSTs the same id, which re-parks it, until
+    ``read_timeout`` has passed in total. The caller is responsible for
+    fail-closed handling on ``None``.
 
     :param url: Absolute URL of the evaluate endpoint.
     :param headers: Auth headers for the Omnigent server.
     :param eval_request: ``EvaluationRequest`` JSON body to POST.
-    :param read_timeout: Per-attempt read timeout in seconds. Should be
-        large (e.g. one day) to accommodate long-polling ASK gates.
+    :param read_timeout: Total seconds to wait for an answer across re-parked
+        polls. Should be large (e.g. one day) to accommodate long-polling ASK
+        gates.
     :param hook_label: Diagnostic label used in stderr messages,
         e.g. ``"evaluate-policy hook"`` or ``"codex evaluate-policy hook"``.
     :param reauth: Optional callable that re-mints fresh auth headers when
@@ -655,7 +659,11 @@ def post_evaluate_with_retry(
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
     deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
-    timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
+    poll_read_timeout = min(read_timeout, LONG_POLL_READ_TIMEOUT_S)
+    timeout = httpx.Timeout(
+        read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S, read=poll_read_timeout
+    )
+    answer_deadline = time.monotonic() + read_timeout
     reauthed = False
     last_error: str = "unknown error"
     while True:
@@ -733,6 +741,7 @@ def post_evaluate_with_retry(
             else:
                 held_poll_severed = (
                     time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                    and time.monotonic() < answer_deadline
                 )
                 print(
                     f"omnigent {hook_label}: Omnigent returned {status}"
@@ -751,13 +760,15 @@ def post_evaluate_with_retry(
             )
         except httpx.HTTPError as exc:
             last_error = f"request error: {exc}"
-            # A connection the gateway tore down after holding the poll is a
-            # sever: the same id re-parks the elicitation. Anything else
-            # mid-stream (a ReadTimeout means the ask itself timed out) is final.
-            held_poll_severed = (
-                isinstance(exc, _HELD_POLL_SEVER_ERRORS)
-                and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+            # A connection torn down after holding the poll, or a poll left
+            # unanswered for its whole period, re-parks the same id while the
+            # caller's budget lasts. Anything else mid-stream is final.
+            unanswered_poll = (
+                isinstance(exc, httpx.ReadTimeout) and time.monotonic() < answer_deadline
             )
+            held_poll_severed = (
+                isinstance(exc, _HELD_POLL_SEVER_ERRORS) or unanswered_poll
+            ) and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
             if not held_poll_severed:
                 print(
                     f"omnigent {hook_label}: Omnigent request failed: {exc}",
@@ -765,7 +776,7 @@ def post_evaluate_with_retry(
                 )
                 return None, last_error
             print(
-                f"omnigent {hook_label}: held poll severed by the gateway; re-parking: {exc}",
+                f"omnigent {hook_label}: held poll ended without an answer; re-parking: {exc}",
                 file=sys.stderr,
             )
         if held_poll_severed:

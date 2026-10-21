@@ -118,6 +118,8 @@ async def restore_active_children(
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
+    from omnigent.server.interrupted_work import keep_interrupted_outcome
+    from omnigent.server.routes._sessions.common import _RUNNER_SESSION_INIT_TIMEOUT_S
     from omnigent.server.routes.sessions import _ensure_runner_relay
 
     if parent.runner_id is None or not _restorable(parent):
@@ -287,7 +289,7 @@ async def restore_active_children(
                     response = await initializer.initialize(
                         child,
                         client,
-                        timeout=10.0,
+                        timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                         suppress_recovery_turn=not _interrupted(child),
                         resume_interrupted_turn=_interrupted(child),
                         generation=generation,
@@ -296,6 +298,11 @@ async def restore_active_children(
                     if is_session_agent_removed(response):
                         return False  # nothing to restore; already logged as expected
                     response.raise_for_status()
+                    # A child interrupted in another runner process is not
+                    # continued on its own; its unknown outcome stays visible.
+                    await keep_interrupted_outcome(
+                        child.id, response, store, runner_id=parent.runner_id
+                    )
                 initializer.require_generation(runner_id, client, generation)
                 _ensure_runner_relay(child.id, parent.runner_id, client, store, conversation=child)
                 # Only execution status can clear the interruption. Initialization

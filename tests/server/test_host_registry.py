@@ -737,3 +737,60 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+@pytest.mark.parametrize("closed_by", ["deregister", "replacement"])
+async def test_closed_connection_answers_every_waiting_request_with_its_outcome(
+    closed_by: str,
+) -> None:
+    """A host whose tunnel closes answers all its requests at once, not at their timeouts.
+
+    A request that changes the host may already have taken effect, so its
+    outcome is unknown; a read simply failed.
+    """
+    from omnigent.server.host_registry import (
+        _MUTATING_PENDING_MAPS,
+        _READ_PENDING_MAPS,
+        HostOperationOutcomeUnknownError,
+    )
+
+    registry = HostRegistry()
+    conn = registry.register("host_ops", FakeWebSocket(), _make_hello(), owner="bob")
+    loop = asyncio.get_running_loop()
+    waiting = {name: loop.create_future() for name in _MUTATING_PENDING_MAPS + _READ_PENDING_MAPS}
+    for name, future in waiting.items():
+        getattr(conn, name)["req_1"] = future
+
+    if closed_by == "deregister":
+        assert registry.deregister("host_ops") is True
+    else:
+        registry.register("host_ops", FakeWebSocket(), _make_hello(), owner="bob")
+
+    for name, future in waiting.items():
+        assert future.done(), f"{name} was left to wait out its timeout"
+        error = future.exception()
+        assert isinstance(error, ConnectionError)
+        assert isinstance(error, HostOperationOutcomeUnknownError) is (
+            name in _MUTATING_PENDING_MAPS
+        ), name
+        assert getattr(conn, name) == {}
+    # A host-changing request may still be running there: it keeps counting.
+    assert set(conn.inflight_unanswered) == {"req_1"}
+
+
+async def test_unanswered_operation_hold_outlives_other_references_to_its_connection() -> None:
+    """A fence that tracks connections weakly keeps seeing the hold until it expires."""
+    import gc
+    import weakref
+
+    registry = HostRegistry()
+    old = registry.register("host_hold", FakeWebSocket(), _make_hello(), owner="bob")
+    old.pending_installs["req_install"] = asyncio.get_running_loop().create_future()
+    registry.register("host_hold", FakeWebSocket(), _make_hello(), owner="bob")
+    retired = weakref.ref(old)
+    del old
+    gc.collect()
+
+    held = retired()
+    assert held is not None, "the retired connection was collected with its hold"
+    assert set(held.inflight_unanswered) == {"req_install"}

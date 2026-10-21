@@ -103,6 +103,10 @@ async def read_workspace_from_host(
             ) from exc
         try:
             result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+        except ConnectionError as exc:
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' disconnected before answering the fs read"
+            ) from exc
         except asyncio.TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs op %r within %.0fs",
@@ -182,6 +186,10 @@ async def write_workspace_from_host(
             ) from exc
         try:
             result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+        except ConnectionError as exc:
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' disconnected before answering the fs write"
+            ) from exc
         except asyncio.TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs write op %r within %.0fs",

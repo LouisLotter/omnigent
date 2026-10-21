@@ -22,19 +22,23 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
-from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 from omnigent.server.permissions import check_session_access
 from omnigent.server.persistent_hosts import ensure_host_ready
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 
 _logger = logging.getLogger(__name__)
 
@@ -322,3 +326,55 @@ def resolve_host_launch(
             raise HTTPException(status_code=404, detail="session not found")
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
+
+
+LaunchSettlement = Literal["started", "failed", "unknown"]
+
+
+async def settle_unanswered_launch(
+    *,
+    host_id: str,
+    runner_id: str,
+    host_registry: HostRegistry,
+    tunnel_registry: TunnelRegistry | None,
+    runner_exit_reports: RunnerExitReports | None = None,
+) -> LaunchSettlement:
+    """
+    Find out what happened to a launch whose result never arrived.
+
+    The result frame can be lost on a dropped host tunnel while the runner
+    starts anyway. The runner's own tunnel registration, the host's
+    ``host.runner_status`` answer (which waits for a launch still in progress),
+    or the host's exit report tells a started runner from one that already
+    exited. A host with no record of the runner is not evidence that the launch
+    never arrived: its record goes when an exited runner is reaped, and with a
+    restarted host process. That stays unknown.
+
+    :param host_id: The host the launch was sent to, e.g. ``"host_a1b2..."``.
+    :param runner_id: The runner the launch was for.
+    :param host_registry: Registry holding the host's current connection.
+    :param tunnel_registry: Registry of connected runners, if configured.
+    :param runner_exit_reports: The hosts' runner exit reports, if configured.
+    :returns: ``"started"`` when the runner is up or starting, ``"failed"``
+        when its process exited, ``"unknown"`` otherwise.
+    """
+    from omnigent.server.routes._sessions.helpers import _query_host_runner_status
+
+    def exited() -> bool:
+        return runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
+
+    if tunnel_registry is not None and tunnel_registry.get(runner_id) is not None:
+        return "started"
+    if exited():
+        return "failed"
+    conn = host_registry.get(host_id)
+    if conn is None:
+        return "unknown"
+    status = await _query_host_runner_status(conn, host_registry, runner_id)
+    if tunnel_registry is not None and tunnel_registry.get(runner_id) is not None:
+        return "started"
+    if status in ("alive", "sign_in_pending"):
+        return "started"
+    if status == "dead" or exited():
+        return "failed"
+    return "unknown"

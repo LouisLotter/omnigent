@@ -437,6 +437,7 @@ class TunnelRegistry:
         runner_id: str,
         *,
         timeout_s: float,
+        newer_than_generation: int | None = None,
     ) -> RunnerSession | None:
         """
         Wait until a runner registers or the timeout expires.
@@ -450,17 +451,28 @@ class TunnelRegistry:
         :param runner_id: Runner id to wait for, e.g.
             ``"runner_0123456789abcdef"``.
         :param timeout_s: Maximum seconds to wait, e.g. ``3.0``.
+        :param newer_than_generation: When set, a connection of this
+            generation or older does not count, so a caller that saw a
+            request fail on a half-open tunnel waits for the reconnect.
         :returns: The registered :class:`RunnerSession`, or ``None`` if
             the runner did not connect before the timeout.
         """
+
+        def usable(session: RunnerSession | None) -> RunnerSession | None:
+            if session is None or (
+                newer_than_generation is not None and session.generation <= newer_than_generation
+            ):
+                return None
+            return session
+
         if timeout_s <= 0:
-            return self.get(runner_id)
+            return usable(self.get(runner_id))
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[RunnerSession] = loop.create_future()
         overflow_reason: str | None = None
         with self._lock:
-            current = self._sessions.get(runner_id)
+            current = usable(self._sessions.get(runner_id))
             if current is not None:
                 return current
             state = self._connect_waits.get(runner_id)
@@ -485,7 +497,7 @@ class TunnelRegistry:
                 extra={"session_id": runner_primary_session_id()},
             )
             await asyncio.sleep(timeout_s)
-            return self.get(runner_id)
+            return usable(self.get(runner_id))
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_s)
@@ -752,7 +764,12 @@ class TunnelRegistry:
         )
 
     async def send_text(
-        self, session: RunnerSession, data: str, *, app_ping_ts: int | None = None
+        self,
+        session: RunnerSession,
+        data: str,
+        *,
+        app_ping_ts: int | None = None,
+        still_wanted: Callable[[], bool] | None = None,
     ) -> None:
         """Enqueue one outbound WebSocket frame on the session's owner loop.
 
@@ -760,6 +777,9 @@ class TunnelRegistry:
             the frame.
         :param data: Encoded tunnel frame JSON.
         :param app_ping_ts: Application ping token, only for heartbeat diagnostics.
+        :param still_wanted: Checked on the owner loop just before queuing; when
+            it returns ``False`` the frame is dropped, e.g. for a request its
+            caller abandoned while the owner loop was busy.
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
@@ -776,6 +796,8 @@ class TunnelRegistry:
                 with self._lock:
                     if self._sessions.get(session.runner_id) is not session:
                         raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                    if still_wanted is not None and not still_wanted():
+                        raise ConnectionError("request was abandoned before it was sent")
                     frame = OutboundFrame(
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )

@@ -213,6 +213,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RUNNER_CONVICTION_POLL_S,
     _RUNNER_FORWARD_TIMEOUT,
+    _RUNNER_SESSION_INIT_TIMEOUT_S,
     _SERVER_STREAM_EVENT_ADAPTER,
     _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
     _SHARED_DISCOVERY_KEY,
@@ -5084,6 +5085,8 @@ def reconcile_orphaned_running_status(
     session_id: str,
     conversation_store: ConversationStore,
     stale_before: int,
+    *,
+    as_interrupted: bool = False,
 ) -> bool:
     """
     Settle a session that reads ``running`` but whose runner is
@@ -5107,14 +5110,43 @@ def reconcile_orphaned_running_status(
     :param session_id: Session/conversation identifier to settle.
     :param conversation_store: Store performing the conditional transition.
     :param stale_before: Runner stamps at or after this epoch are fresh.
+    :param as_interrupted: Settle to the runner-disconnect failure, naming the
+        tool left without a result, instead of ``idle``: a passive read must
+        not hide that the turn was interrupted. A Stop settles to ``idle``.
     :returns: Whether this call performed the transition.
     """
     if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
         return False
+    if not as_interrupted:
+        _publish_status(
+            session_id,
+            "idle",
+            persist_live_status=False,
+            scheduled_run_outcome="failed",
+        )
+        return True
+    from omnigent.server.interrupted_work import runner_lost_error
+
+    conversation = conversation_store.get_conversation(session_id)
+    error = runner_lost_error(conversation_store, session_id)
+    try:
+        conversation_store.set_labels(
+            session_id,
+            _session_status_error_label_updates(
+                error, owner_runner_id=conversation.runner_id if conversation else None
+            ),
+        )
+    except Exception:  # noqa: BLE001 — the published status still carries the cause
+        _logger.exception(
+            "Failed to persist the interrupted status of %s",
+            session_id,
+            extra={"session_id": session_id},
+        )
     _publish_status(
         session_id,
-        "idle",
-        persist_live_status=False,
+        "failed",
+        error,
+        failure_origin="runner_orphaned",
         scheduled_run_outcome="failed",
     )
     return True
@@ -5205,11 +5237,38 @@ async def _persist_session_status_error_labels(
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
     """
+    updates = _session_status_error_label_updates(
+        error, owner_runner_id=owner_runner_id, agent_name=agent_name, item_id=item_id
+    )
+    try:
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+    except Exception:  # noqa: BLE001
+        _logger.exception(
+            "Failed to persist session status error labels for %s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+
+
+def _session_status_error_label_updates(
+    error: ErrorDetail | None,
+    *,
+    owner_runner_id: str | None = None,
+    agent_name: str | None = None,
+    item_id: str | None = None,
+) -> dict[str, str]:
+    """
+    Build the label writes that persist or clear a session's failure detail.
+
+    See :func:`_persist_session_status_error_labels` for the parameters.
+
+    :returns: Label updates, every key present (empty values clear).
+    """
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
     # label store is upsert-only and a stale title/cause from a prior failure
     # must not leak onto a later, unclassified one.
-    updates = (
+    return (
         {
             _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
             _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_error_message_label(error.message),
@@ -5232,14 +5291,6 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
         }
     )
-    try:
-        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Failed to persist session status error labels for %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
 
 
 def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:
@@ -6249,7 +6300,7 @@ async def _launch_runner_on_host_locked(
                 launch_future,
                 timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
             host_conn.pending_launches.pop(request_id, None)
@@ -7308,7 +7359,7 @@ async def _stop_session_host_runner(
                 future,
                 timeout=_STOP_RUNNER_RESULT_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             _logger.warning(
                 "Host %s did not acknowledge stop of runner %s for session %s",
                 host_id,
@@ -7980,10 +8031,16 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param delivery: ``"accepted"`` when the runner took the message;
+        ``"duplicate"`` when it had already accepted it, so nothing new runs;
+        ``"unknown"`` when it may have taken it but its answer was lost, so a
+        client must not resend it (a resend with the same stable id is
+        de-duplicated while the pending entry is kept).
     """
 
     item_id: str | None
     pending_id: str | None
+    delivery: Literal["accepted", "duplicate", "unknown"] = "accepted"
 
 
 def _extract_persistent_item_from_sse(
@@ -10761,7 +10818,7 @@ async def _notify_runner_of_bundled_child(
                 "agent_id": agent_id,
                 "sub_agent_name": None,
             },
-            timeout=10.0,
+            timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
         )
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(

@@ -182,3 +182,34 @@ async def test_inventory_waiters_on_worker_loop_fail_from_foreign_teardown(
     for result in results:
         assert isinstance(result, HTTPException)
         assert result.status_code == 502
+
+
+async def test_install_whose_host_disconnects_reports_an_unknown_outcome_at_once() -> None:
+    """A dropped host ends a 420 s install wait immediately, as a possible success."""
+    from omnigent.server.routes.hosts import (
+        _INSTALL_HARNESS_TIMEOUT_S,
+        _proxy_install_harness,
+    )
+
+    registry = HostRegistry()
+    conn = registry.register(
+        host_id="host_install_drop",
+        ws=AsyncMock(),
+        hello=HostHelloFrame(version="test", frame_protocol_version=1, name="test"),
+        owner=None,
+    )
+    task = asyncio.create_task(
+        _proxy_install_harness(host_registry=registry, host_conn=conn, harness="claude")
+    )
+    await asyncio.wait_for(conn.outbound_queue.get(), timeout=1)
+    assert conn.pending_installs
+
+    registry.deregister(conn.host_id)
+    (result,) = await asyncio.wait_for(
+        asyncio.gather(task, return_exceptions=True), timeout=_INSTALL_HARNESS_TIMEOUT_S / 100
+    )
+
+    assert isinstance(result, HTTPException)
+    assert result.status_code == 504
+    assert "may have taken effect" in str(result.detail)
+    assert conn.pending_installs == {}

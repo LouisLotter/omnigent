@@ -2207,6 +2207,8 @@ class CodexNativeAppServer:
         )
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
+            # A runner killed outright must not leave Codex finishing its turn
+            # unobserved; the host's registry sweep covers other platforms.
             self.proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -2215,6 +2217,7 @@ class CodexNativeAppServer:
                 env=proc_env,
                 cwd=str(self.cwd),
                 executable=self.codex_path,
+                preexec_fn=_proc.die_with_parent_preexec(),
                 **_proc.spawn_kwargs(),
             )
         except BaseException:

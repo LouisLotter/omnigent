@@ -970,7 +970,9 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
-_RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
+# Session initialization can launch the harness on the runner (Codex's app-server
+# waits up to 60 s to become ready), and the runner tunnel enforces this bound.
+_RUNNER_SESSION_INIT_TIMEOUT_S = 120.0
 
 
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0

@@ -806,6 +806,142 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+class _LostAcceptanceRunner:
+    """
+    Runner fake that de-duplicates like the real one and can lose its answers.
+
+    ``lose_answers`` forwards are accepted (run) and then answered with a read
+    timeout, as when the runner took a message and its reply was lost on a
+    half-open tunnel. ``refuse_next`` forwards never reach it.
+    """
+
+    def __init__(self) -> None:
+        from omnigent.runner.message_acceptance import AcceptedMessages
+
+        self.accepted = AcceptedMessages()
+        self.runs: list[str] = []
+        self.lose_answers = 0
+        self.refuse_next = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/events"):
+            return httpx.Response(202, json={})
+        if self.refuse_next:
+            self.refuse_next -= 1
+            raise httpx.ConnectError("runner offline", request=request)
+        body = json.loads(request.content)
+        if self.accepted.seen("conv", body):
+            return httpx.Response(202, json={"status": "duplicate"})
+        self.accepted.remember("conv", body)
+        self.runs.append(body["content"][0]["text"])
+        if self.lose_answers:
+            self.lose_answers -= 1
+            raise httpx.ReadTimeout("answer lost", request=request)
+        return httpx.Response(202, json={"status": "accepted"})
+
+
+async def test_native_message_whose_acceptance_is_lost_runs_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message the runner took, whose answer was lost, runs once across retries.
+
+    The first answer is "delivery unknown, do not resend" instead of 502, and
+    the pending entry is kept, so a retry with the same stable id is answered
+    from it. A retry after the mirror drained the entry reaches the runner,
+    which answers it as a duplicate. A send that never reached the runner is
+    still a 502 whose retry runs.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    pending_inputs.reset_for_tests()
+    runner_fake = _LostAcceptanceRunner()
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+
+    def message(text: str, stable_id: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+                "stable_id": stable_id,
+            },
+        }
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_fake), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.wrapper": "claude-code-native-ui",
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events = f"/v1/sessions/{session_id}/events"
+        try:
+            lost = message("append one line", "1" * 32)
+            runner_fake.lose_answers = 1
+            first = await client.post(events, json=lost)
+            assert first.status_code == 202, first.text
+            assert first.json()["delivery"] == "unknown"
+            assert pending_inputs.snapshot_for(session_id), "the entry must be kept"
+
+            retry = await client.post(events, json=lost)
+            assert retry.status_code == 202, retry.text
+            assert retry.json()["delivery"] == "duplicate"
+            assert retry.json()["pending_id"] == first.json()["pending_id"]
+
+            mirrored = await client.post(
+                events,
+                json={
+                    "type": "external_conversation_item",
+                    "data": {"item_type": "message", "item_data": lost["data"]},
+                },
+            )
+            assert mirrored.status_code == 202, mirrored.text
+            assert not pending_inputs.snapshot_for(session_id)
+            late_retry = await client.post(events, json=lost)
+            assert late_retry.status_code == 202, late_retry.text
+            assert late_retry.json()["delivery"] == "duplicate"
+            assert "pending_id" not in late_retry.json()
+            assert not pending_inputs.snapshot_for(session_id)
+            assert runner_fake.runs == ["append one line"]
+
+            never_sent = message("second message", "2" * 32)
+            runner_fake.refuse_next = 1
+            refused = await client.post(events, json=never_sent)
+            assert refused.status_code == 502, refused.text
+            assert not pending_inputs.snapshot_for(session_id)
+            resent = await client.post(events, json=never_sent)
+            assert resent.status_code == 202, resent.text
+            assert "delivery" not in resent.json()
+            assert runner_fake.runs == ["append one line", "second message"]
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
 async def test_native_user_item_respects_background_title_header_opt_out(
     client: httpx.AsyncClient,
     app: Any,
@@ -5338,7 +5474,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert len(runner_client.posts) == 1
     init_post = runner_client.posts[0]
     assert init_post["url"] == "/v1/sessions"
-    assert init_post["timeout"] == 10.0
+    assert init_post["timeout"] == sessions_module._RUNNER_SESSION_INIT_TIMEOUT_S
     assert init_post["json"]["session_id"] == sid
     assert init_post["json"]["agent_id"] == agent["id"]
     assert init_post["json"]["sub_agent_name"] is None
@@ -5348,6 +5484,53 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert [event["status"] for event in published] == ["failed", "idle"]
     assert cache_after == "idle"
     assert relay_bindings == [(sid, "runner_recovered")]
+
+
+async def test_patch_rebind_to_a_new_runner_keeps_an_interrupted_turns_unknown_outcome(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Re-attaching an interrupted session to a new runner process does not settle it.
+
+    The runner that ran the turn died; the rebound runner declines to continue
+    it. The rebind must leave the "interrupted, outcome unknown" failure for
+    the person instead of clearing it to idle.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _runner(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201, json={"runner_incarnation_id": "e" * 32, "continuation_blocked": True}
+        )
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(_runner), base_url="http://runner")
+
+    async def _get_runner_client(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return runner
+
+    async def _no_relay(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        sessions_module, "_registered_runner_id", lambda _router, raw, **_: raw.strip()
+    )
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner_client)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _no_relay)
+    agent = await create_test_agent(client)
+    sid = (await _create_session(client, agent["id"]))["id"]
+    sessions_module._session_status_cache[sid] = "running"
+    try:
+        resp = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_new"})
+        cache_after = sessions_module._session_status_cache.get(sid)
+        snapshot = await client.get(f"/v1/sessions/{sid}")
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        await runner.aclose()
+
+    assert resp.status_code == 200, resp.text
+    assert cache_after == "failed"
+    assert snapshot.json()["last_task_error"]["code"] == "interrupted_outcome_unknown"
 
 
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
@@ -10030,6 +10213,38 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     assert after.json()["items"] == before_items
 
 
+async def test_retry_session_asks_to_continue_work_left_with_an_unknown_outcome(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry is the person asking: it lets a replacement runner continue the work."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"],
+        {
+            "omnigent.last_task_error_code": "interrupted_outcome_unknown",
+            "omnigent.last_task_error_message": "The runner stopped while Bash was running.",
+        },
+    )
+    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=object()))
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    initialize.assert_awaited_once()
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
+    assert initialize.await_args.kwargs["continuation_requested"] is True
+
+
 async def test_retry_session_ensures_dead_required_native_terminal_once(
     client: httpx.AsyncClient,
     app: Any,
@@ -10342,6 +10557,118 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
         await fake_runner.aclose()
+
+
+async def test_stop_on_a_silent_runner_tunnel_is_reported_and_sent_after_reconnect(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Stop the runner never answered is reported pending and lands after the reconnect.
+
+    On a half-open tunnel the interrupt forward times out while the turn runs
+    on. The route answers ``"delivery": "pending"`` instead of a silent 202,
+    and sends the Stop again over the runner's next tunnel.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import interrupt_delivery
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    interrupts: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            interrupts.append(request)
+            if len(interrupts) == 1:
+                raise httpx.ReadTimeout("no answer on a half-open tunnel", request=request)
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+
+    async def _fake_get_runner_client(session_id: str, runner_router: object, **_: Any) -> Any:
+        del session_id, runner_router
+        return fake_runner
+
+    class _NoopWS:
+        async def send_text(self, data: str) -> None:
+            del data
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    def _hello() -> HelloFrame:
+        return HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    registry = app.state.tunnel_registry
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, "runner_silent_tunnel")
+    registry.register("runner_silent_tunnel", _NoopWS(), _hello())
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+        )
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"queued": False, "delivery": "pending"}
+        assert session_id not in _interrupt_fenced_sessions, "the turn still runs"
+
+        registry.register("runner_silent_tunnel", _NoopWS(), _hello())
+        for _ in range(200):
+            if not interrupt_delivery.has_pending_interrupt(session_id):
+                break
+            await asyncio.sleep(0.01)
+        assert len(interrupts) == 2, "the Stop must be sent again over the new tunnel"
+        assert session_id in _interrupt_fenced_sessions
+    finally:
+        interrupt_delivery.cancel_pending_interrupt(session_id)
+        registry.deregister("runner_silent_tunnel", retire=False)
+        sessions_module._session_status_cache.pop(session_id, None)
+        _interrupt_fenced_sessions.discard(session_id)
+        await fake_runner.aclose()
+
+
+async def test_stop_superseded_by_a_message_during_its_lookup_is_not_sent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that arrives while Stop looks up its runner keeps its turn running."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import interrupt_delivery
+
+    posted: list[httpx.Request] = []
+    runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: posted.append(request) or httpx.Response(204)
+        ),
+        base_url="http://runner",
+    )
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+
+    async def lookup_while_a_message_arrives(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        interrupt_delivery.note_new_input(session_id)
+        return runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", lookup_while_a_message_arrives)
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
+        )
+    finally:
+        await runner.aclose()
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False, "delivery": "superseded"}
+    assert posted == []
+    assert not interrupt_delivery.has_pending_interrupt(session_id)
 
 
 @pytest.mark.parametrize(
