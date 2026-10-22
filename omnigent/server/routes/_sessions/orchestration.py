@@ -3183,9 +3183,13 @@ async def _persist_external_conversation_item_unlocked(
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         # A mirror replayed from a saved transcript is older than anything
-        # queued now; only an exact text match can be its own entry.
+        # queued now, and equal text does not prove an entry is its own.
         replayed = body.data.get("replayed") is True
-        matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        matched = (
+            pending_inputs.MatchedDrain(matched=None, skipped=[])
+            if replayed
+            else pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        )
         drained = matched.matched
         match_method = matched.match_method
         if agent_message_candidate or replayed:
