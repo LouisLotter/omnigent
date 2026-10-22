@@ -8598,6 +8598,7 @@ async def _auto_create_claude_terminal(
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
+    _launched_here_before = _bridge_dir_for_bridge_id(bridge_id).is_dir()
     if _pre_wipe_claude_sid is not None:
         # Keep it past the wipe, for a retry after a launch that stops before Claude starts.
         remember_claude_session_id(_bridge_dir_for_bridge_id(bridge_id), _pre_wipe_claude_sid)
@@ -8850,6 +8851,20 @@ async def _auto_create_claude_terminal(
                     session_id,
                     exc_info=True,
                 )
+    if (
+        server_client is not None
+        and session_external_id is None
+        and fork_source_external_id is None
+        and not fork_carry_history
+    ):
+        # No Claude session id to resume: launch fresh only over a history Claude never wrote.
+        from omnigent.harnesses.claude_native.main import (
+            _refuse_fresh_launch_over_claude_history,
+        )
+
+        await _refuse_fresh_launch_over_claude_history(
+            server_client, session_id, launched_here_before=_launched_here_before
+        )
     _logger.info(
         "Claude terminal cold-resume decision: session=%s external_session_id_set=%s "
         "fork_source_set=%s resume_enabled=%s",

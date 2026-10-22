@@ -2086,7 +2086,7 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"labels": {}}),
+            lambda req: httpx.Response(200, json={"labels": {}, "data": [], "has_more": False}),
         ),
     )
     session_id = "conv_launch_config_retry"
@@ -2910,7 +2910,9 @@ async def test_auto_create_claude_terminal_never_launches_fresh_past_an_unreconc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("first_failure", ["history_outage", "no_space", "cancelled"])
+@pytest.mark.parametrize(
+    "first_failure", ["history_outage", "no_space", "cancelled", "snapshot_id_no_space"]
+)
 async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_starts(
     first_failure: str,
     tmp_path: Path,
@@ -2922,7 +2924,9 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
     only record of the Claude session, and preparing the bridge clears its
     state. Whatever stops the first start, the refused retry and the recovery
     must still resume that id, never launch fresh past the saved transcript's
-    undelivered tail.
+    undelivered tail. In ``snapshot_id_no_space`` the bridge never held the id:
+    only the first snapshot reports it, keeping it fails, and the retry finds
+    no id at all, so the Claude items in the history must refuse it.
     """
     import errno
     from unittest.mock import AsyncMock
@@ -2947,11 +2951,13 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
 
     session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
     prior_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
-    bridge_dir = bridge_dir_for_bridge_id(session_id)
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (bridge_dir / "state.json").write_text(
-        json.dumps({"claude_session_id": prior_claude_sid}), encoding="utf-8"
-    )
+    snapshot_id_only = first_failure == "snapshot_id_no_space"
+    if not snapshot_id_only:
+        bridge_dir = bridge_dir_for_bridge_id(session_id)
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (bridge_dir / "state.json").write_text(
+            json.dumps({"claude_session_id": prior_claude_sid}), encoding="utf-8"
+        )
     transcript = (
         claude_native._claude_project_dir_for_cwd(workspace.resolve())
         / f"{prior_claude_sid}.jsonl"
@@ -2986,9 +2992,11 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
         }
     ]
     posts: list[str] = []
-    history_down = True
+    # With the id only in the first snapshot, the readable history refuses the retry.
+    history_down = not snapshot_id_only
+    snapshot_ids = iter([prior_claude_sid, None, prior_claude_sid] if snapshot_id_only else [])
     cancel_history_read = first_failure == "cancelled"
-    if first_failure == "no_space":
+    if first_failure in ("no_space", "snapshot_id_no_space"):
         remember = claude_native_bridge.remember_claude_session_id
         remember_calls = 0
 
@@ -3026,7 +3034,11 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
             return httpx.Response(202, json={"queued": False})
         if request.url.path.endswith("/labels"):
             return httpx.Response(200, json={"labels": {}})
-        # The session snapshot omits external_session_id; PATCHes succeed.
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{session_id}":
+            snapshot_id = next(snapshot_ids, None)
+            return httpx.Response(
+                200, json={"external_session_id": snapshot_id} if snapshot_id else {}
+            )
         return httpx.Response(200, json={})
 
     captured: dict[str, Any] = {}
@@ -3037,6 +3049,7 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
             "history_outage": ClaudeTranscriptUnreconciledError,
             "no_space": OSError,
             "cancelled": asyncio.CancelledError,
+            "snapshot_id_no_space": OSError,
         }[first_failure]
         for expected_error in (first_error, ClaudeTranscriptUnreconciledError):
             with pytest.raises(expected_error):

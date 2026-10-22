@@ -30,14 +30,23 @@ class NullServerClient:
         def raise_for_status(self) -> None:
             """No-op: stub always succeeds."""
 
+    class _EmptyItemsResponse(_Response):
+        """Stub 200 response holding an empty session item page."""
+
+        def json(self) -> dict[str, Any]:
+            """Return an item page with no items."""
+            return {"data": [], "has_more": False}
+
     async def get(self, url: str, **kwargs: Any) -> _Response:
         """Return an empty 200 for any GET request.
 
-        :param url: Request URL (ignored).
+        :param url: Request URL; a session item listing gets an empty page.
         :param kwargs: Extra keyword arguments (ignored).
         :returns: Stub 200 response with empty JSON body.
         """
-        del url, kwargs
+        del kwargs
+        if url.endswith("/items"):
+            return self._EmptyItemsResponse()
         return self._Response()
 
     async def post(self, url: str, **kwargs: Any) -> _Response:
