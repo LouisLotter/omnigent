@@ -391,6 +391,8 @@ class PreparedClaudeTerminal:
     :param resume_forward_from: Byte offset where the forwarder starts on a
         cold resume that kept a transcript the server has not fully
         received; ``None`` skips the existing transcript.
+    :param resume_replayed_source_ids: Items of that transcript the
+        forwarder posts as replayed.
     :param tmux_socket: Runner tmux server socket path when the
         terminal exposed one and it is reachable from this process,
         e.g. ``Path("/tmp/omnigent-501/.../tmux.sock")``. ``None``
@@ -409,6 +411,7 @@ class PreparedClaudeTerminal:
     reattached: bool
     cold_resumed: bool = False
     resume_forward_from: int | None = None
+    resume_replayed_source_ids: frozenset[str] = frozenset()
     tmux_socket: Path | None = None
     tmux_target: str | None = None
 
@@ -3990,6 +3993,7 @@ async def _attach_with_transcript_forwarder(
                 agent_name=agent_name,
                 start_at_end=skip_existing_transcript,
                 start_at_offset=prepared.resume_forward_from,
+                replayed_source_ids=prepared.resume_replayed_source_ids,
                 auth=auth,
             ),
             name="claude-native-transcript-forwarder",
@@ -5216,6 +5220,7 @@ async def _prepare_claude_terminal(
         reattached=False,
         cold_resumed=cold_resumed,
         resume_forward_from=cold_resume.forward_from,
+        resume_replayed_source_ids=cold_resume.replayed_source_ids,
         tmux_socket=launch_tmux.socket,
         tmux_target=launch_tmux.target,
     )
@@ -5265,10 +5270,12 @@ class _ColdResume:
     :param args: ``("--resume", "<claude_sid>")``, or ``()`` to launch fresh.
     :param forward_from: Byte offset the transcript forwarder must start
         from, or ``None`` to skip the whole existing transcript.
+    :param replayed_source_ids: Items the forwarder posts as replayed.
     """
 
     args: tuple[str, ...] = ()
     forward_from: int | None = None
+    replayed_source_ids: frozenset[str] = frozenset()
 
 
 async def _resolve_cold_resume(
@@ -5347,7 +5354,11 @@ async def _resolve_cold_resume(
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
         return _ColdResume()
-    return _ColdResume(("--resume", external_session_id), transcript.forward_from)
+    return _ColdResume(
+        ("--resume", external_session_id),
+        transcript.forward_from,
+        transcript.replayed_source_ids,
+    )
 
 
 @dataclass(frozen=True)
@@ -5362,10 +5373,13 @@ class ClaudeResumeTranscript:
         forwarder starts there. ``None`` when the forwarder skips the whole
         file: it was rebuilt from server history, or that history was
         unreachable.
+    :param replayed_source_ids: Source ids of the items left to the
+        forwarder, which posts them as replayed.
     """
 
     path: Path
     forward_from: int | None = None
+    replayed_source_ids: frozenset[str] = frozenset()
 
 
 async def _ensure_local_claude_resume_transcript(
@@ -5415,8 +5429,9 @@ async def _prepare_claude_resume_transcript(
     but the server never received (a restored home loses the forwarder's
     cursor) are delivered under their ``source_id`` keys. If some stay
     undelivered, it is kept rather than rewritten, and the forwarder starts at
-    its first undelivered record. A transcript that cannot be read, or holds
-    undelivered items but cannot be resumed, is set aside before rewriting.
+    its first undelivered record, posting them as replayed. A transcript that
+    cannot be read or placed in the server's history, or holds undelivered
+    items but cannot be resumed, is set aside before rewriting.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -5467,10 +5482,14 @@ async def _prepare_claude_resume_transcript(
                 target,
                 replay.undelivered,
             )
-            return ClaudeResumeTranscript(target, forward_from=replay.resume_offset)
+            return ClaudeResumeTranscript(
+                target,
+                forward_from=replay.resume_offset,
+                replayed_source_ids=replay.undelivered_source_ids,
+            )
         if replay.undelivered or not replay.reconciled:
-            # It may hold items the server lacks but cannot be resumed or read:
-            # keep it beside the rebuilt transcript instead of overwriting it.
+            # It may hold items the server lacks but cannot be resumed, read or
+            # placed: keep it beside the rebuilt transcript, never overwrite it.
             _set_aside_claude_transcript(target)
         if replay.delivered:
             items = await _fetch_all_session_items_for_claude_resume(client, session_id)
@@ -5629,6 +5648,8 @@ async def _replay_undelivered_claude_transcript(
             "Could not read the local Claude transcript %s for replay", transcript, exc_info=True
         )
         return TranscriptReplayResult(reconciled=False)
+    if undelivered is None:
+        return TranscriptReplayResult(reconciled=False)
     if not undelivered:
         return TranscriptReplayResult()
     try:
@@ -5638,7 +5659,9 @@ async def _replay_undelivered_claude_transcript(
             "Replay of the local Claude transcript for %r failed", session_id, exc_info=True
         )
         return TranscriptReplayResult(
-            undelivered=len(undelivered), resume_offset=undelivered[0].record_offset
+            undelivered=len(undelivered),
+            resume_offset=undelivered[0].record_offset,
+            undelivered_source_ids=frozenset(pending.item.source_id for pending in undelivered),
         )
 
 

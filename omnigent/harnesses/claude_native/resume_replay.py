@@ -70,8 +70,10 @@ class TranscriptReplayResult:
     :param undelivered: Items still not delivered when the replay stopped.
     :param resume_offset: Record offset of the first undelivered item, or
         ``None`` when every item was delivered or rejected.
-    :param reconciled: ``False`` when the transcript could not be read, so
-        whether it holds undelivered items is unknown.
+    :param reconciled: ``False`` when the transcript could not be read or
+        placed in the server's history, so what it holds is unknown.
+    :param undelivered_source_ids: Source ids of the undelivered items; the
+        forwarder posts them as replayed.
     """
 
     delivered: int = 0
@@ -79,6 +81,7 @@ class TranscriptReplayResult:
     undelivered: int = 0
     resume_offset: int | None = None
     reconciled: bool = True
+    undelivered_source_ids: frozenset[str] = frozenset()
 
 
 def external_item_id(session_id: str, source_id: str) -> str:
@@ -105,19 +108,17 @@ def undelivered_transcript_items(
     server_items: Sequence[Mapping[str, object]],
     server_record_positions: Mapping[str, int],
     agent_name: str,
-) -> list[UndeliveredItem]:
+) -> list[UndeliveredItem] | None:
     """
     Return the saved transcript's items the server never received.
 
     The forwarder delivers in order, so the undelivered items are the tail
     after the last item the server holds. An item is held when the server has
     its source-derived id, or when its record was rebuilt from a server item by
-    an earlier cold resume. Without either, as in a fork whose copied items got
-    fresh ids, items are matched to the server's items of the same response,
-    in order.
-    Nothing is returned when the transcript cannot be placed in the server's
-    history: no held item while the server has items, or Claude items from
-    another transcript after the last held one.
+    an earlier cold resume. Delivery is never inferred otherwise: a transcript
+    with no held item while the server has items (such as a fork's, whose
+    copies have fresh ids), or with Claude items from another transcript after
+    its last held one, cannot be placed.
 
     :param transcript: Saved Claude transcript, e.g.
         ``"~/.claude/projects/-work-repo/<sid>.jsonl"``.
@@ -127,7 +128,8 @@ def undelivered_transcript_items(
         *server_items* writes to the index of the last item it represents.
     :param agent_name: Agent name the forwarder stamps on items, e.g.
         ``"claude-native-ui"``.
-    :returns: Undelivered items in transcript order; compaction summaries are
+    :returns: Undelivered items in transcript order, or ``None`` when the
+        transcript holds items that cannot be placed. Compaction summaries are
         left out, since the server records those as compaction boundaries.
     :raises OSError: If the transcript cannot be read.
     """
@@ -143,8 +145,6 @@ def undelivered_transcript_items(
         _first_known(server_index.get(item_id), server_record_positions.get(record_uuid or ""))
         for _, item_id, record_uuid, _ in local
     ]
-    if all(position is None for position in positions):
-        positions = _positions_of_copies([item for item, *_ in local], server_items)
     held = [index for index, position in enumerate(positions) if position is not None]
     last_held = held[-1] if held else -1
     tail = [
@@ -161,7 +161,7 @@ def undelivered_transcript_items(
                 "is in the server's history",
                 session_id,
             )
-            return []
+            return None
         return tail
     anchor_position = positions[last_held]
     assert anchor_position is not None
@@ -176,7 +176,7 @@ def undelivered_transcript_items(
             "history continued from another transcript",
             session_id,
         )
-        return []
+        return None
     return tail
 
 
@@ -213,32 +213,6 @@ def _keyed_transcript_items(
             session_id,
         )
     return keyed
-
-
-def _positions_of_copies(
-    local_items: Sequence[ClaudeTranscriptItem],
-    server_items: Sequence[Mapping[str, object]],
-) -> list[int | None]:
-    """
-    Match local items to server copies that have fresh ids, as a fork makes.
-
-    A fork copies items in order and keeps their response ids, so the n-th
-    local item of a response matches the n-th server item of that response.
-    A response the fork copied only in part leaves its later items unmatched.
-
-    :param local_items: Items parsed from the saved transcript, in order.
-    :param server_items: Committed session items in chronological order.
-    :returns: Each local item's server index, or ``None`` when unmatched.
-    """
-    copies: dict[str, list[int]] = {}
-    for index, server_item in enumerate(server_items):
-        if isinstance(response_id := server_item.get("response_id"), str):
-            copies.setdefault(response_id, []).append(index)
-    positions: list[int | None] = []
-    for item in local_items:
-        indexes = copies.get(item.response_id)
-        positions.append(indexes.pop(0) if indexes else None)
-    return positions
 
 
 def _first_known(*positions: int | None) -> int | None:
@@ -326,7 +300,13 @@ async def replay_transcript_items(
             len(items) - next_index,
         )
         return TranscriptReplayResult(
-            delivered, rejected, len(items) - next_index, items[next_index].record_offset
+            delivered,
+            rejected,
+            len(items) - next_index,
+            items[next_index].record_offset,
+            undelivered_source_ids=frozenset(
+                pending.item.source_id for pending in items[next_index:]
+            ),
         )
 
     try:

@@ -258,15 +258,14 @@ async def test_unreadable_transcript_file_is_set_aside(saved_transcript: Path) -
 
 
 @pytest.mark.asyncio
-async def test_fork_continuation_is_delivered_after_its_copied_prefix(
-    saved_transcript: Path,
-) -> None:
-    """A fork's copies have fresh ids but their response ids place the new turn."""
-    saved_transcript.write_bytes(
+async def test_fork_without_a_delivered_item_is_set_aside(saved_transcript: Path) -> None:
+    """A fork's copies have fresh ids, so its undelivered turn is kept aside, not guessed."""
+    saved = (
         _line(_user("copied-1", "copied question"))
         + _line(_assistant("copied-2", "copied answer"))
         + _line(_user("new-1", "first fork question"))
     )
+    saved_transcript.write_bytes(saved)
     parsed = _parsed(saved_transcript)
     server = _FakeServer(
         [
@@ -275,31 +274,41 @@ async def test_fork_continuation_is_delivered_after_its_copied_prefix(
         ]
     )
 
-    await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
-    assert server.posts == ["new-1:0:message"]
+    assert server.posts == []
+    assert resumed is not None
+    assert "first fork question" not in resumed.path.read_text(encoding="utf-8")
+    (aside,) = saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*")
+    assert aside.read_bytes() == saved
 
 
 @pytest.mark.asyncio
-async def test_fork_that_copied_part_of_a_response_gets_the_rest(saved_transcript: Path) -> None:
-    """Copies match one for one within a response; the uncopied item is delivered."""
-    saved_transcript.write_bytes(
+async def test_fork_with_a_rejected_item_is_set_aside_not_duplicated(
+    saved_transcript: Path,
+) -> None:
+    """A gap the forwarder left (a rejected item) never makes a copy look undelivered."""
+    saved = (
         _line(_user("copied-1", "copied question"))
-        + _line(_assistant("copied-2", "first part"))
-        + _line(_assistant("copied-3", "second part"))
+        + _line(_assistant("copied-2", "rejected part"))
+        + _line(_assistant("copied-3", "delivered part"))
     )
+    saved_transcript.write_bytes(saved)
     parsed = _parsed(saved_transcript)
-    assert parsed["copied-2:0:message"].response_id == parsed["copied-3:0:message"].response_id
     server = _FakeServer(
         [
             _stored(parsed["copied-1:0:message"], item_id="fork_copy_1"),
-            _stored(parsed["copied-2:0:message"], item_id="fork_copy_2"),
+            _stored(parsed["copied-3:0:message"], item_id="fork_copy_3"),
         ]
     )
 
-    await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
-    assert server.posts == ["copied-3:0:message"]
+    assert server.posts == []
+    assert server.texts() == ["copied question", "delivered part"]
+    assert resumed is not None
+    (aside,) = saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*")
+    assert aside.read_bytes() == saved
 
 
 @pytest.mark.asyncio
@@ -325,6 +334,7 @@ async def test_transcript_absent_from_server_history_is_not_replayed(
     await _cold_resume(server)
 
     assert server.posts == []
+    assert list(saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*"))
 
 
 @pytest.mark.asyncio
@@ -349,6 +359,7 @@ async def test_history_continued_elsewhere_is_not_replayed(saved_transcript: Pat
     await _cold_resume(server)
 
     assert server.posts == []
+    assert list(saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*"))
 
 
 @pytest.mark.asyncio
@@ -503,6 +514,7 @@ async def test_undelivered_items_are_left_to_the_forwarder(
     assert resumed is not None
     assert resumed.path == saved_transcript
     assert resumed.forward_from == len(first_record)
+    assert resumed.replayed_source_ids == {"a-1:0:message"}
     assert saved_transcript.read_bytes() == saved
 
 
@@ -628,7 +640,9 @@ async def test_cold_resume_tells_the_cli_forwarder_where_to_start(
     """The CLI launch carries a kept transcript's first undelivered offset."""
 
     async def kept(*args: object, **kwargs: object) -> claude_native.ClaudeResumeTranscript:
-        return claude_native.ClaudeResumeTranscript(saved_transcript, forward_from=42)
+        return claude_native.ClaudeResumeTranscript(
+            saved_transcript, forward_from=42, replayed_source_ids=frozenset({"a-1:0:message"})
+        )
 
     monkeypatch.setattr(claude_native, "_prepare_claude_resume_transcript", kept)
 
@@ -645,7 +659,9 @@ async def test_cold_resume_tells_the_cli_forwarder_where_to_start(
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         cold_resume = await claude_native._resolve_cold_resume(client, _SESSION_ID)
 
-    assert cold_resume == claude_native._ColdResume(("--resume", _CLAUDE_SESSION_ID), 42)
+    assert cold_resume == claude_native._ColdResume(
+        ("--resume", _CLAUDE_SESSION_ID), 42, frozenset({"a-1:0:message"})
+    )
 
 
 def test_external_item_id_matches_the_server() -> None:

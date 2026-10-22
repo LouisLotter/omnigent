@@ -417,3 +417,71 @@ async def test_replayed_message_leaves_a_newer_queued_web_message_alone(
     )
     assert replayed_question.get("created_by") != "web-user@example.com"
     assert all(block.get("type") != "input_file" for block in replayed_question["content"])
+
+
+async def test_forwarded_backlog_leaves_a_newer_queued_web_message_alone(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old items the forwarder delivers after an unfinished replay never take a newer receipt."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(resume_replay, "_sleep", _no_sleep)
+    monkeypatch.setattr(resume_replay, "_REPLAY_DEADLINE_S", 0.5)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    workspace = Path("/work/replay-repo")
+    session_id = await _create_session(client)
+    saved = _write_saved_transcript(projects, workspace)
+    await _deliver_records(client, session_id, saved, {"u-1", "a-1"})
+    queued = pending_inputs.record(
+        session_id,
+        [
+            {"type": "input_text", "text": "new web request"},
+            {"type": "input_file", "file_id": "file_newer", "filename": "notes.txt"},
+        ],
+        created_by="web-user@example.com",
+    )
+
+    refusing = _RefusingTransport(httpx.ASGITransport(app=app))
+    async with httpx.AsyncClient(transport=refusing, base_url="http://test") as resume_client:
+        resumed = await claude_native._prepare_claude_resume_transcript(
+            resume_client,
+            session_id=session_id,
+            external_session_id=_CLAUDE_SESSION_ID,
+            workspace=workspace,
+        )
+    assert resumed is not None
+    assert resumed.replayed_source_ids == {"u-2:0:message", "a-2:0:message"}
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = await _ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=saved,
+        start_at_end=True,
+        session_id=session_id,
+        start_at_offset=resumed.forward_from,
+    )
+    await _forward_available_items(
+        client=client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        agent_name=_AGENT_NAME,
+        state=state,
+        retry_tracker=_PostRetryTracker(),
+        dedupe=_ForwardDedupeState(),
+        replayed_source_ids=resumed.replayed_source_ids,
+    )
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [queued]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    old_request = next(
+        item
+        for item in items
+        if any(block.get("text") == "second question" for block in item.get("content", []))
+    )
+    assert old_request.get("created_by") != "web-user@example.com"
+    assert [block["type"] for block in old_request["content"]] == ["input_text"]

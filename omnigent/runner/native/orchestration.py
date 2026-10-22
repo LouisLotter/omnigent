@@ -8683,6 +8683,8 @@ async def _auto_create_claude_terminal(
     # ``stat`` taken later routinely skips the freshly-injected message. When a
     # kept transcript holds records the server lacks, it starts at the first.
     resume_prefix_bytes: int | None = None
+    # Items of a kept transcript that the forwarder posts as replayed.
+    resume_replayed_source_ids: frozenset[str] = frozenset()
     if server_client is not None and session_external_id is not None:
         from omnigent.harnesses.claude_native.main import _prepare_claude_resume_transcript
 
@@ -8701,6 +8703,7 @@ async def _auto_create_claude_terminal(
                     if _resume.forward_from is not None
                     else _measured_prefix_bytes(_resume.path)
                 )
+                resume_replayed_source_ids = _resume.replayed_source_ids
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _logger.warning(
                 "Could not synthesize Claude resume transcript for %s; launching without --resume",
@@ -9396,6 +9399,7 @@ async def _auto_create_claude_terminal(
                 agent_name="claude-native-ui",
                 start_at_end=resume_external_session_id is not None,
                 start_at_offset=resume_prefix_bytes,
+                replayed_source_ids=resume_replayed_source_ids,
                 auth=_runner_auth,
                 event_dispatcher=event_dispatcher,
             )
