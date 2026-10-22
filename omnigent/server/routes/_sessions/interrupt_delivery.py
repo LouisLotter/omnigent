@@ -8,7 +8,7 @@ has changed.
 A Stop is forwarded once. When its tunnel has dropped, the Stop is reported as
 not delivered, or as of unknown delivery, and is not sent again after the
 runner reconnects: by then another turn may be running, and the person can
-press Stop again.
+press Interrupt again.
 """
 
 from __future__ import annotations
