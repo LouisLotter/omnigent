@@ -1110,9 +1110,10 @@ def _synthesize_codex_api_key_provider(auth: ApiKeyAuth) -> ProviderEntry:
         families={
             OPENAI_FAMILY: FamilyConfig(
                 base_url=auth.base_url or "https://api.openai.com/v1",
-                # ApiKeyAuth is already resolved; family lookup must not
-                # expand literal dollar signs in the secret a second time.
-                auth_command=f"printf %s {shlex.quote(auth.api_key)}",
+                # A static key, so native Codex can keep it out of its config.
+                # ApiKeyAuth is already resolved: never expand its dollars again.
+                api_key=auth.api_key,
+                api_key_resolved=True,
                 wire_api=RESPONSES_WIRE_API,
             )
         },

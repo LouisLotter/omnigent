@@ -10,9 +10,11 @@ from omnigent.errors import OmnigentError
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
+    KEY_KIND,
     OPENAI_FAMILY,
     PI_SURFACE,
     FamilyConfig,
+    ProviderEntry,
     default_provider_for_harness,
     harness_family,
     load_providers,
@@ -1051,3 +1053,31 @@ def test_resolve_model_tier_without_models_map_is_passthrough() -> None:
     """No ``models:`` map → nothing to resolve."""
     family = FamilyConfig(base_url="http://bifrost.example.com/v1")
     assert family.resolve_model_tier("gpt-5") == "gpt-5"
+
+
+@pytest.mark.parametrize(
+    ("api_key_resolved", "expected"),
+    [(False, "sk-expanded-fragment"), (True, "sk-$KEY_FRAGMENT")],
+    ids=["config-reference", "resolved-literal"],
+)
+def test_family_expands_api_key_unless_already_resolved(
+    monkeypatch: pytest.MonkeyPatch, api_key_resolved: bool, expected: str
+) -> None:
+    """A config key expands ``$VAR``; a key resolved before synthesis stays literal."""
+    monkeypatch.setenv("KEY_FRAGMENT", "expanded-fragment")
+    entry = ProviderEntry(
+        name="synthesized",
+        kind=KEY_KIND,
+        families={
+            OPENAI_FAMILY: FamilyConfig(
+                base_url="https://api.example.com/v1",
+                api_key="sk-$KEY_FRAGMENT",
+                api_key_resolved=api_key_resolved,
+            )
+        },
+    )
+
+    family = entry.family(OPENAI_FAMILY)
+
+    assert family is not None
+    assert family.api_key == expected
