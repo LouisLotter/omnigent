@@ -502,8 +502,6 @@ class SessionResourceRegistry:
         self._last_session_status: dict[str, str] = {}
         self._session_activity_epoch: dict[str, int] = {}
         self._active_session_turns: set[str] = set()
-        # When each active turn began, on the monotonic clock.
-        self._session_turn_started_at: dict[str, float] = {}
         # Last status *edge published to the server* per session, shared by the
         # watcher and the native forwarders' hook-derived edges so the two
         # dedup against one baseline. Kept separate from the exit memo above,
@@ -600,8 +598,6 @@ class SessionResourceRegistry:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
             if record_activity and status in {"running", "waiting"}:
-                if session_id not in self._active_session_turns:
-                    self._session_turn_started_at[session_id] = time.monotonic()
                 self._active_session_turns.add(session_id)
                 self._session_activity_epoch[session_id] = (
                     self._session_activity_epoch.get(session_id, 0) + 1
@@ -614,7 +610,6 @@ class SessionResourceRegistry:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
             self._active_session_turns.discard(session_id)
-            self._session_turn_started_at.pop(session_id, None)
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
@@ -693,19 +688,6 @@ class SessionResourceRegistry:
         """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
         with self._lock:
             return session_id in self._active_session_turns
-
-    def session_turn_started_at(self, session_id: str) -> float | None:
-        """
-        Return when the session's latest observed turn began, on the monotonic clock.
-
-        Covers turns the runner did not start, such as one typed into the
-        terminal, as their status edges report them.
-
-        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
-        :returns: The start time, or ``None`` before any turn.
-        """
-        with self._lock:
-            return self._session_turn_started_at.get(session_id)
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.

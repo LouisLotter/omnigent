@@ -147,7 +147,6 @@ from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
-from omnigent.runner.resent_stop import TURN_ENDED_STATUS, resent_stop_outlived_its_turn
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
@@ -1433,9 +1432,6 @@ def create_runner_app(
     _turn_epoch_seq = itertools.count(1)
     _turn_bind_epoch: dict[str, int] = {}
     app.state.turn_bind_epoch = _turn_bind_epoch
-    # When each session's latest turn was bound, on the monotonic clock.
-    _turn_started_at: dict[str, float] = {}
-    app.state.turn_started_at = _turn_started_at
     # Epoch at which desync recovery claimed the terminal token; competing sites skip their
     # ``idle`` only if the epoch still matches.
     _desync_terminalized: dict[str, int] = {}
@@ -3412,7 +3408,6 @@ def create_runner_app(
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
-        _turn_started_at.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
@@ -3853,27 +3848,6 @@ def create_runner_app(
         """
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
-        _turn_started_at[conv_id] = time.monotonic()
-
-    def _resent_stop_outlived_its_turn(conv_id: str, event: object) -> bool:
-        """Whether a Stop sent again after a drop would reach a turn begun after it."""
-        if not isinstance(event, dict):
-            return False
-        starts = [
-            started
-            for started in (
-                _turn_started_at.get(conv_id),
-                resource_registry.session_turn_started_at(conv_id),
-            )
-            if started is not None
-        ]
-        return resent_stop_outlived_its_turn(
-            event,
-            turn_active=conv_id in _active_turns
-            or resource_registry.session_turn_is_active(conv_id),
-            turn_started_at=max(starts, default=None),
-            now=time.monotonic(),
-        )
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -6735,14 +6709,6 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
-            if _resent_stop_outlived_its_turn(conversation_id, body):
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "status": TURN_ENDED_STATUS,
-                        "detail": "The turn this Stop was pressed for has ended.",
-                    },
-                )
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "interrupt")
