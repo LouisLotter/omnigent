@@ -4696,6 +4696,39 @@ def test_materialize_codex_provider_config_key_write_failure_keeps_previous_key(
     assert not (codex_home / "config.toml").exists()
 
 
+@pytest.mark.parametrize("failing_call", ["mkstemp", "replace"])
+def test_materialize_codex_provider_config_failed_config_write_removes_new_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_call: str
+) -> None:
+    """A key installed for a config that never lands is removed, with no temporaries."""
+    from omnigent.inner import codex_executor
+
+    codex_home = tmp_path / "bridge" / "codex-home"
+    key_file = tmp_path / "bridge" / "provider_key"
+    real_mkstemp = codex_executor.tempfile.mkstemp
+    real_replace = codex_executor.os.replace
+
+    def _mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        if failing_call == "mkstemp" and kwargs.get("prefix") == "config.toml.":
+            raise OSError("no space for config")
+        return real_mkstemp(*args, **kwargs)
+
+    def _replace(source: str, destination: Path) -> None:
+        if failing_call == "replace" and Path(destination).name == "config.toml":
+            raise OSError("no space for config")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(codex_executor.tempfile, "mkstemp", _mkstemp)
+    monkeypatch.setattr(codex_executor.os, "replace", _replace)
+    with pytest.raises(OSError, match="no space for config"):
+        codex_executor.materialize_codex_provider_config(
+            codex_home, _static_key_overrides(), key_file=key_file
+        )
+
+    assert sorted(path.name for path in key_file.parent.iterdir()) == ["codex-home"]
+    assert list(codex_home.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # _clean_codex_env tests
 # ---------------------------------------------------------------------------

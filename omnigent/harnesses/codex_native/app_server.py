@@ -59,6 +59,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     materialize_codex_config_profile,
     read_codex_mcp_servers,
     reject_reserved_codex_transport_args,
+    scrub_codex_provider_credentials,
     validate_codex_config_profile_state,
     without_codex_add_dirs,
     without_codex_config_profile,
@@ -81,6 +82,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
+    CODEX_GENERATED_PROVIDER_NAME,
     CODEX_PROVIDER_KEY_FILE,
     _clean_codex_env,
     _codex_cli_version,
@@ -2125,6 +2127,9 @@ class CodexNativeAppServer:
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
         )
+        # Before the profile journal snapshots config.toml; materialization
+        # below writes this launch's own reference.
+        scrub_codex_provider_credentials(self.codex_home, CODEX_GENERATED_PROVIDER_NAME)
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
@@ -2489,10 +2494,18 @@ class CodexNativeAppServer:
 
     async def close(self) -> None:
         """
-        Stop the app-server subprocess.
+        Stop the app-server subprocess and remove its provider key file.
 
         :returns: None.
         """
+        try:
+            await self._stop_process()
+        finally:
+            # Even when the caller cancels the close mid-shutdown.
+            self._remove_provider_key()
+
+    async def _stop_process(self) -> None:
+        """Stop the app-server subprocess and release its tracking state."""
         if self.proc is not None and self.proc.returncode is None:
             _terminate_process_tree(self.proc)
             try:
@@ -2521,7 +2534,6 @@ class CodexNativeAppServer:
                 self.stderr_task = None
                 self.process_registry_tag = None
                 self.process_owner_lock = None
-                self._remove_provider_key()
                 if diagnostics is not None:
                     diagnostics.finish()
                     with contextlib.suppress(Exception):

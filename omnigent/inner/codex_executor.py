@@ -218,6 +218,8 @@ _CODEX_HOME_SYMLINK_DIRS = (
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
+# Provider id of the table generated for a configured key / gateway / local provider.
+CODEX_GENERATED_PROVIDER_NAME = "omnigent_provider"
 # Codex's literal-bearer provider field. Generated overrides carry a static key
 # in it only in memory; materialization moves the key into a private key file.
 _CODEX_BEARER_TOKEN_FIELD = "experimental_bearer_token"
@@ -1373,7 +1375,7 @@ def materialize_codex_provider_config(
                 and _CODEX_BEARER_TOKEN_FIELD in provider_config
             ):
                 keyed_providers.append(provider_config)
-    _reference_codex_provider_key(keyed_providers, key_file, codex_home=codex_home)
+    provider_key = _reference_codex_provider_key(keyed_providers, key_file, codex_home=codex_home)
 
     from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
 
@@ -1394,16 +1396,25 @@ def materialize_codex_provider_config(
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
 
-    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
+    if provider_key is not None:
+        _write_codex_provider_key(*provider_key)
+    tmp_name: str | None = None
     try:
+        fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
         os.chmod(tmp_name, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(tomlkit.dumps(document))
         os.replace(tmp_name, config_path)
         os.chmod(config_path, 0o600)
+    except BaseException:
+        if provider_key is not None:
+            # The config naming this key never landed, so nothing else would remove it.
+            provider_key[0].unlink(missing_ok=True)
+        raise
     finally:
-        with suppress(FileNotFoundError):
-            os.unlink(tmp_name)
+        if tmp_name is not None:
+            with suppress(FileNotFoundError):
+                os.unlink(tmp_name)
     return argv_overrides
 
 
@@ -1412,8 +1423,8 @@ def _reference_codex_provider_key(
     key_file: Path | None,
     *,
     codex_home: Path,
-) -> None:
-    """Move a generated provider's static key into *key_file* and reference it.
+) -> tuple[Path, str] | None:
+    """Take a generated provider's static key out of its table and reference *key_file*.
 
     The provider's ``auth`` command reads the file, so Codex sends the same
     bearer token while its config holds only the path. Without a keyed
@@ -1423,13 +1434,15 @@ def _reference_codex_provider_key(
         ``experimental_bearer_token``; at most one.
     :param key_file: Absolute key file path outside *codex_home*, or ``None``.
     :param codex_home: The private Codex home the config is written to.
+    :returns: ``(key_file, key)`` for the caller to write with the config, or
+        ``None`` when no provider carries a key.
     :raises ValueError: When a key has no usable *key_file*, or more than
         one generated provider carries a key.
     """
     if not keyed_providers:
         if key_file is not None:
             key_file.unlink(missing_ok=True)
-        return
+        return None
     if (
         key_file is None
         or not key_file.is_absolute()
@@ -1444,7 +1457,7 @@ def _reference_codex_provider_key(
     import tomlkit
 
     provider = keyed_providers[0]
-    _write_codex_provider_key(key_file, str(provider.pop(_CODEX_BEARER_TOKEN_FIELD)))
+    key = str(provider.pop(_CODEX_BEARER_TOKEN_FIELD))
     auth = tomlkit.inline_table()
     auth.update(
         {
@@ -1455,6 +1468,7 @@ def _reference_codex_provider_key(
         }
     )
     provider["auth"] = auth
+    return key_file, key
 
 
 def _write_codex_provider_key(key_file: Path, key: str) -> None:
@@ -2350,7 +2364,7 @@ def _provider_codex_config_overrides(
     """
     if (auth_command is None) == (api_key is None):
         raise ValueError("A Codex provider needs exactly one of auth_command and api_key")
-    provider_name = "omnigent_provider"
+    provider_name = CODEX_GENERATED_PROVIDER_NAME
     if api_key is not None:
         credential = f"{_CODEX_BEARER_TOKEN_FIELD}={json.dumps(api_key)},"
     else:

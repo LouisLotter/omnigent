@@ -16,6 +16,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     codex_config_profile,
     materialize_codex_config_profile,
     redact_codex_launch_args,
+    scrub_codex_provider_credentials,
     without_codex_positional_prompt,
 )
 
@@ -718,3 +719,72 @@ def test_reject_reserved_codex_transport_args_allows(allowed_args: list[str]) ->
     )
     # Omnigent still appends exactly its own single attach.
     assert result[-2:] == ["--remote", "ws://127.0.0.1:9876"]
+
+
+_LEGACY_PROVIDER = {
+    "name": "Omnigent Provider",
+    "base_url": "https://provider.invalid/v1",
+    "auth": {"command": "sh", "args": ["-c", "printf %s sk-legacy-key"]},
+    "wire_api": "responses",
+}
+
+
+@pytest.mark.parametrize("inline", [True, False], ids=["inline-tables", "tables"])
+def test_scrub_provider_credentials_cleans_config_and_every_journal_table(
+    tmp_path: Path, inline: bool
+) -> None:
+    """A generated provider keeps its routing but loses its credential everywhere."""
+    config = {
+        "model": "gpt-5.5",
+        "model_providers": {
+            "omnigent_provider": _LEGACY_PROVIDER,
+            "user": {"name": "User", "auth": {"command": "user-helper"}},
+        },
+    }
+    document = tomlkit.document()
+    document["model"] = config["model"]
+    providers = tomlkit.table()
+    for name, provider in config["model_providers"].items():
+        # Materialization writes generated providers as inline tables.
+        providers[name] = tomlkit.inline_table() if inline else tomlkit.table()
+        providers[name].update(provider)
+    document["model_providers"] = providers
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(tomlkit.dumps(document))
+    state_path = tmp_path / ".omnigent-config-profile.toml"
+    state_path.write_text(
+        tomlkit.dumps({"base": config, "applied": config, "pending": {"model": "profile"}})
+    )
+
+    scrub_codex_provider_credentials(tmp_path, "omnigent_provider")
+
+    scrubbed_provider = {key: value for key, value in _LEGACY_PROVIDER.items() if key != "auth"}
+    expected = {
+        **config,
+        "model_providers": {**config["model_providers"], "omnigent_provider": scrubbed_provider},
+    }
+    assert tomlkit.parse(config_path.read_text()).unwrap() == expected
+    assert tomlkit.parse(state_path.read_text()).unwrap() == {
+        "base": expected,
+        "applied": expected,
+        "pending": {"model": "profile"},
+    }
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_scrub_provider_credentials_leaves_linked_and_unparseable_files(tmp_path: Path) -> None:
+    """A linked config is never written through; invalid files stay for validation."""
+    shared = tmp_path / "shared-config.toml"
+    shared.write_text(tomlkit.dumps({"model_providers": {"omnigent_provider": _LEGACY_PROVIDER}}))
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "config.toml").symlink_to(shared)
+    state_path = private / ".omnigent-config-profile.toml"
+    state_path.write_text("invalid=[")
+    original = shared.read_text()
+
+    scrub_codex_provider_credentials(private, "omnigent_provider")
+
+    assert (private / "config.toml").is_symlink()
+    assert shared.read_text() == original
+    assert state_path.read_text() == "invalid=["

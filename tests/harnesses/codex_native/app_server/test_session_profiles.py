@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
+import tomlkit
 
 try:
     import tomllib
@@ -421,6 +423,41 @@ async def test_native_codex_failed_start_removes_provider_key(
     assert server.proc is None
 
 
+async def test_native_codex_cancelled_close_still_removes_provider_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close cancelled while Codex shuts down still removes the key file."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    server = _key_provider_server(tmp_path, monkeypatch)
+    await server.start()
+    key_file = server.bridge_dir / "provider_key"
+    assert key_file.exists()
+    assert server.proc is not None
+    await server.proc.wait()
+    shutting_down = asyncio.Event()
+
+    class _ShuttingDownProcess:
+        returncode = None
+
+        async def wait(self) -> int:
+            shutting_down.set()
+            await asyncio.Event().wait()
+            return 0
+
+    monkeypatch.setattr(codex_native_app_server, "_terminate_process_tree", lambda _process: None)
+    monkeypatch.setattr(server, "proc", _ShuttingDownProcess())
+    closing = asyncio.create_task(server.close())
+    await shutting_down.wait()
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert not key_file.exists()
+    monkeypatch.setattr(server, "proc", None)
+    await server.close()
+
+
 async def test_native_codex_close_keeps_a_newer_starts_provider_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -459,3 +496,52 @@ async def test_native_codex_subscription_launch_is_unchanged_by_key_files(
     config = tomllib.loads((server.codex_home / "config.toml").read_text(encoding="utf-8"))
     assert "omnigent_provider" not in config.get("model_providers", {})
     assert (server.codex_home / "auth.json").resolve() == (source_home / "auth.json").resolve()
+
+
+@pytest.mark.parametrize("launch", ["static-key", "auth-command", "subscription"])
+async def test_native_codex_first_start_scrubs_a_key_an_earlier_version_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch: str
+) -> None:
+    """One start after an upgrade leaves no literal key in the config or the journal.
+
+    Earlier versions wrote ``printf %s <key>`` into the generated provider table,
+    and the profile journal copied it. A launch that no longer uses that provider
+    must not keep the key either.
+    """
+    legacy_key = "sk-sentinel-legacy-key-do-not-use"
+    server = _key_provider_server(tmp_path, monkeypatch)
+    legacy_config = tomllib.loads(
+        "\n".join(
+            _provider_codex_config_overrides(
+                model=None,
+                base_url="https://provider.invalid/v1",
+                auth_command=f"printf %s {legacy_key}",
+                wire_api="responses",
+            )
+        )
+    )
+    legacy_config["model"] = "gpt-5.5"
+    codex_home = server.codex_home
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(tomlkit.dumps(legacy_config), encoding="utf-8")
+    (codex_home / ".omnigent-config-profile.toml").write_text(
+        tomlkit.dumps({"base": legacy_config, "applied": legacy_config}), encoding="utf-8"
+    )
+    server.config_overrides = {
+        "static-key": _static_key_overrides(_PROVIDER_KEY),
+        "auth-command": _provider_codex_config_overrides(
+            model=None,
+            base_url="https://provider.invalid/v1",
+            auth_command="credential-helper",
+            wire_api="responses",
+        ),
+        "subscription": ['model_provider="openai"'],
+    }[launch]
+
+    await server.start()
+    try:
+        assert _files_holding(server.bridge_dir, legacy_key) == []
+    finally:
+        await server.close()
+    assert _files_holding(server.bridge_dir, legacy_key) == []
+    assert _files_holding(server.bridge_dir, _PROVIDER_KEY) == []

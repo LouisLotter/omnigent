@@ -7,10 +7,11 @@ file beside the home instead, which the generated provider's ``auth`` command
 reads, and which is removed when the app-server closes.
 
 The journey drives the real ``codex`` app-server through two launches of one
-session (the second is the one whose profile journal snapshots the provider
-table), runs a turn on each against a loopback provider that accepts only the
-configured key, then scans the whole bridge directory, rollouts and Codex's
-databases included, for the key in every encoded form a save could carry.
+session (the second resumes the first's thread, and is the one whose profile
+journal snapshots the provider table), runs a turn on each against a loopback
+provider that accepts only the configured key, then scans the whole bridge
+directory, rollouts and Codex's databases included, for the key in every
+encoded form a save could carry.
 
 Self-contained: the provider is a loopback fake; no credentials, no network.
 """
@@ -32,6 +33,8 @@ import yaml
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     build_codex_native_server,
+    codex_session_meta_model_provider,
+    preload_codex_thread_for_resume,
     resolve_native_codex_launch,
 )
 from tests.e2e._codex_loopback_resume import wait_for_turn_end
@@ -51,8 +54,8 @@ def _encoded_forms(value: str) -> dict[str, bytes]:
         "hex": raw.hex().encode(),
     }
     for shift in range(3):
-        # Base64 of the value at any alignment inside a longer string: keep only
-        # the characters every alignment-``shift`` encoding shares.
+        # The value after ``shift`` other bytes: keep only the base64 characters
+        # its neighbours cannot change.
         encoded = base64.b64encode(b"\0" * shift + raw)
         start = (shift * 4 + 2) // 3 + (1 if shift else 0)
         stable = encoded[start : len(encoded) - 4]
@@ -81,11 +84,24 @@ def _loopback_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def test_key_scan_finds_every_planted_form(tmp_path: Path) -> None:
-    """The scan used below detects the key however a file encodes it."""
-    for index, (form, needle) in enumerate(_encoded_forms(_PROVIDER_KEY).items()):
-        (tmp_path / f"planted-{index}").write_bytes(b"prefix:" + needle + b":suffix")
-        assert (f"planted-{index}", form) in _key_hits(tmp_path, _PROVIDER_KEY)
+def test_key_scan_finds_independently_encoded_keys(tmp_path: Path) -> None:
+    """The scan used below finds a key however a saved file encodes it."""
+    value = "sk-t/e+s=t'\"key:%1"
+    raw = value.encode()
+    planted = {
+        "raw": b"token=" + raw,
+        "json": json.dumps({"auth": {"token": value}}).encode(),
+        "url": f"https://x.invalid/?key={urllib.parse.quote(value, safe='')}".encode(),
+        "hex": b"0x" + raw.hex().encode(),
+        # Different prefix lengths put the key at every base64 alignment.
+        **{f"base64-{n}": base64.b64encode(b"Bearer "[:n] + raw) for n in range(4)},
+        **{f"base64url-{n}": base64.urlsafe_b64encode(b"user:"[:n] + raw) for n in range(3)},
+    }
+    for name, payload in planted.items():
+        (tmp_path / name).write_bytes(payload)
+    (tmp_path / "unrelated").write_bytes(base64.b64encode(b"Bearer sk-another-key-entirely"))
+
+    assert {path for path, _ in _key_hits(tmp_path, value)} == set(planted)
 
 
 @pytest.mark.posix_only
@@ -144,6 +160,7 @@ async def test_key_provider_turns_reference_the_key_and_save_none_of_it(
         assert _PROVIDER_KEY not in launch.summary
         key_file = bridge_dir / "provider_key"
 
+        thread_id: str | None = None
         for launch_number in range(2):
             server = build_codex_native_server(
                 socket_path=bridge_dir / "app-server.sock",
@@ -174,14 +191,25 @@ async def test_key_provider_turns_reference_the_key_and_save_none_of_it(
                 assert {path for path, _ in _key_hits(bridge_dir, _PROVIDER_KEY)} == {
                     "provider_key"
                 }
-                client = CodexAppServerClient(
-                    ws_url=server.listen_url, client_name="omnigent-referenced-key-e2e"
-                )
-                await client.connect()
-                started = await client.request(
-                    "thread/start", {"model": "mock-model", "cwd": str(workspace)}
-                )
-                thread_id = started["result"]["thread"]["id"]
+                if thread_id is None:
+                    client = CodexAppServerClient(
+                        ws_url=server.listen_url, client_name="omnigent-referenced-key-e2e"
+                    )
+                    await client.connect()
+                    started = await client.request(
+                        "thread/start", {"model": "mock-model", "cwd": str(workspace)}
+                    )
+                    thread_id = started["result"]["thread"]["id"]
+                else:
+                    # The relaunch resumes the first launch's thread, as a session restart does.
+                    client = await preload_codex_thread_for_resume(
+                        server.listen_url,
+                        thread_id,
+                        retain_client=True,
+                        cwd=workspace,
+                        model_provider=codex_session_meta_model_provider(launch),
+                    )
+                assert client is not None
                 await client.request(
                     "turn/start",
                     {

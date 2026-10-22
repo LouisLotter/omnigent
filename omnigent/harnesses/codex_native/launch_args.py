@@ -436,6 +436,60 @@ def _profile_base(state_path: Path, current: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+# Codex provider fields that carry or produce a credential.
+_PROVIDER_CREDENTIAL_KEYS = ("auth", "experimental_bearer_token")
+
+
+def scrub_codex_provider_credentials(codex_home: Path, provider_name: str) -> None:
+    """Drop a generated provider's credential from the private config and profile journal.
+
+    Run before the profile layer snapshots ``config.toml``. The launch then
+    writes its own reference for that provider, so a table this start does not
+    refresh keeps its routing but holds no secret, including a literal key an
+    earlier version wrote. The journal is scrubbed the same way so it still
+    matches the config. Files that cannot be read or parsed, and a linked
+    ``config.toml``, are left to the existing validation.
+
+    :param codex_home: Private session ``CODEX_HOME``.
+    :param provider_name: The generated provider's id, e.g. ``"omnigent_provider"``.
+    """
+    journal_tables = ("base", "applied", "pending")
+    for path, tables in (
+        (codex_home / "config.toml", None),
+        (codex_home / ".omnigent-config-profile.toml", journal_tables),
+    ):
+        if path.is_symlink():
+            continue
+        try:
+            document = tomlkit.parse(path.read_text(encoding="utf-8"))
+        except (OSError, TOMLKitError, UnicodeError):
+            continue
+        configs = [document] if tables is None else [document.get(table) for table in tables]
+        scrubbed = False
+        for config in configs:
+            providers = config.get("model_providers") if isinstance(config, dict) else None
+            if not isinstance(providers, dict):
+                continue
+            provider = providers.get(provider_name)
+            if not isinstance(provider, dict) or provider.keys().isdisjoint(
+                _PROVIDER_CREDENTIAL_KEYS
+            ):
+                continue
+            # Rebuilt rather than edited: tomlkit leaves a stray comma when a key
+            # is deleted from a parsed inline table.
+            kept = {k: v for k, v in provider.items() if k not in _PROVIDER_CREDENTIAL_KEYS}
+            if isinstance(provider, tomlkit.items.InlineTable):
+                rebuilt = tomlkit.inline_table()
+                rebuilt.update(kept)
+                providers[provider_name] = rebuilt
+            else:
+                for key in _PROVIDER_CREDENTIAL_KEYS:
+                    provider.pop(key, None)
+            scrubbed = True
+        if scrubbed:
+            _write_private_config(path, tomlkit.dumps(document))
+
+
 def validate_codex_config_profile_state(codex_home: Path) -> None:
     """Validate an existing profile journal without modifying private config."""
     state_path = codex_home / ".omnigent-config-profile.toml"
