@@ -312,6 +312,9 @@ class FamilyConfig:
     :param auth_command: Shell command that prints a bearer token, for
         short-lived / dynamic tokens, e.g. ``"my-cli print-token"``.
         Mutually exclusive with :attr:`api_key` and :attr:`api_key_ref`.
+    :param api_key_resolved: ``True`` when :attr:`api_key` is already
+        plaintext (an in-memory provider built from resolved auth), so
+        :meth:`ProviderEntry.family` must not expand a ``$`` in it again.
     :param wire_api: Wire protocol for the ``openai`` family —
         ``"responses"`` or ``"chat"``. ``None`` lets the consuming harness
         pick its own default. Ignored for the ``anthropic`` family.
@@ -337,6 +340,7 @@ class FamilyConfig:
     api_key: str | None = None
     api_key_ref: str | None = None
     auth_command: str | None = None
+    api_key_resolved: bool = False
     wire_api: str | None = None
     models: dict[str, str] = field(default_factory=dict)
     pricing: ModelPricingConfig | None = None
@@ -655,7 +659,11 @@ def _expand_family(provider_name: str, family_name: str, family: FamilyConfig) -
     prefix = f"providers.{provider_name}.{family_name}"
     base_url = _expand(f"{prefix}.base_url", family.base_url)
     if family.api_key is not None:
-        api_key = _expand(f"{prefix}.api_key", family.api_key)
+        api_key = (
+            family.api_key
+            if family.api_key_resolved
+            else _expand(f"{prefix}.api_key", family.api_key)
+        )
         return replace(family, base_url=base_url, api_key=api_key)
     if family.api_key_ref is not None:
         resolved = resolve_secret(family.api_key_ref)

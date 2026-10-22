@@ -59,6 +59,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     materialize_codex_config_profile,
     read_codex_mcp_servers,
     reject_reserved_codex_transport_args,
+    scrub_codex_provider_credentials,
     validate_codex_config_profile_state,
     without_codex_add_dirs,
     without_codex_config_profile,
@@ -81,6 +82,9 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
+    CODEX_GENERATED_PROVIDER_DISPLAY_NAME,
+    CODEX_GENERATED_PROVIDER_NAME,
+    CODEX_PROVIDER_KEY_FILE,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -2018,6 +2022,9 @@ class CodexNativeAppServer:
     # bridge so the forwarder can fail a stuck turn with the cause.
     certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+    # (st_dev, st_ino) of the provider key file this start wrote, so close()
+    # never removes a file a newer start of the same bridge wrote.
+    _provider_key_identity: tuple[int, int] | None = field(default=None, init=False)
 
     async def start(self) -> None:
         """
@@ -2027,6 +2034,15 @@ class CodexNativeAppServer:
         :raises OmnigentError: ``WORKSPACE_MISSING`` when the session's working
             directory was removed, e.g. a deleted git worktree.
         """
+        try:
+            await self._start()
+        except BaseException:
+            # A start that fails before its process exists never reaches close().
+            self._remove_provider_key()
+            raise
+
+    async def _start(self) -> None:
+        """Start the app-server; :meth:`start` removes the provider key on failure."""
         if not self.cwd.is_dir():
             # Spawning in it would only fail with a bare ENOENT; name the cause.
             raise OmnigentError(
@@ -2112,6 +2128,11 @@ class CodexNativeAppServer:
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
         )
+        # Before the profile journal snapshots config.toml; materialization
+        # below writes this launch's own reference.
+        scrub_codex_provider_credentials(
+            self.codex_home, CODEX_GENERATED_PROVIDER_NAME, CODEX_GENERATED_PROVIDER_DISPLAY_NAME
+        )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
@@ -2150,10 +2171,13 @@ class CodexNativeAppServer:
             self.developer_instructions,
             use_current_base=compose_profile_instructions,
         )
+        provider_key_file = (self.bridge_dir / CODEX_PROVIDER_KEY_FILE).absolute()
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+            key_file=provider_key_file,
         )
+        self._provider_key_identity = _file_identity(provider_key_file)
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -2473,10 +2497,18 @@ class CodexNativeAppServer:
 
     async def close(self) -> None:
         """
-        Stop the app-server subprocess.
+        Stop the app-server subprocess and remove its provider key file.
 
         :returns: None.
         """
+        try:
+            await self._stop_process()
+        finally:
+            # Even when the caller cancels the close mid-shutdown.
+            self._remove_provider_key()
+
+    async def _stop_process(self) -> None:
+        """Stop the app-server subprocess and release its tracking state."""
         if self.proc is not None and self.proc.returncode is None:
             _terminate_process_tree(self.proc)
             try:
@@ -2509,6 +2541,16 @@ class CodexNativeAppServer:
                     diagnostics.finish()
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(diagnostics.close)
+
+    def _remove_provider_key(self) -> None:
+        """Remove the provider key file this start wrote, if it is still that file."""
+        identity, self._provider_key_identity = self._provider_key_identity, None
+        if identity is None:
+            return
+        key_file = self.bridge_dir / CODEX_PROVIDER_KEY_FILE
+        if _file_identity(key_file) == identity:
+            with contextlib.suppress(FileNotFoundError):
+                key_file.unlink()
 
     async def _wait_until_ready(self) -> CodexAppServerClient:
         """
@@ -3781,18 +3823,19 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         return None
     if family is None:
         return None
-    if family.auth_command:
-        auth_command = family.auth_command
-    elif family.api_key:
-        auth_command = f"printf %s {shlex.quote(family.api_key)}"
-    else:
+    auth_command = family.auth_command or None
+    api_key = None if auth_command else family.api_key or None
+    if auth_command is None and api_key is None:
         # Serves openai but carries no usable credential.
         return None
     pinned = model or family.default_model
+    # A static key stays in memory: starting the app-server moves it into a
+    # private key file the provider's auth command reads.
     overrides = _provider_codex_config_overrides(
         model=pinned,
         base_url=family.base_url,
         auth_command=auth_command,
+        api_key=api_key,
         wire_api=family.wire_api or "responses",
     )
     return NativeCodexLaunch(
@@ -4899,6 +4942,15 @@ def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     :returns: None.
     """
     _proc.terminate_tree(process)
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """Return ``(st_dev, st_ino)`` for *path* without following a link, or ``None``."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return (info.st_dev, info.st_ino)
 
 
 def _process_group_id(process: asyncio.subprocess.Process) -> int:

@@ -26,6 +26,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     )
     from omnigent.inner import _proc
     from omnigent.inner.codex_executor import (
+        CODEX_PROVIDER_KEY_FILE,
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
         materialize_codex_provider_config,
@@ -63,9 +64,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             bridge_dir=temp_root / "bridge",
             extra_config_overrides=launch.config_overrides,
         )
+        # The key file lives beside the throwaway home and goes with the temp dir.
         native_server.config_overrides = materialize_codex_provider_config(
             codex_home,
             native_server.config_overrides,
+            key_file=temp_root.absolute() / CODEX_PROVIDER_KEY_FILE,
         )
         output_path = temp_root / "title.txt"
         args = [

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
+import tomlkit
 
 try:
     import tomllib
@@ -305,3 +307,265 @@ def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(provider_override,),
         )
+
+
+# ── Static provider keys: referenced from a bridge key file, never written ──
+
+_PROVIDER_KEY = "sk-sentinel-provider-key-do-not-use"
+
+
+def _static_key_overrides(key: str) -> list[str]:
+    return _provider_codex_config_overrides(
+        model="test-model",
+        base_url="https://provider.invalid/v1",
+        api_key=key,
+        wire_api="responses",
+    )
+
+
+def _files_holding(root: Path, needle: str) -> list[str]:
+    """Return the files under *root* whose bytes contain *needle*."""
+    return sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink() and needle.encode() in path.read_bytes()
+    )
+
+
+def _key_provider_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, key: str = _PROVIDER_KEY
+) -> Any:
+    """Build an app-server whose source home selects a ``work`` config profile."""
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir(exist_ok=True)
+    (source_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+    (source_home / "work.config.toml").write_text(
+        'model_reasoning_effort = "low"\n', encoding="utf-8"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _set_codex_version(monkeypatch, (0, 163, 0))
+    _disable_codex_startup_rpc(monkeypatch)
+    bridge_dir = tmp_path / "bridge"
+    server = _test_app_server(tmp_path, bridge_dir / "codex-home", bridge_dir, workspace)
+    server.config_overrides = _static_key_overrides(key)
+    server.config_profile = "work"
+    return server
+
+
+async def test_native_codex_static_provider_key_is_referenced_never_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key provider's session keeps its key in a 0600 bridge file, out of every save.
+
+    The second start is the one whose profile journal snapshots the provider
+    table, so both ``config.toml`` and ``.omnigent-config-profile.toml`` are
+    checked after a restart.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    server = _key_provider_server(tmp_path, monkeypatch)
+    overrides = list(server.config_overrides)
+    bridge_dir = server.bridge_dir
+    codex_home = server.codex_home
+    key_file = bridge_dir / "provider_key"
+
+    for _ in range(2):
+        server.config_overrides = list(overrides)
+        await server.start()
+        assert key_file.read_text(encoding="utf-8") == _PROVIDER_KEY
+        assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+        provider = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))[
+            "model_providers"
+        ]["omnigent_provider"]
+        assert provider["auth"]["command"] == "cat"
+        assert provider["auth"]["args"] == [str(key_file.absolute())]
+        assert _files_holding(bridge_dir, _PROVIDER_KEY) == ["provider_key"]
+        await server.close()
+        assert not key_file.exists()
+
+    # The journal snapshots the provider table, so it would carry a literal key.
+    journal = (codex_home / ".omnigent-config-profile.toml").read_text(encoding="utf-8")
+    assert "omnigent_provider" in journal
+    assert _files_holding(bridge_dir, _PROVIDER_KEY) == []
+    app_server_argv = _build_native_codex_app_server_argv(
+        tagged_argv0="codex session-tag",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=server.config_overrides,
+    )
+    remote_argv = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=tuple(server.config_overrides),
+    )
+    assert all(_PROVIDER_KEY not in arg for arg in (*app_server_argv, *remote_argv))
+    assert 'model_provider="omnigent_provider"' in remote_argv
+
+
+async def test_native_codex_failed_start_removes_provider_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A start that fails before Codex runs leaves no key file behind."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    server = _key_provider_server(tmp_path, monkeypatch)
+
+    def _fail_hooks(*args: object, **kwargs: object) -> None:
+        raise OSError("hooks.json is not writable")
+
+    monkeypatch.setattr(codex_native_app_server, "_write_codex_policy_hooks_file", _fail_hooks)
+    with pytest.raises(OSError, match="not writable"):
+        await server.start()
+
+    assert not (server.bridge_dir / "provider_key").exists()
+    assert server.proc is None
+
+
+async def test_native_codex_cancelled_close_still_removes_provider_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close cancelled while Codex shuts down still removes the key file."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    server = _key_provider_server(tmp_path, monkeypatch)
+    await server.start()
+    key_file = server.bridge_dir / "provider_key"
+    assert key_file.exists()
+    assert server.proc is not None
+    await server.proc.wait()
+    shutting_down = asyncio.Event()
+
+    class _ShuttingDownProcess:
+        returncode = None
+
+        async def wait(self) -> int:
+            shutting_down.set()
+            await asyncio.Event().wait()
+            return 0
+
+    monkeypatch.setattr(codex_native_app_server, "_terminate_process_tree", lambda _process: None)
+    monkeypatch.setattr(server, "proc", _ShuttingDownProcess())
+    closing = asyncio.create_task(server.close())
+    await shutting_down.wait()
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert not key_file.exists()
+    monkeypatch.setattr(server, "proc", None)
+    await server.close()
+
+
+async def test_native_codex_close_keeps_a_newer_starts_provider_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing an older app-server never removes the key a newer one wrote."""
+    older = _key_provider_server(tmp_path, monkeypatch, key="sk-older")
+    newer = _key_provider_server(tmp_path, monkeypatch, key="sk-newer")
+    key_file = older.bridge_dir / "provider_key"
+
+    await older.start()
+    await newer.start()
+    await older.close()
+
+    assert key_file.read_text(encoding="utf-8") == "sk-newer"
+    await newer.close()
+    assert not key_file.exists()
+
+
+async def test_native_codex_subscription_launch_is_unchanged_by_key_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subscription launch keeps Codex's own login and drops a stale key file."""
+    server = _key_provider_server(tmp_path, monkeypatch)
+    source_home = tmp_path / "source-codex-home"
+    (source_home / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+    key_file = server.bridge_dir / "provider_key"
+    key_file.parent.mkdir(parents=True)
+    key_file.write_text("sk-previous-launch", encoding="utf-8")
+    server.config_overrides = ['model_provider="openai"']
+    server.config_profile = None
+
+    await server.start()
+    await server.close()
+
+    assert server.config_overrides == ['model_provider="openai"']
+    assert not key_file.exists()
+    config = tomllib.loads((server.codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert "omnigent_provider" not in config.get("model_providers", {})
+    assert (server.codex_home / "auth.json").resolve() == (source_home / "auth.json").resolve()
+
+
+@pytest.mark.parametrize("launch", ["static-key", "auth-command", "subscription"])
+async def test_native_codex_first_start_scrubs_a_key_an_earlier_version_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch: str
+) -> None:
+    """One start after an upgrade leaves no literal key in the config or the journal.
+
+    Earlier versions wrote ``printf %s <key>`` into the generated provider table,
+    and the profile journal copied it. A launch that no longer uses that provider
+    must not keep the key either.
+    """
+    legacy_key = "sk-sentinel-legacy-key-do-not-use"
+    server = _key_provider_server(tmp_path, monkeypatch)
+    legacy_config = tomllib.loads(
+        "\n".join(
+            _provider_codex_config_overrides(
+                model=None,
+                base_url="https://provider.invalid/v1",
+                auth_command=f"printf %s {legacy_key}",
+                wire_api="responses",
+            )
+        )
+    )
+    legacy_config["model"] = "gpt-5.5"
+    codex_home = server.codex_home
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(tomlkit.dumps(legacy_config), encoding="utf-8")
+    (codex_home / ".omnigent-config-profile.toml").write_text(
+        tomlkit.dumps({"base": legacy_config, "applied": legacy_config}), encoding="utf-8"
+    )
+    server.config_overrides = {
+        "static-key": _static_key_overrides(_PROVIDER_KEY),
+        "auth-command": _provider_codex_config_overrides(
+            model=None,
+            base_url="https://provider.invalid/v1",
+            auth_command="credential-helper",
+            wire_api="responses",
+        ),
+        "subscription": ['model_provider="openai"'],
+    }[launch]
+
+    await server.start()
+    try:
+        assert _files_holding(server.bridge_dir, legacy_key) == []
+    finally:
+        await server.close()
+    assert _files_holding(server.bridge_dir, legacy_key) == []
+    assert _files_holding(server.bridge_dir, _PROVIDER_KEY) == []
+
+
+async def test_native_codex_user_table_with_the_generated_id_keeps_its_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cli-config provider the user named ``omnigent_provider`` keeps its credential."""
+    server = _key_provider_server(tmp_path, monkeypatch)
+    (tmp_path / "source-codex-home" / "config.toml").write_text(
+        'model = "gpt-5.5"\n\n'
+        "[model_providers.omnigent_provider]\n"
+        'name = "My gateway"\n'
+        'base_url = "https://gateway.invalid/v1"\n'
+        'auth = { command = "credential-helper" }\n',
+        encoding="utf-8",
+    )
+
+    for _ in range(2):
+        server.config_overrides = ['model_provider="omnigent_provider"']
+        await server.start()
+        await server.close()
+
+    for name in ("config.toml", ".omnigent-config-profile.toml"):
+        text = (server.codex_home / name).read_text(encoding="utf-8")
+        assert 'command = "credential-helper"' in text, name
