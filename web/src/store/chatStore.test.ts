@@ -6072,39 +6072,93 @@ describe("chatStore — stop", () => {
   });
 
   it.each([
-    { delivery: "not_delivered", notice: true },
-    { delivery: "unknown", notice: true },
-    { delivery: "delivered", notice: false },
-    { delivery: "failed", notice: false },
-  ])(
-    "flags a Stop answered $delivery as not reaching the computer: $notice",
-    async ({ delivery, notice }) => {
-      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
-        String(input).endsWith("/v1/sessions/conv_abc/events")
-          ? mockResponse({ queued: false, delivery })
-          : defaultFetchHandler(input, init),
-      );
-      useChatStore.setState({ conversationId: "conv_abc", stopNotDelivered: false });
+    { delivery: "not_delivered", notice: "not_delivered" },
+    { delivery: "unknown", notice: "not_delivered" },
+    { delivery: "failed", notice: "refused" },
+    { delivery: "superseded", notice: "superseded" },
+    { delivery: "delivered", notice: null },
+    { delivery: undefined, notice: null },
+  ])("shows the $notice notice for a Stop answered $delivery", async ({ delivery, notice }) => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/v1/sessions/conv_abc/events")
+        ? mockResponse({ queued: false, delivery })
+        : defaultFetchHandler(input, init),
+    );
+    useChatStore.setState({ conversationId: "conv_abc", stopNotice: null });
 
-      useChatStore.getState().stop();
-      await tick();
+    useChatStore.getState().stop();
+    await tick();
 
-      expect(useChatStore.getState().stopNotDelivered).toBe(notice);
+    expect(useChatStore.getState().stopNotice).toBe(notice);
+  });
+
+  it.each([
+    {
+      failure: "a network failure",
+      answer: () => Promise.reject(new TypeError("Failed to fetch")),
     },
-  );
+    {
+      failure: "an upstream 502",
+      answer: async () => mockResponse("Bad Gateway", { ok: false, status: 502 }),
+    },
+    {
+      failure: "a coded refusal",
+      answer: async () =>
+        mockResponse(
+          { error: { code: "conflict", message: "Try interrupting again." } },
+          { ok: false, status: 409 },
+        ),
+    },
+  ])("shows the request-failed notice after $failure", async ({ answer }) => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/v1/sessions/conv_abc/events")
+        ? answer()
+        : defaultFetchHandler(input, init),
+    );
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      stopNotice: null,
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
 
-  it.each(["newer Stop", "message"] as const)(
-    "ignores an older Stop's lost answer that settles after a %s",
-    async (newer) => {
-      const answers: ((delivery: string) => void)[] = [];
+    useChatStore.getState().stop();
+    await tick();
+
+    const state = useChatStore.getState();
+    expect(state.stopNotice).toBe("request_failed");
+    // The optimistic stop stands; the notice is what corrects it.
+    expect(state.activeResponse?.state).toBe("cancelled");
+    expect(state.sessionStatus).toBe("idle");
+    // Never sent again on its own.
+    const interrupts = fetchMock.mock.calls.filter(([input]) =>
+      String(input).endsWith("/v1/sessions/conv_abc/events"),
+    );
+    expect(interrupts).toHaveLength(1);
+  });
+
+  it.each([
+    { newer: "newer Stop", old: "lost answer" },
+    { newer: "message", old: "lost answer" },
+    { newer: "newer Stop", old: "request failure" },
+    { newer: "message", old: "request failure" },
+  ] as const)(
+    "ignores an older Stop's $old that settles after a $newer",
+    async ({ newer, old }) => {
+      const answers: ((settle: "delivered" | "unknown" | "reject") => void)[] = [];
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         if (!String(input).endsWith("/v1/sessions/conv_abc/events")) {
           return defaultFetchHandler(input, init);
         }
         const body = JSON.parse(String(init?.body)) as { type: string };
         if (body.type !== "interrupt") return mockResponse({ queued: true, item_id: "ci_mock" });
-        return new Promise<Response>((resolve) => {
-          answers.push((delivery) => resolve(mockResponse({ queued: false, delivery })));
+        return new Promise<Response>((resolve, reject) => {
+          answers.push((settle) =>
+            settle === "reject"
+              ? reject(new TypeError("Failed to fetch"))
+              : resolve(mockResponse({ queued: false, delivery: settle })),
+          );
         });
       });
       seedSession("conv_abc");
@@ -6120,19 +6174,19 @@ describe("chatStore — stop", () => {
         await useChatStore.getState().send("next request", "agent_xyz");
       }
       await tick();
-      answers[0]!("unknown");
+      answers[0]!(old === "lost answer" ? "unknown" : "reject");
       await tick();
 
-      expect(useChatStore.getState().stopNotDelivered).toBe(false);
+      expect(useChatStore.getState().stopNotice).toBeNull();
     },
   );
 
-  it("clears the undelivered-Stop flag when Stop is pressed again", () => {
-    useChatStore.setState({ conversationId: "conv_abc", stopNotDelivered: true });
+  it("clears the Stop notice when Stop is pressed again", () => {
+    useChatStore.setState({ conversationId: "conv_abc", stopNotice: "request_failed" });
 
     useChatStore.getState().stop();
 
-    expect(useChatStore.getState().stopNotDelivered).toBe(false);
+    expect(useChatStore.getState().stopNotice).toBeNull();
   });
 });
 

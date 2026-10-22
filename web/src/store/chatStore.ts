@@ -75,7 +75,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
-import { stopDidNotReachComputer } from "@/lib/stopDelivery";
+import { stopNoticeForDelivery, type StopNotice } from "@/lib/stopDelivery";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -875,11 +875,10 @@ export interface ConversationState {
     delivered: boolean;
   } | null;
   /**
-   * The last Stop did not reach the computer: no runner connection took it, or
-   * its answer was lost. It is not sent again, so the composer says so until
-   * the next Stop or message.
+   * Why the last Stop may not have stopped the turn, or `null`. A Stop is not
+   * sent again, so the composer says so until the next Stop or message.
    */
-  stopNotDelivered: boolean;
+  stopNotice: StopNotice | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1964,7 +1963,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   pendingRetryStableId: null,
   restoredSendDraft: null,
-  stopNotDelivered: false,
+  stopNotice: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -2335,7 +2334,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
     const sendTarget = pinnedId ?? get().conversationId;
     if (sendTarget !== null) advanceStopNoticeGeneration(sendTarget);
-    if (pinnedState?.stopNotDelivered) pinnedSetter({ stopNotDelivered: false });
+    if (pinnedState?.stopNotice) pinnedSetter({ stopNotice: null });
     // A restored failed send keeps its stable id only when resent untouched:
     // the server persists a web send under that id and dedupes a repeat, so an
     // edited body under the old id would run without ever being persisted.
@@ -2894,24 +2893,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
     const stopGeneration = advanceStopNoticeGeneration(sessionId);
-    void interruptSession(sessionId)
-      .then(({ delivery }) => {
-        // A Stop is never sent again, so tell the person to press it again,
-        // unless a newer Stop or message has made this answer stale.
-        if (stopNoticeGenerations.get(sessionId) !== stopGeneration) return;
-        if (!stopDidNotReachComputer(delivery)) return;
-        if (get().conversationId === sessionId) setActive({ stopNotDelivered: true });
-        else setterFor(sessionId)({ stopNotDelivered: true });
-      })
-      .catch(() => {
-        // Interrupt is best-effort. A network failure here means the
-        // user's cancel won't reach the server, but the local UI already
-        // reflects the user's stop request below.
-      });
+    const showStopNotice = (notice: StopNotice | null) => {
+      // A Stop is never sent again, so tell the person to press it again,
+      // unless a newer Stop or message has made this answer stale.
+      if (notice === null || stopNoticeGenerations.get(sessionId) !== stopGeneration) return;
+      if (get().conversationId === sessionId) setActive({ stopNotice: notice });
+      else setterFor(sessionId)({ stopNotice: notice });
+    };
+    void interruptSession(sessionId).then(
+      ({ delivery }) => showStopNotice(stopNoticeForDelivery(delivery)),
+      // The local UI shows the turn stopped below, but the Stop may not have
+      // reached the server (network failure, a 502 from a proxy).
+      () => showStopNotice("request_failed"),
+    );
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};
       const patch: Partial<ChatState> = {
-        stopNotDelivered: false,
+        stopNotice: null,
         pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
