@@ -17,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import click
 import httpx
 import pytest
 
@@ -27,6 +28,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
 )
 from omnigent.harnesses.claude_native.resume_replay import UndeliveredItem, external_item_id
+from omnigent.native import native_terminal
 
 _SESSION_ID = "conv_replay"
 _CLAUDE_SESSION_ID = "4b0f2a52-2b5e-4d8e-9a39-6f0f1c1d2e3f"
@@ -76,17 +78,21 @@ class _FakeServer:
         *,
         fail_post: Callable[[str], httpx.Response | None] | None = None,
         history_fetches_allowed: int | None = None,
+        fail_history: Callable[[httpx.Request], httpx.Response] | None = None,
     ) -> None:
         self.items = list(items or [])
         self.posts: list[str] = []
         self.replayed_flags: list[object] = []
         self.history_fetches = 0
+        self.fail_history = fail_history
         self._fail_post = fail_post
         self._history_fetches_allowed = history_fetches_allowed
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.endswith("/items"):
             self.history_fetches += 1
+            if self.fail_history is not None:
+                return self.fail_history(request)
             allowed = self._history_fetches_allowed
             if allowed is not None and self.history_fetches > allowed:
                 return httpx.Response(500, json={"error": {"code": "internal_error"}})
@@ -167,7 +173,7 @@ async def test_corrupt_and_partial_lines_are_skipped(saved_transcript: Path) -> 
     assert server.replayed_flags == [True]
     assert server.texts() == ["first question", "first answer"]
     assert resumed is not None
-    assert resumed.forward_from is None
+    assert resumed.forward_from == resumed.path.stat().st_size
     assert "second question" not in resumed.path.read_text(encoding="utf-8")
 
 
@@ -232,7 +238,7 @@ async def test_transcript_that_cannot_be_read_is_set_aside(
 
     assert server.posts == []
     assert resumed is not None
-    assert resumed.forward_from is None
+    assert resumed.forward_from == resumed.path.stat().st_size
     assert "unread answer" not in resumed.path.read_text(encoding="utf-8")
     (aside,) = saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*")
     assert aside.read_bytes() == saved
@@ -484,7 +490,7 @@ async def test_rejected_item_is_skipped_and_the_rest_delivered(
     assert server.posts == ["a-1:0:message"] * 3 + ["u-2:0:message"]
     assert server.texts() == ["first question", "second question"]
     assert resumed is not None
-    assert resumed.forward_from is None
+    assert resumed.forward_from == resumed.path.stat().st_size
     assert "rejected answer" not in resumed.path.read_text(encoding="utf-8")
 
 
@@ -548,6 +554,100 @@ async def test_unfinished_replay_keeps_its_offset_without_refetching(
     assert server.history_fetches == 1
     assert resumed is not None
     assert resumed.forward_from == len(delivered_records)
+    assert saved_transcript.read_bytes() == saved
+
+
+def _history_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("history page timed out", request=request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outage",
+    [
+        pytest.param(lambda request: httpx.Response(503), id="503"),
+        pytest.param(_history_timeout, id="timeout"),
+        pytest.param(lambda request: httpx.Response(429), id="429"),
+    ],
+)
+async def test_history_outage_keeps_the_saved_transcript_for_a_later_resume(
+    saved_transcript: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outage: Callable[[httpx.Request], httpx.Response],
+) -> None:
+    """Without history the resume is refused untouched; once it returns, nothing is lost."""
+    monkeypatch.setattr(native_terminal, "_sleep", _no_sleep)
+    saved = _line(_user("u-1", "saved prompt")) + _line(_assistant("a-1", "saved answer"))
+    saved_transcript.write_bytes(saved)
+    server = _FakeServer(
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])], fail_history=outage
+    )
+
+    with pytest.raises(claude_native.ClaudeTranscriptUnreconciledError):
+        await _cold_resume(server)
+
+    assert server.posts == []
+    assert saved_transcript.read_bytes() == saved
+    assert [path.name for path in saved_transcript.parent.iterdir()] == [saved_transcript.name]
+
+    server.fail_history = None
+    resumed = await _cold_resume(server)
+
+    assert server.posts == ["a-1:0:message"]
+    assert server.texts() == ["saved prompt", "saved answer"]
+    assert resumed is not None
+    assert "saved answer" in resumed.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+async def test_history_contract_error_refuses_the_saved_transcript(
+    saved_transcript: Path, status: int
+) -> None:
+    """A rejected history read is never retried, and the saved transcript stays as it is."""
+    saved = _line(_user("u-1", "saved prompt")) + _line(_assistant("a-1", "saved answer"))
+    saved_transcript.write_bytes(saved)
+    server = _FakeServer(fail_history=lambda request: httpx.Response(status))
+
+    with pytest.raises(claude_native.ClaudeTranscriptUnreconciledError) as refused:
+        await _cold_resume(server)
+
+    assert f"({status})" in refused.value.message
+    assert server.history_fetches == 1
+    assert server.posts == []
+    assert saved_transcript.read_bytes() == saved
+
+
+@pytest.mark.asyncio
+async def test_history_failure_without_a_saved_transcript_is_not_a_refusal(
+    saved_transcript: Path,
+) -> None:
+    """With nothing local to strand, the history error reaches the caller unchanged."""
+    server = _FakeServer(fail_history=lambda request: httpx.Response(403))
+
+    with pytest.raises(click.ClickException) as failed:
+        await _cold_resume(server)
+
+    assert not isinstance(failed.value, claude_native.ClaudeTranscriptUnreconciledError)
+    assert not saved_transcript.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_after_a_full_replay_resumes_the_saved_transcript(
+    saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once every saved item is delivered, a failed refresh keeps the transcript as it is."""
+    monkeypatch.setattr(native_terminal, "_sleep", _no_sleep)
+    saved = _line(_user("u-1", "saved prompt")) + _line(_assistant("a-1", "saved answer"))
+    saved_transcript.write_bytes(saved)
+    server = _FakeServer(
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])], history_fetches_allowed=1
+    )
+
+    resumed = await _cold_resume(server)
+
+    assert server.posts == ["a-1:0:message"]
+    assert resumed == claude_native.ClaudeResumeTranscript(saved_transcript, len(saved))
     assert saved_transcript.read_bytes() == saved
 
 

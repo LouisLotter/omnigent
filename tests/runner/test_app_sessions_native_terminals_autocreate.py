@@ -2824,6 +2824,91 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     assert forwarder_kwargs.get("start_at_end") is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unreconciled", [True, False])
+async def test_auto_create_claude_terminal_never_launches_fresh_past_an_unreconciled_transcript(
+    unreconciled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local transcript the cold resume could not reconcile fails the start instead.
+
+    A fresh Claude session would continue the conversation past whatever that
+    transcript holds undelivered. Any other preparation failure still launches
+    fresh.
+    """
+    import click
+
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    failure = (
+        ClaudeTranscriptUnreconciledError("history could not be read")
+        if unreconciled
+        else click.ClickException("transcript could not be written")
+    )
+
+    async def _failing_prepare(*args: Any, **kwargs: Any) -> ClaudeResumeTranscript:
+        raise failure
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._prepare_claude_resume_transcript",
+        _failing_prepare,
+    )
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _capture_forwarder(**kwargs: Any) -> None:
+        forwarder_kwargs.update(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _capture_forwarder,
+    )
+
+    class _ResumableServerClient(NullServerClient):
+        """Server client whose session snapshot binds a prior Claude session."""
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            del kwargs
+            payload: dict[str, Any] = (
+                {"labels": {}}
+                if url.endswith("/labels")
+                else {"external_session_id": "02857840-6362-408f-b41f-309e396ed7c6"}
+            )
+
+            class _Response(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return payload
+
+            return _Response()
+
+    captured: dict[str, Any] = {}
+
+    async def _auto_create() -> None:
+        await _auto_create_claude_terminal(
+            "5cdbea97a2fb0c659bc09605401e2bb2",
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=_ResumableServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+
+    if unreconciled:
+        with pytest.raises(ClaudeTranscriptUnreconciledError):
+            await _auto_create()
+        assert captured == {}
+        assert forwarder_kwargs == {}
+    else:
+        await _auto_create()
+        assert "--resume" not in captured["spec"].args
+        assert forwarder_kwargs.get("start_at_end") is False
+
+
 @dataclass
 class _PublishedEvent:
     """

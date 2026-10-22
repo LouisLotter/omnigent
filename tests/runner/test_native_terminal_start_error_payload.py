@@ -90,6 +90,22 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
     assert "agent no longer exists" not in payload["message"]
 
 
+def test_unreconciled_claude_transcript_asks_for_a_retry_without_its_path() -> None:
+    """A refused cold resume says why and what to do, without the local path."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    exc = ClaudeTranscriptUnreconciledError(
+        "Not resuming 'conv_1': the local Claude transcript /home/me/.claude/x.jsonl may hold "
+        "items the server never received"
+    )
+
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    assert "Try again" in payload["message"]
+    assert "/home/me" not in payload["message"]
+
+
 @pytest.mark.parametrize(
     ("exc", "category"),
     [

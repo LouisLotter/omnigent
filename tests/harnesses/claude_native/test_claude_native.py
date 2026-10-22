@@ -3284,53 +3284,6 @@ async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [500, 429])
-async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    status_code: int,
-) -> None:
-    """
-    Server history unreachable + intact local transcript → resume from it.
-
-    When every page size fails, or throttling outlasts the 429 retries, a
-    previous run's local ``~/.claude/projects/<ws>/<sid>.jsonl`` still holds
-    the conversation; resuming from it beats silently launching a blank
-    session.
-    """
-    projects = tmp_path / "projects"
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
-    workspace = Path("/work/some-repo")
-    target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
-    target_dir.mkdir(parents=True)
-    local = target_dir / "sid123.jsonl"
-    local.write_text('{"type":"user"}\n', encoding="utf-8")
-
-    async def no_sleep(delay: float) -> None:
-        del delay
-
-    monkeypatch.setattr(native_terminal, "_sleep", no_sleep)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        del request
-        return httpx.Response(status_code, json={"error": {"code": "unavailable"}})
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
-        written = await claude_native._ensure_local_claude_resume_transcript(
-            client,
-            session_id="conv_abc",
-            external_session_id="sid123",
-            workspace=workspace,
-        )
-
-    assert written == local
-    # The untouched local transcript is used as-is, never overwritten with
-    # partial server state.
-    assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
-
-
-@pytest.mark.asyncio
 async def test_resume_transcript_ignores_corrupt_local_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6432,6 +6385,7 @@ async def test_attach_passes_start_at_end_true_on_cold_resume(
         bridge_dir=tmp_path / "bridge",
         reattached=False,
         cold_resumed=True,
+        resume_forward_from=4096,
     )
     await claude_native._attach_with_transcript_forwarder(
         base_url="https://example.com",
@@ -6454,6 +6408,8 @@ async def test_attach_passes_start_at_end_true_on_cold_resume(
         f"every prior turn in the reopened claude transcript is "
         f"re-POSTed to Omnigent on resume and broadcast to live clients."
     )
+    # The boundary measured before launch wins over a live end-of-file seed.
+    assert captured.get("start_at_offset") == 4096
 
 
 @pytest.mark.asyncio

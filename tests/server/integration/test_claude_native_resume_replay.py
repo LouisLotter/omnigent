@@ -21,12 +21,14 @@ from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native import resume_replay
 from omnigent.harnesses.claude_native.bridge import read_transcript_items_from_offset
 from omnigent.harnesses.claude_native.forwarder import (
+    TranscriptForwardState,
     _ensure_state_for_transcript,
     _forward_available_items,
     _ForwardDedupeState,
     _post_external_conversation_item,
     _PostRetryTracker,
 )
+from omnigent.runner.native.orchestration import _measured_prefix_bytes
 from omnigent.runtime import pending_inputs
 from tests.server.helpers import create_test_agent
 
@@ -485,3 +487,152 @@ async def test_forwarded_backlog_leaves_a_newer_queued_web_message_alone(
     )
     assert old_request.get("created_by") != "web-user@example.com"
     assert [block["type"] for block in old_request["content"]] == ["input_text"]
+
+
+class _HistoryOutageTransport(_CountingTransport):
+    """Answer every history page with 503 while ``unavailable`` is set."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        super().__init__(inner)
+        self.unavailable = True
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.unavailable and request.method == "GET" and request.url.path.endswith("/items"):
+            return httpx.Response(503, json={"error": {"code": "unavailable"}})
+        return await super().handle_async_request(request)
+
+
+async def _cold_resume_forward_from(
+    client: httpx.AsyncClient, session_id: str, workspace: Path, launch_path: str
+) -> int | None:
+    """Prepare a cold resume as *launch_path* does; return where its forwarder starts."""
+    if launch_path == "cli":
+        cold_resume = await claude_native._resolve_cold_resume(client, session_id)
+        assert cold_resume.args == ("--resume", _CLAUDE_SESSION_ID)
+        return cold_resume.forward_from
+    resumed = await claude_native._prepare_claude_resume_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=_CLAUDE_SESSION_ID,
+        workspace=workspace,
+    )
+    assert resumed is not None
+    if resumed.forward_from is None:
+        return _measured_prefix_bytes(resumed.path)
+    return resumed.forward_from
+
+
+async def _forward_new_records(
+    client: httpx.AsyncClient, session_id: str, bridge_dir: Path, state: TranscriptForwardState
+) -> TranscriptForwardState:
+    return await _forward_available_items(
+        client=client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        agent_name=_AGENT_NAME,
+        state=state,
+        retry_tracker=_PostRetryTracker(),
+        dedupe=_ForwardDedupeState(),
+    )
+
+
+@pytest.mark.parametrize("launch_path", ["runner", "cli"])
+async def test_history_outage_then_recovery_loses_and_duplicates_nothing(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_path: str,
+) -> None:
+    """A refused resume, a prompt before the first hook and later restores keep each item once."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(resume_replay, "_sleep", _no_sleep)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    workspace = tmp_path / "replay-repo"
+    workspace.mkdir()
+    workspace = workspace.resolve()
+    monkeypatch.chdir(workspace)
+    session_id = await _create_session(client)
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "labels": {claude_native._WRAPPER_LABEL_KEY: claude_native._WRAPPER_LABEL_VALUE},
+            "external_session_id": _CLAUDE_SESSION_ID,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    saved = _write_saved_transcript(projects, workspace)
+    checkpoint = saved.read_bytes()
+    # The forwarder delivered the first turn; the second never reached the server.
+    await _deliver_records(client, session_id, saved, {"u-1", "a-1"})
+    queued = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "new web request"}],
+        created_by="web-user@example.com",
+    )
+
+    outage = _HistoryOutageTransport(httpx.ASGITransport(app=app))
+    async with httpx.AsyncClient(transport=outage, base_url="http://test") as resume_client:
+        with pytest.raises(claude_native.ClaudeTranscriptUnreconciledError):
+            await _cold_resume_forward_from(resume_client, session_id, workspace, launch_path)
+        assert outage.item_posts == []
+        assert saved.read_bytes() == checkpoint
+
+        outage.unavailable = False
+        forward_from = await _cold_resume_forward_from(
+            resume_client, session_id, workspace, launch_path
+        )
+    assert outage.item_posts == ["u-2:0:message", "a-2:0:message"]
+    assert forward_from == saved.stat().st_size
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [queued]
+
+    # The queued web request reaches Claude before its first hook seeds the cursor.
+    last_uuid = json.loads(saved.read_text(encoding="utf-8").splitlines()[-1])["uuid"]
+    with saved.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_user("u-3", "new web request", last_uuid)) + "\n")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = await _ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=saved,
+        start_at_end=True,
+        session_id=session_id,
+        start_at_offset=forward_from,
+    )
+    state = await _forward_new_records(client, session_id, bridge_dir, state)
+    with saved.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_assistant("a-3", "newer answer", "u-3")) + "\n")
+    await _forward_new_records(client, session_id, bridge_dir, state)
+
+    expected = [
+        "first question",
+        "first answer",
+        "second question",
+        "second answer",
+        "new web request",
+        "newer answer",
+    ]
+    assert await _message_texts(client, session_id) == expected
+    assert pending_inputs.snapshot_for(session_id) == []
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    web_request = next(
+        item
+        for item in items
+        if any(block.get("text") == "new web request" for block in item.get("content", []))
+    )
+    assert web_request.get("created_by") == "web-user@example.com"
+
+    # Restoring the newer or the original checkpoint later posts and loses nothing.
+    for restored in (saved.read_bytes(), checkpoint):
+        saved.write_bytes(restored)
+        counting = _CountingTransport(httpx.ASGITransport(app=app))
+        async with httpx.AsyncClient(transport=counting, base_url="http://test") as resume_client:
+            await _cold_resume_forward_from(resume_client, session_id, workspace, launch_path)
+        assert counting.item_posts == []
+        assert await _message_texts(client, session_id) == expected
+        rebuilt = saved.read_text(encoding="utf-8")
+        positions = [rebuilt.index(text) for text in expected]
+        assert positions == sorted(positions)

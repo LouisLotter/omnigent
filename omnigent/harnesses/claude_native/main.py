@@ -5368,11 +5368,12 @@ class ClaudeResumeTranscript:
 
     :param path: Transcript path, e.g.
         ``Path("~/.claude/projects/-work-repo/<sid>.jsonl")``.
-    :param forward_from: Byte offset of the first record the server has not
-        received when the transcript was kept rather than rewritten; the
-        forwarder starts there. ``None`` when the forwarder skips the whole
-        file: it was rebuilt from server history, or that history was
-        unreachable.
+    :param forward_from: Byte offset where the transcript forwarder starts,
+        measured before Claude launches so nothing Claude writes before its
+        first hook falls behind it: the first record the server has not
+        received when the transcript was kept, else the end of the
+        transcript. ``None`` when unknown; the forwarder then measures the
+        file itself.
     :param replayed_source_ids: Source ids of the items left to the
         forwarder, which posts them as replayed.
     """
@@ -5431,7 +5432,9 @@ async def _prepare_claude_resume_transcript(
     undelivered, it is kept rather than rewritten, and the forwarder starts at
     its first undelivered record, posting them as replayed. A transcript that
     cannot be read or placed in the server's history, or holds undelivered
-    items but cannot be resumed, is set aside before rewriting.
+    items but cannot be resumed, is set aside before rewriting. When the
+    history cannot be read at all, nothing shows which saved items the server
+    lacks, so a local transcript is neither resumed nor replaced.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -5452,6 +5455,8 @@ async def _prepare_claude_resume_transcript(
         if the AP history yields no resumable records (an empty transcript
         would make ``claude --resume`` exit instead of start, so the caller
         must launch fresh).
+    :raises ClaudeTranscriptUnreconciledError: If Omnigent history cannot be
+        fetched while a local transcript exists.
     :raises click.ClickException: If Omnigent history cannot be fetched or
         the transcript cannot be written.
     """
@@ -5465,52 +5470,56 @@ async def _prepare_claude_resume_transcript(
 
     try:
         items = await _fetch_all_session_items_for_claude_resume(client, session_id)
-        replay = await _replay_undelivered_claude_transcript(
-            client,
-            session_id=session_id,
-            external_session_id=external_session_id,
-            transcript=target,
-            server_items=items,
-        )
-        if replay.undelivered and _is_resumable_claude_transcript(target):
-            # Rewriting would drop items the server lacks; the forwarder
-            # delivers them from the first undelivered record instead.
-            _logger.warning(
-                "Resuming %r from the existing local transcript %s: %d item(s) the "
-                "server never received are left to the forwarder",
-                session_id,
-                target,
-                replay.undelivered,
-            )
-            return ClaudeResumeTranscript(
-                target,
-                forward_from=replay.resume_offset,
-                replayed_source_ids=replay.undelivered_source_ids,
-            )
-        if replay.undelivered or not replay.reconciled:
-            # It may hold items the server lacks but cannot be resumed, read or
-            # placed: keep it beside the rebuilt transcript, never overwrite it.
-            _set_aside_claude_transcript(target)
-        if replay.delivered:
-            items = await _fetch_all_session_items_for_claude_resume(client, session_id)
-    except _ResumeHistoryUnavailableError:
-        # Server history is unreachable (5xx / dropped connections at every
-        # page size, or throttling that outlasts the 429 retries), but an
-        # intact local transcript from a previous run on this machine can
-        # still resume the conversation — far better than silently starting
-        # blank. It may be somewhat stale relative to the server, which the
-        # resumed session tolerates. Other 4xx contract errors (plain
-        # ClickException) still propagate: the server explicitly rejected
-        # the conversation, so reviving local history is unsafe.
-        if _is_resumable_claude_transcript(target):
-            _logger.warning(
-                "Could not fetch server history for %r; resuming from the "
-                "existing local transcript %s",
-                session_id,
-                target,
-            )
-            return ClaudeResumeTranscript(target)
+    except click.ClickException as exc:
+        # Resuming would start the forwarder after items the server may lack,
+        # and a later delivered item would then pass them off as delivered.
+        if os.path.lexists(target):
+            raise ClaudeTranscriptUnreconciledError(
+                f"Not resuming {session_id!r}: the local Claude transcript {target} may "
+                "hold items the server never received, and the server's history could "
+                f"not be read to check. Retry once it can be read. {exc.message}"
+            ) from exc
         raise
+    replay = await _replay_undelivered_claude_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=external_session_id,
+        transcript=target,
+        server_items=items,
+    )
+    if replay.undelivered and _is_resumable_claude_transcript(target):
+        # Rewriting would drop items the server lacks; the forwarder
+        # delivers them from the first undelivered record instead.
+        _logger.warning(
+            "Resuming %r from the existing local transcript %s: %d item(s) the "
+            "server never received are left to the forwarder",
+            session_id,
+            target,
+            replay.undelivered,
+        )
+        return ClaudeResumeTranscript(
+            target,
+            forward_from=replay.resume_offset,
+            replayed_source_ids=replay.undelivered_source_ids,
+        )
+    if replay.undelivered or not replay.reconciled:
+        # It may hold items the server lacks but cannot be resumed, read or
+        # placed: keep it beside the rebuilt transcript, never overwrite it.
+        _set_aside_claude_transcript(target)
+    if replay.delivered:
+        try:
+            items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+        except _ResumeHistoryUnavailableError:
+            # The replay delivered every saved item, so the transcript resumes as it is.
+            if not _is_resumable_claude_transcript(target):
+                raise
+            _logger.warning(
+                "Could not refresh server history for %r; resuming from the "
+                "reconciled local transcript %s",
+                session_id,
+                target,
+            )
+            return ClaudeResumeTranscript(target, forward_from=target.stat().st_size)
     from omnigent.inner.native_attachments import resolve_session_item_file_references
 
     # Items are persisted with unresolved file_id attachment blocks;
@@ -5535,6 +5544,8 @@ async def _prepare_claude_resume_transcript(
         with tmp.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            handle.flush()
+            written_bytes = os.fstat(handle.fileno()).st_size
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(
@@ -5543,7 +5554,7 @@ async def _prepare_claude_resume_transcript(
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
-    return ClaudeResumeTranscript(target)
+    return ClaudeResumeTranscript(target, forward_from=written_bytes)
 
 
 def _set_aside_claude_transcript(path: Path) -> None:
@@ -5669,10 +5680,20 @@ class _ResumeHistoryUnavailableError(click.ClickException):
     """Server history stayed unreachable after every page-size or 429 retry.
 
     Distinct from a plain :class:`click.ClickException` so callers can tell
-    "the backend cannot serve the rows right now" (a local-transcript
-    fallback is safe) apart from 4xx contract errors (the server explicitly
-    rejected the conversation — resuming local history could revive the
-    wrong session).
+    "the backend cannot serve the rows right now" apart from 4xx contract
+    errors (the server explicitly rejected the conversation — resuming local
+    history could revive the wrong session). A local transcript resumes
+    through it only once a replay has delivered everything it holds.
+    """
+
+
+class ClaudeTranscriptUnreconciledError(click.ClickException):
+    """A cold resume could not read server history to reconcile a local transcript.
+
+    The transcript may hold items the server never received, and only that
+    history shows which. Resuming it, or launching fresh and continuing the
+    conversation past it, would leave them undeliverable, so the launch must
+    not go ahead; a retry reconciles the untouched transcript.
     """
 
 
@@ -5711,7 +5732,7 @@ async def _fetch_all_session_items_for_claude_resume(
             # connection mid-response instead of returning a clean 5xx;
             # treat it the same way and retry the page smaller. Broad on
             # purpose: total connectivity loss also degrades to the floor,
-            # then the local-transcript fallback rescues the resume.
+            # then reports the history unavailable.
             if limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
                 limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
                 _logger.warning(
@@ -5741,7 +5762,7 @@ async def _fetch_all_session_items_for_claude_resume(
             continue
         if resp.status_code >= 500 or resp.status_code == 429:
             # Throttling that outlasts the retries is the server being busy,
-            # not a rejection, so the local-transcript fallback still applies.
+            # not a rejection.
             raise _ResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"

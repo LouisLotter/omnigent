@@ -7944,6 +7944,7 @@ def _native_terminal_start_error_payload(
         extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
     from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
@@ -7980,6 +7981,12 @@ def _native_terminal_start_error_payload(
         # The raise site composes a client-safe message (versions + upgrade
         # command), so it can be shown verbatim.
         message = str(exc)
+    elif isinstance(exc, ClaudeTranscriptUnreconciledError):
+        message = (
+            f"{runtime_name}'s saved conversation may hold messages the server never "
+            "received, and the server's history could not be read to check, so it was "
+            "not resumed. Try again shortly; if it keeps failing, see the runner log."
+        )
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
@@ -8686,7 +8693,10 @@ async def _auto_create_claude_terminal(
     # Items of a kept transcript that the forwarder posts as replayed.
     resume_replayed_source_ids: frozenset[str] = frozenset()
     if server_client is not None and session_external_id is not None:
-        from omnigent.harnesses.claude_native.main import _prepare_claude_resume_transcript
+        from omnigent.harnesses.claude_native.main import (
+            ClaudeTranscriptUnreconciledError,
+            _prepare_claude_resume_transcript,
+        )
 
         try:
             _resume = await _prepare_claude_resume_transcript(
@@ -8704,6 +8714,10 @@ async def _auto_create_claude_terminal(
                     else _measured_prefix_bytes(_resume.path)
                 )
                 resume_replayed_source_ids = _resume.replayed_source_ids
+        except ClaudeTranscriptUnreconciledError:
+            # A fresh session would continue the conversation past items the
+            # local transcript may hold undelivered; fail the start for a retry.
+            raise
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _logger.warning(
                 "Could not synthesize Claude resume transcript for %s; launching without --resume",
