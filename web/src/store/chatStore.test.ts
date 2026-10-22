@@ -6070,6 +6070,70 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { delivery: "not_delivered", notice: true },
+    { delivery: "unknown", notice: true },
+    { delivery: "delivered", notice: false },
+    { delivery: "failed", notice: false },
+  ])(
+    "flags a Stop answered $delivery as not reaching the computer: $notice",
+    async ({ delivery, notice }) => {
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith("/v1/sessions/conv_abc/events")
+          ? mockResponse({ queued: false, delivery })
+          : defaultFetchHandler(input, init),
+      );
+      useChatStore.setState({ conversationId: "conv_abc", stopNotDelivered: false });
+
+      useChatStore.getState().stop();
+      await tick();
+
+      expect(useChatStore.getState().stopNotDelivered).toBe(notice);
+    },
+  );
+
+  it.each(["newer Stop", "message"] as const)(
+    "ignores an older Stop's lost answer that settles after a %s",
+    async (newer) => {
+      const answers: ((delivery: string) => void)[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (!String(input).endsWith("/v1/sessions/conv_abc/events")) {
+          return defaultFetchHandler(input, init);
+        }
+        const body = JSON.parse(String(init?.body)) as { type: string };
+        if (body.type !== "interrupt") return mockResponse({ queued: true, item_id: "ci_mock" });
+        return new Promise<Response>((resolve) => {
+          answers.push((delivery) => resolve(mockResponse({ queued: false, delivery })));
+        });
+      });
+      seedSession("conv_abc");
+      await useChatStore.getState().switchTo("conv_abc");
+
+      useChatStore.getState().stop();
+      await tick();
+      if (newer === "newer Stop") {
+        useChatStore.getState().stop();
+        await tick();
+        answers[1]!("delivered");
+      } else {
+        await useChatStore.getState().send("next request", "agent_xyz");
+      }
+      await tick();
+      answers[0]!("unknown");
+      await tick();
+
+      expect(useChatStore.getState().stopNotDelivered).toBe(false);
+    },
+  );
+
+  it("clears the undelivered-Stop flag when Stop is pressed again", () => {
+    useChatStore.setState({ conversationId: "conv_abc", stopNotDelivered: true });
+
+    useChatStore.getState().stop();
+
+    expect(useChatStore.getState().stopNotDelivered).toBe(false);
+  });
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {

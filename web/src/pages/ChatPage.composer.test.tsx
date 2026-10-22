@@ -168,6 +168,7 @@ import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
+import { STOP_NOT_DELIVERED_MESSAGE } from "@/lib/stopDelivery";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
@@ -343,6 +344,56 @@ describe("Composer Escape interrupt", () => {
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(props.onStop).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("Composer undelivered Stop notice", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    useChatStore.setState({ conversationId: "conv_stop", blocks: [], stopNotDelivered: false });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    vi.unstubAllGlobals();
+    useChatStore.setState({ stopNotDelivered: false });
+  });
+
+  it.each([
+    { delivery: "not_delivered", shown: true },
+    { delivery: "unknown", shown: true },
+    { delivery: "delivered", shown: false },
+  ])(
+    "after a Stop answered $delivery, shows the press-again notice: $shown",
+    async ({ delivery, shown }) => {
+      const answered = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ queued: false, delivery }), {
+            status: 202,
+            headers: { "Content-Type": "application/json" },
+          }),
+      );
+      vi.stubGlobal("fetch", answered);
+      const props = composerProps({
+        status: "streaming",
+        isWorking: true,
+        onStop: () => useChatStore.getState().stop(),
+      });
+      render(<Composer {...props} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+      await waitFor(() => expect(answered).toHaveBeenCalled());
+
+      if (shown) {
+        expect(await screen.findByTestId("composer-stop-not-delivered")).toHaveTextContent(
+          STOP_NOT_DELIVERED_MESSAGE,
+        );
+      } else {
+        await act(async () => {});
+        expect(screen.queryByTestId("composer-stop-not-delivered")).toBeNull();
+      }
+    },
+  );
 });
 
 describe("Composer session drafts", () => {

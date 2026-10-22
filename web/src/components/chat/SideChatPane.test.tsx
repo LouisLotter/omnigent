@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as sessionsApi from "@/lib/sessionsApi";
+import { STOP_NOT_DELIVERED_MESSAGE } from "@/lib/stopDelivery";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -353,6 +354,26 @@ describe("side-chat interrupt", () => {
     expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, undefined);
     await waitFor(() => expect(interrupt).toBeEnabled());
   });
+
+  it.each([
+    { delivery: "not_delivered", shown: true },
+    { delivery: "unknown", shown: true },
+    { delivery: "delivered", shown: false },
+  ] as const)(
+    "after a Stop answered $delivery, shows the press-again notice: $shown",
+    async ({ delivery, shown }) => {
+      vi.mocked(sessionsApi.interrupt).mockResolvedValue({ queued: false, delivery });
+      renderPane(<SideChatPane childId={childId} />);
+
+      const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
+      fireEvent.click(interrupt);
+      await waitFor(() => expect(interrupt).toBeEnabled());
+
+      const notice = screen.queryByTestId("side-chat-stop-not-delivered");
+      if (shown) expect(notice).toHaveTextContent(STOP_NOT_DELIVERED_MESSAGE);
+      else expect(notice).toBeNull();
+    },
+  );
 
   it("does not target a completed native response while the session status settles", () => {
     conversationRegistry.acquire(childId).setState({

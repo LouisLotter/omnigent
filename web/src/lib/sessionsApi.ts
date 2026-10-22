@@ -80,6 +80,14 @@ export interface PostEventResponse {
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
   recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  /**
+   * What happened to an interrupt: `"delivered"`, `"not_delivered"` (no
+   * runner connection took it), `"unknown"` (sent, but its answer was lost),
+   * `"failed"` (the runner refused it) or `"superseded"` (a newer message came
+   * first). Neither undelivered outcome is retried by the server. Messages
+   * report `"unknown"` or `"duplicate"`. Absent when there was no runner.
+   */
+  delivery?: "delivered" | "not_delivered" | "unknown" | "failed" | "superseded" | "duplicate";
 }
 
 /**
@@ -452,6 +460,7 @@ function postEventResponseFromWire(wire: {
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
+  delivery?: PostEventResponse["delivery"];
 }): PostEventResponse {
   return {
     queued: wire.queued,
@@ -460,6 +469,7 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    delivery: wire.delivery,
   };
 }
 
@@ -1410,6 +1420,7 @@ export async function postEvent(
       pending_id?: string;
       recovered?: boolean;
       recovery?: PostEventResponse["recovery"];
+      delivery?: PostEventResponse["delivery"];
     },
   );
 }
