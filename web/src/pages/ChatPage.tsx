@@ -84,6 +84,11 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
 import { STOP_NOTICE_MESSAGES } from "@/lib/stopDelivery";
+import {
+  clearRunnerLaunchNotice,
+  RUNNER_LAUNCH_MESSAGES,
+  useRunnerLaunchNotice,
+} from "@/store/runnerLaunchNotices";
 import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -2447,6 +2452,13 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  // The create's runner launch did not confirm a start: said until the runner is online.
+  const runnerLaunchNotice = useRunnerLaunchNotice(composerSessionId);
+  useEffect(() => {
+    if (runnerOnline === true && composerSessionId !== null) {
+      clearRunnerLaunchNotice(composerSessionId);
+    }
+  }, [runnerOnline, composerSessionId, runnerLaunchNotice]);
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
@@ -3832,6 +3844,11 @@ function ComposerImpl(
               />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
+              {runnerLaunchNotice !== null && runnerOnline !== true && (
+                <ComposerFeedbackRow role="status" data-testid="composer-runner-launch-notice">
+                  {RUNNER_LAUNCH_MESSAGES[runnerLaunchNotice]}
+                </ComposerFeedbackRow>
+              )}
               {stopNotice !== null && (
                 <ComposerFeedbackRow role="status" data-testid="composer-stop-notice">
                   {STOP_NOTICE_MESSAGES[stopNotice]}

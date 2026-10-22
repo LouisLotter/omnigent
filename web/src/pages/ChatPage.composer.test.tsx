@@ -170,6 +170,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
 import { STOP_NOTICE_MESSAGES, type StopNotice } from "@/lib/stopDelivery";
 import { computeIsTurnActive } from "@/components/chat/chatBubbleParts";
+import {
+  clearRunnerLaunchNotice,
+  noteRunnerLaunch,
+  RUNNER_LAUNCH_MESSAGES,
+} from "@/store/runnerLaunchNotices";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
@@ -485,6 +490,44 @@ describe("Composer Stop notice", () => {
     await act(async () => failFirst());
 
     expect(screen.queryByTestId("composer-stop-notice")).toBeNull();
+  });
+});
+
+describe("Composer runner launch notice", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_launch", blocks: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearRunnerLaunchNotice("conv_launch");
+  });
+
+  it.each(["failed", "unknown"] as const)(
+    "says a %s launch until the runner comes online",
+    async (outcome) => {
+      noteRunnerLaunch("conv_launch", outcome);
+      const { rerender } = render(<Composer {...composerProps({ runnerOnline: false })} />);
+
+      expect(screen.getByTestId("composer-runner-launch-notice")).toHaveTextContent(
+        RUNNER_LAUNCH_MESSAGES[outcome],
+      );
+
+      rerender(<Composer {...composerProps({ runnerOnline: true })} />);
+      expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+      // Cleared, not just hidden: a later drop of the runner does not bring it back.
+      rerender(<Composer {...composerProps({ runnerOnline: false })} />);
+      expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+    },
+  );
+
+  it("shows nothing for a started launch or another session's notice", () => {
+    noteRunnerLaunch("conv_launch", "started");
+    noteRunnerLaunch("conv_other", "failed");
+    render(<Composer {...composerProps({ runnerOnline: false })} />);
+
+    expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+    clearRunnerLaunchNotice("conv_other");
   });
 });
 
