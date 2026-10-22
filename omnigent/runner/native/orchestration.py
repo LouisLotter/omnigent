@@ -7985,7 +7985,8 @@ def _native_terminal_start_error_payload(
         message = (
             f"{runtime_name}'s saved conversation may hold messages the server never "
             "received, and the server's history could not be read to check, so it was "
-            "not resumed. Try again shortly; if it keeps failing, see the runner log."
+            "not resumed. Try again shortly; if it keeps failing, see the runner log: "
+            f"{process_log_reference('runner')}"
         )
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
@@ -8526,6 +8527,7 @@ async def _auto_create_claude_terminal(
         augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        remember_claude_session_id,
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
@@ -8716,7 +8718,9 @@ async def _auto_create_claude_terminal(
                 resume_replayed_source_ids = _resume.replayed_source_ids
         except ClaudeTranscriptUnreconciledError:
             # A fresh session would continue the conversation past items the
-            # local transcript may hold undelivered; fail the start for a retry.
+            # local transcript may hold undelivered; fail the start for a retry,
+            # which must still find this id when the snapshot omits it.
+            remember_claude_session_id(bridge_dir, session_external_id)
             raise
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _logger.warning(

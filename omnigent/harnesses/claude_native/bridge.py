@@ -2965,6 +2965,29 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     return raw
 
 
+def remember_claude_session_id(bridge_dir: Path, claude_session_id: str) -> None:
+    """
+    Record a Claude-native session id in the bridge state without a hook event.
+
+    Preparing the bridge for a launch clears the state. A launch that stops
+    afterwards puts back the id it resumes, so a retry that cannot get it from
+    the server still finds it through :func:`read_claude_session_id`.
+
+    :param bridge_dir: Bridge directory path.
+    :param claude_session_id: Claude session uuid, e.g.
+        ``"a1b2c3d4-1234-5678-9abc-def012345678"``.
+    :returns: None.
+    """
+    _ensure_secure_dir(bridge_dir)
+    with _bridge_metadata_write_lock(bridge_dir):
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        state["claude_session_id"] = claude_session_id
+        state["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _STATE_FILE, state)
+
+
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
     """
     Return Claude session ids already observed by this bridge.

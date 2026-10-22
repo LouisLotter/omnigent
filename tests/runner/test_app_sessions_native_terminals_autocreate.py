@@ -2909,6 +2909,133 @@ async def test_auto_create_claude_terminal_never_launches_fresh_past_an_unreconc
         assert forwarder_kwargs.get("start_at_end") is False
 
 
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_refused_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refused starts keep the bridge's session id, so recovery resumes that transcript.
+
+    The snapshot omits ``external_session_id`` throughout, so the bridge state is
+    the only record of the Claude session. Preparing the bridge clears it; a
+    refusal must put it back, or the retry would launch fresh past the saved
+    transcript's undelivered tail.
+    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_from_offset
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+    from omnigent.harnesses.claude_native.resume_replay import external_item_id
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    forwarder = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", forwarder
+    )
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    prior_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (bridge_dir / "state.json").write_text(
+        json.dumps({"claude_session_id": prior_claude_sid}), encoding="utf-8"
+    )
+    transcript = (
+        claude_native._claude_project_dir_for_cwd(workspace.resolve())
+        / f"{prior_claude_sid}.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps({"type": "user", "uuid": "u-1", "message": {"role": "user", "content": "q"}})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "a-1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (delivered,) = [
+        item
+        for item in read_transcript_items_from_offset(
+            transcript, 0, start_line=0, agent_name="claude-native-ui"
+        ).items
+        if item.source_id == "u-1:0:message"
+    ]
+    server_items: list[dict[str, Any]] = [
+        {
+            "id": external_item_id(session_id, delivered.source_id),
+            "type": delivered.item_type,
+            "response_id": delivered.response_id,
+            **delivered.data,
+        }
+    ]
+    posts: list[str] = []
+    history_down = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/items"):
+            if history_down:
+                return httpx.Response(503, json={"error": {"code": "unavailable"}})
+            return httpx.Response(200, json={"data": server_items, "has_more": False})
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            data = json.loads(request.content)["data"]
+            posts.append(data["source_id"])
+            server_items.append(
+                {
+                    "id": external_item_id(session_id, data["source_id"]),
+                    "type": data["item_type"],
+                    "response_id": data["response_id"],
+                    **data["item_data"],
+                }
+            )
+            return httpx.Response(202, json={"queued": False})
+        if request.url.path.endswith("/labels"):
+            return httpx.Response(200, json={"labels": {}})
+        # The session snapshot omits external_session_id; PATCHes succeed.
+        return httpx.Response(200, json={})
+
+    captured: dict[str, Any] = {}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8000"
+    ) as client:
+        for _attempt in range(2):
+            with pytest.raises(ClaudeTranscriptUnreconciledError):
+                await _auto_create_claude_terminal(
+                    session_id,
+                    _RecordingClaudeRegistry(captured),
+                    lambda _sid, _evt: None,
+                    server_client=client,
+                )
+            assert captured == {}
+            assert posts == []
+
+        history_down = False
+        await _auto_create_claude_terminal(
+            session_id,
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=client,
+        )
+        await asyncio.sleep(0)
+
+    args = captured["spec"].args
+    assert args[args.index("--resume") + 1] == prior_claude_sid
+    assert posts == ["a-1:0:message"]
+    assert forwarder.call_args.kwargs["start_at_offset"] == transcript.stat().st_size
+
+
 @dataclass
 class _PublishedEvent:
     """

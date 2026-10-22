@@ -5510,7 +5510,7 @@ async def _prepare_claude_resume_transcript(
         try:
             items = await _fetch_all_session_items_for_claude_resume(client, session_id)
         except _ResumeHistoryUnavailableError:
-            # The replay delivered every saved item, so the transcript resumes as it is.
+            # The replay left no saved item undelivered, so the transcript resumes as it is.
             if not _is_resumable_claude_transcript(target):
                 raise
             _logger.warning(
@@ -5683,7 +5683,7 @@ class _ResumeHistoryUnavailableError(click.ClickException):
     "the backend cannot serve the rows right now" apart from 4xx contract
     errors (the server explicitly rejected the conversation — resuming local
     history could revive the wrong session). A local transcript resumes
-    through it only once a replay has delivered everything it holds.
+    through it only once a replay has left nothing it holds undelivered.
     """
 
 

@@ -633,22 +633,72 @@ async def test_history_failure_without_a_saved_transcript_is_not_a_refusal(
 
 
 @pytest.mark.asyncio
-async def test_failed_refresh_after_a_full_replay_resumes_the_saved_transcript(
+async def test_failed_refresh_after_a_finished_replay_resumes_the_saved_transcript(
     saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Once every saved item is delivered, a failed refresh keeps the transcript as it is."""
+    """Once no saved item is left undelivered, a failed refresh keeps the transcript as it is."""
     monkeypatch.setattr(native_terminal, "_sleep", _no_sleep)
-    saved = _line(_user("u-1", "saved prompt")) + _line(_assistant("a-1", "saved answer"))
+    monkeypatch.setattr(resume_replay, "_sleep", _no_sleep)
+    saved = (
+        _line(_user("u-1", "saved prompt"))
+        + _line(_assistant("a-1", "rejected answer"))
+        + _line(_user("u-2", "saved follow-up"))
+    )
     saved_transcript.write_bytes(saved)
+
+    def reject_answer(source_id: str) -> httpx.Response | None:
+        if source_id == "a-1:0:message":
+            return httpx.Response(422, json={"error": {"code": "invalid_input"}})
+        return None
+
     server = _FakeServer(
-        [_stored(_parsed(saved_transcript)["u-1:0:message"])], history_fetches_allowed=1
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])],
+        fail_post=reject_answer,
+        history_fetches_allowed=1,
+    )
+
+    resumed = await _cold_resume(server)
+
+    assert server.posts == ["a-1:0:message"] * 3 + ["u-2:0:message"]
+    assert server.texts() == ["saved prompt", "saved follow-up"]
+    assert resumed == claude_native.ClaudeResumeTranscript(saved_transcript, len(saved))
+    assert saved_transcript.read_bytes() == saved
+
+
+@pytest.mark.asyncio
+async def test_message_failed_during_a_refused_resume_does_not_strand_the_saved_tail(
+    saved_transcript: Path,
+) -> None:
+    """A send the refused start recorded as failed is not taken for another transcript."""
+    saved_transcript.write_bytes(
+        _line(_user("u-1", "saved prompt")) + _line(_assistant("a-1", "saved answer"))
+    )
+    failed_turn = "resp_0123456789abcdef0123456789abcdef"
+    server = _FakeServer(
+        [
+            _stored(_parsed(saved_transcript)["u-1:0:message"]),
+            {
+                "id": "msg_failed",
+                "type": "message",
+                "role": "user",
+                "response_id": failed_turn,
+                "content": [{"type": "input_text", "text": "sent while history was down"}],
+            },
+            {
+                "id": "err_failed",
+                "type": "error",
+                "response_id": failed_turn,
+                "code": "native_terminal_start_failed",
+                "message": "Claude's saved conversation ... was not resumed.",
+            },
+        ]
     )
 
     resumed = await _cold_resume(server)
 
     assert server.posts == ["a-1:0:message"]
-    assert resumed == claude_native.ClaudeResumeTranscript(saved_transcript, len(saved))
-    assert saved_transcript.read_bytes() == saved
+    assert resumed is not None
+    assert "saved answer" in resumed.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
