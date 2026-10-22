@@ -13864,61 +13864,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
-  it("shows the known interrupted-work card a reconnect snapshot reports", async () => {
-    const id = "conv_interrupted_reconnect";
-    const unknown = {
-      code: "interrupted_outcome_unknown",
-      title: "Interrupted, outcome unknown",
-      message: "The runner stopped while Bash was running, so its outcome is unknown.",
-    };
-    const known = {
-      code: "interrupted_outcome_known",
-      title: "Interrupted",
-      message: "The runner stopped while Bash was running. Its result arrived afterwards.",
-    };
-    seedSession(id, []);
-    const sinks = routeStreamOpens();
-    const streamOpens = fetchMock.getMockImplementation()!;
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const path = String(input).split("?")[0];
-      if (path === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
-        return mockResponse({
-          id,
-          agent_id: "agent_xyz",
-          status: "failed",
-          created_at: 0,
-          items: [],
-          labels: {},
-          last_task_error: known,
-        });
-      }
-      return streamOpens(input, init);
-    });
-    const controller = new AbortController();
-    const ctx = { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null };
-    useChatStore.setState({
-      conversationId: id,
-      abortController: controller,
-      sessionStatus: "failed",
-      blocks: [{ type: "error", ctx, source: "", ...unknown }],
-    });
-
-    const loop = startStreamPump(id, controller, setState, getState);
-    await drainAsync();
-    // Settled while the stream was down: the edge is not replayed.
-    sinks[0]!.error();
-    await drainAsync();
-    expect(sinks).toHaveLength(2);
-
-    const cards = useChatStore.getState().blocks.filter((b) => b.type === "error");
-    expect(cards).toMatchObject([known]);
-
-    sinks[1]!.push("data: [DONE]\n\n");
-    sinks[1]!.close();
-    await drainAsync(2);
-    await loop;
-  });
-
   it("keeps a live status event that arrives during snapshot reconciliation", async () => {
     seedSession("conv_status_race", []);
     const sink = pushableStream();
@@ -14349,6 +14294,99 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    { path: "ordinary backfill", gapLength: 5, newerRecord: false },
+    { path: "ordinary backfill", gapLength: 5, newerRecord: true },
+    { path: "the fresh-window fallback", gapLength: 100, newerRecord: false },
+    { path: "the fresh-window fallback", gapLength: 100, newerRecord: true },
+  ])(
+    "settles only the interrupted-work card shown before the fetch through $path (newer record: $newerRecord)",
+    async ({ gapLength, newerRecord }) => {
+      const id = `conv_interrupted_gap_${gapLength}`;
+      const ctx = { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null };
+      const unknownA = {
+        code: "interrupted_outcome_unknown",
+        title: "Interrupted, outcome unknown",
+        message: "The runner stopped while Bash was running, so its outcome is unknown.",
+      };
+      const knownA = {
+        code: "interrupted_outcome_known",
+        title: "Interrupted",
+        message: "The runner stopped while Bash was running. Its result arrived afterwards.",
+      };
+      const unknownB = { ...unknownA, message: "The runner stopped while Edit was running." };
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const sinks = routeStreamOpens();
+      const streamOpens = fetchMock.getMockImplementation()!;
+      let releaseSnapshot: () => void = () => {};
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path !== `/v1/sessions/${id}` || (init?.method ?? "GET") !== "GET") {
+          return streamOpens(input, init);
+        }
+        // Record A's settlement, fetched before any newer record arrives.
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = () =>
+            resolve(
+              mockResponse({
+                id,
+                agent_id: "agent_xyz",
+                status: "failed",
+                created_at: 0,
+                items: [],
+                labels: {},
+                last_task_error: knownA,
+              }),
+            );
+        });
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: [...itemsToBlocks(windowItems), { type: "error", ctx, source: "", ...unknownA }],
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+        sessionStatus: "failed",
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      // The interrupted turn's output lands during the gap; the person has not acted.
+      const gap = Array.from({ length: gapLength }, (_, i) =>
+        assistantMessage(`gap_${i.toString().padStart(4, "0")}`, `gap ${i}`),
+      );
+      seedSessionItems(id, [...preGap, ...gap]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      if (newerRecord) {
+        // The person acted and a newer interruption failed while the snapshot was in flight.
+        setState((st) => ({
+          blocks: [...st.blocks, ...itemsToBlocks([userMessage("new", "go on")])],
+        }));
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: id,
+          status: "failed",
+          error: unknownB,
+        });
+      }
+      releaseSnapshot();
+      await drainAsync(4);
+
+      const cards = useChatStore.getState().blocks.filter((b) => b.type === "error");
+      expect(cards).toMatchObject(newerRecord ? [unknownA, unknownB] : [knownA]);
+
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it.each([
     { path: "ordinary backfill", gapLength: 5, refreshesWindow: false },

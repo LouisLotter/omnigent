@@ -4974,7 +4974,12 @@ async function reconcileActiveSessionStatus(
   set((s) => {
     const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
     const spinners = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
-    const blocks = snapshotInterruptedWorkCard(spinners ?? s.blocks, session) ?? spinners;
+    const blocks =
+      snapshotInterruptedWorkCard(
+        spinners ?? s.blocks,
+        session,
+        currentInterruptedWorkCard(stateBeforeFetch.blocks),
+      ) ?? spinners;
     return blocks === null ? patch : { ...patch, blocks };
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
@@ -5180,6 +5185,7 @@ async function rehydrateWindowOnReconnect(
   session: Session,
   preGapIds: Set<string>,
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
+  preGapInterruptedCard: AnyBlock | null,
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
@@ -5231,7 +5237,8 @@ async function rehydrateWindowOnReconnect(
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
-      blocks: snapshotInterruptedWorkCard(withSpinners, session) ?? withSpinners,
+      blocks:
+        snapshotInterruptedWorkCard(withSpinners, session, preGapInterruptedCard) ?? withSpinners,
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -5289,6 +5296,8 @@ async function reconcileOnReconnect(
   // before the snapshot fetch are eligible for its flips — see
   // `reconcileElicitationBlocks`.
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
+  // Likewise only the interrupted-work card shown before the fetch can be settled.
+  const preGapInterruptedCard = currentInterruptedWorkCard(get().blocks);
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
@@ -5347,6 +5356,7 @@ async function reconcileOnReconnect(
       session,
       preGapIds,
       preGapElicitations,
+      preGapInterruptedCard,
       set,
       get,
       ignoredNativeMessageIds,
@@ -5420,7 +5430,8 @@ async function reconcileOnReconnect(
     if (reconciled !== null) nextBlocks = reconciled;
     nextBlocks =
       snapshotCompactionSpinners(nextBlocks, s.activeResponse, patch.activeResponse) ?? nextBlocks;
-    nextBlocks = snapshotInterruptedWorkCard(nextBlocks, session) ?? nextBlocks;
+    nextBlocks =
+      snapshotInterruptedWorkCard(nextBlocks, session, preGapInterruptedCard) ?? nextBlocks;
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
@@ -6230,20 +6241,32 @@ function withoutCurrentInterruptedWorkCard(blocks: AnyBlock[]): AnyBlock[] {
   return at === -1 ? blocks : [...blocks.slice(0, at), ...blocks.slice(at + 1)];
 }
 
+/** The card for the session's current interrupted-work record, or `null`. */
+function currentInterruptedWorkCard(blocks: AnyBlock[]): AnyBlock | null {
+  return blocks[currentInterruptedWorkCardIndex(blocks)] ?? null;
+}
+
 /**
  * Show a snapshot's settled interrupted-work record in place of the unknown
  * card still on screen: the status edge that settled it is not replayed to a
  * client that was disconnected. Settlement only goes from unknown to known,
- * so an older snapshot cannot undo a newer live edge.
+ * and only the card shown before the snapshot was fetched is eligible, so an
+ * older snapshot can neither undo a known outcome nor settle a newer record.
  *
+ * @param shownBeforeFetch `currentInterruptedWorkCard` when the fetch began.
  * @returns the rewritten blocks, or `null` when nothing changes.
  */
-function snapshotInterruptedWorkCard(blocks: AnyBlock[], session: Session): AnyBlock[] | null {
+function snapshotInterruptedWorkCard(
+  blocks: AnyBlock[],
+  session: Session,
+  shownBeforeFetch: AnyBlock | null,
+): AnyBlock[] | null {
   const error = session.lastTaskError;
   if (session.status !== "failed" || error?.code !== "interrupted_outcome_known") return null;
   const at = currentInterruptedWorkCardIndex(blocks);
   const card = blocks[at];
-  if (card?.type !== "error" || card.code !== "interrupted_outcome_unknown") return null;
+  if (card === undefined || card !== shownBeforeFetch) return null;
+  if (card.type !== "error" || card.code !== "interrupted_outcome_unknown") return null;
   const settled: ErrorBlock = {
     type: "error",
     ctx: card.ctx,
