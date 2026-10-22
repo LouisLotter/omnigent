@@ -1969,7 +1969,9 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
-def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, object]:
+def _external_conversation_item_event(
+    item: ClaudeTranscriptItem, *, replayed: bool = False
+) -> dict[str, object]:
     """Convert one parsed transcript item to the existing event shape."""
     return {
         "type": "external_conversation_item",
@@ -1984,6 +1986,7 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
                 else {}
             ),
             **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
+            **({"replayed": True} if replayed else {}),
         },
     }
 
@@ -5619,6 +5622,7 @@ async def _post_external_conversation_item(
     session_id: str,
     item: ClaudeTranscriptItem,
     timeout: float | None = None,
+    replayed: bool = False,
 ) -> None:
     """
     Post one mirrored transcript item to the Sessions API.
@@ -5628,6 +5632,8 @@ async def _post_external_conversation_item(
     :param item: Transcript-derived conversation item.
     :param timeout: Per-request timeout in seconds; ``None`` keeps the
         client's own.
+    :param replayed: Whether the item is replayed from a saved transcript, so
+        the server must not pair it with a newer queued input.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
@@ -5651,7 +5657,7 @@ async def _post_external_conversation_item(
         # re-post of an item it already holds is a no-op, not a duplicate.
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
-            json=_external_conversation_item_event(item),
+            json=_external_conversation_item_event(item, replayed=replayed),
             timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
         )
         resp.raise_for_status()
