@@ -9,7 +9,10 @@ items by ``source_id`` as the real one does.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,7 +26,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     read_transcript_items_from_offset,
 )
-from omnigent.harnesses.claude_native.resume_replay import external_item_id
+from omnigent.harnesses.claude_native.resume_replay import UndeliveredItem, external_item_id
 
 _SESSION_ID = "conv_replay"
 _CLAUDE_SESSION_ID = "4b0f2a52-2b5e-4d8e-9a39-6f0f1c1d2e3f"
@@ -72,14 +75,21 @@ class _FakeServer:
         items: list[dict[str, Any]] | None = None,
         *,
         fail_post: Callable[[str], httpx.Response | None] | None = None,
+        history_fetches_allowed: int | None = None,
     ) -> None:
         self.items = list(items or [])
         self.posts: list[str] = []
         self.replayed_flags: list[object] = []
+        self.history_fetches = 0
         self._fail_post = fail_post
+        self._history_fetches_allowed = history_fetches_allowed
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.endswith("/items"):
+            self.history_fetches += 1
+            allowed = self._history_fetches_allowed
+            if allowed is not None and self.history_fetches > allowed:
+                return httpx.Response(500, json={"error": {"code": "internal_error"}})
             return httpx.Response(200, json={"data": self.items, "has_more": False})
         if request.method == "POST" and request.url.path.endswith("/events"):
             data = json.loads(request.content)["data"]
@@ -205,10 +215,10 @@ async def test_transcript_without_items_is_rebuilt_from_server_history(
 
 
 @pytest.mark.asyncio
-async def test_transcript_that_cannot_be_read_is_kept(
+async def test_transcript_that_cannot_be_read_is_set_aside(
     saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A read error leaves the transcript unknown, so it is not overwritten."""
+    """A read error leaves the transcript unknown: it is kept aside, not overwritten."""
     saved = _line(_user("u-1", "first question")) + _line(_assistant("a-1", "unread answer"))
     saved_transcript.write_bytes(saved)
     server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])])
@@ -222,9 +232,29 @@ async def test_transcript_that_cannot_be_read_is_kept(
 
     assert server.posts == []
     assert resumed is not None
-    assert resumed.path == saved_transcript
     assert resumed.forward_from is None
-    assert saved_transcript.read_bytes() == saved
+    assert "unread answer" not in resumed.path.read_text(encoding="utf-8")
+    (aside,) = saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*")
+    assert aside.read_bytes() == saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files regardless of mode")
+async def test_unreadable_transcript_file_is_set_aside(saved_transcript: Path) -> None:
+    """With no read access at all, the file is renamed aside, never replaced."""
+    saved = _line(_user("u-1", "first question")) + _line(_assistant("a-1", "unread answer"))
+    saved_transcript.write_bytes(saved)
+    server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])])
+    saved_transcript.chmod(0)
+
+    resumed = await _cold_resume(server)
+
+    (aside,) = saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*")
+    aside.chmod(0o600)
+    assert aside.read_bytes() == saved
+    assert server.posts == []
+    assert resumed is not None
+    assert "first question" in resumed.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -248,6 +278,28 @@ async def test_fork_continuation_is_delivered_after_its_copied_prefix(
     await _cold_resume(server)
 
     assert server.posts == ["new-1:0:message"]
+
+
+@pytest.mark.asyncio
+async def test_fork_that_copied_part_of_a_response_gets_the_rest(saved_transcript: Path) -> None:
+    """Copies match one for one within a response; the uncopied item is delivered."""
+    saved_transcript.write_bytes(
+        _line(_user("copied-1", "copied question"))
+        + _line(_assistant("copied-2", "first part"))
+        + _line(_assistant("copied-3", "second part"))
+    )
+    parsed = _parsed(saved_transcript)
+    assert parsed["copied-2:0:message"].response_id == parsed["copied-3:0:message"].response_id
+    server = _FakeServer(
+        [
+            _stored(parsed["copied-1:0:message"], item_id="fork_copy_1"),
+            _stored(parsed["copied-2:0:message"], item_id="fork_copy_2"),
+        ]
+    )
+
+    await _cold_resume(server)
+
+    assert server.posts == ["copied-3:0:message"]
 
 
 @pytest.mark.asyncio
@@ -452,6 +504,93 @@ async def test_undelivered_items_are_left_to_the_forwarder(
     assert resumed.path == saved_transcript
     assert resumed.forward_from == len(first_record)
     assert saved_transcript.read_bytes() == saved
+
+
+@pytest.mark.asyncio
+async def test_unfinished_replay_keeps_its_offset_without_refetching(
+    saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial replay hands the rest to the forwarder before any history refresh."""
+    monkeypatch.setattr(resume_replay, "_sleep", _no_sleep)
+    monkeypatch.setattr(resume_replay, "_REPLAY_DEADLINE_S", 0.5)
+    delivered_records = _line(_user("u-1", "first question")) + _line(
+        _assistant("a-1", "first answer")
+    )
+    saved = delivered_records + _line(_user("u-2", "second question"))
+    saved_transcript.write_bytes(saved)
+
+    def refuse_second(source_id: str) -> httpx.Response | None:
+        if source_id == "u-2:0:message":
+            return httpx.Response(503, json={"error": {"code": "durability_unconfirmed"}})
+        return None
+
+    server = _FakeServer(
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])],
+        fail_post=refuse_second,
+        history_fetches_allowed=1,
+    )
+
+    resumed = await _cold_resume(server)
+
+    assert server.posts == ["a-1:0:message", "u-2:0:message"]
+    assert server.history_fetches == 1
+    assert resumed is not None
+    assert resumed.forward_from == len(delivered_records)
+    assert saved_transcript.read_bytes() == saved
+
+
+@pytest.mark.asyncio
+async def test_replay_deadline_bounds_a_hung_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A post that never answers is abandoned at the budget, not the client timeout."""
+    monkeypatch.setattr(resume_replay, "_REPLAY_DEADLINE_S", 0.2)
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        del request
+        await asyncio.sleep(30)
+        return httpx.Response(202)
+
+    item = ClaudeTranscriptItem(
+        source_id="a-1:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
+        response_id="resp_claude_a",
+    )
+    transport = httpx.MockTransport(hang)
+    started = time.monotonic()
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        result = await resume_replay.replay_transcript_items(
+            client, session_id=_SESSION_ID, items=[UndeliveredItem(item, 40)]
+        )
+
+    assert time.monotonic() - started < 5
+    assert (result.delivered, result.undelivered, result.resume_offset) == (0, 1, 40)
+
+
+@pytest.mark.asyncio
+async def test_replay_deadline_bounds_the_effort_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A delivered ``/effort`` whose session update hangs still ends the replay on time."""
+    monkeypatch.setattr(resume_replay, "_REPLAY_DEADLINE_S", 0.2)
+
+    async def hang_on_patch(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            await asyncio.sleep(30)
+        return httpx.Response(202, json={"queued": False})
+
+    item = ClaudeTranscriptItem(
+        source_id="u-1:0:slash_command",
+        item_type="slash_command",
+        data={"agent": "claude", "kind": "command", "name": "effort", "arguments": "high"},
+        response_id="resp_claude_u",
+    )
+    transport = httpx.MockTransport(hang_on_patch)
+    started = time.monotonic()
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        result = await resume_replay.replay_transcript_items(
+            client, session_id=_SESSION_ID, items=[UndeliveredItem(item, 0)]
+        )
+
+    assert time.monotonic() - started < 5
+    assert (result.delivered, result.undelivered, result.resume_offset) == (1, 0, None)
 
 
 @pytest.mark.asyncio

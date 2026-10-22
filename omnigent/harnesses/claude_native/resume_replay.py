@@ -113,7 +113,8 @@ def undelivered_transcript_items(
     after the last item the server holds. An item is held when the server has
     its source-derived id, or when its record was rebuilt from a server item by
     an earlier cold resume. Without either, as in a fork whose copied items got
-    fresh ids, an item whose response id the server holds counts as held.
+    fresh ids, items are matched to the server's items of the same response,
+    in order.
     Nothing is returned when the transcript cannot be placed in the server's
     history: no held item while the server has items, or Claude items from
     another transcript after the last held one.
@@ -133,20 +134,17 @@ def undelivered_transcript_items(
     local = _keyed_transcript_items(transcript, session_id=session_id, agent_name=agent_name)
     if not local:
         return []
-    server_index: dict[str, int] = {}
-    last_index_by_response: dict[str, int] = {}
-    for index, server_item in enumerate(server_items):
-        if isinstance(item_id := server_item.get("id"), str):
-            server_index[item_id] = index
-        if isinstance(response_id := server_item.get("response_id"), str):
-            last_index_by_response[response_id] = index
+    server_index = {
+        item_id: index
+        for index, server_item in enumerate(server_items)
+        if isinstance(item_id := server_item.get("id"), str)
+    }
     positions = [
         _first_known(server_index.get(item_id), server_record_positions.get(record_uuid or ""))
         for _, item_id, record_uuid, _ in local
     ]
     if all(position is None for position in positions):
-        # A fork copies items under fresh ids but keeps their response ids.
-        positions = [last_index_by_response.get(item.response_id) for item, *_ in local]
+        positions = _positions_of_copies([item for item, *_ in local], server_items)
     held = [index for index, position in enumerate(positions) if position is not None]
     last_held = held[-1] if held else -1
     tail = [
@@ -217,6 +215,32 @@ def _keyed_transcript_items(
     return keyed
 
 
+def _positions_of_copies(
+    local_items: Sequence[ClaudeTranscriptItem],
+    server_items: Sequence[Mapping[str, object]],
+) -> list[int | None]:
+    """
+    Match local items to server copies that have fresh ids, as a fork makes.
+
+    A fork copies items in order and keeps their response ids, so the n-th
+    local item of a response matches the n-th server item of that response.
+    A response the fork copied only in part leaves its later items unmatched.
+
+    :param local_items: Items parsed from the saved transcript, in order.
+    :param server_items: Committed session items in chronological order.
+    :returns: Each local item's server index, or ``None`` when unmatched.
+    """
+    copies: dict[str, list[int]] = {}
+    for index, server_item in enumerate(server_items):
+        if isinstance(response_id := server_item.get("response_id"), str):
+            copies.setdefault(response_id, []).append(index)
+    positions: list[int | None] = []
+    for item in local_items:
+        indexes = copies.get(item.response_id)
+        positions.append(indexes.pop(0) if indexes else None)
+    return positions
+
+
 def _first_known(*positions: int | None) -> int | None:
     """Return the first position that is not ``None``."""
     return next((position for position in positions if position is not None), None)
@@ -272,9 +296,10 @@ async def replay_transcript_items(
     Transient failures, including an unconfirmed-durability 503, are retried
     with the forwarder's backoff; a retry is safe because the server applies
     each ``source_id`` once. A permanent rejection of one item skips it, as the
-    forwarder does. The replay stops at the deadline, or when the server
-    refuses the request itself; the result then names the first undelivered
-    record so the live forwarder can continue from it.
+    forwarder does. The replay stops at the deadline, which bounds every
+    request it makes, or when the server refuses the request itself; the
+    result then names the first undelivered record so the live forwarder can
+    continue from it.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -283,65 +308,82 @@ async def replay_transcript_items(
         uses the module default.
     :returns: Counts of delivered, rejected and still-undelivered items.
     """
-    give_up_at = time.monotonic() + (_REPLAY_DEADLINE_S if deadline_s is None else deadline_s)
+    budget_s = _REPLAY_DEADLINE_S if deadline_s is None else deadline_s
+    give_up_at = time.monotonic() + budget_s
     retry_tracker = _PostRetryTracker()
     delivered = 0
     rejected = 0
+    # Index of the first item neither delivered nor rejected yet.
+    next_index = 0
 
-    def stopped_at(index: int) -> TranscriptReplayResult:
+    def stopped() -> TranscriptReplayResult:
+        if next_index >= len(items):
+            return TranscriptReplayResult(delivered, rejected)
         _logger.warning(
             "Stopped replaying the saved Claude transcript for %s; %d item(s) are "
             "left to the transcript forwarder",
             session_id,
-            len(items) - index,
+            len(items) - next_index,
         )
         return TranscriptReplayResult(
-            delivered, rejected, len(items) - index, items[index].record_offset
+            delivered, rejected, len(items) - next_index, items[next_index].record_offset
         )
 
-    for index, pending in enumerate(items):
-        item = pending.item
-        retry_key = f"item:{item.source_id}"
-        while True:
-            remaining = give_up_at - time.monotonic()
-            if remaining <= 0:
-                return stopped_at(index)
-            try:
-                await _post_external_conversation_item(
-                    client,
-                    session_id=session_id,
-                    item=item,
-                    timeout=min(_POST_TIMEOUT_S, remaining),
-                    replayed=True,
-                )
-            except httpx.HTTPError as exc:
-                status = _http_status_for_log(exc)
-                decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
-                if decision.permanent and status in _REQUEST_REFUSED_STATUS_CODES:
-                    _logger.warning(
-                        "Server refused the transcript replay for %s (HTTP %s)",
-                        session_id,
-                        status,
+    try:
+        async with asyncio.timeout(budget_s):
+            for index, pending in enumerate(items):
+                next_index = index
+                item = pending.item
+                retry_key = f"item:{item.source_id}"
+                while True:
+                    remaining = give_up_at - time.monotonic()
+                    if remaining <= 0:
+                        return stopped()
+                    try:
+                        await _post_external_conversation_item(
+                            client,
+                            session_id=session_id,
+                            item=item,
+                            timeout=min(_POST_TIMEOUT_S, remaining),
+                            replayed=True,
+                        )
+                    except httpx.HTTPError as exc:
+                        status = _http_status_for_log(exc)
+                        decision = retry_tracker.record_failure(
+                            retry_key, exc, session_id=session_id
+                        )
+                        if decision.permanent and status in _REQUEST_REFUSED_STATUS_CODES:
+                            _logger.warning(
+                                "Server refused the transcript replay for %s (HTTP %s)",
+                                session_id,
+                                status,
+                            )
+                            return stopped()
+                        if decision.exhausted:
+                            _logger.error(
+                                "Server rejected a replayed Claude transcript item; "
+                                "session=%s source_id=%s http_status=%s",
+                                session_id,
+                                item.source_id,
+                                status,
+                            )
+                            rejected += 1
+                            next_index = index + 1
+                            break
+                        if time.monotonic() + decision.delay_s >= give_up_at:
+                            return stopped()
+                        await _sleep(decision.delay_s)
+                        continue
+                    retry_tracker.clear(retry_key)
+                    delivered += 1
+                    next_index = index + 1
+                    await _maybe_sync_effort_from_slash_command(
+                        client, session_id=session_id, item=item
                     )
-                    return stopped_at(index)
-                if decision.exhausted:
-                    _logger.error(
-                        "Server rejected a replayed Claude transcript item; "
-                        "session=%s source_id=%s http_status=%s",
-                        session_id,
-                        item.source_id,
-                        status,
-                    )
-                    rejected += 1
                     break
-                if time.monotonic() + decision.delay_s >= give_up_at:
-                    return stopped_at(index)
-                await _sleep(decision.delay_s)
-                continue
-            retry_tracker.clear(retry_key)
-            delivered += 1
-            await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
-            break
+            next_index = len(items)
+    except TimeoutError:
+        return stopped()
     if delivered or rejected:
         _logger.info(
             "Replayed the saved Claude transcript for %s: delivered=%d rejected=%d",

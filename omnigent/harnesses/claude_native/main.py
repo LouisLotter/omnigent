@@ -5359,8 +5359,9 @@ class ClaudeResumeTranscript:
         ``Path("~/.claude/projects/-work-repo/<sid>.jsonl")``.
     :param forward_from: Byte offset of the first record the server has not
         received when the transcript was kept rather than rewritten; the
-        forwarder starts there. ``None`` when the whole file is already on the
-        server (or cannot be told apart), so the forwarder skips it.
+        forwarder starts there. ``None`` when the forwarder skips the whole
+        file: it was rebuilt from server history, or that history was
+        unreachable.
     """
 
     path: Path
@@ -5413,8 +5414,9 @@ async def _prepare_claude_resume_transcript(
     has diverged. Before rewriting, items an existing local transcript holds
     but the server never received (a restored home loses the forwarder's
     cursor) are delivered under their ``source_id`` keys. If some stay
-    undelivered, or the transcript cannot be read, it is kept rather than
-    rewritten, and the forwarder starts at its first undelivered record.
+    undelivered, it is kept rather than rewritten, and the forwarder starts at
+    its first undelivered record. A transcript that cannot be read, or holds
+    undelivered items but cannot be resumed, is set aside before rewriting.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -5446,7 +5448,6 @@ async def _prepare_claude_resume_transcript(
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
-    replay = TranscriptReplayResult()
     try:
         items = await _fetch_all_session_items_for_claude_resume(client, session_id)
         replay = await _replay_undelivered_claude_transcript(
@@ -5456,6 +5457,21 @@ async def _prepare_claude_resume_transcript(
             transcript=target,
             server_items=items,
         )
+        if replay.undelivered and _is_resumable_claude_transcript(target):
+            # Rewriting would drop items the server lacks; the forwarder
+            # delivers them from the first undelivered record instead.
+            _logger.warning(
+                "Resuming %r from the existing local transcript %s: %d item(s) the "
+                "server never received are left to the forwarder",
+                session_id,
+                target,
+                replay.undelivered,
+            )
+            return ClaudeResumeTranscript(target, forward_from=replay.resume_offset)
+        if replay.undelivered or not replay.reconciled:
+            # It may hold items the server lacks but cannot be resumed or read:
+            # keep it beside the rebuilt transcript instead of overwriting it.
+            _set_aside_claude_transcript(target)
         if replay.delivered:
             items = await _fetch_all_session_items_for_claude_resume(client, session_id)
     except _ResumeHistoryUnavailableError:
@@ -5476,18 +5492,6 @@ async def _prepare_claude_resume_transcript(
             )
             return ClaudeResumeTranscript(target)
         raise
-    if (replay.undelivered or not replay.reconciled) and _is_resumable_claude_transcript(target):
-        # Rewriting would drop items the server may lack; the forwarder
-        # delivers them from the first undelivered record instead.
-        _logger.warning(
-            "Resuming %r from the existing local transcript %s: %d item(s) the "
-            "server never received are left to the forwarder (reconciled=%s)",
-            session_id,
-            target,
-            replay.undelivered,
-            replay.reconciled,
-        )
-        return ClaudeResumeTranscript(target, forward_from=replay.resume_offset)
     from omnigent.inner.native_attachments import resolve_session_item_file_references
 
     # Items are persisted with unresolved file_id attachment blocks;
@@ -5521,6 +5525,36 @@ async def _prepare_claude_resume_transcript(
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
     return ClaudeResumeTranscript(target)
+
+
+def _set_aside_claude_transcript(path: Path) -> None:
+    """
+    Move a local transcript out of the resume path, keeping its bytes.
+
+    A rename needs no read access, so even an unreadable transcript is kept.
+    The new name does not end in ``.jsonl``, so Claude never lists it.
+
+    :param path: Transcript path, e.g. ``Path("~/.claude/projects/x/<sid>.jsonl")``.
+    :returns: None.
+    :raises click.ClickException: If the transcript cannot be moved; it is
+        then left in place rather than overwritten.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    aside = path.with_name(f"{path.name}.unreconciled-{stamp}")
+    try:
+        path.rename(aside)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not set aside the local Claude transcript {path}: {exc}"
+        ) from exc
+    _logger.error(
+        "Set aside the local Claude transcript %s as %s: it may hold items the "
+        "server never received",
+        path,
+        aside,
+    )
 
 
 def _is_resumable_claude_transcript(path: Path) -> bool:
@@ -5566,7 +5600,7 @@ async def _replay_undelivered_claude_transcript(
 
     Never raises: a replay that cannot finish reports its undelivered items,
     and a transcript that cannot be read reports itself unreconciled, so the
-    caller keeps the transcript instead of rewriting it.
+    caller never overwrites it.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
