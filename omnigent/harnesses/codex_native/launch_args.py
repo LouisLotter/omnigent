@@ -440,54 +440,75 @@ def _profile_base(state_path: Path, current: dict[str, Any]) -> dict[str, Any]:
 _PROVIDER_CREDENTIAL_KEYS = ("auth", "experimental_bearer_token")
 
 
-def scrub_codex_provider_credentials(codex_home: Path, provider_name: str) -> None:
+def scrub_codex_provider_credentials(
+    codex_home: Path, provider_name: str, display_name: str
+) -> None:
     """Drop a generated provider's credential from the private config and profile journal.
 
     Run before the profile layer snapshots ``config.toml``. The launch then
     writes its own reference for that provider, so a table this start does not
     refresh keeps its routing but holds no secret, including a literal key an
-    earlier version wrote. The journal is scrubbed the same way so it still
-    matches the config. Files that cannot be read or parsed, and a linked
-    ``config.toml``, are left to the existing validation.
+    earlier version wrote. Only a table carrying the generated *display_name*
+    is touched; a user's own table of the same id keeps its credential.
+
+    The config and the journal get the same change or none, so the journal
+    still matches the config: a linked ``config.toml`` is never written
+    through, and files that cannot be read or parsed are left to the existing
+    validation.
 
     :param codex_home: Private session ``CODEX_HOME``.
     :param provider_name: The generated provider's id, e.g. ``"omnigent_provider"``.
+    :param display_name: Its generated ``name``, e.g. ``"Omnigent Provider"``.
     """
-    journal_tables = ("base", "applied", "pending")
-    for path, tables in (
-        (codex_home / "config.toml", None),
-        (codex_home / ".omnigent-config-profile.toml", journal_tables),
-    ):
-        if path.is_symlink():
-            continue
+    config_path = codex_home / "config.toml"
+    journal_path = codex_home / ".omnigent-config-profile.toml"
+    if config_path.is_symlink():
+        return
+    documents: dict[Path, Any] = {}
+    for path in (config_path, journal_path):
         try:
-            document = tomlkit.parse(path.read_text(encoding="utf-8"))
-        except (OSError, TOMLKitError, UnicodeError):
+            documents[path] = tomlkit.parse(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             continue
-        configs = [document] if tables is None else [document.get(table) for table in tables]
-        scrubbed = False
-        for config in configs:
-            providers = config.get("model_providers") if isinstance(config, dict) else None
-            if not isinstance(providers, dict):
-                continue
-            provider = providers.get(provider_name)
-            if not isinstance(provider, dict) or provider.keys().isdisjoint(
-                _PROVIDER_CREDENTIAL_KEYS
-            ):
-                continue
-            # Rebuilt rather than edited: tomlkit leaves a stray comma when a key
-            # is deleted from a parsed inline table.
-            kept = {k: v for k, v in provider.items() if k not in _PROVIDER_CREDENTIAL_KEYS}
-            if isinstance(provider, tomlkit.items.InlineTable):
-                rebuilt = tomlkit.inline_table()
-                rebuilt.update(kept)
-                providers[provider_name] = rebuilt
-            else:
-                for key in _PROVIDER_CREDENTIAL_KEYS:
-                    provider.pop(key, None)
-            scrubbed = True
-        if scrubbed:
+        except (OSError, TOMLKitError, UnicodeError):
+            return
+    for path, document in documents.items():
+        configs = (
+            [document]
+            if path == config_path
+            else [document.get(table) for table in ("base", "applied", "pending")]
+        )
+        if _scrub_generated_provider(configs, provider_name, display_name):
             _write_private_config(path, tomlkit.dumps(document))
+
+
+def _scrub_generated_provider(configs: list[Any], provider_name: str, display_name: str) -> bool:
+    """Remove the generated provider's credential keys from each config; report a change."""
+    scrubbed = False
+    for config in configs:
+        providers = config.get("model_providers") if isinstance(config, dict) else None
+        if not isinstance(providers, dict):
+            continue
+        provider = providers.get(provider_name)
+        if (
+            not isinstance(provider, dict)
+            or provider.get("name") != display_name
+            or provider.keys().isdisjoint(_PROVIDER_CREDENTIAL_KEYS)
+        ):
+            continue
+        # Rebuilt rather than edited: tomlkit leaves a stray comma when a key is
+        # deleted from a parsed inline table.
+        if isinstance(provider, tomlkit.items.InlineTable):
+            rebuilt = tomlkit.inline_table()
+            for key, value in provider.items():
+                if key not in _PROVIDER_CREDENTIAL_KEYS:
+                    rebuilt[key] = value
+            providers[provider_name] = rebuilt
+        else:
+            for key in _PROVIDER_CREDENTIAL_KEYS:
+                provider.pop(key, None)
+        scrubbed = True
+    return scrubbed
 
 
 def validate_codex_config_profile_state(codex_home: Path) -> None:

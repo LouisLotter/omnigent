@@ -729,6 +729,10 @@ _LEGACY_PROVIDER = {
 }
 
 
+def _scrub(codex_home: Path) -> None:
+    scrub_codex_provider_credentials(codex_home, "omnigent_provider", "Omnigent Provider")
+
+
 @pytest.mark.parametrize("inline", [True, False], ids=["inline-tables", "tables"])
 def test_scrub_provider_credentials_cleans_config_and_every_journal_table(
     tmp_path: Path, inline: bool
@@ -756,7 +760,7 @@ def test_scrub_provider_credentials_cleans_config_and_every_journal_table(
         tomlkit.dumps({"base": config, "applied": config, "pending": {"model": "profile"}})
     )
 
-    scrub_codex_provider_credentials(tmp_path, "omnigent_provider")
+    _scrub(tmp_path)
 
     scrubbed_provider = {key: value for key, value in _LEGACY_PROVIDER.items() if key != "auth"}
     expected = {
@@ -772,19 +776,64 @@ def test_scrub_provider_credentials_cleans_config_and_every_journal_table(
     assert config_path.stat().st_mode & 0o777 == 0o600
 
 
-def test_scrub_provider_credentials_leaves_linked_and_unparseable_files(tmp_path: Path) -> None:
-    """A linked config is never written through; invalid files stay for validation."""
+def test_scrub_provider_credentials_keeps_a_user_table_with_the_generated_id(
+    tmp_path: Path,
+) -> None:
+    """A user's own ``omnigent_provider`` table is not Omnigent's to scrub."""
+    config = tomlkit.dumps(
+        {
+            "model_providers": {
+                "omnigent_provider": {
+                    "name": "My gateway",
+                    "base_url": "https://gateway.invalid/v1",
+                    "auth": {"command": "credential-helper"},
+                }
+            }
+        }
+    )
+    (tmp_path / "config.toml").write_text(config)
+    state = tomlkit.dumps({"base": tomlkit.parse(config), "applied": tomlkit.parse(config)})
+    (tmp_path / ".omnigent-config-profile.toml").write_text(state)
+
+    _scrub(tmp_path)
+
+    assert (tmp_path / "config.toml").read_text() == config
+    assert (tmp_path / ".omnigent-config-profile.toml").read_text() == state
+
+
+def test_scrub_provider_credentials_leaves_a_linked_config_and_its_journal(
+    tmp_path: Path,
+) -> None:
+    """A linked config is never written through, and its journal keeps matching it."""
+    legacy = {"model_providers": {"omnigent_provider": _LEGACY_PROVIDER}}
     shared = tmp_path / "shared-config.toml"
-    shared.write_text(tomlkit.dumps({"model_providers": {"omnigent_provider": _LEGACY_PROVIDER}}))
+    shared.write_text(tomlkit.dumps(legacy))
     private = tmp_path / "private"
     private.mkdir()
     (private / "config.toml").symlink_to(shared)
     state_path = private / ".omnigent-config-profile.toml"
-    state_path.write_text("invalid=[")
+    state = tomlkit.dumps({"base": legacy, "applied": legacy, "pending": {"model": "profile"}})
+    state_path.write_text(state)
     original = shared.read_text()
 
-    scrub_codex_provider_credentials(private, "omnigent_provider")
+    _scrub(private)
 
     assert (private / "config.toml").is_symlink()
     assert shared.read_text() == original
-    assert state_path.read_text() == "invalid=["
+    assert state_path.read_text() == state
+    # The interrupted update still matches the config it was recorded against.
+    launch_args.validate_codex_config_profile_state(private)
+
+
+def test_scrub_provider_credentials_changes_nothing_beside_an_unparseable_journal(
+    tmp_path: Path,
+) -> None:
+    """When either file cannot be parsed, neither is changed."""
+    config = tomlkit.dumps({"model_providers": {"omnigent_provider": _LEGACY_PROVIDER}})
+    (tmp_path / "config.toml").write_text(config)
+    (tmp_path / ".omnigent-config-profile.toml").write_text("invalid=[")
+
+    _scrub(tmp_path)
+
+    assert (tmp_path / "config.toml").read_text() == config
+    assert (tmp_path / ".omnigent-config-profile.toml").read_text() == "invalid=["

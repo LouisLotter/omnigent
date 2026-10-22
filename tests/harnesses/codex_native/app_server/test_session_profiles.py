@@ -545,3 +545,27 @@ async def test_native_codex_first_start_scrubs_a_key_an_earlier_version_wrote(
         await server.close()
     assert _files_holding(server.bridge_dir, legacy_key) == []
     assert _files_holding(server.bridge_dir, _PROVIDER_KEY) == []
+
+
+async def test_native_codex_user_table_with_the_generated_id_keeps_its_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cli-config provider the user named ``omnigent_provider`` keeps its credential."""
+    server = _key_provider_server(tmp_path, monkeypatch)
+    (tmp_path / "source-codex-home" / "config.toml").write_text(
+        'model = "gpt-5.5"\n\n'
+        "[model_providers.omnigent_provider]\n"
+        'name = "My gateway"\n'
+        'base_url = "https://gateway.invalid/v1"\n'
+        'auth = { command = "credential-helper" }\n',
+        encoding="utf-8",
+    )
+
+    for _ in range(2):
+        server.config_overrides = ['model_provider="omnigent_provider"']
+        await server.start()
+        await server.close()
+
+    for name in ("config.toml", ".omnigent-config-profile.toml"):
+        text = (server.codex_home / name).read_text(encoding="utf-8")
+        assert 'command = "credential-helper"' in text, name

@@ -218,8 +218,10 @@ _CODEX_HOME_SYMLINK_DIRS = (
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
-# Provider id of the table generated for a configured key / gateway / local provider.
+# Provider id and display name of the table generated for a configured key /
+# gateway / local provider. The display name tells it from a user's own table.
 CODEX_GENERATED_PROVIDER_NAME = "omnigent_provider"
+CODEX_GENERATED_PROVIDER_DISPLAY_NAME = "Omnigent Provider"
 # Codex's literal-bearer provider field. Generated overrides carry a static key
 # in it only in memory; materialization moves the key into a private key file.
 _CODEX_BEARER_TOKEN_FIELD = "experimental_bearer_token"
@@ -2391,7 +2393,7 @@ def _provider_codex_config_overrides(
     overrides.append(f'model_provider="{provider_name}"')
     overrides.append(
         f"model_providers.{provider_name}="
-        '{name="Omnigent Provider",'
+        f"{{name={json.dumps(CODEX_GENERATED_PROVIDER_DISPLAY_NAME)},"
         f"base_url={json.dumps(base_url)},"
         f"{credential}"
         f'wire_api="{effective_wire_api}"}}'

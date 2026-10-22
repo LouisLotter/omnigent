@@ -82,6 +82,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
+    CODEX_GENERATED_PROVIDER_DISPLAY_NAME,
     CODEX_GENERATED_PROVIDER_NAME,
     CODEX_PROVIDER_KEY_FILE,
     _clean_codex_env,
@@ -2129,7 +2130,9 @@ class CodexNativeAppServer:
         )
         # Before the profile journal snapshots config.toml; materialization
         # below writes this launch's own reference.
-        scrub_codex_provider_credentials(self.codex_home, CODEX_GENERATED_PROVIDER_NAME)
+        scrub_codex_provider_credentials(
+            self.codex_home, CODEX_GENERATED_PROVIDER_NAME, CODEX_GENERATED_PROVIDER_DISPLAY_NAME
+        )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
