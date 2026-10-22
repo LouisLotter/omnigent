@@ -2044,7 +2044,9 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_failure() -> None:
+async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     Stale-negative-cache scenario: a ``resolve_launch_config``
     exception used to still be recorded via ``record_launch_config(session_id,
@@ -2058,6 +2060,9 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
     so a later successful resolution still gets recorded.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
 
     class _FakeResourceRegistry:
         """Records the launched terminal spec; returns a stub view."""
@@ -2086,7 +2091,7 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
         transport=httpx.MockTransport(
-            lambda req: httpx.Response(200, json={"labels": {}, "data": [], "has_more": False}),
+            lambda req: httpx.Response(200, json={"labels": {}}),
         ),
     )
     session_id = "conv_launch_config_retry"
@@ -2110,6 +2115,11 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
         f"recorded_configs={recorded_configs!r}. Recording ``None`` here "
         f"would permanently deny this session a provider-backed Claude "
         f"terminal."
+    )
+    # Claude's first hook records its session id, as in a real launch.
+    claude_native_bridge.record_hook_event(
+        claude_native_bridge.bridge_dir_for_bridge_id(session_id),
+        {"hook_event_name": "SessionStart", "session_id": "0b9c2a7e-5f1d-4c3b-9a8e-6d7f1e2c3b4a"},
     )
 
     real_config = ClaudeNativeUcodeConfig(
@@ -2911,7 +2921,15 @@ async def test_auto_create_claude_terminal_never_launches_fresh_past_an_unreconc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "first_failure", ["history_outage", "no_space", "cancelled", "snapshot_id_no_space"]
+    "first_failure",
+    [
+        "history_outage",
+        "no_space",
+        "cancelled",
+        "snapshot_id_no_space",
+        "snapshot_id_no_space_empty_history",
+        "snapshot_id_no_space_failed_sends",
+    ],
 )
 async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_starts(
     first_failure: str,
@@ -2924,9 +2942,10 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
     only record of the Claude session, and preparing the bridge clears its
     state. Whatever stops the first start, the refused retry and the recovery
     must still resume that id, never launch fresh past the saved transcript's
-    undelivered tail. In ``snapshot_id_no_space`` the bridge never held the id:
-    only the first snapshot reports it, keeping it fails, and the retry finds
-    no id at all, so the Claude items in the history must refuse it.
+    undelivered tail. In the ``snapshot_id_no_space`` cases the bridge never
+    held the id: only the first snapshot reports it, keeping it fails, and the
+    retry finds no id at all. The bridge directory the first attempt prepared
+    must refuse it, whatever the history holds.
     """
     import errno
     from unittest.mock import AsyncMock
@@ -2951,7 +2970,7 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
 
     session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
     prior_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
-    snapshot_id_only = first_failure == "snapshot_id_no_space"
+    snapshot_id_only = first_failure.startswith("snapshot_id_no_space")
     if not snapshot_id_only:
         bridge_dir = bridge_dir_for_bridge_id(session_id)
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2991,12 +3010,26 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
             **delivered.data,
         }
     ]
+    if first_failure == "snapshot_id_no_space_empty_history":
+        server_items = []
+    elif first_failure == "snapshot_id_no_space_failed_sends":
+        # A send the server recorded as failed while the start was refused.
+        server_items = [
+            {
+                "id": "msg_failed",
+                "type": "message",
+                "role": "user",
+                "response_id": "resp_0123456789abcdef0123456789abcdef",
+                "content": [{"type": "input_text", "text": "sent while refused"}],
+            }
+        ]
+    saved = transcript.read_bytes()
     posts: list[str] = []
-    # With the id only in the first snapshot, the readable history refuses the retry.
+    # With the id only in the first snapshot, the retry is refused over a readable history.
     history_down = not snapshot_id_only
     snapshot_ids = iter([prior_claude_sid, None, prior_claude_sid] if snapshot_id_only else [])
     cancel_history_read = first_failure == "cancelled"
-    if first_failure in ("no_space", "snapshot_id_no_space"):
+    if first_failure == "no_space" or snapshot_id_only:
         remember = claude_native_bridge.remember_claude_session_id
         remember_calls = 0
 
@@ -3050,6 +3083,8 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
             "no_space": OSError,
             "cancelled": asyncio.CancelledError,
             "snapshot_id_no_space": OSError,
+            "snapshot_id_no_space_empty_history": OSError,
+            "snapshot_id_no_space_failed_sends": OSError,
         }[first_failure]
         for expected_error in (first_error, ClaudeTranscriptUnreconciledError):
             with pytest.raises(expected_error):
@@ -3073,8 +3108,63 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_st
 
     args = captured["spec"].args
     assert args[args.index("--resume") + 1] == prior_claude_sid
-    assert posts == ["a-1:0:message"]
     assert forwarder.call_args.kwargs["start_at_offset"] == transcript.stat().st_size
+    if first_failure == "snapshot_id_no_space_empty_history":
+        assert posts == ["u-1:0:message", "a-1:0:message"]
+    elif first_failure == "snapshot_id_no_space_failed_sends":
+        # Sharing nothing with a non-empty history, the transcript is set aside, not replayed.
+        assert posts == []
+        (aside,) = transcript.parent.glob(f"{transcript.name}.unreconciled-*")
+        assert aside.read_bytes() == saved
+    else:
+        assert posts == ["a-1:0:message"]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_starts_a_new_session_without_reading_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A brand-new session launches fresh at once, even with a stalled history endpoint."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    forwarder = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", forwarder
+    )
+    history_reads: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/items"):
+            history_reads.append(request.url.path)
+            await asyncio.sleep(30)
+        if request.url.path.endswith("/labels"):
+            return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(200, json={})
+
+    captured: dict[str, Any] = {}
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8000"
+        ) as client,
+        asyncio.timeout(5),
+    ):
+        await _auto_create_claude_terminal(
+            "5cdbea97a2fb0c659bc09605401e2bb2",
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=client,
+        )
+        await asyncio.sleep(0)
+
+    assert "--resume" not in captured["spec"].args
+    assert history_reads == []
+    assert forwarder.call_args.kwargs["start_at_end"] is False
 
 
 @dataclass

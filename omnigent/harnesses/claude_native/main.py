@@ -86,7 +86,6 @@ from omnigent.conversation_browser import conversation_url, open_conversation_li
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
-    CLAUDE_RESPONSE_ID_PREFIX,
     ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
@@ -5558,47 +5557,6 @@ async def _prepare_claude_resume_transcript(
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
     return ClaudeResumeTranscript(target, forward_from=written_bytes)
-
-
-async def _refuse_fresh_launch_over_claude_history(
-    client: httpx.AsyncClient, session_id: str, *, launched_here_before: bool
-) -> None:
-    """
-    Refuse a fresh Claude launch when an earlier Claude session may need resuming.
-
-    For a session with no Claude session id to resume. Items a Claude
-    transcript delivered mean one exists, maybe on this machine, and a fresh
-    session would continue the conversation past whatever it holds
-    undelivered. When the history cannot be read, an earlier launch here is
-    reason enough to refuse.
-
-    :param client: HTTP client pointed at the Omnigent server.
-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :param launched_here_before: Whether this machine already prepared a launch
-        for the session.
-    :returns: None when launching fresh is safe.
-    :raises ClaudeTranscriptUnreconciledError: If the history holds Claude items,
-        or cannot be read after an earlier launch here.
-    """
-    try:
-        items = await _fetch_all_session_items_for_claude_resume(client, session_id)
-    except Exception as exc:
-        if not launched_here_before:
-            return
-        cause = exc.message if isinstance(exc, click.ClickException) else repr(exc)
-        raise ClaudeTranscriptUnreconciledError(
-            f"Not launching {session_id!r} fresh: its history could not be read to check "
-            f"for an earlier Claude session. Retry once it can be read. {cause}"
-        ) from exc
-    if any(
-        isinstance(response_id := item.get("response_id"), str)
-        and response_id.startswith(CLAUDE_RESPONSE_ID_PREFIX)
-        for item in items
-    ):
-        raise ClaudeTranscriptUnreconciledError(
-            f"Not launching {session_id!r} fresh: its history came from a Claude session "
-            "whose id could not be found to resume. Retry once the server reports it."
-        )
 
 
 def _set_aside_claude_transcript(path: Path) -> None:

@@ -707,57 +707,6 @@ async def test_message_failed_during_a_refused_resume_does_not_strand_the_saved_
     assert "saved answer" in resumed.path.read_text(encoding="utf-8")
 
 
-_FAILED_WEB_TURN = {
-    "id": "msg_failed",
-    "type": "message",
-    "role": "user",
-    "response_id": "resp_0123456789abcdef0123456789abcdef",
-    "content": [{"type": "input_text", "text": "sent before Claude ever started"}],
-}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("history", "launched_here_before", "refused"),
-    [
-        pytest.param([], True, False, id="empty"),
-        pytest.param([_FAILED_WEB_TURN], True, False, id="no-claude-item"),
-        pytest.param(None, False, False, id="unreadable-first-launch"),
-        pytest.param(None, True, True, id="unreadable-after-a-launch"),
-        pytest.param("claude", False, True, id="claude-item"),
-    ],
-)
-async def test_fresh_launch_is_refused_over_claude_history(
-    history: list[dict[str, Any]] | str | None, launched_here_before: bool, refused: bool
-) -> None:
-    """Without a session id to resume, a fresh launch is refused once Claude wrote the history."""
-    if history == "claude":
-        history = [
-            {
-                "id": "msg_claude",
-                "type": "message",
-                "role": "assistant",
-                "response_id": "resp_claude_a-1",
-                "content": [{"type": "output_text", "text": "answer"}],
-            }
-        ]
-    server = _FakeServer(
-        history if isinstance(history, list) else [],
-        fail_history=(lambda request: httpx.Response(403)) if history is None else None,
-    )
-    transport = httpx.MockTransport(server.handle)
-
-    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
-        check = claude_native._refuse_fresh_launch_over_claude_history(
-            client, _SESSION_ID, launched_here_before=launched_here_before
-        )
-        if refused:
-            with pytest.raises(claude_native.ClaudeTranscriptUnreconciledError):
-                await check
-        else:
-            await check
-
-
 @pytest.mark.asyncio
 async def test_replay_deadline_bounds_a_hung_request(monkeypatch: pytest.MonkeyPatch) -> None:
     """A post that never answers is abandoned at the budget, not the client timeout."""

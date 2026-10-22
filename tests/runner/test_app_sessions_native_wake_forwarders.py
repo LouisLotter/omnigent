@@ -855,6 +855,14 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         # Let forwarder A start and park — in production the recovery
         # re-create fires long after the original create's task is running.
         await asyncio.sleep(0)
+        # Claude's first hook records its session id, as in a real launch.
+        claude_native_bridge.record_hook_event(
+            claude_native_bridge.bridge_dir_for_bridge_id(session_id),
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "0b9c2a7e-5f1d-4c3b-9a8e-6d7f1e2c3b4a",
+            },
+        )
 
         # The recovery path: terminal resource gone, ensure re-creates.
         await runner_app_mod._auto_create_claude_terminal(

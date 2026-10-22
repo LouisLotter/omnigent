@@ -7984,8 +7984,8 @@ def _native_terminal_start_error_payload(
     elif isinstance(exc, ClaudeTranscriptUnreconciledError):
         message = (
             f"{runtime_name}'s saved conversation may hold messages the server never "
-            "received, and the server's history could not be read to check, so it was "
-            "not resumed. Try again shortly; if it keeps failing, see the runner log: "
+            "received, and the server could not confirm which, so it was not resumed. "
+            "Try again shortly; if it keeps failing, see the runner log: "
             f"{process_log_reference('runner')}"
         )
     elif IS_WINDOWS:
@@ -8853,17 +8853,18 @@ async def _auto_create_claude_terminal(
                 )
     if (
         server_client is not None
+        and _launched_here_before
         and session_external_id is None
         and fork_source_external_id is None
         and not fork_carry_history
     ):
-        # No Claude session id to resume: launch fresh only over a history Claude never wrote.
-        from omnigent.harnesses.claude_native.main import (
-            _refuse_fresh_launch_over_claude_history,
-        )
+        # An earlier launch here may have resumed a Claude session whose id is now lost; a
+        # fresh session would continue the conversation past its transcript.
+        from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
 
-        await _refuse_fresh_launch_over_claude_history(
-            server_client, session_id, launched_here_before=_launched_here_before
+        raise ClaudeTranscriptUnreconciledError(
+            f"Not launching {session_id!r} fresh: this machine launched it before, and the "
+            "Claude session id to resume could not be found. Retry once the server reports it."
         )
     _logger.info(
         "Claude terminal cold-resume decision: session=%s external_session_id_set=%s "
