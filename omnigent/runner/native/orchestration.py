@@ -8594,10 +8594,13 @@ async def _auto_create_claude_terminal(
         bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
     )
     from omnigent.harnesses.claude_native.bridge import (
-        read_claude_session_id as _read_csid_pre_wipe,
+        read_resumable_claude_session_id as _read_csid_pre_wipe,
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
+    if _pre_wipe_claude_sid is not None:
+        # Keep it past the wipe, for a retry after a launch that stops before Claude starts.
+        remember_claude_session_id(_bridge_dir_for_bridge_id(bridge_id), _pre_wipe_claude_sid)
     # Resolved once here and reused below (env_spec) so the bridge's own
     # sys_os_* tools and the terminal process see the same sandbox — the
     # agent's declared os_env.sandbox, already overridden by any
@@ -8700,6 +8703,7 @@ async def _auto_create_claude_terminal(
             _prepare_claude_resume_transcript,
         )
 
+        remember_claude_session_id(bridge_dir, session_external_id)
         try:
             _resume = await _prepare_claude_resume_transcript(
                 server_client,
@@ -8718,9 +8722,7 @@ async def _auto_create_claude_terminal(
                 resume_replayed_source_ids = _resume.replayed_source_ids
         except ClaudeTranscriptUnreconciledError:
             # A fresh session would continue the conversation past items the
-            # local transcript may hold undelivered; fail the start for a retry,
-            # which must still find this id when the snapshot omits it.
-            remember_claude_session_id(bridge_dir, session_external_id)
+            # local transcript may hold undelivered; fail the start for a retry.
             raise
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _logger.warning(

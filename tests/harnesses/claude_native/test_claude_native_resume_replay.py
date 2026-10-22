@@ -568,6 +568,12 @@ def _history_timeout(request: httpx.Request) -> httpx.Response:
         pytest.param(lambda request: httpx.Response(503), id="503"),
         pytest.param(_history_timeout, id="timeout"),
         pytest.param(lambda request: httpx.Response(429), id="429"),
+        pytest.param(
+            lambda request: httpx.Response(
+                200, headers={"content-encoding": "gzip"}, content=b"not gzip"
+            ),
+            id="undecodable",
+        ),
     ],
 )
 async def test_history_outage_keeps_the_saved_transcript_for_a_later_resume(

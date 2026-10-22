@@ -2910,17 +2910,21 @@ async def test_auto_create_claude_terminal_never_launches_fresh_past_an_unreconc
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_refused_starts(
+@pytest.mark.parametrize("first_failure", ["history_outage", "no_space", "cancelled"])
+async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_failed_starts(
+    first_failure: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Refused starts keep the bridge's session id, so recovery resumes that transcript.
+    """Failed starts keep the bridge's session id, so recovery resumes that transcript.
 
-    The snapshot omits ``external_session_id`` throughout, so the bridge state is
-    the only record of the Claude session. Preparing the bridge clears it; a
-    refusal must put it back, or the retry would launch fresh past the saved
-    transcript's undelivered tail.
+    The snapshot omits ``external_session_id`` throughout, so the bridge is the
+    only record of the Claude session, and preparing the bridge clears its
+    state. Whatever stops the first start, the refused retry and the recovery
+    must still resume that id, never launch fresh past the saved transcript's
+    undelivered tail.
     """
+    import errno
     from unittest.mock import AsyncMock
 
     from omnigent.harnesses.claude_native import main as claude_native
@@ -2983,9 +2987,28 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_refused_s
     ]
     posts: list[str] = []
     history_down = True
+    cancel_history_read = first_failure == "cancelled"
+    if first_failure == "no_space":
+        remember = claude_native_bridge.remember_claude_session_id
+        remember_calls = 0
+
+        def remember_once_out_of_space(bridge_dir: Path, claude_session_id: str) -> None:
+            nonlocal remember_calls
+            remember_calls += 1
+            if remember_calls == 1:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            remember(bridge_dir, claude_session_id)
+
+        monkeypatch.setattr(
+            claude_native_bridge, "remember_claude_session_id", remember_once_out_of_space
+        )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal cancel_history_read
         if request.method == "GET" and request.url.path.endswith("/items"):
+            if cancel_history_read:
+                cancel_history_read = False
+                raise asyncio.CancelledError
             if history_down:
                 return httpx.Response(503, json={"error": {"code": "unavailable"}})
             return httpx.Response(200, json={"data": server_items, "has_more": False})
@@ -3010,8 +3033,13 @@ async def test_auto_create_claude_terminal_keeps_the_bridge_sid_across_refused_s
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:8000"
     ) as client:
-        for _attempt in range(2):
-            with pytest.raises(ClaudeTranscriptUnreconciledError):
+        first_error: type[BaseException] = {
+            "history_outage": ClaudeTranscriptUnreconciledError,
+            "no_space": OSError,
+            "cancelled": asyncio.CancelledError,
+        }[first_failure]
+        for expected_error in (first_error, ClaudeTranscriptUnreconciledError):
+            with pytest.raises(expected_error):
                 await _auto_create_claude_terminal(
                     session_id,
                     _RecordingClaudeRegistry(captured),

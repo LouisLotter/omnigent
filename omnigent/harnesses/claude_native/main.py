@@ -5470,14 +5470,16 @@ async def _prepare_claude_resume_transcript(
 
     try:
         items = await _fetch_all_session_items_for_claude_resume(client, session_id)
-    except click.ClickException as exc:
-        # Resuming would start the forwarder after items the server may lack,
-        # and a later delivered item would then pass them off as delivered.
+    except Exception as exc:
+        # Any unread history leaves the local transcript unknown. Resuming would start
+        # the forwarder after items the server may lack, and a later delivered item
+        # would then pass them off as delivered.
         if os.path.lexists(target):
+            cause = exc.message if isinstance(exc, click.ClickException) else repr(exc)
             raise ClaudeTranscriptUnreconciledError(
                 f"Not resuming {session_id!r}: the local Claude transcript {target} may "
                 "hold items the server never received, and the server's history could "
-                f"not be read to check. Retry once it can be read. {exc.message}"
+                f"not be read to check. Retry once it can be read. {cause}"
             ) from exc
         raise
     replay = await _replay_undelivered_claude_transcript(
