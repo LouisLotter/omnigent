@@ -278,6 +278,39 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     assert "(ImportError)" in error["message"]
 
 
+@pytest.mark.asyncio
+async def test_ensure_failure_for_an_unreconciled_claude_transcript_asks_for_a_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused cold resume fails the ensure, so the server records the send as failed."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    sid = "aefc71354fadf0dd2ae5c224c40e772c"
+
+    async def _refused_auto_create(*_args: object, **_kwargs: object) -> SessionResourceView:
+        raise ClaudeTranscriptUnreconciledError("history could not be read")
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _refused_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{sid}/resources/terminals",
+            json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+        )
+
+    assert resp.status_code == 500
+    error = resp.json()["error"]
+    assert error["code"] == "native_terminal_start_failed"
+    assert "was not resumed. Try again shortly" in error["message"]
+
+
 @dataclass
 class _EnsureCodexTerminalCase:
     """

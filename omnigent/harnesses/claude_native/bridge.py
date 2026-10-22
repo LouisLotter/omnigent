@@ -209,6 +209,8 @@ _SERVER_FILE = "server.json"
 _MCP_SOCKET_PREFIX = "mcp-"
 _MCP_SOCKET_SUFFIX = ".sock"
 _STATE_FILE = "state.json"
+# The Claude session a launch resumes. Unlike the state, bridge preparation keeps it.
+_RESUME_SESSION_FILE = "resume_session.json"
 _HOOKS_FILE = "hooks.jsonl"
 OBSERVER_HOOK_STDERR_FILE = "observer_hook.stderr"
 _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
@@ -2960,6 +2962,41 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     """
     state = _read_json_file(bridge_dir / _STATE_FILE)
     raw = state.get("claude_session_id") if isinstance(state, dict) else None
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw
+
+
+def remember_claude_session_id(bridge_dir: Path, claude_session_id: str) -> None:
+    """
+    Keep the Claude session id a launch resumes where bridge preparation leaves it.
+
+    Preparing the bridge clears the hook state that records the id. A launch
+    that stops before Claude reports it again would otherwise leave a retry
+    without it whenever the server's snapshot omits it.
+
+    :param bridge_dir: Bridge directory path.
+    :param claude_session_id: Claude session uuid, e.g.
+        ``"a1b2c3d4-1234-5678-9abc-def012345678"``.
+    :returns: None.
+    :raises OSError: If the id cannot be written.
+    """
+    _write_json_file(bridge_dir / _RESUME_SESSION_FILE, {"claude_session_id": claude_session_id})
+
+
+def read_resumable_claude_session_id(bridge_dir: Path) -> str | None:
+    """
+    Return the Claude session id to resume through this bridge.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The id hooks last recorded, else the one a launch kept with
+        :func:`remember_claude_session_id`, else ``None``.
+    """
+    recorded = read_claude_session_id(bridge_dir)
+    if recorded is not None:
+        return recorded
+    remembered = _read_json_file(bridge_dir / _RESUME_SESSION_FILE)
+    raw = remembered.get("claude_session_id") if isinstance(remembered, dict) else None
     if not isinstance(raw, str) or not raw:
         return None
     return raw

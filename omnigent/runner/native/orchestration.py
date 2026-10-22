@@ -7944,6 +7944,7 @@ def _native_terminal_start_error_payload(
         extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
     from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
@@ -7980,6 +7981,13 @@ def _native_terminal_start_error_payload(
         # The raise site composes a client-safe message (versions + upgrade
         # command), so it can be shown verbatim.
         message = str(exc)
+    elif isinstance(exc, ClaudeTranscriptUnreconciledError):
+        message = (
+            f"{runtime_name}'s saved conversation may hold messages the server never "
+            "received, and the server could not confirm which, so it was not resumed. "
+            "Try again shortly; if it keeps failing, see the runner log: "
+            f"{process_log_reference('runner')}"
+        )
     elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
@@ -8519,6 +8527,7 @@ async def _auto_create_claude_terminal(
         augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        remember_claude_session_id,
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
@@ -8585,10 +8594,14 @@ async def _auto_create_claude_terminal(
         bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
     )
     from omnigent.harnesses.claude_native.bridge import (
-        read_claude_session_id as _read_csid_pre_wipe,
+        read_resumable_claude_session_id as _read_csid_pre_wipe,
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
+    _launched_here_before = _bridge_dir_for_bridge_id(bridge_id).is_dir()
+    if _pre_wipe_claude_sid is not None:
+        # Keep it past the wipe, for a retry after a launch that stops before Claude starts.
+        remember_claude_session_id(_bridge_dir_for_bridge_id(bridge_id), _pre_wipe_claude_sid)
     # Resolved once here and reused below (env_spec) so the bridge's own
     # sys_os_* tools and the terminal process see the same sandbox — the
     # agent's declared os_env.sandbox, already overridden by any
@@ -8686,8 +8699,12 @@ async def _auto_create_claude_terminal(
     # Items of a kept transcript that the forwarder posts as replayed.
     resume_replayed_source_ids: frozenset[str] = frozenset()
     if server_client is not None and session_external_id is not None:
-        from omnigent.harnesses.claude_native.main import _prepare_claude_resume_transcript
+        from omnigent.harnesses.claude_native.main import (
+            ClaudeTranscriptUnreconciledError,
+            _prepare_claude_resume_transcript,
+        )
 
+        remember_claude_session_id(bridge_dir, session_external_id)
         try:
             _resume = await _prepare_claude_resume_transcript(
                 server_client,
@@ -8704,6 +8721,10 @@ async def _auto_create_claude_terminal(
                     else _measured_prefix_bytes(_resume.path)
                 )
                 resume_replayed_source_ids = _resume.replayed_source_ids
+        except ClaudeTranscriptUnreconciledError:
+            # A fresh session would continue the conversation past items the
+            # local transcript may hold undelivered; fail the start for a retry.
+            raise
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             _logger.warning(
                 "Could not synthesize Claude resume transcript for %s; launching without --resume",
@@ -8830,6 +8851,21 @@ async def _auto_create_claude_terminal(
                     session_id,
                     exc_info=True,
                 )
+    if (
+        server_client is not None
+        and _launched_here_before
+        and session_external_id is None
+        and fork_source_external_id is None
+        and not fork_carry_history
+    ):
+        # An earlier launch here may have resumed a Claude session whose id is now lost; a
+        # fresh session would continue the conversation past its transcript.
+        from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+        raise ClaudeTranscriptUnreconciledError(
+            f"Not launching {session_id!r} fresh: this machine launched it before, and the "
+            "Claude session id to resume could not be found. Retry once the server reports it."
+        )
     _logger.info(
         "Claude terminal cold-resume decision: session=%s external_session_id_set=%s "
         "fork_source_set=%s resume_enabled=%s",
