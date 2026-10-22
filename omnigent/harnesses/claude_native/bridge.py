@@ -55,7 +55,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -809,6 +809,10 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     )
 
 
+#: Prefix of the response ids transcript items carry; see ``_response_id_from_source``.
+CLAUDE_RESPONSE_ID_PREFIX = "resp_claude_"
+
+
 @dataclass(frozen=True)
 class ClaudeTranscriptItem:
     """
@@ -863,10 +867,12 @@ class TranscriptRecordItems:
     ``next_byte_offset`` is safe to persist only after every item in
     ``items`` has been accepted by the server. Records that produce no visible
     items are included so a forwarder can advance past them without rescanning.
+    ``record_uuid`` is the record's own ``uuid`` field, when it has one.
     """
 
     next_byte_offset: int
     items: tuple[ClaudeTranscriptItem, ...]
+    record_uuid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3303,17 +3309,19 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        record_uuid = entry.get("uuid")
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                record_uuid=record_uuid if isinstance(record_uuid, str) else None,
             )
         )
     items = _dedupe_compact_noop_echo(items)
     retained_source_ids = {item.source_id for item in items}
     record_items = [
-        TranscriptRecordItems(
-            next_byte_offset=record.next_byte_offset,
+        replace(
+            record,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
         )
         for record in record_items
@@ -3430,17 +3438,19 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        record_uuid = entry.get("uuid")
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
                 items=tuple(parsed),
+                record_uuid=record_uuid if isinstance(record_uuid, str) else None,
             )
         )
     items = _dedupe_compact_noop_echo(items)
     retained_source_ids = {item.source_id for item in items}
     record_items = [
-        TranscriptRecordItems(
-            next_byte_offset=record.next_byte_offset,
+        replace(
+            record,
             items=tuple(item for item in record.items if item.source_id in retained_source_ids),
         )
         for record in record_items
@@ -9537,7 +9547,7 @@ def _response_id_from_source(source: str) -> str:
     :returns: String id with the standard ``resp_`` prefix.
     """
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
-    return f"resp_claude_{digest}"
+    return f"{CLAUDE_RESPONSE_ID_PREFIX}{digest}"
 
 
 def _source_id(source_key: str, item_index: int, item_type: str) -> str:

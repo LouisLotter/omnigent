@@ -5618,6 +5618,7 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
+    timeout: float | None = None,
 ) -> None:
     """
     Post one mirrored transcript item to the Sessions API.
@@ -5625,6 +5626,8 @@ async def _post_external_conversation_item(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param item: Transcript-derived conversation item.
+    :param timeout: Per-request timeout in seconds; ``None`` keeps the
+        client's own.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
@@ -5644,27 +5647,12 @@ async def _post_external_conversation_item(
             attributes={"omnigent.response_id": item.response_id},
         ),
     ):
+        # The event's ``source_id`` is the server's idempotency key, so a
+        # re-post of an item it already holds is a no-op, not a duplicate.
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": item.item_type,
-                    "item_data": item.data,
-                    "response_id": item.response_id,
-                    # Server-side idempotency key: the forwarder retries a
-                    # timed-out POST it cannot know the disposition of, so
-                    # the server derives the item's id from this and treats
-                    # a re-post as a no-op instead of a duplicate.
-                    "source_id": item.source_id,
-                    **(
-                        {"subagent_return_id": item.subagent_return_id}
-                        if item.subagent_return_id is not None
-                        else {}
-                    ),
-                    **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
-                },
-            },
+            json=_external_conversation_item_event(item),
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
         )
         resp.raise_for_status()
 
