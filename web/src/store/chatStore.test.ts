@@ -81,6 +81,7 @@ import {
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
   startStreamPump,
+  stopNotices,
   useChatStore,
   type ConversationState,
   type FrameScheduler,
@@ -6038,6 +6039,10 @@ describe("chatStore — delivered-but-unacked send", () => {
 });
 
 describe("chatStore — stop", () => {
+  afterEach(() => {
+    stopNotices.clear("conv_abc");
+  });
+
   it("posts {type: 'interrupt'} to the events endpoint without aborting the local stream", async () => {
     const controller = new AbortController();
     useChatStore.setState({
@@ -6136,12 +6141,12 @@ describe("chatStore — stop", () => {
         ? mockResponse({ queued: false, delivery })
         : defaultFetchHandler(input, init),
     );
-    useChatStore.setState({ conversationId: "conv_abc", stopNotice: null });
+    useChatStore.setState({ conversationId: "conv_abc" });
 
     useChatStore.getState().stop();
     await tick();
 
-    expect(useChatStore.getState().stopNotice).toBe(notice);
+    expect(stopNotices.get("conv_abc")).toBe(notice);
   });
 
   it.each([
@@ -6169,7 +6174,6 @@ describe("chatStore — stop", () => {
     );
     useChatStore.setState({
       conversationId: "conv_abc",
-      stopNotice: null,
       status: "streaming",
       sessionStatus: "running",
       activeResponse: { responseId: "resp_1", state: "streaming", error: null },
@@ -6179,7 +6183,7 @@ describe("chatStore — stop", () => {
     await tick();
 
     const state = useChatStore.getState();
-    expect(state.stopNotice).toBe("request_failed");
+    expect(stopNotices.get("conv_abc")).toBe("request_failed");
     // The optimistic stop stands; the notice is what corrects it.
     expect(state.activeResponse?.state).toBe("cancelled");
     expect(state.sessionStatus).toBe("idle");
@@ -6193,8 +6197,10 @@ describe("chatStore — stop", () => {
   it.each([
     { newer: "newer Stop", old: "lost answer" },
     { newer: "message", old: "lost answer" },
+    { newer: "skill command", old: "lost answer" },
     { newer: "newer Stop", old: "request failure" },
     { newer: "message", old: "request failure" },
+    { newer: "skill command", old: "request failure" },
   ] as const)(
     "ignores an older Stop's $old that settles after a $newer",
     async ({ newer, old }) => {
@@ -6222,23 +6228,54 @@ describe("chatStore — stop", () => {
         useChatStore.getState().stop();
         await tick();
         answers[1]!("delivered");
-      } else {
+      } else if (newer === "message") {
         await useChatStore.getState().send("next request", "agent_xyz");
+      } else {
+        await useChatStore.getState().sendSlashCommand("grill-me", "", "agent_xyz");
       }
       await tick();
       answers[0]!(old === "lost answer" ? "unknown" : "reject");
       await tick();
 
-      expect(useChatStore.getState().stopNotice).toBeNull();
+      expect(stopNotices.get("conv_abc")).toBeNull();
     },
   );
 
-  it("clears the Stop notice when Stop is pressed again", () => {
-    useChatStore.setState({ conversationId: "conv_abc", stopNotice: "request_failed" });
+  it.each(["Stop", "skill command"] as const)(
+    "clears the Stop notice when the person sends a new %s",
+    async (action) => {
+      useChatStore.setState({ conversationId: "conv_abc", abortController: new AbortController() });
+      stopNotices.set("conv_abc", "request_failed");
+
+      if (action === "Stop") useChatStore.getState().stop();
+      else await useChatStore.getState().sendSlashCommand("grill-me", "", "agent_xyz");
+
+      expect(stopNotices.get("conv_abc")).toBeNull();
+    },
+  );
+
+  it("keeps a background conversation's Stop notice when its stream entry is evicted", async () => {
+    let failStop: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).endsWith("/v1/sessions/conv_abc/events")
+        ? new Promise<Response>((_resolve, reject) => {
+            failStop = () => reject(new TypeError("Failed to fetch"));
+          })
+        : defaultFetchHandler(input, init),
+    );
+    seedSession("conv_abc");
+    seedSession("conv_other");
+    await useChatStore.getState().switchTo("conv_abc");
 
     useChatStore.getState().stop();
+    await tick();
+    await useChatStore.getState().switchTo("conv_other");
+    releaseConversation("conv_abc");
+    failStop();
+    await tick();
+    await useChatStore.getState().switchTo("conv_abc");
 
-    expect(useChatStore.getState().stopNotice).toBeNull();
+    expect(stopNotices.get("conv_abc")).toBe("request_failed");
   });
 });
 
@@ -13760,6 +13797,128 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await pump.stop();
   });
 
+  it.each([
+    { shown: "interrupted_outcome_unknown", snapshot: "interrupted_outcome_known" },
+    // Settlement never goes back, so an older snapshot leaves the known card.
+    { shown: "interrupted_outcome_known", snapshot: "interrupted_outcome_unknown" },
+  ] as const)(
+    "shows the known interrupted-work card after a $snapshot snapshot over $shown",
+    async ({ shown, snapshot }) => {
+      const id = "conv_interrupted_gap";
+      const failures = {
+        interrupted_outcome_unknown: {
+          code: "interrupted_outcome_unknown",
+          title: "Interrupted, outcome unknown",
+          message: "The runner stopped while Bash was running, so its outcome is unknown.",
+        },
+        interrupted_outcome_known: {
+          code: "interrupted_outcome_known",
+          title: "Interrupted",
+          message: "The runner stopped while Bash was running. Its result arrived afterwards.",
+        },
+      };
+      seedSession(id, []);
+      const sink = pushableStream();
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === `/v1/sessions/${id}/stream`) {
+          init?.signal?.addEventListener("abort", () =>
+            sink.error(new DOMException("aborted", "AbortError")),
+          );
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (url.startsWith(`/v1/sessions/${id}?`) && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id,
+            agent_id: "agent_xyz",
+            status: "failed",
+            created_at: 0,
+            items: [],
+            labels: {},
+            last_task_error: failures[snapshot],
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const controller = new AbortController();
+      const ctx = { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null };
+      const bound = bindConversationForTest(id, {
+        abortController: controller,
+        sessionStatus: "failed",
+        status: "idle",
+        blocks: [{ type: "error", ctx, source: "", ...failures[shown] }],
+      });
+      const loop = startStreamPump(id, controller, bound.set, bound.get);
+      await drainAsync();
+
+      // The live edge that settled the record was missed; the snapshot carries it.
+      await advanceWithHeartbeats(sink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+      await drainAsync();
+
+      const cards = bound.get().blocks.filter((b) => b.type === "error");
+      expect(cards).toMatchObject([failures.interrupted_outcome_known]);
+
+      controller.abort();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it("shows the known interrupted-work card a reconnect snapshot reports", async () => {
+    const id = "conv_interrupted_reconnect";
+    const unknown = {
+      code: "interrupted_outcome_unknown",
+      title: "Interrupted, outcome unknown",
+      message: "The runner stopped while Bash was running, so its outcome is unknown.",
+    };
+    const known = {
+      code: "interrupted_outcome_known",
+      title: "Interrupted",
+      message: "The runner stopped while Bash was running. Its result arrived afterwards.",
+    };
+    seedSession(id, []);
+    const sinks = routeStreamOpens();
+    const streamOpens = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input).split("?")[0];
+      if (path === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+        return mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "failed",
+          created_at: 0,
+          items: [],
+          labels: {},
+          last_task_error: known,
+        });
+      }
+      return streamOpens(input, init);
+    });
+    const controller = new AbortController();
+    const ctx = { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null };
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      sessionStatus: "failed",
+      blocks: [{ type: "error", ctx, source: "", ...unknown }],
+    });
+
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    // Settled while the stream was down: the edge is not replayed.
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const cards = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(cards).toMatchObject([known]);
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a live status event that arrives during snapshot reconciliation", async () => {
     seedSession("conv_status_race", []);
     const sink = pushableStream();
@@ -17786,6 +17945,21 @@ describe("chatStore — background cross-session flush", () => {
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
+  });
+
+  it("clears a background conversation's Stop notice when its queued message is sent", async () => {
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "bg-first", conversationId: "conv_bg" }],
+    });
+    stopNotices.set("conv_bg", "not_delivered");
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+
+    expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
+    expect(stopNotices.get("conv_bg")).toBeNull();
   });
 
   it("does not flush a non-active conversation that is not idle", async () => {

@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { createSessionNotices } from "./sessionNotices";
 
 /** A session create's `runner_launch` that did not confirm the runner started. */
 export type RunnerLaunchNotice = "failed" | "unknown";
@@ -10,12 +10,7 @@ export const RUNNER_LAUNCH_MESSAGES: Record<RunnerLaunchNotice, string> = {
     "The computer didn't confirm that the agent started. Sending a message starts it if it isn't running.",
 };
 
-interface RunnerLaunchNoticeState {
-  /** Session id -> the launch outcome its create reported. */
-  bySession: Record<string, RunnerLaunchNotice>;
-}
-
-const useRunnerLaunchNoticeStore = create<RunnerLaunchNoticeState>(() => ({ bySession: {} }));
+const runnerLaunchNotices = createSessionNotices<RunnerLaunchNotice>();
 
 /**
  * Record the runner launch a session create reported.
@@ -27,24 +22,11 @@ const useRunnerLaunchNoticeStore = create<RunnerLaunchNoticeState>(() => ({ bySe
  * @param outcome - The create response's `runner_launch`, e.g. `"failed"`.
  */
 export function noteRunnerLaunch(sessionId: string, outcome: unknown): void {
-  if (outcome !== "failed" && outcome !== "unknown") return;
-  useRunnerLaunchNoticeStore.setState((state) => ({
-    bySession: { ...state.bySession, [sessionId]: outcome },
-  }));
+  if (outcome === "failed" || outcome === "unknown") runnerLaunchNotices.set(sessionId, outcome);
 }
 
 /** Forget *sessionId*'s launch notice, e.g. once its runner is online. */
-export function clearRunnerLaunchNotice(sessionId: string): void {
-  useRunnerLaunchNoticeStore.setState((state) => {
-    if (!(sessionId in state.bySession)) return state;
-    const { [sessionId]: _cleared, ...rest } = state.bySession;
-    return { bySession: rest };
-  });
-}
+export const clearRunnerLaunchNotice = runnerLaunchNotices.clear;
 
 /** The launch notice for *sessionId*, or `null`. */
-export function useRunnerLaunchNotice(sessionId: string | null): RunnerLaunchNotice | null {
-  return useRunnerLaunchNoticeStore((state) =>
-    sessionId === null ? null : (state.bySession[sessionId] ?? null),
-  );
-}
+export const useRunnerLaunchNotice = runnerLaunchNotices.useNotice;

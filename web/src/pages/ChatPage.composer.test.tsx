@@ -19,7 +19,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+import { handleSessionEvent, stopNotices, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -358,7 +358,6 @@ describe("Composer Stop notice", () => {
     useChatStore.setState({
       conversationId: "conv_stop",
       blocks: [],
-      stopNotice: null,
       status: "streaming",
       sessionStatus: "running",
       activeResponse: { responseId: "resp_stop", state: "streaming", error: null },
@@ -369,12 +368,8 @@ describe("Composer Stop notice", () => {
     cleanup();
     clearSessionDrafts();
     vi.unstubAllGlobals();
-    useChatStore.setState({
-      stopNotice: null,
-      status: "idle",
-      sessionStatus: "idle",
-      activeResponse: null,
-    });
+    stopNotices.clear("conv_stop");
+    useChatStore.setState({ status: "idle", sessionStatus: "idle", activeResponse: null });
   });
 
   /** The composer as ChatPage wires it: working state and Stop from the real store. */
@@ -520,6 +515,18 @@ describe("Composer runner launch notice", () => {
       expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
     },
   );
+
+  it("clears a launch notice that arrives after the runner came online", () => {
+    render(<Composer {...composerProps({ runnerOnline: true })} />);
+
+    act(() => noteRunnerLaunch("conv_launch", "unknown"));
+
+    expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+    cleanup();
+    // Cleared, not just hidden while online.
+    render(<Composer {...composerProps({ runnerOnline: false })} />);
+    expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+  });
 
   it("shows nothing for a started launch or another session's notice", () => {
     noteRunnerLaunch("conv_launch", "started");

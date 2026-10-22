@@ -100,6 +100,7 @@ import {
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
+  stopNotices,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -2314,8 +2315,6 @@ function ComposerImpl(
   // `delivered` when the send turns out to have reached the server, so the
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
-  // The last Stop may not have stopped the turn and will not be sent again.
-  const stopNotice = useChatStore((s) => s.stopNotice);
   const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
@@ -2420,6 +2419,8 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  // The last Stop may not have stopped the turn and will not be sent again.
+  const stopNotice = stopNotices.useNotice(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
