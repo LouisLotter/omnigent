@@ -99,6 +99,11 @@ from omnigent.harnesses.claude_native.forwarder import (
     reset_transcript_forward_state,
     supervise_forwarder,
 )
+from omnigent.harnesses.claude_native.resume_replay import (
+    TranscriptReplayResult,
+    replay_transcript_items,
+    undelivered_transcript_items,
+)
 from omnigent.harnesses.claude_native.state import (
     read_launch_state,
     redirect_launch_state,
@@ -5341,7 +5346,10 @@ async def _ensure_local_claude_resume_transcript(
     ``--resume <sid>`` consults that local project transcript. The
     wrapper always rewrites it from committed Omnigent items before launch so
     Omnigent remains the source of truth when a previous local Claude JSONL
-    has diverged.
+    has diverged. Before rewriting, items an existing local transcript holds
+    but the server never received (a restored home loses the forwarder's
+    cursor) are delivered under their ``source_id`` keys; if some cannot be
+    delivered, the local transcript is kept rather than rewritten.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -5373,8 +5381,18 @@ async def _ensure_local_claude_resume_transcript(
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
+    replay = TranscriptReplayResult()
     try:
         items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+        replay = await _replay_undelivered_claude_transcript(
+            client,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            transcript=target,
+            server_items=items,
+        )
+        if replay.delivered:
+            items = await _fetch_all_session_items_for_claude_resume(client, session_id)
     except _ResumeHistoryUnavailableError:
         # Server history is unreachable (5xx / dropped connections at every
         # page size, or throttling that outlasts the 429 retries), but an
@@ -5393,6 +5411,17 @@ async def _ensure_local_claude_resume_transcript(
             )
             return target
         raise
+    if replay.undelivered and _is_resumable_claude_transcript(target):
+        # Rewriting would drop the items the server still lacks; a later
+        # cold resume retries them from this transcript.
+        _logger.warning(
+            "Resuming %r from the existing local transcript %s: %d item(s) "
+            "the server never received could not be delivered",
+            session_id,
+            target,
+            replay.undelivered,
+        )
+        return target
     from omnigent.inner.native_attachments import resolve_session_item_file_references
 
     # Items are persisted with unresolved file_id attachment blocks;
@@ -5456,6 +5485,58 @@ def _is_resumable_claude_transcript(path: Path) -> bool:
         # JSON guard — it is just as unresumable as non-JSONL content.
         return False
     return False
+
+
+async def _replay_undelivered_claude_transcript(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    external_session_id: str,
+    transcript: Path,
+    server_items: list[_JsonObject],
+) -> TranscriptReplayResult:
+    """
+    Deliver a local transcript's items the server never received.
+
+    Never raises: a replay that cannot finish reports its undelivered count,
+    so the caller keeps the transcript instead of rewriting it.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param external_session_id: Claude-native session id of *transcript*.
+    :param transcript: Local transcript path; it may not exist.
+    :param server_items: Committed session items in chronological order.
+    :returns: The replay's delivered, rejected and undelivered counts.
+    """
+    if not transcript.is_file():
+        return TranscriptReplayResult()
+    try:
+        undelivered = await asyncio.to_thread(
+            undelivered_transcript_items,
+            transcript,
+            session_id=session_id,
+            server_items=server_items,
+            server_record_positions=_claude_resume_record_positions(
+                server_items,
+                session_id=session_id,
+                external_session_id=external_session_id,
+            ),
+            agent_name=_AGENT_NAME,
+        )
+    except Exception:  # noqa: BLE001 - an unreadable transcript must not block resume.
+        _logger.warning(
+            "Could not read the local Claude transcript %s for replay", transcript, exc_info=True
+        )
+        return TranscriptReplayResult()
+    if not undelivered:
+        return TranscriptReplayResult()
+    try:
+        return await replay_transcript_items(client, session_id=session_id, items=undelivered)
+    except Exception:  # noqa: BLE001 - keep the transcript rather than fail the resume.
+        _logger.warning(
+            "Replay of the local Claude transcript for %r failed", session_id, exc_info=True
+        )
+        return TranscriptReplayResult(undelivered=len(undelivered))
 
 
 class _ResumeHistoryUnavailableError(click.ClickException):
@@ -5898,6 +5979,50 @@ def _claude_native_message_content(
     # downgrade any unusable image block to its omitted-image placeholder.
     sanitized = sanitize_replayed_image_blocks(blocks)
     return cast(list[_JsonObject], sanitized)
+
+
+def _claude_resume_record_positions(
+    items: list[_JsonObject],
+    *,
+    session_id: str,
+    external_session_id: str,
+) -> dict[str, int]:
+    """
+    Map each record uuid a rebuild from *items* writes to its item's index.
+
+    A transcript rewritten by an earlier cold resume holds these records, and
+    the server already has their content.
+
+    :param items: Committed session items in chronological order.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param external_session_id: Claude-native session id of the transcript.
+    :returns: Record uuid to index in *items*.
+    """
+    positions: dict[str, int] = {}
+    for index, item in enumerate(items):
+        positions[
+            _synthetic_claude_transcript_uuid(
+                session_id=session_id,
+                external_session_id=external_session_id,
+                item=item,
+                index=index,
+            )
+        ] = index
+        compacted_messages = item.get("compacted_messages")
+        if item.get("type") != "compaction" or not isinstance(compacted_messages, list):
+            continue
+        for compacted_index, compacted_value in enumerate(compacted_messages):
+            compacted_message = _json_object(compacted_value)
+            if compacted_message is not None:
+                positions[
+                    _synthetic_claude_transcript_uuid(
+                        session_id=session_id,
+                        external_session_id=external_session_id,
+                        item=compacted_message,
+                        index=compacted_index,
+                    )
+                ] = index
+    return positions
 
 
 def _synthetic_claude_transcript_uuid(
