@@ -20,7 +20,14 @@ from fastapi import FastAPI
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native import resume_replay
 from omnigent.harnesses.claude_native.bridge import read_transcript_items_from_offset
-from omnigent.harnesses.claude_native.forwarder import _post_external_conversation_item
+from omnigent.harnesses.claude_native.forwarder import (
+    _ensure_state_for_transcript,
+    _forward_available_items,
+    _ForwardDedupeState,
+    _post_external_conversation_item,
+    _PostRetryTracker,
+)
+from omnigent.runtime import pending_inputs
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -283,3 +290,130 @@ async def test_replay_after_a_lost_response_lands_once(
         "second question",
         "second answer",
     ]
+
+
+class _RefusingTransport(_CountingTransport):
+    """Answer every item post with 503 while ``refusing`` is set."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        super().__init__(inner)
+        self.refusing = True
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.refusing and request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(503, json={"error": {"code": "durability_unconfirmed"}})
+        return await super().handle_async_request(request)
+
+
+async def test_items_a_replay_could_not_deliver_reach_the_server_through_the_forwarder(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kept transcript's undelivered items are forwarded in order, then never lost."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(resume_replay, "_sleep", _no_sleep)
+    monkeypatch.setattr(resume_replay, "_REPLAY_DEADLINE_S", 0.5)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    workspace = Path("/work/replay-repo")
+    session_id = await _create_session(client)
+    saved = _write_saved_transcript(projects, workspace)
+    await _deliver_records(client, session_id, saved, {"u-1", "a-1"})
+
+    refusing = _RefusingTransport(httpx.ASGITransport(app=app))
+    async with httpx.AsyncClient(transport=refusing, base_url="http://test") as resume_client:
+        resumed = await claude_native._prepare_claude_resume_transcript(
+            resume_client,
+            session_id=session_id,
+            external_session_id=_CLAUDE_SESSION_ID,
+            workspace=workspace,
+        )
+    assert resumed is not None
+    assert resumed.forward_from is not None
+    # Claude resumes the kept transcript and writes a new turn.
+    with saved.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_user("u-3", "third question", "a-2")) + "\n")
+
+    # The live forwarder starts at the first undelivered record.
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = await _ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=saved,
+        start_at_end=True,
+        session_id=session_id,
+        start_at_offset=resumed.forward_from,
+    )
+    await _forward_available_items(
+        client=client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        agent_name=_AGENT_NAME,
+        state=state,
+        retry_tracker=_PostRetryTracker(),
+        dedupe=_ForwardDedupeState(),
+    )
+    expected = [
+        "first question",
+        "first answer",
+        "second question",
+        "second answer",
+        "third question",
+    ]
+    assert await _message_texts(client, session_id) == expected
+
+    # The next cold resume finds nothing missing and posts nothing.
+    counting = _CountingTransport(httpx.ASGITransport(app=app))
+    async with httpx.AsyncClient(transport=counting, base_url="http://test") as resume_client:
+        await claude_native._prepare_claude_resume_transcript(
+            resume_client,
+            session_id=session_id,
+            external_session_id=_CLAUDE_SESSION_ID,
+            workspace=workspace,
+        )
+    assert counting.item_posts == []
+    assert await _message_texts(client, session_id) == expected
+
+
+async def test_replayed_message_leaves_a_newer_queued_web_message_alone(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old terminal message does not take a queued message's author or files."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    workspace = Path("/work/replay-repo")
+    session_id = await _create_session(client)
+    saved = _write_saved_transcript(projects, workspace)
+    await _deliver_records(client, session_id, saved, {"u-1", "a-1"})
+    queued = pending_inputs.record(
+        session_id,
+        [
+            {"type": "input_text", "text": "a newer web message"},
+            {"type": "input_file", "file_id": "file_newer", "filename": "notes.txt"},
+        ],
+        created_by="web-user@example.com",
+    )
+
+    await claude_native._prepare_claude_resume_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=_CLAUDE_SESSION_ID,
+        workspace=workspace,
+    )
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [queued]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    replayed_question = next(
+        item
+        for item in items
+        if item.get("type") == "message"
+        and any(block.get("text") == "second question" for block in item.get("content", []))
+    )
+    assert replayed_question.get("created_by") != "web-user@example.com"
+    assert all(block.get("type") != "input_file" for block in replayed_question["content"])

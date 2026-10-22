@@ -1,9 +1,10 @@
 """Claude-native cold resume: replay of a saved transcript's undelivered items.
 
-The real-server scenarios (exactly once, durability barrier, lost response)
-live in ``tests/server/integration/test_claude_native_resume_replay.py``. These
-cover the placement rules and the failure paths against a fake server that
-keys items by ``source_id`` as the real one does.
+The real-server scenarios (exactly once, durability barrier, lost response,
+queued web input, forwarder continuation) live in
+``tests/server/integration/test_claude_native_resume_replay.py``. These cover
+the placement rules and the failure paths against a fake server that keys
+items by ``source_id`` as the real one does.
 """
 
 from __future__ import annotations
@@ -18,6 +19,10 @@ import pytest
 
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native import resume_replay
+from omnigent.harnesses.claude_native.bridge import (
+    ClaudeTranscriptItem,
+    read_transcript_items_from_offset,
+)
 from omnigent.harnesses.claude_native.resume_replay import external_item_id
 
 _SESSION_ID = "conv_replay"
@@ -41,15 +46,21 @@ def _line(entry: dict[str, Any]) -> bytes:
     return (json.dumps(entry) + "\n").encode("utf-8")
 
 
-def _server_item(source_id: str, text: str, *, role: str = "user") -> dict[str, Any]:
-    """A committed item as the server lists it after a source-keyed post."""
-    block_type = "input_text" if role == "user" else "output_text"
+def _parsed(transcript: Path) -> dict[str, ClaudeTranscriptItem]:
+    """Items the live forwarder would post from *transcript*, by source id."""
+    result = read_transcript_items_from_offset(
+        transcript, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    return {item.source_id: item for item in result.items}
+
+
+def _stored(item: ClaudeTranscriptItem, *, item_id: str | None = None) -> dict[str, Any]:
+    """A committed item as the server lists it; a fork copy has a fresh id."""
     return {
-        "id": external_item_id(_SESSION_ID, source_id),
-        "type": "message",
-        "role": role,
-        "response_id": "resp_claude_" + source_id.split(":", 1)[0],
-        "content": [{"type": block_type, "text": text}],
+        "id": item_id or external_item_id(_SESSION_ID, item.source_id),
+        "type": item.item_type,
+        "response_id": item.response_id,
+        **item.data,
     }
 
 
@@ -64,6 +75,7 @@ class _FakeServer:
     ) -> None:
         self.items = list(items or [])
         self.posts: list[str] = []
+        self.replayed_flags: list[object] = []
         self._fail_post = fail_post
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -72,6 +84,7 @@ class _FakeServer:
         if request.method == "POST" and request.url.path.endswith("/events"):
             data = json.loads(request.content)["data"]
             self.posts.append(data["source_id"])
+            self.replayed_flags.append(data.get("replayed"))
             failure = self._fail_post(data["source_id"]) if self._fail_post else None
             if failure is not None:
                 return failure
@@ -89,7 +102,12 @@ class _FakeServer:
         return httpx.Response(404)
 
     def texts(self) -> list[str]:
-        return [block["text"] for item in self.items for block in item.get("content", [])]
+        return [
+            block["text"]
+            for item in self.items
+            for block in item.get("content", [])
+            if isinstance(block, dict) and "text" in block
+        ]
 
 
 @pytest.fixture
@@ -106,10 +124,10 @@ def saved_transcript(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return target
 
 
-async def _cold_resume(server: _FakeServer) -> Path | None:
+async def _cold_resume(server: _FakeServer) -> claude_native.ClaudeResumeTranscript | None:
     transport = httpx.MockTransport(server.handle)
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
-        return await claude_native._ensure_local_claude_resume_transcript(
+        return await claude_native._prepare_claude_resume_transcript(
             client,
             session_id=_SESSION_ID,
             external_session_id=_CLAUDE_SESSION_ID,
@@ -131,62 +149,126 @@ async def test_corrupt_and_partial_lines_are_skipped(saved_transcript: Path) -> 
         + _line(_assistant("a-1", "first answer"))
         + _line(_user("u-2", "second question"))[:20]
     )
-    server = _FakeServer([_server_item("u-1:0:message", "first question")])
+    server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])])
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
     assert server.posts == ["a-1:0:message"]
+    assert server.replayed_flags == [True]
     assert server.texts() == ["first question", "first answer"]
-    assert written is not None
-    assert "second question" not in written.read_text(encoding="utf-8")
+    assert resumed is not None
+    assert resumed.forward_from is None
+    assert "second question" not in resumed.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
-async def test_unreadable_transcript_is_rebuilt_from_server_history(
+async def test_unkeyable_record_is_isolated(saved_transcript: Path) -> None:
+    """A record whose source id the server cannot key does not stop the others."""
+    saved_transcript.write_bytes(
+        _line(_user("u-1", "first question"))
+        + _line(_assistant("a-1", "first answer"))
+        + b'{"type":"assistant","uuid":"\\ud800","message":{"role":"assistant",'
+        b'"content":[{"type":"text","text":"unkeyable"}]}}\n'
+    )
+    server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])])
+
+    resumed = await _cold_resume(server)
+
+    assert server.posts == ["a-1:0:message"]
+    assert resumed is not None
+    assert "first answer" in resumed.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_transcript_without_items_is_rebuilt_from_server_history(
     saved_transcript: Path,
 ) -> None:
-    """A transcript with no parsable record replays nothing and is rewritten."""
+    """A transcript with no parsable record holds nothing to lose and is rewritten."""
     saved_transcript.write_bytes(b"\x00\x01garbage\nnot json\n")
-    server = _FakeServer([_server_item("u-1:0:message", "first question")])
+    server = _FakeServer(
+        [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "response_id": "resp_1",
+                "content": [{"type": "input_text", "text": "first question"}],
+            }
+        ]
+    )
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
     assert server.posts == []
-    assert written == saved_transcript
-    assert "first question" in written.read_text(encoding="utf-8")
+    assert resumed is not None
+    assert "first question" in resumed.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
-async def test_transcript_that_cannot_be_read_is_rebuilt(
+async def test_transcript_that_cannot_be_read_is_kept(
     saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A read error replays nothing and leaves the rewrite to proceed."""
-    saved_transcript.write_bytes(
-        _line(_user("u-1", "first question")) + _line(_assistant("a-1", "unread answer"))
-    )
+    """A read error leaves the transcript unknown, so it is not overwritten."""
+    saved = _line(_user("u-1", "first question")) + _line(_assistant("a-1", "unread answer"))
+    saved_transcript.write_bytes(saved)
+    server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])])
 
     def unreadable(*args: object, **kwargs: object) -> None:
         raise PermissionError("transcript is not readable")
 
     monkeypatch.setattr(resume_replay, "read_transcript_items_from_offset", unreadable)
-    server = _FakeServer([_server_item("u-1:0:message", "first question")])
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
     assert server.posts == []
-    assert written is not None
-    assert "first question" in written.read_text(encoding="utf-8")
+    assert resumed is not None
+    assert resumed.path == saved_transcript
+    assert resumed.forward_from is None
+    assert saved_transcript.read_bytes() == saved
+
+
+@pytest.mark.asyncio
+async def test_fork_continuation_is_delivered_after_its_copied_prefix(
+    saved_transcript: Path,
+) -> None:
+    """A fork's copies have fresh ids but their response ids place the new turn."""
+    saved_transcript.write_bytes(
+        _line(_user("copied-1", "copied question"))
+        + _line(_assistant("copied-2", "copied answer"))
+        + _line(_user("new-1", "first fork question"))
+    )
+    parsed = _parsed(saved_transcript)
+    server = _FakeServer(
+        [
+            _stored(parsed["copied-1:0:message"], item_id="fork_copy_1"),
+            _stored(parsed["copied-2:0:message"], item_id="fork_copy_2"),
+        ]
+    )
+
+    await _cold_resume(server)
+
+    assert server.posts == ["new-1:0:message"]
 
 
 @pytest.mark.asyncio
 async def test_transcript_absent_from_server_history_is_not_replayed(
     saved_transcript: Path,
 ) -> None:
-    """With no item in common, e.g. a fork's copied prefix, nothing can be placed."""
+    """With neither an id nor a response in common, nothing can be placed."""
     saved_transcript.write_bytes(
-        _line(_user("copied-1", "copied question")) + _line(_assistant("new-1", "new answer"))
+        _line(_user("other-1", "unrelated question")) + _line(_assistant("other-2", "answer"))
     )
-    server = _FakeServer([_server_item("other:0:message", "copied question")])
+    server = _FakeServer(
+        [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "response_id": "resp_claude_unrelated",
+                "content": [{"type": "input_text", "text": "server question"}],
+            }
+        ]
+    )
 
     await _cold_resume(server)
 
@@ -201,14 +283,46 @@ async def test_history_continued_elsewhere_is_not_replayed(saved_transcript: Pat
     )
     server = _FakeServer(
         [
-            _server_item("u-1:0:message", "first question"),
-            _server_item("elsewhere:0:message", "answer from another machine", role="assistant"),
+            _stored(_parsed(saved_transcript)["u-1:0:message"]),
+            {
+                "id": external_item_id(_SESSION_ID, "elsewhere:0:message"),
+                "type": "message",
+                "role": "assistant",
+                "response_id": "resp_claude_elsewhere",
+                "content": [{"type": "output_text", "text": "answer from another machine"}],
+            },
         ]
     )
 
     await _cold_resume(server)
 
     assert server.posts == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wake_marker_is_not_mistaken_for_divergence(
+    saved_transcript: Path,
+) -> None:
+    """The forwarder's wake marker for a local record is this transcript's own."""
+    saved_transcript.write_bytes(
+        _line(_user("u-1", "first question")) + _line(_assistant("a-1", "woken answer"))
+    )
+    server = _FakeServer(
+        [
+            _stored(_parsed(saved_transcript)["u-1:0:message"]),
+            {
+                "id": external_item_id(_SESSION_ID, "a-1:0:scheduled_wake"),
+                "type": "message",
+                "role": "user",
+                "response_id": "resp_claude_fresh_wake_turn",
+                "content": [{"type": "input_text", "text": "[System: scheduled wake]"}],
+            },
+        ]
+    )
+
+    await _cold_resume(server)
+
+    assert server.posts == ["a-1:0:message"]
 
 
 @pytest.mark.asyncio
@@ -221,11 +335,11 @@ async def test_empty_server_history_receives_the_whole_transcript(
     )
     server = _FakeServer()
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
     assert server.posts == ["u-1:0:message", "a-1:0:message"]
-    assert written is not None
-    assert "first answer" in written.read_text(encoding="utf-8")
+    assert resumed is not None
+    assert "first answer" in resumed.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -236,11 +350,49 @@ async def test_compaction_summary_is_not_replayed_as_a_message(saved_transcript:
         + _line(_user("s-1", "Summary of the conversation", isCompactSummary=True))
         + _line(_assistant("a-2", "after compaction"))
     )
-    server = _FakeServer([_server_item("u-1:0:message", "first question")])
+    server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])])
 
     await _cold_resume(server)
 
     assert server.posts == ["a-2:0:message"]
+
+
+@pytest.mark.asyncio
+async def test_new_turn_after_a_rebuilt_compaction_is_delivered(saved_transcript: Path) -> None:
+    """Rows a compaction snapshot stands for are not taken for another transcript."""
+    saved_transcript.write_bytes(
+        _line(_user("u-1", "first question")) + _line(_assistant("a-1", "first answer"))
+    )
+    parsed = _parsed(saved_transcript)
+    saved_transcript.unlink()
+    server = _FakeServer(
+        [
+            _stored(parsed["u-1:0:message"]),
+            {
+                "id": "cmp_1",
+                "type": "compaction",
+                "response_id": "compact_1",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "summary so far"}],
+                        "forwarded_source_ids": ["a-1:0:message"],
+                    }
+                ],
+            },
+            # Mirrored after the boundary; the rebuild leaves it to the snapshot.
+            _stored(parsed["a-1:0:message"]),
+        ]
+    )
+    rebuilt = await _cold_resume(server)
+    assert rebuilt is not None
+    with rebuilt.path.open("ab") as handle:
+        handle.write(_line(_user("n-1", "question after compaction")))
+
+    await _cold_resume(server)
+
+    assert server.posts == ["n-1:0:message"]
 
 
 @pytest.mark.asyncio
@@ -261,42 +413,44 @@ async def test_rejected_item_is_skipped_and_the_rest_delivered(
         return None
 
     server = _FakeServer(
-        [_server_item("u-1:0:message", "first question")], fail_post=reject_first_answer
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])], fail_post=reject_first_answer
     )
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
     assert server.posts == ["a-1:0:message"] * 3 + ["u-2:0:message"]
     assert server.texts() == ["first question", "second question"]
-    assert written is not None
-    assert "rejected answer" not in written.read_text(encoding="utf-8")
+    assert resumed is not None
+    assert resumed.forward_from is None
+    assert "rejected answer" not in resumed.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "attempts"),
-    [pytest.param(503, 1, id="server-unavailable"), pytest.param(403, 1, id="refused")],
+    "status", [pytest.param(503, id="unavailable"), pytest.param(403, id="refused")]
 )
-async def test_undeliverable_items_keep_the_local_transcript(
+async def test_undelivered_items_are_left_to_the_forwarder(
     saved_transcript: Path,
     monkeypatch: pytest.MonkeyPatch,
     status: int,
-    attempts: int,
 ) -> None:
-    """Items the server cannot take are kept in the transcript, which is not rewritten."""
+    """The transcript is kept, and the forwarder starts at the first undelivered record."""
     monkeypatch.setattr(resume_replay, "_sleep", _no_sleep)
-    monkeypatch.setattr(resume_replay, "_REPLAY_STALL_TIMEOUT_S", 0.0)
-    saved = _line(_user("u-1", "first question")) + _line(_assistant("a-1", "first answer"))
+    monkeypatch.setattr(resume_replay, "_REPLAY_DEADLINE_S", 0.5)
+    first_record = _line(_user("u-1", "first question"))
+    saved = first_record + _line(_assistant("a-1", "first answer"))
     saved_transcript.write_bytes(saved)
     server = _FakeServer(
-        [_server_item("u-1:0:message", "first question")],
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])],
         fail_post=lambda source_id: httpx.Response(status, json={"error": {"code": "refused"}}),
     )
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
-    assert server.posts == ["a-1:0:message"] * attempts
-    assert written == saved_transcript
+    assert server.posts == ["a-1:0:message"]
+    assert resumed is not None
+    assert resumed.path == saved_transcript
+    assert resumed.forward_from == len(first_record)
     assert saved_transcript.read_bytes() == saved
 
 
@@ -318,14 +472,41 @@ async def test_transient_failures_are_retried_until_delivered(
         del source_id
         return failures.pop(0) if failures else None
 
-    server = _FakeServer([_server_item("u-1:0:message", "first question")], fail_post=flaky)
+    server = _FakeServer([_stored(_parsed(saved_transcript)["u-1:0:message"])], fail_post=flaky)
 
-    written = await _cold_resume(server)
+    resumed = await _cold_resume(server)
 
     assert server.posts == ["a-1:0:message"] * 3
     assert server.texts() == ["first question", "first answer"]
-    assert written is not None
-    assert "first answer" in written.read_text(encoding="utf-8")
+    assert resumed is not None
+    assert "first answer" in resumed.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_cold_resume_tells_the_cli_forwarder_where_to_start(
+    saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI launch carries a kept transcript's first undelivered offset."""
+
+    async def kept(*args: object, **kwargs: object) -> claude_native.ClaudeResumeTranscript:
+        return claude_native.ClaudeResumeTranscript(saved_transcript, forward_from=42)
+
+    monkeypatch.setattr(claude_native, "_prepare_claude_resume_transcript", kept)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "labels": {claude_native._WRAPPER_LABEL_KEY: claude_native._WRAPPER_LABEL_VALUE},
+                "external_session_id": _CLAUDE_SESSION_ID,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        cold_resume = await claude_native._resolve_cold_resume(client, _SESSION_ID)
+
+    assert cold_resume == claude_native._ColdResume(("--resume", _CLAUDE_SESSION_ID), 42)
 
 
 def test_external_item_id_matches_the_server() -> None:
@@ -348,17 +529,24 @@ def test_external_item_id_matches_the_server() -> None:
 
 
 def test_record_positions_cover_rebuilt_and_compacted_records() -> None:
-    """Every record a rebuild writes, compacted messages included, maps to its item."""
+    """Every rebuilt record maps to the last server row it stands for."""
+    overlap_id = external_item_id(_SESSION_ID, "a-1:0:message")
     items: list[dict[str, Any]] = [
-        _server_item("u-1:0:message", "first question"),
+        {"id": "msg_1", "type": "message", "role": "user", "response_id": "r", "content": "hi"},
         {
             "id": "cmp_1",
             "type": "compaction",
             "response_id": "compact_1",
             "compacted_messages": [
-                {"type": "message", "role": "user", "content": "summary"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "summary",
+                    "forwarded_source_ids": ["a-1:0:message"],
+                },
             ],
         },
+        {"id": overlap_id, "type": "message", "role": "user", "response_id": "r", "content": "x"},
     ]
     positions = claude_native._claude_resume_record_positions(
         items, session_id=_SESSION_ID, external_session_id=_CLAUDE_SESSION_ID
@@ -370,10 +558,12 @@ def test_record_positions_cover_rebuilt_and_compacted_records() -> None:
         cwd=_WORKSPACE,
         bridge_dir=Path("/nonexistent-bridge"),
     )
-    rebuilt_uuids = {record["uuid"] for record in records}
 
-    assert rebuilt_uuids <= positions.keys()
-    first = claude_native._synthetic_claude_transcript_uuid(
-        session_id=_SESSION_ID, external_session_id=_CLAUDE_SESSION_ID, item=items[0], index=0
+    assert {record["uuid"] for record in records} <= positions.keys()
+    compacted = claude_native._synthetic_claude_transcript_uuid(
+        session_id=_SESSION_ID,
+        external_session_id=_CLAUDE_SESSION_ID,
+        item=items[1]["compacted_messages"][0],
+        index=0,
     )
-    assert positions[first] == 0
+    assert positions[compacted] == 2

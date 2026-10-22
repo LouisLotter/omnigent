@@ -575,7 +575,7 @@ def test_claude_command_short_r_binds_omnigent_session(
     With the unified ``--resume`` UX, ``-r`` is the Omnigent alias
     (not Claude's own short flag). Users who need Claude's own
     resume can rely on the wrapper to translate the Omnigent conv
-    id internally — see ``omnigent.harnesses.claude_native.main._resolve_cold_resume_args``
+    id internally — see ``omnigent.harnesses.claude_native.main._resolve_cold_resume``
     for the cold-resume injection.
     """
     captured: dict[str, object] = {}
