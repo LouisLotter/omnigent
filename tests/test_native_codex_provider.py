@@ -10,7 +10,6 @@ parser; config + ambient are isolated so resolution is deterministic.
 
 from __future__ import annotations
 
-import shlex
 import sys
 from pathlib import Path
 
@@ -110,8 +109,9 @@ def test_native_codex_inline_api_key_routes_to_declared_endpoint(
     assert launch.profile is None
     assert not launch.login_required
     assert api_key not in launch.summary
-    assert provider["auth"]["command"] == "sh"
-    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+    # The key rides in memory only; starting the app-server moves it to a key file.
+    assert provider["experimental_bearer_token"] == api_key
+    assert "auth" not in provider
 
 
 @pytest.mark.parametrize("fragment", [None, "wrong-key"])
@@ -136,7 +136,7 @@ def test_native_codex_resolved_api_key_preserves_literal_dollars(
 
     config = tomllib.loads("\n".join(launch.config_overrides))
     provider = config["model_providers"][config["model_provider"]]
-    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+    assert provider["experimental_bearer_token"] == api_key
     assert not launch.login_required
 
 
@@ -165,6 +165,24 @@ def test_provider_codex_overrides_coerce_chat_wire_to_responses() -> None:
     assert 'wire_api="chat"' not in joined
     # The token command is embedded as the sh auth command.
     assert "printf %s sk-or-test" in joined
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [{}, {"auth_command": "credential-helper", "api_key": "sk-test"}],
+    ids=["neither", "both"],
+)
+def test_provider_codex_overrides_require_exactly_one_credential(
+    credential: dict[str, str],
+) -> None:
+    """A generated provider has one credential: a static key or an auth command."""
+    with pytest.raises(ValueError, match="exactly one"):
+        _provider_codex_config_overrides(
+            model=None,
+            base_url="https://api.openai.com/v1",
+            wire_api="responses",
+            **credential,
+        )
 
 
 def test_provider_codex_overrides_preserve_responses_wire() -> None:
@@ -219,7 +237,7 @@ def test_resolve_native_codex_launch_key_default_routes_via_overrides(
     assert launch.model == "gpt-5.5"
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://api.openai.com/v1"' in joined
-    assert "printf %s sk-oai-default" in joined
+    assert 'experimental_bearer_token="sk-oai-default"' in joined
 
 
 def test_resolve_native_codex_launch_openrouter_coerces_chat_wire(_isolated: Path) -> None:
@@ -358,7 +376,7 @@ def test_resolve_native_codex_launch_subscription_no_login_falls_through_to_key(
     assert launch.model == "gpt-5.5"
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://api.openai.com/v1"' in joined
-    assert "printf %s sk-oai-real" in joined
+    assert 'experimental_bearer_token="sk-oai-real"' in joined
 
 
 def test_resolve_native_codex_launch_subscription_no_login_no_alternative_uses_login(
@@ -429,7 +447,7 @@ def test_resolve_native_codex_launch_ambient_key_routes(
     assert launch.profile is None
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://api.openai.com/v1"' in joined
-    assert "printf %s sk-oai-ambient" in joined
+    assert 'experimental_bearer_token="sk-oai-ambient"' in joined
 
 
 def test_resolve_native_codex_launch_cli_config_default_pins_provider(
@@ -637,7 +655,7 @@ def test_spec_provider_auth_routes_when_machine_has_nothing(_isolated: Path) -> 
 
     joined = "\n".join(launch.config_overrides)
     assert 'base_url="https://spec.example.com/v1"' in joined
-    assert "printf %s sk-spec" in joined
+    assert 'experimental_bearer_token="sk-spec"' in joined
     assert launch.model == "spec-model"
     assert "Codex CLI login" not in launch.summary
 

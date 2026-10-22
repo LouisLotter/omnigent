@@ -218,6 +218,13 @@ _CODEX_HOME_SYMLINK_DIRS = (
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
+# Codex's literal-bearer provider field. Generated overrides carry a static key
+# in it only in memory; materialization moves the key into a private key file.
+_CODEX_BEARER_TOKEN_FIELD = "experimental_bearer_token"
+# Private file holding a generated provider's static key, beside the session's
+# CODEX_HOME. Anything that saves its directory must exclude it and its
+# ``provider_key.<random>`` temporaries.
+CODEX_PROVIDER_KEY_FILE = "provider_key"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -1292,6 +1299,7 @@ def materialize_codex_provider_config(
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    key_file: Path | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1300,6 +1308,10 @@ def materialize_codex_provider_config(
     commands. Persist them in the session-owned ``config.toml`` instead so
     process arguments contain only non-secret routing and behavior overrides.
 
+    A generated provider's static key is never written to ``config.toml``
+    either: it goes to *key_file*, which the provider's ``auth`` command reads,
+    so a saved or backed-up Codex home holds no key.
+
     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
     untouched: Codex rejects unsupported fields there by discarding the whole config.
 
@@ -1307,7 +1319,12 @@ def materialize_codex_provider_config(
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param key_file: Absolute path outside *codex_home* for a static provider
+        key, e.g. ``<bridge dir>/provider_key``; removed when no generated
+        provider carries one. ``None`` refuses a static key.
     :returns: Overrides safe to retain in subprocess arguments.
+    :raises ValueError: When a generated provider carries a static key and
+        *key_file* is ``None``, relative or inside *codex_home*.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
@@ -1320,6 +1337,9 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
+    if not provider_overrides and key_file is not None:
+        # A previous launch's key must not outlive a switch to another provider.
+        key_file.unlink(missing_ok=True)
     if not provider_overrides and not config_path.is_file():
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
@@ -1340,6 +1360,7 @@ def materialize_codex_provider_config(
     if not isinstance(providers, MutableMapping):
         raise ValueError("Codex model_providers config must be a TOML table")
 
+    keyed_providers: list[MutableMapping[str, Any]] = []
     for override in provider_overrides:
         fragment = tomlkit.parse(override)
         generated = fragment.get("model_providers")
@@ -1347,6 +1368,12 @@ def materialize_codex_provider_config(
             raise ValueError("Codex provider override must define model_providers")
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
+            if (
+                isinstance(provider_config, MutableMapping)
+                and _CODEX_BEARER_TOKEN_FIELD in provider_config
+            ):
+                keyed_providers.append(provider_config)
+    _reference_codex_provider_key(keyed_providers, key_file, codex_home=codex_home)
 
     from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
 
@@ -1378,6 +1405,76 @@ def materialize_codex_provider_config(
         with suppress(FileNotFoundError):
             os.unlink(tmp_name)
     return argv_overrides
+
+
+def _reference_codex_provider_key(
+    keyed_providers: Sequence[MutableMapping[str, Any]],
+    key_file: Path | None,
+    *,
+    codex_home: Path,
+) -> None:
+    """Move a generated provider's static key into *key_file* and reference it.
+
+    The provider's ``auth`` command reads the file, so Codex sends the same
+    bearer token while its config holds only the path. Without a keyed
+    provider, a stale *key_file* is removed.
+
+    :param keyed_providers: Generated provider tables carrying
+        ``experimental_bearer_token``; at most one.
+    :param key_file: Absolute key file path outside *codex_home*, or ``None``.
+    :param codex_home: The private Codex home the config is written to.
+    :raises ValueError: When a key has no usable *key_file*, or more than
+        one generated provider carries a key.
+    """
+    if not keyed_providers:
+        if key_file is not None:
+            key_file.unlink(missing_ok=True)
+        return
+    if (
+        key_file is None
+        or not key_file.is_absolute()
+        or key_file.resolve().is_relative_to(codex_home.resolve())
+    ):
+        raise ValueError(
+            "A static Codex provider key needs an absolute key file outside "
+            "CODEX_HOME; it is never written into the Codex home"
+        )
+    if len(keyed_providers) > 1:
+        raise ValueError("Only one generated Codex provider can carry a static key")
+    import tomlkit
+
+    provider = keyed_providers[0]
+    _write_codex_provider_key(key_file, str(provider.pop(_CODEX_BEARER_TOKEN_FIELD)))
+    auth = tomlkit.inline_table()
+    auth.update(
+        {
+            "command": "cat",
+            "args": [str(key_file)],
+            "timeout_ms": _GATEWAY_AUTH_TIMEOUT_MS,
+            "refresh_interval_ms": _GATEWAY_AUTH_REFRESH_MS,
+        }
+    )
+    provider["auth"] = auth
+
+
+def _write_codex_provider_key(key_file: Path, key: str) -> None:
+    """Atomically write *key* to a ``0600`` file, creating a missing directory ``0700``.
+
+    :param key_file: Destination, e.g. ``<bridge dir>/provider_key``.
+    :param key: The provider key, written without a trailing newline.
+    """
+    key_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # mkstemp creates the file 0600, so no reader sees the key under looser bits.
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{key_file.name}.", dir=str(key_file.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, key_file)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
 
 
 # Bridge directory holding the ``subagent_router.json`` advertisement. Its
@@ -2215,24 +2312,31 @@ def _provider_codex_config_overrides(
     *,
     model: str | None,
     base_url: str,
-    auth_command: str,
     wire_api: str,
+    auth_command: str | None = None,
+    api_key: str | None = None,
 ) -> list[str]:
     """Return Codex config overrides routing through a generic provider.
 
     The OSS counterpart to :func:`_databricks_codex_config_overrides`: it
     points Codex at a ``configure harnesses`` provider (key / gateway / local
     serving the ``openai`` surface) by registering an ``omnigent_provider``
-    ``model_provider`` with the provider's base URL, a bearer-token auth
-    command (``printf`` for a static key, or the provider's ``auth_command``),
-    and the provider's wire protocol — so a native Codex terminal routes
-    exactly like the in-process codex harness.
+    ``model_provider`` with the provider's base URL, its credential (a static
+    key, or the provider's bearer-token ``auth_command``), and the provider's
+    wire protocol — so a native Codex terminal routes exactly like the
+    in-process codex harness.
 
     :param model: Model id to pin, e.g. ``"qwen/qwen3.7-plus"``. ``None``
         omits the ``model`` override (Codex keeps its own default model name
         while still routing through the provider).
     :param base_url: The provider's openai-family base URL, e.g.
         ``"https://openrouter.ai/api/v1"``.
+    :param auth_command: Shell command printing a bearer token, e.g. the
+        provider's ``auth_command``. Exclusive with *api_key*.
+    :param api_key: A static key, e.g. ``"sk-or-..."``. It rides the override
+        as Codex's ``experimental_bearer_token``, which
+        :func:`materialize_codex_provider_config` moves into a private key
+        file. Exclusive with *auth_command*.
     :param wire_api: The provider's configured wire protocol —
         ``"responses"`` (OpenAI / LiteLLM) or ``"chat"`` (OpenRouter and
         most OSS-model gateways). codex >= 0.137 no longer accepts ``"chat"``
@@ -2241,9 +2345,22 @@ def _provider_codex_config_overrides(
         ``"responses"`` — the only wire codex still speaks — before being
         emitted. See the inline note for the OpenRouter caveat.
     :returns: Codex TOML-fragment override strings.
+    :raises ValueError: Unless exactly one of *auth_command* and *api_key*
+        is given.
     """
+    if (auth_command is None) == (api_key is None):
+        raise ValueError("A Codex provider needs exactly one of auth_command and api_key")
     provider_name = "omnigent_provider"
-    auth_command_json = json.dumps(auth_command)
+    if api_key is not None:
+        credential = f"{_CODEX_BEARER_TOKEN_FIELD}={json.dumps(api_key)},"
+    else:
+        credential = (
+            'auth={command="sh",'
+            f'args=["-c",{json.dumps(auth_command)}],'
+            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
+            f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
+            "},"
+        )
     # codex >= 0.137 removed the chat/completions wire from its config schema:
     # any provider block carrying wire_api="chat" makes codex hard-fail config
     # load ("wire_api = \"chat\" is no longer supported"), which broke OSS /
@@ -2262,11 +2379,7 @@ def _provider_codex_config_overrides(
         f"model_providers.{provider_name}="
         '{name="Omnigent Provider",'
         f"base_url={json.dumps(base_url)},"
-        'auth={command="sh",'
-        f'args=["-c",{auth_command_json}],'
-        f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
-        f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
-        "},"
+        f"{credential}"
         f'wire_api="{effective_wire_api}"}}'
     )
     return overrides

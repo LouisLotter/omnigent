@@ -4554,6 +4554,148 @@ def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouc
     assert gateway["request_max_retries"] == RetryPolicy().max_retries
 
 
+_STATIC_PROVIDER_KEY = "sk-sentinel-static-key-$NOT_A_VAR-'quoted'"
+
+
+def _static_key_overrides(key: str = _STATIC_PROVIDER_KEY) -> list[str]:
+    from omnigent.inner.codex_executor import _provider_codex_config_overrides
+
+    return _provider_codex_config_overrides(
+        model="test-model",
+        base_url="https://provider.invalid/v1",
+        api_key=key,
+        wire_api="responses",
+    )
+
+
+def test_materialize_codex_provider_config_references_static_key_from_key_file(
+    tmp_path: Path,
+) -> None:
+    """A static provider key goes to a private key file; config.toml only names it."""
+    import stat
+
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    codex_home = tmp_path / "bridge" / "codex-home"
+    key_file = tmp_path / "bridge" / "provider_key"
+
+    argv_overrides = materialize_codex_provider_config(
+        codex_home, _static_key_overrides(), key_file=key_file
+    )
+
+    config_text = (codex_home / "config.toml").read_text()
+    assert _STATIC_PROVIDER_KEY not in config_text
+    assert all(_STATIC_PROVIDER_KEY not in override for override in argv_overrides)
+    provider = tomllib.loads(config_text)["model_providers"]["omnigent_provider"]
+    assert "experimental_bearer_token" not in provider
+    assert provider["auth"]["command"] == "cat"
+    assert provider["auth"]["args"] == [str(key_file)]
+    assert key_file.read_text(encoding="utf-8") == _STATIC_PROVIDER_KEY
+    assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+    # The atomic write leaves no temporary sibling behind.
+    assert sorted(path.name for path in key_file.parent.iterdir()) == [
+        "codex-home",
+        "provider_key",
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ['model_provider="openai"'],
+        [
+            'model_provider="omnigent_provider"',
+            'model_providers.omnigent_provider={name="Omnigent Provider",'
+            'base_url="https://provider.invalid/v1",'
+            'auth={command="sh",args=["-c","credential-helper"]},wire_api="responses"}',
+        ],
+    ],
+    ids=["subscription", "auth-command"],
+)
+def test_materialize_codex_provider_config_removes_stale_key_file(
+    tmp_path: Path, overrides: list[str]
+) -> None:
+    """A launch without a static key removes the key a previous launch left."""
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    codex_home = tmp_path / "codex-home"
+    key_file = tmp_path / "provider_key"
+    key_file.write_text("sk-previous-launch", encoding="utf-8")
+
+    assert materialize_codex_provider_config(codex_home, overrides, key_file=key_file) == [
+        override for override in overrides if not override.startswith("model_providers.")
+    ]
+
+    assert not key_file.exists()
+
+
+@pytest.mark.parametrize(
+    "key_file_name, extra_override",
+    [
+        (None, None),
+        ("relative", None),
+        ("inside-home", None),
+        (
+            "absolute",
+            'model_providers.second={name="Second",base_url="https://second.invalid/v1",'
+            'experimental_bearer_token="sk-second",wire_api="responses"}',
+        ),
+    ],
+    ids=["no-key-file", "relative-key-file", "key-file-in-codex-home", "two-keyed-providers"],
+)
+def test_materialize_codex_provider_config_refuses_unreferenced_static_key(
+    tmp_path: Path, key_file_name: str | None, extra_override: str | None
+) -> None:
+    """A static key that cannot be referenced fails before config.toml is written."""
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    codex_home = tmp_path / "codex-home"
+    key_file = {
+        None: None,
+        "relative": Path("provider_key"),
+        "inside-home": codex_home / "provider_key",
+        "absolute": tmp_path / "provider_key",
+    }[key_file_name]
+    overrides = _static_key_overrides()
+    if extra_override is not None:
+        overrides.append(extra_override)
+
+    with pytest.raises(ValueError, match="key"):
+        materialize_codex_provider_config(codex_home, overrides, key_file=key_file)
+
+    assert not (codex_home / "config.toml").exists()
+    assert not (tmp_path / "provider_key").exists()
+    assert not (codex_home / "provider_key").exists()
+
+
+def test_materialize_codex_provider_config_key_write_failure_keeps_previous_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted key write leaves the previous key whole and no temporary."""
+    from omnigent.inner import codex_executor
+
+    codex_home = tmp_path / "bridge" / "codex-home"
+    key_file = tmp_path / "bridge" / "provider_key"
+    key_file.parent.mkdir()
+    key_file.write_text("sk-previous-launch", encoding="utf-8")
+
+    def _failing_replace(source: str, destination: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(codex_executor.os, "replace", _failing_replace)
+    with pytest.raises(OSError, match="disk full"):
+        codex_executor.materialize_codex_provider_config(
+            codex_home, _static_key_overrides(), key_file=key_file
+        )
+
+    assert key_file.read_text(encoding="utf-8") == "sk-previous-launch"
+    remaining = sorted(path.name for path in key_file.parent.iterdir())
+    assert remaining == ["codex-home", "provider_key"]
+    assert not (codex_home / "config.toml").exists()
+
+
 # ---------------------------------------------------------------------------
 # _clean_codex_env tests
 # ---------------------------------------------------------------------------
