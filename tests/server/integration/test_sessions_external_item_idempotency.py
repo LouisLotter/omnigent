@@ -224,3 +224,44 @@ async def test_item_answer_waits_until_its_write_is_durable(
     finally:
         app.state.durability_barrier = None
     assert await _message_texts(client, session_id) == ["durable once"]
+
+
+@pytest.mark.parametrize(
+    "queued_text",
+    [pytest.param("newer web message", id="other-text"), pytest.param("continue", id="same-text")],
+)
+async def test_replayed_mirror_does_not_claim_a_newer_queued_input(
+    client: httpx.AsyncClient, queued_text: str
+) -> None:
+    """A mirror replayed from a saved transcript leaves queued inputs alone, even equal ones."""
+    session_id = await _create_session(client, "idem-replayed")
+    newer = pending_inputs.record(
+        session_id,
+        [
+            {"type": "input_text", "text": queued_text},
+            {"type": "input_file", "file_id": "file_newer", "filename": "notes.txt"},
+        ],
+        created_by="alice@example.com",
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+                "response_id": "resp_claude_echo",
+                "source_id": "rec-old:0:message",
+                "replayed": True,
+            },
+        },
+    )
+    assert resp.status_code in (200, 201, 202), resp.text
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [newer]
+    (item,) = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [block["type"] for block in item["content"]] == ["input_text"]
+    assert item.get("created_by") != "alice@example.com"

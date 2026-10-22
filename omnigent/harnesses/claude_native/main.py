@@ -99,6 +99,12 @@ from omnigent.harnesses.claude_native.forwarder import (
     reset_transcript_forward_state,
     supervise_forwarder,
 )
+from omnigent.harnesses.claude_native.resume_replay import (
+    TranscriptReplayResult,
+    external_item_id,
+    replay_transcript_items,
+    undelivered_transcript_items,
+)
 from omnigent.harnesses.claude_native.state import (
     read_launch_state,
     redirect_launch_state,
@@ -382,6 +388,11 @@ class PreparedClaudeTerminal:
         *independent* of ``reattached``: cold resume creates a new
         terminal (we own teardown) but the forwarder still needs the
         skip-existing behavior.
+    :param resume_forward_from: Byte offset where the forwarder starts on a
+        cold resume that kept a transcript the server has not fully
+        received; ``None`` skips the existing transcript.
+    :param resume_replayed_source_ids: Items of that transcript the
+        forwarder posts as replayed.
     :param tmux_socket: Runner tmux server socket path when the
         terminal exposed one and it is reachable from this process,
         e.g. ``Path("/tmp/omnigent-501/.../tmux.sock")``. ``None``
@@ -399,6 +410,8 @@ class PreparedClaudeTerminal:
     bridge_dir: Path
     reattached: bool
     cold_resumed: bool = False
+    resume_forward_from: int | None = None
+    resume_replayed_source_ids: frozenset[str] = frozenset()
     tmux_socket: Path | None = None
     tmux_target: str | None = None
 
@@ -1767,7 +1780,7 @@ def _align_working_directory_with_session(
     Resolve cwd mismatch before resuming a Claude-native session.
 
     Claude Code's ``--resume <claude_sid>`` (which the cold-resume
-    path injects -- see :func:`_resolve_cold_resume_args`) requires
+    path injects -- see :func:`_resolve_cold_resume`) requires
     the cwd of the resumed invocation to match the cwd of the
     original session. If they differ, Claude exits immediately on
     launch. The wrapper records the launch cwd in client-side
@@ -3979,6 +3992,8 @@ async def _attach_with_transcript_forwarder(
                 bridge_dir=prepared.bridge_dir,
                 agent_name=agent_name,
                 start_at_end=skip_existing_transcript,
+                start_at_offset=prepared.resume_forward_from,
+                replayed_source_ids=prepared.resume_replayed_source_ids,
                 auth=auth,
             ),
             name="claude-native-transcript-forwarder",
@@ -5045,9 +5060,9 @@ async def _prepare_claude_terminal(
 
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         startup_profiler.mark("prepare http client ready")
-        cold_resume_args: tuple[str, ...] = ()
+        cold_resume = _ColdResume()
         # Cold resume = session existed but no live terminal. Even when
-        # ``_resolve_cold_resume_args`` returns ``()`` (no captured
+        # ``_resolve_cold_resume`` returns no args (no captured
         # external_session_id, so Claude starts a fresh transcript),
         # Omnigent already holds the prior conversation history from the
         # earlier run. The forwarder must not re-read whatever the new
@@ -5127,7 +5142,7 @@ async def _prepare_claude_terminal(
                 startup_progress=startup_progress,
                 progress_message="Restoring Claude session...",
             )
-            cold_resume_args = await _resolve_cold_resume_args(client, session_id)
+            cold_resume = await _resolve_cold_resume(client, session_id)
             _mark_startup_step(
                 startup_profiler,
                 "cold resume args resolved",
@@ -5177,7 +5192,7 @@ async def _prepare_claude_terminal(
         terminal_id = await _launch_claude_terminal(
             client,
             session_id,
-            (*cold_resume_args, *claude_args),
+            (*cold_resume.args, *claude_args),
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
@@ -5204,6 +5219,8 @@ async def _prepare_claude_terminal(
         bridge_dir=bridge_dir,
         reattached=False,
         cold_resumed=cold_resumed,
+        resume_forward_from=cold_resume.forward_from,
+        resume_replayed_source_ids=cold_resume.replayed_source_ids,
         tmux_socket=launch_tmux.socket,
         tmux_target=launch_tmux.target,
     )
@@ -5245,25 +5262,41 @@ async def _fetch_claude_session_labels(
     return {str(key): str(value) for key, value in labels.items()}
 
 
-async def _resolve_cold_resume_args(
+@dataclass(frozen=True)
+class _ColdResume:
+    """
+    How a cold-resume launch reopens the prior Claude transcript.
+
+    :param args: ``("--resume", "<claude_sid>")``, or ``()`` to launch fresh.
+    :param forward_from: Byte offset the transcript forwarder must start
+        from, or ``None`` to skip the whole existing transcript.
+    :param replayed_source_ids: Items the forwarder posts as replayed.
+    """
+
+    args: tuple[str, ...] = ()
+    forward_from: int | None = None
+    replayed_source_ids: frozenset[str] = frozenset()
+
+
+async def _resolve_cold_resume(
     client: httpx.AsyncClient,
     session_id: str,
-) -> tuple[str, ...]:
+) -> _ColdResume:
     """
-    Build the ``claude --resume <sid>`` args for a cold-resume launch.
+    Build the ``claude --resume <sid>`` launch for a cold resume.
 
     Looks up the claude session id captured into
     ``conversations.external_session_id`` and injects it so the new
     terminal reattaches to the prior claude transcript. Fails loud if
-    the conversation isn't claude-native; warns and returns empty if
+    the conversation isn't claude-native; warns and returns empty args if
     no external session id was ever captured, or if synthesizing the
     local transcript yields no resumable records (an empty transcript
     would make ``claude --resume`` exit instead of start).
 
     :param client: HTTP client for the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :returns: ``("--resume", "<claude_sid>")`` or ``()`` when no id is
-        mapped or there is no resumable history.
+    :returns: The ``--resume`` args, empty when no id is mapped or there is
+        no resumable history, and where the forwarder starts.
     :raises click.ClickException: Conversation missing or not claude-native.
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
@@ -5302,8 +5335,8 @@ async def _resolve_cold_resume_args(
         )
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
-        return ()
-    transcript = await _ensure_local_claude_resume_transcript(
+        return _ColdResume()
+    transcript = await _prepare_claude_resume_transcript(
         client,
         session_id=session_id,
         external_session_id=external_session_id,
@@ -5320,8 +5353,33 @@ async def _resolve_cold_resume_args(
         )
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
-        return ()
-    return ("--resume", external_session_id)
+        return _ColdResume()
+    return _ColdResume(
+        ("--resume", external_session_id),
+        transcript.forward_from,
+        transcript.replayed_source_ids,
+    )
+
+
+@dataclass(frozen=True)
+class ClaudeResumeTranscript:
+    """
+    The local transcript a cold resume launches ``claude --resume`` against.
+
+    :param path: Transcript path, e.g.
+        ``Path("~/.claude/projects/-work-repo/<sid>.jsonl")``.
+    :param forward_from: Byte offset of the first record the server has not
+        received when the transcript was kept rather than rewritten; the
+        forwarder starts there. ``None`` when the forwarder skips the whole
+        file: it was rebuilt from server history, or that history was
+        unreachable.
+    :param replayed_source_ids: Source ids of the items left to the
+        forwarder, which posts them as replayed.
+    """
+
+    path: Path
+    forward_from: int | None = None
+    replayed_source_ids: frozenset[str] = frozenset()
 
 
 async def _ensure_local_claude_resume_transcript(
@@ -5335,13 +5393,45 @@ async def _ensure_local_claude_resume_transcript(
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
 
+    See :func:`_prepare_claude_resume_transcript`, which also reports where
+    the transcript forwarder must start.
+
+    :returns: Path to the transcript to resume, or ``None`` to launch fresh.
+    """
+    transcript = await _prepare_claude_resume_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=external_session_id,
+        workspace=workspace,
+        bridge_dir=bridge_dir,
+    )
+    return None if transcript is None else transcript.path
+
+
+async def _prepare_claude_resume_transcript(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    external_session_id: str,
+    workspace: Path,
+    bridge_dir: Path | None = None,
+) -> ClaudeResumeTranscript | None:
+    """
+    Refresh Claude Code's local JSONL transcript for cold resume.
+
     Cross-machine resume has the Omnigent conversation and Claude external
     session id on the server, but not Claude Code's local
     ``~/.claude/projects/<cwd>/<sid>.jsonl`` file. Claude's
     ``--resume <sid>`` consults that local project transcript. The
     wrapper always rewrites it from committed Omnigent items before launch so
     Omnigent remains the source of truth when a previous local Claude JSONL
-    has diverged.
+    has diverged. Before rewriting, items an existing local transcript holds
+    but the server never received (a restored home loses the forwarder's
+    cursor) are delivered under their ``source_id`` keys. If some stay
+    undelivered, it is kept rather than rewritten, and the forwarder starts at
+    its first undelivered record, posting them as replayed. A transcript that
+    cannot be read or placed in the server's history, or holds undelivered
+    items but cannot be resumed, is set aside before rewriting.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -5357,11 +5447,11 @@ async def _ensure_local_claude_resume_transcript(
         what Claude computes.
     :param bridge_dir: Launch bridge path identifying the attachment cache.
         Defaults to the legacy session-id bridge when omitted.
-    :returns: Path to the local transcript that was written; ``None`` if
-        *external_session_id* is not a safe transcript stem, or if the AP
-        history yields no resumable records (an empty transcript would make
-        ``claude --resume`` exit instead of start, so the caller must launch
-        fresh).
+    :returns: The transcript to resume and where the forwarder starts;
+        ``None`` if *external_session_id* is not a safe transcript stem, or
+        if the AP history yields no resumable records (an empty transcript
+        would make ``claude --resume`` exit instead of start, so the caller
+        must launch fresh).
     :raises click.ClickException: If Omnigent history cannot be fetched or
         the transcript cannot be written.
     """
@@ -5375,6 +5465,34 @@ async def _ensure_local_claude_resume_transcript(
 
     try:
         items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+        replay = await _replay_undelivered_claude_transcript(
+            client,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            transcript=target,
+            server_items=items,
+        )
+        if replay.undelivered and _is_resumable_claude_transcript(target):
+            # Rewriting would drop items the server lacks; the forwarder
+            # delivers them from the first undelivered record instead.
+            _logger.warning(
+                "Resuming %r from the existing local transcript %s: %d item(s) the "
+                "server never received are left to the forwarder",
+                session_id,
+                target,
+                replay.undelivered,
+            )
+            return ClaudeResumeTranscript(
+                target,
+                forward_from=replay.resume_offset,
+                replayed_source_ids=replay.undelivered_source_ids,
+            )
+        if replay.undelivered or not replay.reconciled:
+            # It may hold items the server lacks but cannot be resumed, read or
+            # placed: keep it beside the rebuilt transcript, never overwrite it.
+            _set_aside_claude_transcript(target)
+        if replay.delivered:
+            items = await _fetch_all_session_items_for_claude_resume(client, session_id)
     except _ResumeHistoryUnavailableError:
         # Server history is unreachable (5xx / dropped connections at every
         # page size, or throttling that outlasts the 429 retries), but an
@@ -5391,7 +5509,7 @@ async def _ensure_local_claude_resume_transcript(
                 session_id,
                 target,
             )
-            return target
+            return ClaudeResumeTranscript(target)
         raise
     from omnigent.inner.native_attachments import resolve_session_item_file_references
 
@@ -5425,7 +5543,37 @@ async def _ensure_local_claude_resume_transcript(
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
-    return target
+    return ClaudeResumeTranscript(target)
+
+
+def _set_aside_claude_transcript(path: Path) -> None:
+    """
+    Move a local transcript out of the resume path, keeping its bytes.
+
+    A rename needs no read access, so even an unreadable transcript is kept.
+    The new name does not end in ``.jsonl``, so Claude never lists it.
+
+    :param path: Transcript path, e.g. ``Path("~/.claude/projects/x/<sid>.jsonl")``.
+    :returns: None.
+    :raises click.ClickException: If the transcript cannot be moved; it is
+        then left in place rather than overwritten.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    aside = path.with_name(f"{path.name}.unreconciled-{stamp}")
+    try:
+        path.rename(aside)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not set aside the local Claude transcript {path}: {exc}"
+        ) from exc
+    _logger.error(
+        "Set aside the local Claude transcript %s as %s: it may hold items the "
+        "server never received",
+        path,
+        aside,
+    )
 
 
 def _is_resumable_claude_transcript(path: Path) -> bool:
@@ -5456,6 +5604,65 @@ def _is_resumable_claude_transcript(path: Path) -> bool:
         # JSON guard — it is just as unresumable as non-JSONL content.
         return False
     return False
+
+
+async def _replay_undelivered_claude_transcript(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    external_session_id: str,
+    transcript: Path,
+    server_items: list[_JsonObject],
+) -> TranscriptReplayResult:
+    """
+    Deliver a local transcript's items the server never received.
+
+    Never raises: a replay that cannot finish reports its undelivered items,
+    and a transcript that cannot be read reports itself unreconciled, so the
+    caller never overwrites it.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param external_session_id: Claude-native session id of *transcript*.
+    :param transcript: Local transcript path; it may not exist.
+    :param server_items: Committed session items in chronological order.
+    :returns: The replay's delivered, rejected and undelivered counts.
+    """
+    if not transcript.is_file():
+        return TranscriptReplayResult()
+    try:
+        undelivered = await asyncio.to_thread(
+            undelivered_transcript_items,
+            transcript,
+            session_id=session_id,
+            server_items=server_items,
+            server_record_positions=_claude_resume_record_positions(
+                server_items,
+                session_id=session_id,
+                external_session_id=external_session_id,
+            ),
+            agent_name=_AGENT_NAME,
+        )
+    except Exception:  # noqa: BLE001 - an unreadable transcript must not block resume.
+        _logger.warning(
+            "Could not read the local Claude transcript %s for replay", transcript, exc_info=True
+        )
+        return TranscriptReplayResult(reconciled=False)
+    if undelivered is None:
+        return TranscriptReplayResult(reconciled=False)
+    if not undelivered:
+        return TranscriptReplayResult()
+    try:
+        return await replay_transcript_items(client, session_id=session_id, items=undelivered)
+    except Exception:  # noqa: BLE001 - keep the transcript rather than fail the resume.
+        _logger.warning(
+            "Replay of the local Claude transcript for %r failed", session_id, exc_info=True
+        )
+        return TranscriptReplayResult(
+            undelivered=len(undelivered),
+            resume_offset=undelivered[0].record_offset,
+            undelivered_source_ids=frozenset(pending.item.source_id for pending in undelivered),
+        )
 
 
 class _ResumeHistoryUnavailableError(click.ClickException):
@@ -5898,6 +6105,63 @@ def _claude_native_message_content(
     # downgrade any unusable image block to its omitted-image placeholder.
     sanitized = sanitize_replayed_image_blocks(blocks)
     return cast(list[_JsonObject], sanitized)
+
+
+def _claude_resume_record_positions(
+    items: list[_JsonObject],
+    *,
+    session_id: str,
+    external_session_id: str,
+) -> dict[str, int]:
+    """
+    Map each record uuid a rebuild from *items* writes to the last item it represents.
+
+    A transcript rewritten by an earlier cold resume holds these records, and
+    the server already has their content. A compacted message also stands for
+    the rows its snapshot lists as forwarded, which the rebuild leaves out.
+
+    :param items: Committed session items in chronological order.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param external_session_id: Claude-native session id of the transcript.
+    :returns: Record uuid to index in *items*.
+    """
+    index_by_id = {
+        item_id: index
+        for index, item in enumerate(items)
+        if isinstance(item_id := item.get("id"), str)
+    }
+    positions: dict[str, int] = {}
+    for index, item in enumerate(items):
+        positions[
+            _synthetic_claude_transcript_uuid(
+                session_id=session_id,
+                external_session_id=external_session_id,
+                item=item,
+                index=index,
+            )
+        ] = index
+        compacted_messages = item.get("compacted_messages")
+        if item.get("type") != "compaction" or not isinstance(compacted_messages, list):
+            continue
+        for compacted_index, compacted_value in enumerate(compacted_messages):
+            compacted_message = _json_object(compacted_value)
+            if compacted_message is None:
+                continue
+            forwarded = compacted_message.get("forwarded_source_ids")
+            represented = [
+                index_by_id.get(external_item_id(session_id, source_id), index)
+                for source_id in (forwarded if isinstance(forwarded, list) else [])
+                if isinstance(source_id, str)
+            ]
+            positions[
+                _synthetic_claude_transcript_uuid(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=compacted_message,
+                    index=compacted_index,
+                )
+            ] = max([index, *represented])
+    return positions
 
 
 def _synthetic_claude_transcript_uuid(

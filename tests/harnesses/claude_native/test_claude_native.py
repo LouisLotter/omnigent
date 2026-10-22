@@ -1713,8 +1713,10 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
     async def _fake_fetch_labels(_client: object, _session_id: str) -> dict[str, str]:
         return {}
 
-    async def _fake_resolve_cold_resume_args(_client: object, _session_id: str) -> tuple[str, ...]:
-        return ("--resume", "claude-sid-cold")
+    async def _fake_resolve_cold_resume(
+        _client: object, _session_id: str
+    ) -> claude_native._ColdResume:
+        return claude_native._ColdResume(("--resume", "claude-sid-cold"))
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -1747,7 +1749,7 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
     monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
     monkeypatch.setattr(claude_native, "_find_running_claude_terminal", _fake_find_running)
     monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", _fake_fetch_labels)
-    monkeypatch.setattr(claude_native, "_resolve_cold_resume_args", _fake_resolve_cold_resume_args)
+    monkeypatch.setattr(claude_native, "_resolve_cold_resume", _fake_resolve_cold_resume)
     monkeypatch.setattr(claude_native, "_bind_session_runner", _fake_bind_session_runner)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", _fake_launch_claude_terminal)
     monkeypatch.setattr(claude_native, "attach_local_terminal", fake_attach)
@@ -3666,7 +3668,7 @@ async def test_resume_restores_attachments_using_the_launch_bridge(
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         for attempt in range(2):
             if resume_path == "cli":
-                args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+                args = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
                 assert args == ("--resume", "sid123")
                 written = claude_native._claude_project_dir_for_cwd(workspace) / "sid123.jsonl"
             else:
@@ -5490,7 +5492,7 @@ def test_strip_resume_from_claude_args_removes_recognized_forms(
     assert claude_native._strip_resume_from_claude_args(args) == expected
 
 
-# ── _resolve_cold_resume_args ───────────────────────────────
+# ── _resolve_cold_resume ───────────────────────────────
 
 
 def _conversation_response_body(
@@ -5553,7 +5555,7 @@ async def _httpx_client_with_canned_response(
     """
     Build an ``httpx.AsyncClient`` that returns one canned response.
 
-    Used to drive :func:`_resolve_cold_resume_args` without standing
+    Used to drive :func:`_resolve_cold_resume` without standing
     up a real server. The handler ignores the URL, so the same
     canned reply works regardless of the conv id under test.
 
@@ -5562,7 +5564,7 @@ async def _httpx_client_with_canned_response(
     :param items: Session items to return from the ``/items`` history
         fetch. Defaults to a single user message so cold resume has at
         least one record to synthesize — an empty history now makes
-        ``_resolve_cold_resume_args`` decline ``--resume`` (launch
+        ``_resolve_cold_resume`` decline ``--resume`` (launch
         fresh), so tests that exercise the ``--resume`` path must supply
         real history.
     :returns: Connected :class:`httpx.AsyncClient`.
@@ -5622,7 +5624,7 @@ async def test_resolve_cold_resume_args_injects_external_session_id(
         200,
     )
     async with client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
     assert args == ("--resume", "claude-uuid-abc")
 
 
@@ -5656,7 +5658,7 @@ async def test_resolve_cold_resume_args_declines_resume_when_no_history(
         items=[],
     )
     async with client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
     assert args == ()
     # And it must not leave an empty transcript behind for a later launch.
     assert list((tmp_path / "projects").rglob("claude-uuid-abc.jsonl")) == []
@@ -5752,7 +5754,7 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
 
     assert args == ("--resume", "claude-uuid-abc")
     transcript_path = (
@@ -5876,7 +5878,7 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
 
     assert args == ("--resume", "claude-uuid-abc")
     assert item_requests == 1, "cold resume must fetch Omnigent items even when local JSONL exists"
@@ -5984,7 +5986,7 @@ async def test_resolve_cold_resume_args_warns_when_external_session_id_missing(
         200,
     )
     async with client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
     assert args == ()
     captured = capsys.readouterr()
     # Warning lands on stderr (click.echo(..., err=True) in production).
@@ -6010,7 +6012,7 @@ async def test_resolve_cold_resume_args_rejects_non_claude_native_conv() -> None
     )
     async with client:
         with pytest.raises(click.ClickException) as excinfo:
-            await claude_native._resolve_cold_resume_args(client, "conv_abc")
+            await claude_native._resolve_cold_resume(client, "conv_abc")
     assert "not a claude-native session" in excinfo.value.message
     # Redirect hint includes the right command and conv id so the
     # user can copy-paste to recover. If this assertion fails, the
@@ -6029,7 +6031,7 @@ async def test_resolve_cold_resume_args_raises_on_missing_conversation() -> None
     client = await _httpx_client_with_canned_response(None, 404)
     async with client:
         with pytest.raises(click.ClickException) as excinfo:
-            await claude_native._resolve_cold_resume_args(client, "conv_missing")
+            await claude_native._resolve_cold_resume(client, "conv_missing")
     assert "conv_missing" in excinfo.value.message
     assert "not found" in excinfo.value.message
 
@@ -6069,7 +6071,7 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
         200,
     )
     async with client:
-        result = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        result = (await claude_native._resolve_cold_resume(client, "conv_abc")).args
     assert result == ()
     # Warning was issued — if a regression replaced
     # ``_logger.warning(...)`` with ``pass`` or a print, this
@@ -6097,7 +6099,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     regression that dropped the cold-resume args at the launch
     seam would silently lose Claude-side context — the user keeps
     the Omnigent conv id but Claude starts fresh. Tests
-    ``_resolve_cold_resume_args`` in isolation cannot catch this.
+    ``_resolve_cold_resume`` in isolation cannot catch this.
     """
     captured_terminal_args: dict[str, Any] = {}
 
@@ -6111,19 +6113,19 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         """
         return None
 
-    async def _fake_resolve_cold_resume_args(
+    async def _fake_resolve_cold_resume(
         _client: object,
         _session_id: str,
-    ) -> tuple[str, ...]:
+    ) -> claude_native._ColdResume:
         """
         Stand in for the real wrapper-label / external_session_id
         lookup. Returns the args that production injects.
 
         :param _client: Unused HTTP client.
         :param _session_id: Unused conversation id.
-        :returns: Fixed ``("--resume", "claude-sid-abc")``.
+        :returns: Fixed ``("--resume", "claude-sid-abc")`` args.
         """
-        return ("--resume", "claude-sid-abc")
+        return claude_native._ColdResume(("--resume", "claude-sid-abc"))
 
     async def _fake_fetch_labels(
         _client: object,
@@ -6181,8 +6183,8 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     )
     monkeypatch.setattr(
         claude_native,
-        "_resolve_cold_resume_args",
-        _fake_resolve_cold_resume_args,
+        "_resolve_cold_resume",
+        _fake_resolve_cold_resume,
     )
     monkeypatch.setattr(
         claude_native,

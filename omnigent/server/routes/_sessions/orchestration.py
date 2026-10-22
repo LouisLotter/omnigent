@@ -3182,10 +3182,17 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
-        matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        # A mirror replayed from a saved transcript is older than anything
+        # queued now, and equal text does not prove an entry is its own.
+        replayed = body.data.get("replayed") is True
+        matched = (
+            pending_inputs.MatchedDrain(matched=None, skipped=[])
+            if replayed
+            else pending_inputs.resolve_matching_text(session_id, text, hold=True)
+        )
         drained = matched.matched
         match_method = matched.match_method
-        if agent_message_candidate:
+        if agent_message_candidate or replayed:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
             held_older = [*matched.skipped, *matched.uncertain]
@@ -3202,7 +3209,12 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if (
+            drained is None
+            and not agent_message_candidate
+            and not replayed
+            and not _is_kiro_native_session(conv)
+        ):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"

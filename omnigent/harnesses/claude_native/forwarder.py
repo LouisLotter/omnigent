@@ -1279,6 +1279,7 @@ async def forward_claude_transcript_to_session(
     skip_user_messages: bool = False,
     start_at_offset: int | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
+    replayed_source_ids: frozenset[str] = frozenset(),
 ) -> None:
     """
     Tail Claude's JSONL transcript and mirror semantic items into AP.
@@ -1306,6 +1307,8 @@ async def forward_claude_transcript_to_session(
         cold-resume path: the exact prefix is known before launch, where a
         live end-offset measured after Claude boots can skip a prompt the
         executor injected in the meantime.
+    :param replayed_source_ids: Source ids of saved-transcript items a cold
+        resume could not deliver; they are posted as replayed.
     :param poll_interval_s: Seconds between transcript polls.
     :param auth: Optional httpx Auth that mints a fresh bearer token
         per request, e.g. ``_server_auth(profile)`` for a Databricks
@@ -1563,6 +1566,7 @@ async def forward_claude_transcript_to_session(
                             compaction_retry_tracker=compaction_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
+                            replayed_source_ids=replayed_source_ids,
                         )
                         hook_state = await _forward_available_status_events(
                             client=client,
@@ -1969,7 +1973,9 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     }
 
 
-def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, object]:
+def _external_conversation_item_event(
+    item: ClaudeTranscriptItem, *, replayed: bool = False
+) -> dict[str, object]:
     """Convert one parsed transcript item to the existing event shape."""
     return {
         "type": "external_conversation_item",
@@ -1984,6 +1990,7 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
                 else {}
             ),
             **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
+            **({"replayed": True} if replayed else {}),
         },
     }
 
@@ -3206,6 +3213,7 @@ async def supervise_forwarder(
     skip_user_messages: bool = False,
     start_at_offset: int | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
+    replayed_source_ids: frozenset[str] = frozenset(),
 ) -> None:
     """
     Run :func:`forward_claude_transcript_to_session` under a restart supervisor.
@@ -3245,6 +3253,8 @@ async def supervise_forwarder(
     :param start_at_offset: Byte length of a resume prefix this launch
         synthesized. Forwarded verbatim; see
         :func:`forward_claude_transcript_to_session`.
+    :param replayed_source_ids: Items a cold resume left to this forwarder.
+        Forwarded verbatim.
     :param poll_interval_s: Seconds between transcript polls inside
         the forwarder loop. Forwarded verbatim.
     :param auth: Optional httpx Auth that mints a fresh bearer token
@@ -3269,6 +3279,7 @@ async def supervise_forwarder(
                 skip_user_messages=skip_user_messages,
                 start_at_offset=start_at_offset,
                 event_dispatcher=event_dispatcher,
+                replayed_source_ids=replayed_source_ids,
             )
             # The forwarder loop is ``while True`` and is not expected
             # to return normally. Treat any normal return as a crash
@@ -4895,6 +4906,7 @@ async def _forward_available_items(
     dedupe: _ForwardDedupeState,
     compaction_retry_tracker: _PostRetryTracker | None = None,
     skip_user_messages: bool = False,
+    replayed_source_ids: frozenset[str] = frozenset(),
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -4910,6 +4922,8 @@ async def _forward_available_items(
         compaction snapshot reads; ``retry_tracker`` when omitted.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
+    :param replayed_source_ids: Items a cold resume left to this forwarder;
+        posted as replayed so they never pair with a newer queued input.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -5063,6 +5077,7 @@ async def _forward_available_items(
                 client,
                 session_id=session_id,
                 item=item,
+                replayed=item.source_id in replayed_source_ids,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
@@ -5618,6 +5633,8 @@ async def _post_external_conversation_item(
     *,
     session_id: str,
     item: ClaudeTranscriptItem,
+    timeout: float | None = None,
+    replayed: bool = False,
 ) -> None:
     """
     Post one mirrored transcript item to the Sessions API.
@@ -5625,6 +5642,10 @@ async def _post_external_conversation_item(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param item: Transcript-derived conversation item.
+    :param timeout: Per-request timeout in seconds; ``None`` keeps the
+        client's own.
+    :param replayed: Whether the item is replayed from a saved transcript, so
+        the server must not pair it with a newer queued input.
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
@@ -5644,27 +5665,12 @@ async def _post_external_conversation_item(
             attributes={"omnigent.response_id": item.response_id},
         ),
     ):
+        # The event's ``source_id`` is the server's idempotency key, so a
+        # re-post of an item it already holds is a no-op, not a duplicate.
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": item.item_type,
-                    "item_data": item.data,
-                    "response_id": item.response_id,
-                    # Server-side idempotency key: the forwarder retries a
-                    # timed-out POST it cannot know the disposition of, so
-                    # the server derives the item's id from this and treats
-                    # a re-post as a no-op instead of a duplicate.
-                    "source_id": item.source_id,
-                    **(
-                        {"subagent_return_id": item.subagent_return_id}
-                        if item.subagent_return_id is not None
-                        else {}
-                    ),
-                    **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
-                },
-            },
+            json=_external_conversation_item_event(item, replayed=replayed),
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
         )
         resp.raise_for_status()
 
