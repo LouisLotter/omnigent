@@ -83,6 +83,7 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
+import { STOP_NOT_DELIVERED_MESSAGE } from "@/lib/stopDelivery";
 import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -2308,6 +2309,8 @@ function ComposerImpl(
   // `delivered` when the send turns out to have reached the server, so the
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
+  // The last Stop did not reach the computer and will not be sent again.
+  const stopNotDelivered = useChatStore((s) => s.stopNotDelivered);
   const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
@@ -3827,6 +3830,11 @@ function ComposerImpl(
               />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
+              {stopNotDelivered && (
+                <ComposerFeedbackRow role="status" data-testid="composer-stop-not-delivered">
+                  {STOP_NOT_DELIVERED_MESSAGE}
+                </ComposerFeedbackRow>
+              )}
             </>
           ),
         }}

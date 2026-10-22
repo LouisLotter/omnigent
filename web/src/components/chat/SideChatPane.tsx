@@ -60,6 +60,7 @@ import { usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { serializeReplyDraft } from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
+import { STOP_NOT_DELIVERED_MESSAGE, stopDidNotReachComputer } from "@/lib/stopDelivery";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
@@ -413,6 +414,10 @@ function SideChatComposer({
     [childId, updateComposer],
   );
   const [interrupting, setInterrupting] = useState(false);
+  // The child whose last Stop did not reach the computer; it is never sent again.
+  const [stopNotDeliveredFor, setStopNotDeliveredFor] = useState<string | null>(null);
+  // Counts Stops and messages, so an older Stop's answer cannot show the notice.
+  const stopRequestRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const voiceSnapshotRef = useRef("");
@@ -561,12 +566,21 @@ function SideChatComposer({
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
     setInterrupting(true);
+    setStopNotDeliveredFor(null);
+    const request = ++stopRequestRef.current;
     void interrupt(childId, responseId)
+      .then(({ delivery }) => {
+        if (request === stopRequestRef.current && stopDidNotReachComputer(delivery)) {
+          setStopNotDeliveredFor(childId);
+        }
+      })
       .catch(() => toast.error("Couldn’t interrupt this side chat. Please try again."))
       .finally(() => setInterrupting(false));
   };
 
   const submit = () => {
+    stopRequestRef.current += 1;
+    setStopNotDeliveredFor(null);
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
@@ -642,6 +656,11 @@ function SideChatComposer({
       {commandNotice !== null && (
         <ComposerFeedbackRow data-testid="side-chat-command-notice">
           {commandNotice}
+        </ComposerFeedbackRow>
+      )}
+      {stopNotDeliveredFor === childId && (
+        <ComposerFeedbackRow role="status" data-testid="side-chat-stop-not-delivered">
+          {STOP_NOT_DELIVERED_MESSAGE}
         </ComposerFeedbackRow>
       )}
       <ChatComposer

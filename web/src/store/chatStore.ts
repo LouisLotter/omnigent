@@ -75,6 +75,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
+import { stopDidNotReachComputer } from "@/lib/stopDelivery";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -873,6 +874,12 @@ export interface ConversationState {
     serverRefused?: boolean;
     delivered: boolean;
   } | null;
+  /**
+   * The last Stop did not reach the computer: no runner connection took it, or
+   * its answer was lost. It is not sent again, so the composer says so until
+   * the next Stop or message.
+   */
+  stopNotDelivered: boolean;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1957,6 +1964,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   pendingRetryStableId: null,
   restoredSendDraft: null,
+  stopNotDelivered: false,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -2325,6 +2333,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (retryId !== null || restoredDraft !== null) {
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
+    const sendTarget = pinnedId ?? get().conversationId;
+    if (sendTarget !== null) advanceStopNoticeGeneration(sendTarget);
+    if (pinnedState?.stopNotDelivered) pinnedSetter({ stopNotDelivered: false });
     // A restored failed send keeps its stable id only when resent untouched:
     // the server persists a web send under that id and dedupes a repeat, so an
     // edited body under the old id would run without ever being persisted.
@@ -2882,14 +2893,25 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // do NOT abort the local SSE stream — it remains open across
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
-    void interruptSession(sessionId).catch(() => {
-      // Interrupt is best-effort. A network failure here means the
-      // user's cancel won't reach the server, but the local UI already
-      // reflects the user's stop request below.
-    });
+    const stopGeneration = advanceStopNoticeGeneration(sessionId);
+    void interruptSession(sessionId)
+      .then(({ delivery }) => {
+        // A Stop is never sent again, so tell the person to press it again,
+        // unless a newer Stop or message has made this answer stale.
+        if (stopNoticeGenerations.get(sessionId) !== stopGeneration) return;
+        if (!stopDidNotReachComputer(delivery)) return;
+        if (get().conversationId === sessionId) setActive({ stopNotDelivered: true });
+        else setterFor(sessionId)({ stopNotDelivered: true });
+      })
+      .catch(() => {
+        // Interrupt is best-effort. A network failure here means the
+        // user's cancel won't reach the server, but the local UI already
+        // reflects the user's stop request below.
+      });
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};
       const patch: Partial<ChatState> = {
+        stopNotDelivered: false,
         pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
@@ -3454,6 +3476,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 // zustand's own `set` (`_rootSet`) is unused: it writes the root store, which is
 // a projection of the active entry, so a write there would be overwritten by the
 // next mirror.
+// Each conversation's latest Stop or message: an older Stop's answer is stale.
+const stopNoticeGenerations = new Map<string, number>();
+
+/** Mark a new Stop or message for *conversationId*; returns its generation. */
+function advanceStopNoticeGeneration(conversationId: string): number {
+  const generation = (stopNoticeGenerations.get(conversationId) ?? 0) + 1;
+  stopNoticeGenerations.set(conversationId, generation);
+  return generation;
+}
+
 function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)): void {
   const active = conversationRegistry.getActive();
   if (active === null) {

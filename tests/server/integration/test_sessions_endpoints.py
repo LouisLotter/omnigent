@@ -6490,7 +6490,8 @@ async def test_post_interrupt_without_data_field_is_accepted(
     # layer; a 422 here means the pydantic default regressed and every
     # deployed bare-control client breaks again.
     assert resp.status_code == 202, resp.text
-    assert resp.json() == {"queued": False}
+    # No runner holds the session, so the Stop reached none.
+    assert resp.json() == {"queued": False, "delivery": "not_delivered"}
     # The interrupt actually took effect (not just validated): the
     # route published the cancellation signal for the web turn.
     interrupted = [e for _sid, e in published if e.get("type") == "session.interrupted"]
@@ -10596,22 +10597,27 @@ async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
 
 
 @pytest.mark.parametrize(
-    "failure_mode",
+    ("failure_mode", "delivery"),
     [
-        # Runner unreachable: the 5s POST raises (the swallowed-HTTPError leg).
-        "transport_error",
-        # WS tunnel closed mid-POST: a BARE ConnectionError, not an httpx.HTTPError.
-        "bare_connection_error",
+        # Runner unreachable: the connection never opened, nothing was sent.
+        ("transport_error", "not_delivered"),
+        # WS tunnel closed mid-POST: a BARE ConnectionError; the runner may have it.
+        ("bare_connection_error", "unknown"),
+        # Sent, but no answer within the deadline: the runner may have acted on it.
+        ("read_timeout", "unknown"),
         # Runner reachable but the cancel didn't land (claude-native 503 leg).
-        "runner_503",
+        ("runner_503", "failed"),
+        # A client that raises on the runner's error answer.
+        ("raised_status_error", "failed"),
         # No runner client resolves at all: nothing was forwarded anywhere.
-        "no_runner_client",
+        ("no_runner_client", "not_delivered"),
     ],
 )
 async def test_interrupt_forward_failure_lifts_stop_fence(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     failure_mode: str,
+    delivery: str | None,
 ) -> None:
     """
     A failed interrupt forward removes the fence it just installed.
@@ -10634,7 +10640,12 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
             if failure_mode == "bare_connection_error":
                 # What WSTunnelTransport raises when the tunnel closes mid-request.
                 raise ConnectionError("tunnel closed mid-request")
-            return httpx.Response(503, json={"error": "claude_native_interrupt_failed"})
+            if failure_mode == "read_timeout":
+                raise httpx.ReadTimeout("no answer", request=request)
+            refused = httpx.Response(503, json={"error": "claude_native_interrupt_failed"})
+            if failure_mode == "raised_status_error":
+                raise httpx.HTTPStatusError("refused", request=request, response=refused)
+            return refused
         return httpx.Response(204)
 
     fake_runner = httpx.AsyncClient(
@@ -10665,8 +10676,9 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
             json={"type": "interrupt", "data": {}},
         )
         # Interrupt is best-effort and still ACKs (the UI already marked the
-        # bubble interrupted); the fence removal below is the fix under test.
+        # bubble interrupted), saying what happened to it.
         assert resp.status_code == 202, resp.text
+        assert resp.json().get("delivery") == delivery
         assert session_id not in _interrupt_fenced_sessions, (
             "a failed interrupt forward must remove the fence it installed — "
             "leaving it set drops the rest of the still-running turn"
@@ -10677,22 +10689,22 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         await fake_runner.aclose()
 
 
-async def test_stop_on_a_silent_runner_tunnel_is_reported_and_sent_after_reconnect(
+async def test_stop_on_a_silent_runner_tunnel_is_reported_unknown_and_never_resent(
     client: httpx.AsyncClient,
     app: Any,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A Stop the runner never answered is reported pending and lands after the reconnect.
+    A Stop the runner never answered is reported of unknown delivery, and is sent only once.
 
-    On a half-open tunnel the interrupt forward times out while the turn runs
-    on. The route answers ``"delivery": "pending"`` instead of a silent 202,
-    and sends the Stop again over the runner's next tunnel.
+    On a half-open tunnel the interrupt forward times out while the turn may run
+    on. The runner may have acted on it, so the route answers
+    ``"delivery": "unknown"``. After the reconnect another turn may be running,
+    so the Stop is not sent again: the person presses Stop again if needed.
     """
     from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import interrupt_delivery
     from omnigent.server.routes.sessions import _interrupt_fenced_sessions
 
     interrupts: list[httpx.Request] = []
@@ -10735,18 +10747,13 @@ async def test_stop_on_a_silent_runner_tunnel_is_reported_and_sent_after_reconne
             f"/v1/sessions/{session_id}/events", json={"type": "interrupt", "data": {}}
         )
         assert resp.status_code == 202, resp.text
-        assert resp.json() == {"queued": False, "delivery": "pending"}
-        assert session_id not in _interrupt_fenced_sessions, "the turn still runs"
+        assert resp.json() == {"queued": False, "delivery": "unknown"}
+        assert session_id not in _interrupt_fenced_sessions, "the turn may still run"
 
         registry.register("runner_silent_tunnel", _NoopWS(), _hello())
-        for _ in range(200):
-            if not interrupt_delivery.has_pending_interrupt(session_id):
-                break
-            await asyncio.sleep(0.01)
-        assert len(interrupts) == 2, "the Stop must be sent again over the new tunnel"
-        assert session_id in _interrupt_fenced_sessions
+        await asyncio.sleep(0.1)
+        assert len(interrupts) == 1, "a Stop is never sent again after the reconnect"
     finally:
-        interrupt_delivery.cancel_pending_interrupt(session_id)
         registry.deregister("runner_silent_tunnel", retire=False)
         sessions_module._session_status_cache.pop(session_id, None)
         _interrupt_fenced_sessions.discard(session_id)
@@ -10786,7 +10793,6 @@ async def test_stop_superseded_by_a_message_during_its_lookup_is_not_sent(
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False, "delivery": "superseded"}
     assert posted == []
-    assert not interrupt_delivery.has_pending_interrupt(session_id)
 
 
 @pytest.mark.parametrize(
