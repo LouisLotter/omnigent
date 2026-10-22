@@ -4644,6 +4644,58 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(errorBlocks[0]).toMatchObject({ code: "executor_error", message: "boom" });
   });
 
+  describe("interrupted work a lost runner left", () => {
+    const unknownOutcome = {
+      code: "interrupted_outcome_unknown",
+      title: "Interrupted, outcome unknown",
+      message: "The runner stopped while Bash was running, so its outcome is unknown.",
+      remediation: "Check whether it took effect before you continue or retry.",
+    };
+    const knownOutcome = {
+      code: "interrupted_outcome_known",
+      title: "Interrupted",
+      message: "The runner stopped while Bash was running. Its result arrived afterwards.",
+      remediation: "Check the result, then continue or retry.",
+    };
+    const ctx = { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null };
+    const failWith = (error: typeof unknownOutcome) =>
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "failed",
+        error,
+      });
+    const errorCards = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+
+    it("shows the known outcome in place of the unknown one once the result arrives", () => {
+      useChatStore.setState({ conversationId: "conv_abc", sessionStatus: "idle", blocks: [] });
+
+      failWith(unknownOutcome);
+      expect(errorCards()).toMatchObject([unknownOutcome]);
+      failWith(knownOutcome);
+
+      expect(errorCards()).toMatchObject([knownOutcome]);
+      expect(useChatStore.getState().sessionStatus).toBe("failed");
+    });
+
+    it("keeps an earlier interruption's card from before the person's last message", () => {
+      const earlier = { ...unknownOutcome, message: "The runner stopped while Edit was running." };
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        sessionStatus: "idle",
+        blocks: [
+          { type: "error", ctx, source: "", ...earlier },
+          { type: "user_message", ctx, content: [{ type: "input_text", text: "go on" }] },
+        ],
+      });
+
+      failWith(unknownOutcome);
+      failWith(knownOutcome);
+
+      expect(errorCards()).toMatchObject([earlier, knownOutcome]);
+    });
+  });
+
   it("preserves a cancelled turn across a bare idle edge", () => {
     // The user's interrupt verdict must survive the trailing idle the
     // teardown publishes.

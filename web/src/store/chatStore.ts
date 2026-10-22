@@ -6194,6 +6194,30 @@ export function withoutSettledCompactionSpinners(
   return blocks.filter((b) => !owned(b));
 }
 
+// Failures for work a lost runner left unfinished. A session holds one such
+// record until the person acts, and settling it replaces it (unknown -> known).
+const INTERRUPTED_WORK_CODES = new Set([
+  "interrupted_outcome_unknown",
+  "interrupted_outcome_known",
+]);
+
+/**
+ * Remove the card for the session's current interrupted-work record: the
+ * latest such card since the person's last message.
+ *
+ * @returns the remaining blocks, or *blocks* itself when there is none.
+ */
+function withoutCurrentInterruptedWorkCard(blocks: AnyBlock[]): AnyBlock[] {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]!;
+    if (block.type === "user_message") break;
+    if (block.type === "error" && INTERRUPTED_WORK_CODES.has(block.code)) {
+      return [...blocks.slice(0, i), ...blocks.slice(i + 1)];
+    }
+  }
+  return blocks;
+}
+
 /**
  * Apply the turn transition a status snapshot makes to the "Compacting…"
  * spinners, as the live edge it stands in for would: settling the open turn
@@ -7621,8 +7645,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           const statusAgentName =
             responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
+          // A settled interrupted-work record replaces its earlier card.
+          const kept = INTERRUPTED_WORK_CODES.has(statusError.code)
+            ? withoutCurrentInterruptedWorkCard(s.blocks)
+            : s.blocks;
           patch.blocks = [
-            ...s.blocks,
+            ...kept,
             {
               type: "error",
               ctx: {
