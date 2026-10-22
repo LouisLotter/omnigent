@@ -6361,6 +6361,52 @@ async def test_host_drops_a_tunnel_whose_server_falls_silent(
     assert end["error_type"] == "TunnelSilenceTimeoutError"
 
 
+async def test_host_aborts_a_dead_tunnel_without_waiting_for_a_close_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead path never answers a close, so the deadline aborts the socket instead."""
+    import functools
+
+    import websockets.asyncio.client
+    from websockets.asyncio.server import serve
+
+    from omnigent.util.tunnel_silence import TunnelSilenceTimeoutError
+    from tests.budgets import budget
+
+    deadline_s = 0.2
+    _short_silence_deadline(monkeypatch, deadline_s)
+    # A close handshake would wait this long for the dead peer, past the guard below.
+    monkeypatch.setattr(
+        websockets.asyncio.client,
+        "connect",
+        functools.partial(websockets.asyncio.client.connect, close_timeout=3600),
+    )
+    release = asyncio.Event()
+
+    async def dead_peer(ws):
+        assert isinstance(decode_host_frame(await ws.recv()), HostHelloFrame)
+        # The path dies: nothing more is read or sent, not even a close reply.
+        ws.transport.pause_reading()
+        await release.wait()
+        ws.transport.abort()
+
+    async with serve(dead_peer, "127.0.0.1", 0) as server:
+        host = _host(f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+        host._owner_user_id = "test-owner"
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        started = time.monotonic()
+        try:
+            with pytest.raises(TunnelSilenceTimeoutError) as raised:
+                await asyncio.wait_for(host._connect_and_serve(), timeout=budget(10))
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            await host._quiesce_frame_tasks()
+
+    assert raised.value.silent_s == pytest.approx(deadline_s * 1.25)
+    assert elapsed >= deadline_s * 1.25
+
+
 async def test_host_tunnel_stays_open_while_the_server_pings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

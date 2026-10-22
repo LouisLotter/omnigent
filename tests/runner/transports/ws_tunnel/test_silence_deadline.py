@@ -66,6 +66,40 @@ async def test_half_open_server_is_dropped_after_the_deadline(shutdown_signal: b
 
 
 @pytest.mark.parametrize("shutdown_signal", [False, True])
+async def test_dead_tunnel_is_aborted_without_waiting_for_a_close_handshake(
+    shutdown_signal: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A close handshake would wait this long for the dead peer, past the guard below.
+    monkeypatch.setattr(serve_module, "_RUNNER_TUNNEL_CLOSE_TIMEOUT_S", 3600.0)
+    monkeypatch.setattr(serve_module, "_GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S", 3600.0)
+    release = asyncio.Event()
+
+    async def dead_peer(ws: ServerConnection) -> None:
+        assert isinstance(decode_frame(await ws.recv()), HelloFrame)
+        # The path dies: nothing more is read or sent, not even a close reply.
+        ws.transport.pause_reading()
+        await release.wait()
+        ws.transport.abort()
+
+    async with serve(dead_peer, "127.0.0.1", 0) as server:
+        started = time.monotonic()
+        try:
+            with pytest.raises(TunnelSilenceTimeoutError) as raised:
+                await asyncio.wait_for(
+                    _serve_once(
+                        server.sockets[0].getsockname()[1], shutdown_signal=shutdown_signal
+                    ),
+                    timeout=budget(10),
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+    assert raised.value.silent_s == pytest.approx(_DEADLINE_S + _GRACE_S)
+    assert elapsed >= _DEADLINE_S + _GRACE_S
+
+
+@pytest.mark.parametrize("shutdown_signal", [False, True])
 async def test_server_pings_keep_the_tunnel_open(shutdown_signal: bool) -> None:
     pongs: list[Any] = []
 

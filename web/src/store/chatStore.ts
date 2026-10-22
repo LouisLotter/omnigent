@@ -75,7 +75,8 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
-import { stopDidNotReachComputer } from "@/lib/stopDelivery";
+import { stopNoticeForDelivery, type StopNotice } from "@/lib/stopDelivery";
+import { createSessionNotices } from "./sessionNotices";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -874,12 +875,6 @@ export interface ConversationState {
     serverRefused?: boolean;
     delivered: boolean;
   } | null;
-  /**
-   * The last Stop did not reach the computer: no runner connection took it, or
-   * its answer was lost. It is not sent again, so the composer says so until
-   * the next Stop or message.
-   */
-  stopNotDelivered: boolean;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1964,7 +1959,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   failedSendDraft: null,
   pendingRetryStableId: null,
   restoredSendDraft: null,
-  stopNotDelivered: false,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -2226,6 +2220,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // release in finally) serializes every POST to this conversation across
       // both paths through one ordering primitive.
       const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+      startNewWork(conversationId);
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -2334,8 +2329,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
     const sendTarget = pinnedId ?? get().conversationId;
-    if (sendTarget !== null) advanceStopNoticeGeneration(sendTarget);
-    if (pinnedState?.stopNotDelivered) pinnedSetter({ stopNotDelivered: false });
+    if (sendTarget !== null) startNewWork(sendTarget);
     // A restored failed send keeps its stable id only when resent untouched:
     // the server persists a web send under that id and dedupes a repeat, so an
     // edited body under the old id would run without ever being persisted.
@@ -2748,6 +2742,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the just-created session even after the user moved to another chat.
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
+    const commandTarget = pinnedId ?? get().conversationId;
+    if (commandTarget !== null) startNewWork(commandTarget);
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming =
@@ -2893,25 +2889,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // do NOT abort the local SSE stream — it remains open across
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
-    const stopGeneration = advanceStopNoticeGeneration(sessionId);
-    void interruptSession(sessionId)
-      .then(({ delivery }) => {
-        // A Stop is never sent again, so tell the person to press it again,
-        // unless a newer Stop or message has made this answer stale.
-        if (stopNoticeGenerations.get(sessionId) !== stopGeneration) return;
-        if (!stopDidNotReachComputer(delivery)) return;
-        if (get().conversationId === sessionId) setActive({ stopNotDelivered: true });
-        else setterFor(sessionId)({ stopNotDelivered: true });
-      })
-      .catch(() => {
-        // Interrupt is best-effort. A network failure here means the
-        // user's cancel won't reach the server, but the local UI already
-        // reflects the user's stop request below.
-      });
+    const stopGeneration = startNewWork(sessionId);
+    const showStopNotice = (notice: StopNotice | null) => {
+      // A Stop is never sent again, so tell the person to press it again,
+      // unless a newer Stop or message has made this answer stale.
+      if (notice === null || stopNoticeGenerations.get(sessionId) !== stopGeneration) return;
+      stopNotices.set(sessionId, notice);
+    };
+    void interruptSession(sessionId).then(
+      ({ delivery }) => showStopNotice(stopNoticeForDelivery(delivery)),
+      // The local UI shows the turn stopped below, but the Stop may not have
+      // reached the server (network failure, a 502 from a proxy).
+      () => showStopNotice("request_failed"),
+    );
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};
       const patch: Partial<ChatState> = {
-        stopNotDelivered: false,
         pendingUserMessages: [],
         status: "idle",
         sessionStatus: "idle",
@@ -3479,10 +3472,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 // Each conversation's latest Stop or message: an older Stop's answer is stale.
 const stopNoticeGenerations = new Map<string, number>();
 
-/** Mark a new Stop or message for *conversationId*; returns its generation. */
-function advanceStopNoticeGeneration(conversationId: string): number {
+/** Why each conversation's last Stop may not have stopped its turn. */
+export const stopNotices = createSessionNotices<StopNotice>();
+
+/**
+ * Mark a new Stop or message for *conversationId*: its earlier Stop's notice
+ * goes, and that Stop's answer becomes stale.
+ *
+ * @returns The new generation, which the Stop being sent (if any) keeps.
+ */
+function startNewWork(conversationId: string): number {
   const generation = (stopNoticeGenerations.get(conversationId) ?? 0) + 1;
   stopNoticeGenerations.set(conversationId, generation);
+  stopNotices.clear(conversationId);
   return generation;
 }
 
@@ -4971,7 +4973,13 @@ async function reconcileActiveSessionStatus(
   }
   set((s) => {
     const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
-    const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
+    const spinners = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
+    const blocks =
+      snapshotInterruptedWorkCard(
+        spinners ?? s.blocks,
+        session,
+        currentInterruptedWorkCard(stateBeforeFetch.blocks),
+      ) ?? spinners;
     return blocks === null ? patch : { ...patch, blocks };
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
@@ -5177,6 +5185,7 @@ async function rehydrateWindowOnReconnect(
   session: Session,
   preGapIds: Set<string>,
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
+  preGapInterruptedCard: AnyBlock | null,
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
@@ -5221,13 +5230,15 @@ async function rehydrateWindowOnReconnect(
         preGapElicitations.pending,
         preGapElicitations.autoResolved,
       ) ?? merged;
+    const withSpinners =
+      snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks;
     return {
       ...statusPatch,
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
-        snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
+        snapshotInterruptedWorkCard(withSpinners, session, preGapInterruptedCard) ?? withSpinners,
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -5285,6 +5296,8 @@ async function reconcileOnReconnect(
   // before the snapshot fetch are eligible for its flips — see
   // `reconcileElicitationBlocks`.
   const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
+  // Likewise only the interrupted-work card shown before the fetch can be settled.
+  const preGapInterruptedCard = currentInterruptedWorkCard(get().blocks);
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
@@ -5343,6 +5356,7 @@ async function reconcileOnReconnect(
       session,
       preGapIds,
       preGapElicitations,
+      preGapInterruptedCard,
       set,
       get,
       ignoredNativeMessageIds,
@@ -5416,6 +5430,8 @@ async function reconcileOnReconnect(
     if (reconciled !== null) nextBlocks = reconciled;
     nextBlocks =
       snapshotCompactionSpinners(nextBlocks, s.activeResponse, patch.activeResponse) ?? nextBlocks;
+    nextBlocks =
+      snapshotInterruptedWorkCard(nextBlocks, session, preGapInterruptedCard) ?? nextBlocks;
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
@@ -6194,6 +6210,72 @@ export function withoutSettledCompactionSpinners(
   const owned = (b: AnyBlock) => b.type === "compaction_loading" && b.ctx.responseId === responseId;
   if (!blocks.some(owned)) return null;
   return blocks.filter((b) => !owned(b));
+}
+
+// Failures for work a lost runner left unfinished. A session holds one such
+// record until the person acts, and settling it replaces it (unknown -> known).
+const INTERRUPTED_WORK_CODES = new Set([
+  "interrupted_outcome_unknown",
+  "interrupted_outcome_known",
+]);
+
+/** Index of the card for the session's current interrupted-work record, or -1. */
+function currentInterruptedWorkCardIndex(blocks: AnyBlock[]): number {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]!;
+    // Only the person's next action clears a record, so an older card is history.
+    if (block.type === "user_message") return -1;
+    if (block.type === "error" && INTERRUPTED_WORK_CODES.has(block.code)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Remove the card for the session's current interrupted-work record: the
+ * latest such card since the person's last message.
+ *
+ * @returns the remaining blocks, or *blocks* itself when there is none.
+ */
+function withoutCurrentInterruptedWorkCard(blocks: AnyBlock[]): AnyBlock[] {
+  const at = currentInterruptedWorkCardIndex(blocks);
+  return at === -1 ? blocks : [...blocks.slice(0, at), ...blocks.slice(at + 1)];
+}
+
+/** The card for the session's current interrupted-work record, or `null`. */
+function currentInterruptedWorkCard(blocks: AnyBlock[]): AnyBlock | null {
+  return blocks[currentInterruptedWorkCardIndex(blocks)] ?? null;
+}
+
+/**
+ * Show a snapshot's settled interrupted-work record in place of the unknown
+ * card still on screen: the status edge that settled it is not replayed to a
+ * client that was disconnected. Settlement only goes from unknown to known,
+ * and only the card shown before the snapshot was fetched is eligible, so an
+ * older snapshot can neither undo a known outcome nor settle a newer record.
+ *
+ * @param shownBeforeFetch `currentInterruptedWorkCard` when the fetch began.
+ * @returns the rewritten blocks, or `null` when nothing changes.
+ */
+function snapshotInterruptedWorkCard(
+  blocks: AnyBlock[],
+  session: Session,
+  shownBeforeFetch: AnyBlock | null,
+): AnyBlock[] | null {
+  const error = session.lastTaskError;
+  if (session.status !== "failed" || error?.code !== "interrupted_outcome_known") return null;
+  const at = currentInterruptedWorkCardIndex(blocks);
+  const card = blocks[at];
+  if (card === undefined || card !== shownBeforeFetch) return null;
+  if (card.type !== "error" || card.code !== "interrupted_outcome_unknown") return null;
+  const settled: ErrorBlock = {
+    type: "error",
+    ctx: card.ctx,
+    source: card.source,
+    message: error.message,
+    code: error.code,
+    ...structuredErrorFields(error, error.agent_name),
+  };
+  return [...blocks.slice(0, at), settled, ...blocks.slice(at + 1)];
 }
 
 /**
@@ -7623,8 +7705,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           const statusAgentName =
             responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
+          // A settled interrupted-work record replaces its earlier card.
+          const kept = INTERRUPTED_WORK_CODES.has(statusError.code)
+            ? withoutCurrentInterruptedWorkCard(s.blocks)
+            : s.blocks;
           patch.blocks = [
-            ...s.blocks,
+            ...kept,
             {
               type: "error",
               ctx: {

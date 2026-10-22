@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as sessionsApi from "@/lib/sessionsApi";
-import { STOP_NOT_DELIVERED_MESSAGE } from "@/lib/stopDelivery";
+import { STOP_NOTICE_MESSAGES } from "@/lib/stopDelivery";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -356,12 +356,14 @@ describe("side-chat interrupt", () => {
   });
 
   it.each([
-    { delivery: "not_delivered", shown: true },
-    { delivery: "unknown", shown: true },
-    { delivery: "delivered", shown: false },
+    { delivery: "not_delivered", notice: "not_delivered" },
+    { delivery: "unknown", notice: "not_delivered" },
+    { delivery: "failed", notice: "refused" },
+    { delivery: "superseded", notice: "superseded" },
+    { delivery: "delivered", notice: null },
   ] as const)(
-    "after a Stop answered $delivery, shows the press-again notice: $shown",
-    async ({ delivery, shown }) => {
+    "after a Stop answered $delivery, shows the $notice notice",
+    async ({ delivery, notice }) => {
       vi.mocked(sessionsApi.interrupt).mockResolvedValue({ queued: false, delivery });
       renderPane(<SideChatPane childId={childId} />);
 
@@ -369,9 +371,9 @@ describe("side-chat interrupt", () => {
       fireEvent.click(interrupt);
       await waitFor(() => expect(interrupt).toBeEnabled());
 
-      const notice = screen.queryByTestId("side-chat-stop-not-delivered");
-      if (shown) expect(notice).toHaveTextContent(STOP_NOT_DELIVERED_MESSAGE);
-      else expect(notice).toBeNull();
+      const shown = screen.queryByTestId("side-chat-stop-notice");
+      if (notice !== null) expect(shown).toHaveTextContent(STOP_NOTICE_MESSAGES[notice]);
+      else expect(shown).toBeNull();
     },
   );
 

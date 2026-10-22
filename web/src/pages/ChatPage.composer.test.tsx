@@ -19,7 +19,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+import { handleSessionEvent, stopNotices, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -168,7 +168,13 @@ import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
-import { STOP_NOT_DELIVERED_MESSAGE } from "@/lib/stopDelivery";
+import { STOP_NOTICE_MESSAGES, type StopNotice } from "@/lib/stopDelivery";
+import { computeIsTurnActive } from "@/components/chat/chatBubbleParts";
+import {
+  clearRunnerLaunchNotice,
+  noteRunnerLaunch,
+  RUNNER_LAUNCH_MESSAGES,
+} from "@/store/runnerLaunchNotices";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
@@ -346,54 +352,190 @@ describe("Composer Escape interrupt", () => {
   });
 });
 
-describe("Composer undelivered Stop notice", () => {
+describe("Composer Stop notice", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({ conversationId: "conv_stop", blocks: [], stopNotDelivered: false });
+    useChatStore.setState({
+      conversationId: "conv_stop",
+      blocks: [],
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_stop", state: "streaming", error: null },
+    });
   });
 
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
     vi.unstubAllGlobals();
-    useChatStore.setState({ stopNotDelivered: false });
+    stopNotices.clear("conv_stop");
+    useChatStore.setState({ status: "idle", sessionStatus: "idle", activeResponse: null });
   });
 
+  /** The composer as ChatPage wires it: working state and Stop from the real store. */
+  function StoreBackedComposer() {
+    const status = useChatStore((s) => s.status);
+    const sessionStatus = useChatStore((s) => s.sessionStatus);
+    const isWorking = computeIsTurnActive(sessionStatus, status === "streaming");
+    return (
+      <Composer
+        {...composerProps({ status, isWorking, onStop: () => useChatStore.getState().stop() })}
+      />
+    );
+  }
+
+  const answered = (body: unknown, status = 202) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  const rejected = () => Promise.reject(new TypeError("Failed to fetch"));
+
   it.each([
-    { delivery: "not_delivered", shown: true },
-    { delivery: "unknown", shown: true },
-    { delivery: "delivered", shown: false },
-  ])(
-    "after a Stop answered $delivery, shows the press-again notice: $shown",
-    async ({ delivery, shown }) => {
-      const answered = vi.fn(
-        async () =>
-          new Response(JSON.stringify({ queued: false, delivery }), {
-            status: 202,
-            headers: { "Content-Type": "application/json" },
-          }),
-      );
-      vi.stubGlobal("fetch", answered);
-      const props = composerProps({
-        status: "streaming",
-        isWorking: true,
-        onStop: () => useChatStore.getState().stop(),
-      });
-      render(<Composer {...props} />);
+    {
+      outcome: "not_delivered",
+      answer: async () => answered({ queued: false, delivery: "not_delivered" }),
+      notice: "not_delivered",
+    },
+    {
+      outcome: "a lost answer",
+      answer: async () => answered({ queued: false, delivery: "unknown" }),
+      notice: "not_delivered",
+    },
+    {
+      outcome: "delivery=failed",
+      answer: async () => answered({ queued: false, delivery: "failed" }),
+      notice: "refused",
+    },
+    {
+      outcome: "superseded",
+      answer: async () => answered({ queued: false, delivery: "superseded" }),
+      notice: "superseded",
+    },
+    { outcome: "a rejected request", answer: rejected, notice: "request_failed" },
+    {
+      outcome: "an upstream 502",
+      answer: async () => new Response("Bad Gateway", { status: 502 }),
+      notice: "request_failed",
+    },
+    {
+      outcome: "a successful Stop",
+      answer: async () => answered({ queued: false, delivery: "delivered" }),
+      notice: null,
+    },
+  ] satisfies { outcome: string; answer: () => Promise<Response>; notice: StopNotice | null }[])(
+    "after $outcome, shows the $notice notice and keeps Interrupt for it",
+    async ({ answer, notice }) => {
+      const fetchStub = vi.fn(answer);
+      vi.stubGlobal("fetch", fetchStub);
+      render(<StoreBackedComposer />);
 
       fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
-      await waitFor(() => expect(answered).toHaveBeenCalled());
+      await waitFor(() => expect(fetchStub).toHaveBeenCalled());
 
-      if (shown) {
-        expect(await screen.findByTestId("composer-stop-not-delivered")).toHaveTextContent(
-          STOP_NOT_DELIVERED_MESSAGE,
+      if (notice !== null) {
+        expect(await screen.findByTestId("composer-stop-notice")).toHaveTextContent(
+          STOP_NOTICE_MESSAGES[notice],
         );
+        // The Stop cleared the working state; Interrupt stays for the press the notice asks for.
+        expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
       } else {
         await act(async () => {});
-        expect(screen.queryByTestId("composer-stop-not-delivered")).toBeNull();
+        expect(screen.queryByTestId("composer-stop-notice")).toBeNull();
+        expect(screen.queryByRole("button", { name: "Interrupt" })).toBeNull();
       }
+      // The turn shows stopped either way, and the Stop is never sent again on its own.
+      expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+      expect(fetchStub).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("pressing Interrupt again after a failed Stop sends it again and clears the notice", async () => {
+    const answers = [rejected, async () => answered({ queued: false, delivery: "delivered" })];
+    const fetchStub = vi.fn(() => answers.shift()!());
+    vi.stubGlobal("fetch", fetchStub);
+    render(<StoreBackedComposer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+    await screen.findByTestId("composer-stop-notice");
+    fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+
+    await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(screen.queryByTestId("composer-stop-notice")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Interrupt" })).toBeNull();
+  });
+
+  it("an older Stop's failure that arrives after a newer Stop shows nothing", async () => {
+    let failFirst: () => void = () => {};
+    const answers = [
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          failFirst = () => reject(new TypeError("Failed to fetch"));
+        }),
+      async () => answered({ queued: false, delivery: "delivered" }),
+    ];
+    const fetchStub = vi.fn(() => answers.shift()!());
+    vi.stubGlobal("fetch", fetchStub);
+    render(<StoreBackedComposer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+    act(() => useChatStore.getState().stop());
+    await waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(2));
+    await act(async () => failFirst());
+
+    expect(screen.queryByTestId("composer-stop-notice")).toBeNull();
+  });
+});
+
+describe("Composer runner launch notice", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_launch", blocks: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearRunnerLaunchNotice("conv_launch");
+  });
+
+  it.each(["failed", "unknown"] as const)(
+    "says a %s launch until the runner comes online",
+    async (outcome) => {
+      noteRunnerLaunch("conv_launch", outcome);
+      const { rerender } = render(<Composer {...composerProps({ runnerOnline: false })} />);
+
+      expect(screen.getByTestId("composer-runner-launch-notice")).toHaveTextContent(
+        RUNNER_LAUNCH_MESSAGES[outcome],
+      );
+
+      rerender(<Composer {...composerProps({ runnerOnline: true })} />);
+      expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+      // Cleared, not just hidden: a later drop of the runner does not bring it back.
+      rerender(<Composer {...composerProps({ runnerOnline: false })} />);
+      expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+    },
+  );
+
+  it("clears a launch notice that arrives after the runner came online", () => {
+    render(<Composer {...composerProps({ runnerOnline: true })} />);
+
+    act(() => noteRunnerLaunch("conv_launch", "unknown"));
+
+    expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+    cleanup();
+    // Cleared, not just hidden while online.
+    render(<Composer {...composerProps({ runnerOnline: false })} />);
+    expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+  });
+
+  it("shows nothing for a started launch or another session's notice", () => {
+    noteRunnerLaunch("conv_launch", "started");
+    noteRunnerLaunch("conv_other", "failed");
+    render(<Composer {...composerProps({ runnerOnline: false })} />);
+
+    expect(screen.queryByTestId("composer-runner-launch-notice")).toBeNull();
+    clearRunnerLaunchNotice("conv_other");
+  });
 });
 
 describe("Composer session drafts", () => {

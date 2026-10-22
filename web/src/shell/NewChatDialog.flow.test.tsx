@@ -35,10 +35,19 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { clearRunnerLaunchNotice, useRunnerLaunchNotice } from "@/store/runnerLaunchNotices";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
 import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
 
@@ -1204,6 +1213,52 @@ describe("NewChatLandingScreen create flow", () => {
       expect.objectContaining({ text: "inspect the repo" }),
     );
   });
+
+  it.each([
+    { outcome: "failed", notice: "failed" },
+    { outcome: "unknown", notice: "unknown" },
+    { outcome: "started", notice: null },
+  ])(
+    "records the create's runner_launch $outcome after the stream opened the session",
+    async ({ outcome, notice }) => {
+      let answerCreate!: (response: Response) => void;
+      vi.mocked(authenticatedFetch).mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          answerCreate = resolve;
+        }) as ReturnType<typeof authenticatedFetch>,
+      );
+      const { result } = renderHook(() => useRunnerLaunchNotice("conv_pushed"));
+      try {
+        renderLanding();
+        await waitForWorkspaceSeed();
+        typeMessage("inspect the repo");
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+        await waitFor(() => expect(announcePushedSession).not.toBeNull());
+        const [, createInit] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+        const token = JSON.parse(createInit.body as string).labels["omnigent.client_create_token"];
+        act(() =>
+          announcePushedSession?.({
+            id: "conv_pushed",
+            parent_session_id: null,
+            labels: { "omnigent.client_create_token": token },
+          }),
+        );
+        await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_pushed"));
+
+        // The launch's outcome arrives only with the create's own answer, later.
+        await act(async () =>
+          answerCreate({
+            ok: true,
+            json: async () => ({ id: "conv_pushed", runner_launch: outcome }),
+          } as unknown as Response),
+        );
+        expect(result.current).toBe(notice);
+      } finally {
+        clearRunnerLaunchNotice("conv_pushed");
+      }
+    },
+  );
 
   it("recognizes only the session it just asked for among the stream's pushes", async () => {
     vi.mocked(authenticatedFetch).mockReturnValueOnce(

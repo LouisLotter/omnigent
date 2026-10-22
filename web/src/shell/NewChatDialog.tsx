@@ -158,6 +158,7 @@ import {
   setPendingInitialPrompt,
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
+import { noteRunnerLaunch } from "@/store/runnerLaunchNotices";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -5807,7 +5808,10 @@ export function NewChatLandingScreen() {
           const created = (await response.json()) as {
             id: string;
             labels?: Record<string, string>;
+            runner_launch?: string | null;
           };
+          // Answered even when the stream's push already opened the session.
+          noteRunnerLaunch(created.id, created.runner_launch);
           // Route the new session's first requests by its chosen host id
           // before any snapshot of it loads. Only seeds: a null here would
           // erase a host the session's snapshot already recorded.

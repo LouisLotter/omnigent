@@ -83,7 +83,12 @@ import {
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
 import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
-import { STOP_NOT_DELIVERED_MESSAGE } from "@/lib/stopDelivery";
+import { STOP_NOTICE_MESSAGES } from "@/lib/stopDelivery";
+import {
+  clearRunnerLaunchNotice,
+  RUNNER_LAUNCH_MESSAGES,
+  useRunnerLaunchNotice,
+} from "@/store/runnerLaunchNotices";
 import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -95,6 +100,7 @@ import {
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
+  stopNotices,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -2309,8 +2315,6 @@ function ComposerImpl(
   // `delivered` when the send turns out to have reached the server, so the
   // retraction effect below can empty the composer.
   const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
-  // The last Stop did not reach the computer and will not be sent again.
-  const stopNotDelivered = useChatStore((s) => s.stopNotDelivered);
   const pendingFailedSendRestore = useRef<{ stableId: string; draft: typeof draft } | null>(null);
   const hasPendingInitialMessage = useChatStore((s) =>
     s.pendingUserMessages.some((message) => message.initialDraft !== undefined),
@@ -2415,6 +2419,8 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  // The last Stop may not have stopped the turn and will not be sent again.
+  const stopNotice = stopNotices.useNotice(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
@@ -2447,6 +2453,13 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  // The create's runner launch did not confirm a start: said until the runner is online.
+  const runnerLaunchNotice = useRunnerLaunchNotice(composerSessionId);
+  useEffect(() => {
+    if (runnerOnline === true && composerSessionId !== null) {
+      clearRunnerLaunchNotice(composerSessionId);
+    }
+  }, [runnerOnline, composerSessionId, runnerLaunchNotice]);
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
@@ -2800,8 +2813,10 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  // A Stop clears the working state at once, so its notice keeps Interrupt
+  // available for the press it asks for.
   const showInterruptButton =
-    isWorking &&
+    (isWorking || stopNotice !== null) &&
     (!hasDraft ||
       hasPendingElicitation ||
       isTempConvId(conversationId) ||
@@ -3830,9 +3845,14 @@ function ComposerImpl(
               />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
-              {stopNotDelivered && (
-                <ComposerFeedbackRow role="status" data-testid="composer-stop-not-delivered">
-                  {STOP_NOT_DELIVERED_MESSAGE}
+              {runnerLaunchNotice !== null && runnerOnline !== true && (
+                <ComposerFeedbackRow role="status" data-testid="composer-runner-launch-notice">
+                  {RUNNER_LAUNCH_MESSAGES[runnerLaunchNotice]}
+                </ComposerFeedbackRow>
+              )}
+              {stopNotice !== null && (
+                <ComposerFeedbackRow role="status" data-testid="composer-stop-notice">
+                  {STOP_NOTICE_MESSAGES[stopNotice]}
                 </ComposerFeedbackRow>
               )}
             </>
