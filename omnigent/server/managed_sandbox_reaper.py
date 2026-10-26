@@ -207,7 +207,13 @@ class ManagedSandboxReaper:
                 for candidate in candidates:
                     try:
                         if candidate.deleted_at is not None:
-                            sandbox_id = candidate.terminating_sandbox_id or candidate.sandbox_id
+                            # The current tombstone never holds an id a live host records.
+                            tombstone = self._host_store.deleted_host_for_cleanup(
+                                candidate.host_id
+                            )
+                            if tombstone is None:
+                                continue
+                            sandbox_id = tombstone.terminating_sandbox_id or tombstone.sandbox_id
                             if sandbox_id is None:
                                 continue
                             launcher.terminate(sandbox_id)

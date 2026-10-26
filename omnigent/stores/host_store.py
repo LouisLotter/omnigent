@@ -1610,6 +1610,33 @@ class HostStore:
 
         return run_write_transaction(self._lifecycle_session, "delete_host", write)
 
+    def deleted_host_for_cleanup(self, host_id: str) -> Host | None:
+        """
+        Re-read a deleted host's tombstone before its sandbox cleanup.
+
+        The deletion's guard is applied again: a sandbox id that a live host
+        also records is dropped from the tombstone, and an emptied tombstone
+        is removed, so cleanup never terminates that sandbox.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The current tombstone, or ``None`` when the host is gone or
+            not deleted.
+        """
+
+        def write(session: Session) -> Host | None:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_not(None),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            return None if row is None else delete_host_in_session(session, row)
+
+        return run_write_transaction(self._lifecycle_session, "refresh_deleted_host", write)
+
     def detach_stale_managed_sandbox(
         self,
         host_id: str,

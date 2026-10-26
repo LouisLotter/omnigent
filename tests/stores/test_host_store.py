@@ -1889,6 +1889,16 @@ def _set_sandbox_ids(db_uri: str, host_id: str, **sandbox_ids: str) -> None:
         session.commit()
 
 
+def _set_deleted_at(db_uri: str, host_id: str) -> None:
+    """Tombstone a row directly, without the deletion's guard."""
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlHost).where(SqlHost.host_id == host_id).values(deleted_at=now_epoch())
+        )
+        session.commit()
+
+
 def _armed_persistent(host_store: HostStore, token: str) -> Host:
     pending = _persistent(host_store)
     attached = host_store.attach_persistent_sandbox(
@@ -2004,6 +2014,27 @@ def test_deleting_a_host_leaves_a_sandbox_another_live_host_records(
     assert last_tombstone is not None and getattr(last_tombstone, column) == "sb-shared"
     listed = host_store.list_deleted_persistent_hosts("alice@example.com")
     assert [host.host_id for host in listed] == [second.host_id]
+
+
+def test_deleted_host_for_cleanup_rereads_only_tombstones(
+    host_store: HostStore, db_uri: str
+) -> None:
+    """A live host is never touched; a tombstone keeps its own sandbox and drops a shared one."""
+    live, own, shared = (_persistent(host_store, name=name) for name in ("Live", "Own", "Shared"))
+    _set_sandbox_ids(db_uri, live.host_id, sandbox_id="sb-live")
+    _set_sandbox_ids(db_uri, own.host_id, sandbox_id="sb-own")
+    _set_sandbox_ids(db_uri, shared.host_id, sandbox_id="sb-live")
+    for host in (own, shared):
+        _set_deleted_at(db_uri, host.host_id)
+
+    assert host_store.deleted_host_for_cleanup(live.host_id) is None
+    assert host_store.get_host(live.host_id) is not None
+    tombstone = host_store.deleted_host_for_cleanup(own.host_id)
+    assert tombstone is not None and tombstone.sandbox_id == "sb-own"
+    emptied = host_store.deleted_host_for_cleanup(shared.host_id)
+    assert emptied is not None and emptied.sandbox_id is None
+    listed = host_store.list_deleted_persistent_hosts("alice@example.com")
+    assert [host.host_id for host in listed] == [own.host_id]
 
 
 def test_start_failure_is_recorded_truncated_and_cleared(host_store: HostStore) -> None:

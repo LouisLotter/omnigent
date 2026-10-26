@@ -151,6 +151,10 @@ class _FakeHostStore:
         self.detached.append((workspace_id, host_id, sandbox_id))
         return True
 
+    def deleted_host_for_cleanup(self, host_id: str) -> Host | None:
+        host = self.hosts[current_workspace_id()].get(host_id)
+        return host if host is not None and host.deleted_at is not None else None
+
     def mark_sandbox_terminated(
         self,
         host_id: str,
@@ -711,3 +715,39 @@ async def test_sweep_retries_only_deleted_persistent_hosts() -> None:
     assert cloud.terminated == ["sb-deleted"]
     assert hosts.hosts[7]["host_asleep"].sandbox_id == "sb-asleep"
     assert hosts.detached == []
+
+
+@pytest.mark.parametrize("column", ["sandbox_id", "terminating_sandbox_id"])
+async def test_tombstone_never_terminates_a_sandbox_a_live_host_records(
+    db_uri: str, column: str
+) -> None:
+    """A tombstone sharing a live host's sandbox drops it; the live host's deletion removes it."""
+    hosts = HostStore(db_uri)
+    cloud = _RecordingLauncher("cloud")
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=_deployment([cloud]))
+    live_id, deleted_id = "c0ffee00" + "1" * 24, "c0ffee00" + "2" * 24
+    for host_id in (live_id, deleted_id):
+        hosts.create_persistent_host(
+            host_id=host_id, name=host_id, user_id="alice@example.com", provider="cloud"
+        )
+    # A tombstone written before deletion checked for a sandbox another host records.
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost).where(SqlHost.host_id == live_id).values(sandbox_id="sb-shared")
+        )
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.host_id == deleted_id)
+            .values({column: "sb-shared", "deleted_at": now_epoch()})
+        )
+        session.commit()
+
+    assert await reaper.sweep_once(now=now_epoch()) == 0
+    assert cloud.terminated == []
+    assert hosts.list_deleted_persistent_hosts("alice@example.com") == []
+    live = hosts.get_host(live_id)
+    assert live is not None and live.sandbox_id == "sb-shared"
+
+    hosts.delete_host(live_id)
+    assert await reaper.sweep_once(now=now_epoch()) == 1
+    assert cloud.terminated == ["sb-shared"]
