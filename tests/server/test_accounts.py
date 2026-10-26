@@ -1890,7 +1890,9 @@ def test_delete_user_removes_their_persistent_hosts_after_the_commit(
         computer_row = hosts.create_persistent_host(
             host_id=uuid.uuid4().hex, name="Work computer", user_id="alice", provider="fakepersist"
         )
-        hosts.attach_persistent_sandbox(computer_row.host_id, sandbox_id="sb-alice")
+        hosts.attach_persistent_sandbox(
+            computer_row.host_id, provider="fakepersist", sandbox_id="sb-alice"
+        )
 
         resp = admin.delete("/auth/users/alice")
 

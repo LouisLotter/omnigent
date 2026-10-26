@@ -23,6 +23,7 @@ from omnigent.stores.host_store import (
     Host,
     HostRegistrationRefusedError,
     HostStore,
+    SandboxInUseError,
     host_is_live,
 )
 
@@ -1880,9 +1881,19 @@ def _persistent(host_store: HostStore, *, name: str = "Work computer") -> Host:
     )
 
 
+def _set_sandbox_ids(db_uri: str, host_id: str, **sandbox_ids: str) -> None:
+    """Record sandbox ids on a row directly, as provisioning by a shared name once could."""
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(update(SqlHost).where(SqlHost.host_id == host_id).values(**sandbox_ids))
+        session.commit()
+
+
 def _armed_persistent(host_store: HostStore, token: str) -> Host:
     pending = _persistent(host_store)
-    attached = host_store.attach_persistent_sandbox(pending.host_id, sandbox_id="sb-1")
+    attached = host_store.attach_persistent_sandbox(
+        pending.host_id, provider="cloud", sandbox_id="sb-1"
+    )
     assert attached is not None
     armed = host_store.rearm_managed_host(
         pending.host_id,
@@ -1916,7 +1927,7 @@ def test_persistent_host_name_is_unique_per_owner_including_tombstones(
     first = _persistent(host_store)
     with pytest.raises(ValueError, match="already exists"):
         _persistent(host_store)
-    host_store.attach_persistent_sandbox(first.host_id, sandbox_id="sb-1")
+    host_store.attach_persistent_sandbox(first.host_id, provider="cloud", sandbox_id="sb-1")
     host_store.delete_host(first.host_id)  # a tombstone awaiting sandbox removal
     with pytest.raises(ValueError, match="already exists"):
         _persistent(host_store)
@@ -1928,12 +1939,71 @@ def test_attach_persistent_sandbox_only_once_and_never_after_deletion(
 ) -> None:
     """A sandbox attaches to a live pending row once; a deleted row refuses it."""
     pending = _persistent(host_store)
-    attached = host_store.attach_persistent_sandbox(pending.host_id, sandbox_id="sb-1")
+    attached = host_store.attach_persistent_sandbox(
+        pending.host_id, provider="cloud", sandbox_id="sb-1"
+    )
     assert attached is not None and attached.sandbox_id == "sb-1"
-    assert host_store.attach_persistent_sandbox(pending.host_id, sandbox_id="sb-2") is None
+    repeated = host_store.attach_persistent_sandbox(
+        pending.host_id, provider="cloud", sandbox_id="sb-1"
+    )
+    assert repeated is not None and repeated.sandbox_id == "sb-1"
+    assert (
+        host_store.attach_persistent_sandbox(pending.host_id, provider="cloud", sandbox_id="sb-2")
+        is None
+    )
     other = _persistent(host_store, name="Gone computer")
     host_store.delete_host(other.host_id)
-    assert host_store.attach_persistent_sandbox(other.host_id, sandbox_id="sb-3") is None
+    assert (
+        host_store.attach_persistent_sandbox(other.host_id, provider="cloud", sandbox_id="sb-3")
+        is None
+    )
+
+
+@pytest.mark.parametrize("holder", ["live", "tombstone", "terminating"])
+def test_attach_refuses_a_sandbox_another_host_records(
+    host_store: HostStore, db_uri: str, holder: str
+) -> None:
+    """Another host's sandbox, live or being removed, is refused; another provider's id is not."""
+    held = _persistent(host_store, name="First computer")
+    column = "terminating_sandbox_id" if holder == "terminating" else "sandbox_id"
+    _set_sandbox_ids(db_uri, held.host_id, **{column: "sb-1"})
+    if holder == "tombstone":
+        host_store.delete_host(held.host_id)
+    pending = _persistent(host_store)
+    with pytest.raises(SandboxInUseError):
+        host_store.attach_persistent_sandbox(pending.host_id, provider="cloud", sandbox_id="sb-1")
+    stored = host_store.get_host(pending.host_id)
+    assert stored is not None and stored.sandbox_id is None
+
+    other_provider = host_store.create_persistent_host(
+        host_id=uuid.uuid4().hex, name="Elsewhere", user_id="alice@example.com", provider="other"
+    )
+    attached = host_store.attach_persistent_sandbox(
+        other_provider.host_id, provider="other", sandbox_id="sb-1"
+    )
+    assert attached is not None and attached.sandbox_id == "sb-1"
+
+
+@pytest.mark.parametrize("column", ["sandbox_id", "terminating_sandbox_id"])
+def test_deleting_a_host_leaves_a_sandbox_another_live_host_records(
+    host_store: HostStore, db_uri: str, column: str
+) -> None:
+    """Two rows recording one sandbox: the first deletion leaves it, the last one removes it."""
+    first, second = _persistent(host_store, name="First"), _persistent(host_store, name="Second")
+    for host in (first, second):
+        _set_sandbox_ids(db_uri, host.host_id, **{column: "sb-shared"})
+
+    first_tombstone = host_store.delete_host(first.host_id)
+    assert first_tombstone is not None
+    assert (first_tombstone.sandbox_id, first_tombstone.terminating_sandbox_id) == (None, None)
+    assert host_store.list_deleted_persistent_hosts("alice@example.com") == []
+    kept = host_store.get_host(second.host_id)
+    assert kept is not None and getattr(kept, column) == "sb-shared"
+
+    last_tombstone = host_store.delete_host(second.host_id)
+    assert last_tombstone is not None and getattr(last_tombstone, column) == "sb-shared"
+    listed = host_store.list_deleted_persistent_hosts("alice@example.com")
+    assert [host.host_id for host in listed] == [second.host_id]
 
 
 def test_start_failure_is_recorded_truncated_and_cleared(host_store: HostStore) -> None:
@@ -1979,7 +2049,7 @@ def test_deleted_persistent_hosts_are_listed_for_removal(host_store: HostStore) 
         user_id="alice@example.com",
         provider="cloud",
     )
-    host_store.attach_persistent_sandbox(deleted.host_id, sandbox_id="sb-old")
+    host_store.attach_persistent_sandbox(deleted.host_id, provider="cloud", sandbox_id="sb-old")
     host_store.delete_host(deleted.host_id)
     never_provisioned = _persistent(host_store, name="Never started")
     host_store.delete_host(never_provisioned.host_id)

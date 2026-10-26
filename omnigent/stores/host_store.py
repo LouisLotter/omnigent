@@ -78,6 +78,10 @@ class HostRegistrationRefusedError(ValueError):
         self.retryable = retryable
 
 
+class SandboxInUseError(ValueError):
+    """A sandbox another host already records: it is neither attached nor removed."""
+
+
 LAUNCH_TOKEN_ONLY_REFUSAL = "This host is server-managed; it registers only with its launch token."
 SUPERSEDED_LAUNCH_TOKEN_REFUSAL = "This host's launch token has been replaced or revoked."
 
@@ -301,9 +305,39 @@ def _refuse_name_takeover(row: SqlHost) -> None:
         )
 
 
+def _sandbox_recorded_elsewhere(
+    session: Session, *, host_id: str, provider: str, sandbox_id: str, live_only: bool
+) -> bool:
+    """Whether a host other than *host_id* records *provider*'s sandbox *sandbox_id*."""
+    query = select(SqlHost.host_id).where(
+        SqlHost.workspace_id == current_workspace_id(),
+        SqlHost.host_id != host_id,
+        SqlHost.sandbox_provider == provider,
+        or_(SqlHost.sandbox_id == sandbox_id, SqlHost.terminating_sandbox_id == sandbox_id),
+    )
+    if live_only:
+        query = query.where(SqlHost.deleted_at.is_(None))
+    return session.execute(query.limit(1)).first() is not None
+
+
 def delete_host_in_session(session: Session, row: SqlHost) -> Host:
-    """Delete an already locked host while retaining pending provider cleanup."""
+    """Delete an already locked host while retaining pending provider cleanup.
+
+    A sandbox that another live host also records stays with that host, so
+    this host's removal never terminates it.
+    """
     host_id = row.host_id
+    if row.sandbox_provider is not None:
+        for column in ("sandbox_id", "terminating_sandbox_id"):
+            sandbox_id = getattr(row, column)
+            if sandbox_id is not None and _sandbox_recorded_elsewhere(
+                session,
+                host_id=host_id,
+                provider=row.sandbox_provider,
+                sandbox_id=sandbox_id,
+                live_only=True,
+            ):
+                setattr(row, column, None)
     deleted = _row_to_host(row)
     session.execute(
         update(SqlConversationMetadata)
@@ -1717,17 +1751,27 @@ class HostStore:
         except IntegrityError as exc:
             raise ValueError(f"a host named {name!r} already exists") from exc
 
-    def attach_persistent_sandbox(self, host_id: str, *, sandbox_id: str) -> Host | None:
+    def attach_persistent_sandbox(
+        self, host_id: str, *, provider: str, sandbox_id: str
+    ) -> Host | None:
         """
         Record the sandbox provisioned for a pending persistent host.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param provider: Provider that returned the sandbox, e.g. ``"cloudflare"``.
         :param sandbox_id: Provider-assigned sandbox id, e.g. ``"sb-a1b2c3"``.
-        :returns: The updated host, or ``None`` when the host was deleted or
-            already has a sandbox; the caller then owns the new sandbox.
+        :returns: The updated host (also when it already records this
+            sandbox), or ``None`` when the host was deleted or already has
+            another sandbox; the caller then owns the new sandbox.
+        :raises SandboxInUseError: When another host, live or deleted, records
+            the sandbox. It is that host's, so the caller must not remove it.
         """
 
         def write(session: Session) -> Host | None:
+            if _sandbox_recorded_elsewhere(
+                session, host_id=host_id, provider=provider, sandbox_id=sandbox_id, live_only=False
+            ):
+                raise SandboxInUseError(f"{provider} returned a sandbox another host already uses")
             row = session.execute(
                 select(SqlHost)
                 .where(
@@ -1736,9 +1780,12 @@ class HostStore:
                     SqlHost.deleted_at.is_(None),
                     SqlHost.lifecycle == encode_host_lifecycle("persistent"),
                     SqlHost.launch_token_only.is_(True),
+                    SqlHost.sandbox_provider == provider,
                 )
                 .with_for_update()
             ).scalar_one_or_none()
+            if row is not None and row.sandbox_id == sandbox_id:
+                return _row_to_host(row)
             if row is None or row.sandbox_id is not None:
                 return None
             row.sandbox_id = sandbox_id

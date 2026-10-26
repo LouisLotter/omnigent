@@ -71,6 +71,9 @@ class FakeComputer(SandboxHostLauncher):
     :ivar status: The computer's typed status, as the provider tracks it.
     :ivar events: Calls in order: ``resume``, ``claim``, ``start_host``,
         ``suspend``, ``stopped``, ``terminate``, ``provision``.
+    :ivar sandboxes: Sandbox ids by the name they were provisioned under; a
+        repeated name returns its sandbox, as a provider idempotent by name does.
+    :ivar terminated: The sandbox ids ``terminate`` was called with.
     """
 
     provider: ClassVar[str] = "fakepersist"
@@ -105,7 +108,9 @@ class FakeComputer(SandboxHostLauncher):
     in_flight: set[str] = field(default_factory=set)
     provision_error: str | None = None
     on_provision: Callable[[], None] | None = None
+    sandboxes: dict[str, str] = field(default_factory=dict)
     terminate_error: str | None = None
+    terminated: list[str] = field(default_factory=list)
     # The supervisor taking a start's parameters: the host process connects.
     on_host_start: Callable[[str], None] | None = None
 
@@ -113,14 +118,17 @@ class FakeComputer(SandboxHostLauncher):
         return None
 
     def provision(self, name: str) -> str:
-        del name
         self.events.append("provision")
         if self.on_provision is not None:
             self.on_provision()
         if self.provision_error is not None:
             raise click.ClickException(self.provision_error)
         self.status = "stopped"
-        return SANDBOX_ID
+        if name not in self.sandboxes:
+            self.sandboxes[name] = (
+                f"sb-persistent-{len(self.sandboxes) + 1}" if self.sandboxes else SANDBOX_ID
+            )
+        return self.sandboxes[name]
 
     def admission(self, sandbox_id: str) -> AdmissionReport | None:
         del sandbox_id
@@ -236,10 +244,10 @@ class FakeComputer(SandboxHostLauncher):
         return result
 
     def terminate(self, sandbox_id: str) -> None:
-        del sandbox_id
         self.events.append("terminate")
         if self.terminate_error is not None:
             raise LostReplyError(self.terminate_error)
+        self.terminated.append(sandbox_id)
 
 
 @dataclass
@@ -325,7 +333,9 @@ def register_persistent_row(store: HostStore, *, token: str = FIRST_TOKEN) -> No
     store.create_persistent_host(
         host_id=HOST_ID, name="computer", user_id=OWNER, provider=FakeComputer.provider
     )
-    attached = store.attach_persistent_sandbox(HOST_ID, sandbox_id=SANDBOX_ID)
+    attached = store.attach_persistent_sandbox(
+        HOST_ID, provider=FakeComputer.provider, sandbox_id=SANDBOX_ID
+    )
     assert attached is not None
     armed = store.rearm_managed_host(
         HOST_ID,

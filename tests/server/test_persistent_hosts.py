@@ -21,7 +21,11 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
+from sqlalchemy import update
+from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import SqlHost
+from omnigent.db.utils import get_or_create_engine
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.sandboxes.types import AdmissionReport
 from omnigent.server import persistent_hosts
@@ -31,9 +35,10 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     PersistentHostPolicy,
+    managed_host_name,
     resume_managed_host,
 )
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import Host, HostStore
 from tests.server.persistent_host_fakes import (
     FIRST_TOKEN,
     HOST_ID,
@@ -1362,6 +1367,122 @@ async def test_deleting_while_provisioning_still_removes_the_new_sandbox(
     assert fresh.computer.events == ["provision", "terminate"]
     leftovers = fresh.store.list_deleted_persistent_hosts(OWNER)
     assert [row.sandbox_id for row in leftovers] == ([SANDBOX_ID] if removal_fails else [])
+
+
+# ── Sandbox names: one sandbox per host ────────────────────────────────
+
+
+async def _started(fake: FakeHost, host_id: str, name: str) -> Host:
+    """Create a pending host with a chosen id and run its first start."""
+    fake.store.create_persistent_host(
+        host_id=host_id, name=name, user_id=OWNER, provider=FakeComputer.provider
+    )
+    fake.host_id = host_id
+    with contextlib.suppress(OmnigentError):
+        await asyncio.wait_for(persistent_hosts.start_host_now(host_id), 10)
+    started = fake.store.get_host(host_id)
+    assert started is not None
+    return started
+
+
+def _record_sandbox(db_uri: str, host_id: str, sandbox_id: str) -> None:
+    """Record a sandbox on a row directly, as provisioning by the eight-digit name could."""
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost).where(SqlHost.host_id == host_id).values(sandbox_id=sandbox_id)
+        )
+        session.commit()
+
+
+async def test_hosts_sharing_a_short_id_get_separate_sandboxes(fresh: FakeHost) -> None:
+    """Hosts whose ids share the first 8 hex digits each provision, and remove, their own."""
+    first_id, second_id = "c0ffee00" + "1" * 24, "c0ffee00" + "2" * 24
+    assert managed_host_name(first_id) == managed_host_name(second_id)
+    first = await _started(fresh, first_id, "First computer")
+    second = await _started(fresh, second_id, "Second computer")
+    assert list(fresh.computer.sandboxes) == [f"managed-{first_id}", f"managed-{second_id}"]
+    assert first.start_failure is None and second.start_failure is None
+    assert first.sandbox_id is not None and second.sandbox_id is not None
+    assert first.sandbox_id != second.sandbox_id
+
+    await persistent_hosts.delete_host(second)
+    assert fresh.computer.terminated == [second.sandbox_id]
+    kept = fresh.store.get_host(first_id)
+    assert kept is not None and kept.sandbox_id == first.sandbox_id
+    await persistent_hosts.ensure_host_ready(first_id, operation="message", timeout_s=5)
+
+
+async def test_hosts_already_sharing_a_sandbox_never_remove_each_others(
+    host: FakeHost, db_uri: str
+) -> None:
+    """Rows that share a sandbox from the eight-digit name: only the last deletion removes it."""
+    second_id = HOST_ID[:8] + "0" * 24
+    host.store.create_persistent_host(
+        host_id=second_id, name="Second computer", user_id=OWNER, provider=FakeComputer.provider
+    )
+    _record_sandbox(db_uri, second_id, SANDBOX_ID)
+    second = host.store.get_host(second_id)
+    assert second is not None
+    await persistent_hosts.delete_host(second)
+    assert "terminate" not in host.computer.events
+    assert host.store.list_deleted_persistent_hosts(OWNER) == []
+
+    await persistent_hosts.ensure_host_ready(HOST_ID, operation="message", timeout_s=5)
+    first = host.store.get_host(HOST_ID)
+    assert first is not None and first.sandbox_id == SANDBOX_ID
+    await persistent_hosts.delete_host(first)
+    assert host.computer.terminated == [SANDBOX_ID]
+
+
+async def test_sandbox_provisioned_under_the_short_name_keeps_working(host: FakeHost) -> None:
+    """A host attached under the eight-digit name sleeps, wakes and is removed by its own id."""
+    host.computer.sandboxes[managed_host_name(HOST_ID)] = SANDBOX_ID
+    await _asleep(host)
+    await persistent_hosts.ensure_host_ready(HOST_ID, operation="message", timeout_s=5)
+    assert host.computer.events == ["resume", "claim", "start_host"]
+    current = host.store.get_host(HOST_ID)
+    assert current is not None and current.sandbox_id == SANDBOX_ID
+    await persistent_hosts.delete_host(current)
+    assert host.computer.terminated == [SANDBOX_ID]
+    assert list(host.computer.sandboxes) == [managed_host_name(HOST_ID)]
+
+
+async def test_pending_host_never_adopts_the_sandbox_of_its_short_name(fresh: FakeHost) -> None:
+    """A pending host provisions under its whole id: the eight-digit name may be another host's."""
+    host_id = uuid.uuid4().hex
+    fresh.computer.sandboxes[managed_host_name(host_id)] = "sb-short-name"
+    started = await _started(fresh, host_id, "Work computer")
+    assert started.start_failure is None
+    assert started.sandbox_id == fresh.computer.sandboxes[f"managed-{host_id}"] != "sb-short-name"
+    assert fresh.computer.terminated == []
+
+
+@pytest.mark.parametrize("deleted_meanwhile", [False, True])
+async def test_sandbox_of_another_host_is_never_attached_or_removed(
+    host: FakeHost, deleted_meanwhile: bool
+) -> None:
+    """A provider that returns another host's sandbox fails the new host and never removes it."""
+    other_id = uuid.uuid4().hex
+    host.computer.sandboxes[f"managed-{other_id}"] = SANDBOX_ID
+    if deleted_meanwhile:
+        host.computer.on_provision = lambda: host.store.delete_host(other_id)
+    host.store.create_persistent_host(
+        host_id=other_id, name="Second computer", user_id=OWNER, provider=FakeComputer.provider
+    )
+    with pytest.raises(OmnigentError):
+        await asyncio.wait_for(persistent_hosts.start_host_now(other_id), 10)
+    assert host.computer.terminated == []
+    first = host.store.get_host(HOST_ID)
+    assert first is not None and first.sandbox_id == SANDBOX_ID
+    other = host.store.get_host(other_id)
+    if deleted_meanwhile:
+        assert other is None
+        return
+    assert other is not None and other.sandbox_id is None
+    assert other.start_failure is not None and "another host already uses" in other.start_failure
+    assert SANDBOX_ID not in other.start_failure
+    await persistent_hosts.delete_host(other)
+    assert host.computer.terminated == []
 
 
 async def test_removed_persistent_policy_never_wakes_the_host_as_disposable(

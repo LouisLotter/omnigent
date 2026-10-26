@@ -67,9 +67,9 @@ from omnigent.server.managed_hosts import (
     _resume_locks,
     _start_sandbox_host,
     _terminate_sandbox_best_effort,
-    managed_host_name,
     terminate_managed_host,
 )
+from omnigent.stores.host_store import SandboxInUseError
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
@@ -198,6 +198,19 @@ def enabled() -> bool:
 def is_persistent_host(host: Host) -> bool:
     """Whether *host* is a persistent managed host."""
     return host.lifecycle == PERSISTENT
+
+
+def sandbox_name(host_id: str) -> str:
+    """The stable name a persistent host's sandbox is provisioned under.
+
+    It carries the whole host id, unlike the display name
+    :func:`~omnigent.server.managed_hosts.managed_host_name`, so a provider
+    that provisions idempotently by name never gives two hosts one sandbox.
+
+    :param host_id: The host's id, e.g. ``"5b0e7c1d9a2f4e6b8c3d1a0f9e8d7c6b"``.
+    :returns: e.g. ``"managed-5b0e7c1d9a2f4e6b8c3d1a0f9e8d7c6b"``.
+    """
+    return f"managed-{host_id}"
 
 
 def _entry_for(host: Host) -> ManagedSandboxConfig | None:
@@ -723,23 +736,36 @@ async def _provision(
 ) -> Host | None:
     """Provision the sandbox for a pending persistent host.
 
-    The provider is asked under the host's stable name
-    (:func:`~omnigent.server.managed_hosts.managed_host_name`), so a provider
-    that provisions idempotently by name returns the same sandbox when a start
-    is retried after a crash between its reply and the row update.
+    The provider is asked under the host's stable :func:`sandbox_name`, so a
+    provider that provisions idempotently by name returns the same sandbox
+    when a start is retried after a crash between its reply and the row update.
 
     :returns: The host with its sandbox recorded, or ``None`` when the host
         was deleted meanwhile; its new sandbox is then removed, and kept as a
         tombstone the reaper retries if that removal fails.
+    :raises SandboxInUseError: When the provider returned a sandbox another
+        host records; it is left untouched.
     """
     assert _host_store is not None
     state.publish("provisioning")
     await asyncio.to_thread(launcher.prepare_for_launch, agent_name=None)
     await asyncio.to_thread(launcher.prepare)
-    sandbox_id = await asyncio.to_thread(launcher.provision, managed_host_name(host.host_id))
-    attached = await asyncio.to_thread(
-        _host_store.attach_persistent_sandbox, host.host_id, sandbox_id=sandbox_id
-    )
+    sandbox_id = await asyncio.to_thread(launcher.provision, sandbox_name(host.host_id))
+    try:
+        attached = await asyncio.to_thread(
+            _host_store.attach_persistent_sandbox,
+            host.host_id,
+            provider=launcher.provider,
+            sandbox_id=sandbox_id,
+        )
+    except SandboxInUseError:
+        _logger.warning(
+            "%s returned sandbox %s for host %s, but another host records it; left untouched",
+            launcher.provider,
+            sandbox_id,
+            host.host_id,
+        )
+        raise
     if attached is None and not await _terminate_sandbox_best_effort(
         launcher, sandbox_id, host_id=host.host_id, provider=launcher.provider
     ):
