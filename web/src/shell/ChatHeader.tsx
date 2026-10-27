@@ -9,7 +9,6 @@ import {
   GitPullRequestIcon,
   InfoIcon,
   ListIcon,
-  MenuIcon,
   Maximize2Icon,
   MessagesSquareIcon,
   PanelLeftIcon,
@@ -34,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -47,8 +47,9 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { SidebarOpenButton } from "./SidebarOpenButton";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -135,6 +136,7 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -302,10 +304,10 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * ChatHeader — the top action bar for the conversation region.
  *
  * Rendered as an **absolute overlay** (``z-30``) spanning the full width
- * of the chat + workspace group. The bar paints no background — the app
- * canvas shows through, and chat content dissolves before it slides
- * under the controls (the conversation viewport's ``chat-scroll-fade``
- * mask, index.css; chat reserves clearance via ``pt-20``,
+ * of the chat + workspace group. Active sessions use a glass backdrop that
+ * fades at its lower edge while chat content scrolls behind it and appears
+ * blurred. The conversation viewport keeps its bottom composer fade
+ * (``chat-scroll-fade`` in index.css); chat reserves initial clearance via ``pt-20``,
  * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
  * breadcrumb (``[folder] / <title> [/ <sub-agent>]``, with the session-actions
  * kebab on desktop and a "Move to…" project picker on the folder tag). Right
@@ -327,6 +329,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
@@ -352,43 +355,9 @@ export function ChatHeader({
   pending = false,
   mobileMenu,
 }: ChatHeaderProps) {
-  // Dwell on the toggle for 400ms to peek the sidebar; leaving before then cancels
-  // the pending peek so a quick pass-over never opens it. Peek is a desktop
-  // hover affordance — on mobile the toggle just opens the full-screen overlay,
-  // so a tap's synthetic pointerenter must not trigger it.
   const isMobile = useIsMobileViewport();
   const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
-  const peekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const peekRequest = useRef(0);
-  // Once the dwell fires the peek, the card fades in click-through, so the
-  // pointer keeps resting on the toggle — long enough to trip the hover
-  // tooltip's own (longer) delay. The peek is the intended hover reveal, so
-  // suppress the tooltip when the peek fires. Pointer-armed only: keyboard
-  // focus never arms a peek, so the focus tooltip still works.
-  const suppressTooltip = useRef(false);
-  const [tooltipOpen, setTooltipOpen] = useState(false);
-  const cancelPeek = useCallback(() => {
-    peekRequest.current += 1;
-    if (peekTimer.current) {
-      clearTimeout(peekTimer.current);
-      peekTimer.current = null;
-    }
-    suppressTooltip.current = false;
-  }, []);
-  const onPeekSidebar = useCallback(() => {
-    if (isMobile) return;
-    cancelPeek();
-    const request = peekRequest.current;
-    peekTimer.current = setTimeout(() => {
-      peekTimer.current = null;
-      if (peekRequest.current !== request) return;
-      suppressTooltip.current = true;
-      setTooltipOpen(false);
-      onOpenSidebar(true);
-    }, 400);
-  }, [isMobile, onOpenSidebar, cancelPeek]);
-  useEffect(() => cancelPeek, [cancelPeek]);
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
   // opening the matching rail tab as a full-screen drawer. Mobile only: they
   // ride in the header's single kebab rather than a second trigger of their
@@ -570,12 +539,10 @@ export function ChatHeader({
     <header
       className={cn(
         // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
-        // the 32px controls. No own background — the app canvas shows
-        // through (a scrim can't track the canvas gradient).
-        // Scrolled chat text can't render through the controls because the
-        // conversation viewport fades its top edge instead (chat-scroll-fade
-        // in index.css, applied in ChatPage).
+        // the 32px controls. Session pages add a fading glass backdrop over
+        // scrolling conversation content.
         "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        conversationId && "session-header-glass",
         settingsMode && "settings-mobile-header",
       )}
     >
@@ -595,6 +562,13 @@ export function ChatHeader({
           !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
+        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
+          <SidebarOpenButton
+            onOpenSidebar={onOpenSidebar}
+            settingsMode={settingsMode}
+            componentId="chat.header.open_sidebar"
+          />
+        )}
         {canvas?.compact && (
           <Button
             variant="ghost"
@@ -606,53 +580,6 @@ export function ChatHeader({
             <ArrowLeftIcon className="size-4" />
             Canvas
           </Button>
-        )}
-        {!sidebarOpen && !canvas && (
-          <Tooltip
-            open={tooltipOpen}
-            onOpenChange={(next) => {
-              if (next && suppressTooltip.current) return;
-              setTooltipOpen(next);
-            }}
-          >
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                // Match the right-panel toggle's 24px icon-xs geometry on
-                // desktop; mobile keeps its larger touch target below.
-                size="icon-xs"
-                aria-label={settingsMode ? "Back to settings menu" : "Open sidebar"}
-                componentId="chat.header.open_sidebar"
-                onClick={() => {
-                  cancelPeek();
-                  onOpenSidebar(false);
-                }}
-                // chat-header-sidebar-toggle is hidden on the macOS shell, where
-                // the title-bar cluster carries an always-present toggle (with
-                // the same dwell-to-peek) and this would be a second, offset
-                // copy of it. Kept everywhere else, where it is the ONLY way to
-                // reopen a collapsed sidebar.
-                className="chat-header-sidebar-toggle border-none text-muted-foreground hover:text-foreground max-md:size-11"
-                onPointerEnter={onPeekSidebar}
-                onPointerDown={cancelPeek}
-                onPointerLeave={cancelPeek}
-              >
-                {settingsMode ? (
-                  <ArrowLeftIcon className="size-4 max-md:size-5" />
-                ) : isMobile ? (
-                  <MenuIcon className="size-5" />
-                ) : (
-                  <PanelLeftIcon className="size-4" />
-                )}
-              </Button>
-            </TooltipTrigger>
-            {/* Bottom placement keeps the tooltip clear of the macOS
-                Electron shell's traffic lights at the window's top edge. */}
-            <TooltipContent side="bottom">
-              {settingsMode ? "Back to settings menu" : "Open sidebar"}
-            </TooltipContent>
-          </Tooltip>
         )}
         {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
             landing composer. A resolved title is enough; so is titleLinkTo —
@@ -677,6 +604,9 @@ export function ChatHeader({
             className="pr-1"
           />
         )}
+        {conversationId && createdBySessionId && (
+          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
+        )}
       </div>
 
       <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
@@ -694,6 +624,14 @@ export function ChatHeader({
           <AgentInfoButton
             agent={boundAgent}
             sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
+        )}
+        {/* Split the Terminal view into shell panes — self-gates to null
+            unless the feature is on and the agent terminal is shown. */}
+        {!pending && conversationId && (
+          <TerminalSplitControls
+            conversationId={conversationId}
             permissionLevel={permissionLevel}
           />
         )}

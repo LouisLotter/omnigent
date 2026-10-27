@@ -145,7 +145,12 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
+  arcaExtendResult = { ok: true, shutdownAt: null },
+  dbcertRefreshResult = { ok: true },
+  dbcertSyncResult = { ok: true },
+  dbcertPreflightResult = { ok: true, valid: true },
   arcaLoginResult = { ok: true },
+  arcaConsentResult,
   loadServer = async () => {},
   loadURL = null,
   managedServers = [],
@@ -178,12 +183,18 @@ function loadNavigationHarness({
     loading: [],
     reloads: 0,
     arcaConnects: [],
+    arcaExtends: [],
+    dbcertRefreshes: 0,
+    dbcertSyncs: 0,
+    dbcertPreflights: 0,
+    arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
     arcaLoginCancels: 0,
   };
   const pickers = [];
+  const findBars = [];
   const ipc = new Map();
   const webRequest = {};
   const jar = new Map();
@@ -214,6 +225,12 @@ function loadNavigationHarness({
     },
   });
   const defaultSession = {
+    setPermissionRequestHandler(handler) {
+      this.request = handler;
+    },
+    setPermissionCheckHandler(handler) {
+      this.check = handler;
+    },
     cookies: network?.cookies ?? cookies,
     webRequest: {
       onBeforeRequest: (fn) => {
@@ -233,6 +250,8 @@ function loadNavigationHarness({
   const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
+  const powerMonitor = new EventEmitter();
+  const connectivity = { online: true };
   const webContents = {
     id: 1,
     send: (channel, data) => calls.progress.push({ channel, data }),
@@ -340,6 +359,20 @@ function loadNavigationHarness({
           pickers.push(picker);
           return picker;
         }
+        if (options?.webPreferences?.preload?.endsWith("find_preload.js")) {
+          let destroyed = false;
+          const bar = Object.assign(new EventEmitter(), {
+            webContents: { send: () => {} },
+            isDestroyed: () => destroyed,
+            close() {
+              destroyed = true;
+              this.emit("closed");
+            },
+            loadFile: async () => {},
+          });
+          findBars.push(bar);
+          return bar;
+        }
         return win;
       },
       {
@@ -383,6 +416,8 @@ function loadNavigationHarness({
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
+    net: { isOnline: () => connectivity.online },
+    powerMonitor,
     screen: {},
     session: { defaultSession },
     shell: {},
@@ -400,7 +435,10 @@ function loadNavigationHarness({
     "./update_overlay": {
       createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
     },
-    "./localhost_cors": { registerLocalhostCors: () => {} },
+    "./localhost_cors": {
+      isLocalhostUrl: require("../src/localhost_cors").isLocalhostUrl,
+      registerLocalhostCors: () => {},
+    },
     "./browserPermissionPrompt": {
       createBrowserPermissionPrompt: () => ({
         show: async (options) => {
@@ -437,6 +475,26 @@ function loadNavigationHarness({
       ...require("../src/arca"),
       resolveArcaPath: () => arcaPath,
       resolveArcaPathAsync: async () => arcaPath,
+      runArcaExtend: async (mode) => {
+        calls.arcaExtends.push(mode);
+        return typeof arcaExtendResult === "function" ? arcaExtendResult(mode) : arcaExtendResult;
+      },
+      runDbcertRefresh: async (options) => {
+        calls.dbcertRefreshes += 1;
+        return typeof dbcertRefreshResult === "function"
+          ? dbcertRefreshResult(options)
+          : dbcertRefreshResult;
+      },
+      runDbcertArcaSync: async () => {
+        calls.dbcertSyncs += 1;
+        return typeof dbcertSyncResult === "function" ? dbcertSyncResult() : dbcertSyncResult;
+      },
+      checkDbcert: async () => {
+        calls.dbcertPreflights += 1;
+        return typeof dbcertPreflightResult === "function"
+          ? dbcertPreflightResult()
+          : dbcertPreflightResult;
+      },
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
         calls.arcaConnects.push(url);
@@ -578,11 +636,28 @@ function loadNavigationHarness({
     },
   };
 
+  if (arcaConsentResult !== undefined) {
+    localRequires["./arca_connect_window"] = {
+      createArcaConnectFlow: (deps) => ({
+        run: async (_parentWin, consentServerUrl, options) => {
+          calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
+          const consent =
+            typeof arcaConsentResult === "function"
+              ? await arcaConsentResult(consentServerUrl, options)
+              : arcaConsentResult;
+          if (consent?.ok !== true) return consent;
+          const connect = deps.startConnect(consentServerUrl, () => {});
+          return { ...(await connect.promise), shownInConsole: true };
+        },
+      }),
+    };
+  }
+
   const mainPath = path.join(__dirname, "../src/main.js");
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs };";
+    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -632,11 +707,14 @@ function loadNavigationHarness({
     browserIpcDeps: () => browserIpcDeps,
     permissionPromptCalls,
     electron,
+    powerMonitor,
+    connectivity,
     ipc,
     webRequest,
     webContents,
     settingsPath: path.join(userData, "settings.json"),
     pickers,
+    findBars,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     emitWindow: (eventName) => {
       for (const listener of winListeners.get(eventName) ?? []) listener();
@@ -647,12 +725,324 @@ function loadNavigationHarness({
     },
     win,
     cleanup: () => {
+      // Network failures retry until they succeed; a closed window would stop them.
+      api.cancelReconnect(win);
       api.disposeAuth();
       api.windows.clear();
       fs.rmSync(userData, { recursive: true, force: true });
     },
   };
 }
+
+describe("Arca extend IPC", () => {
+  it("rejects a second extension until the first finishes", async (t) => {
+    let finish;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaExtendResult: () => pending,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const extend = h.ipc.get("omnigent:arca-extend");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const first = extend(event, "overnight");
+    assert.match((await extend(event, "workweek")).error, /already in progress/);
+    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
+    finish({ ok: true, shutdownAt: null });
+    assert.equal((await first).ok, true);
+    assert.equal((await extend(event, "workweek")).ok, true);
+    assert.deepEqual(h.calls.arcaExtends, ["overnight", "workweek"]);
+  });
+  it("accepts only the connected page's pinned origin and managed server", async (t) => {
+    const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const extend = h.ipc.get("omnigent:arca-extend");
+    const features = h.ipc.get("omnigent:get-desktop-features");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    assert.deepEqual(
+      { ...features(event) },
+      {
+        databricksInternalFeatures: true,
+        canExtendArca: true,
+        canRefreshDbcert: true,
+        arcaPreviewRecovery: true,
+        // Internal-feature fixtures simulate macOS on every test host.
+        chromeCookieImport: true,
+      },
+    );
+    assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
+    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
+    assert.equal((await extend(event, "default")).ok, false);
+    assert.equal((await extend(event, ["overnight"])).ok, false);
+    await assert.rejects(
+      extend({ ...event, senderFrame: { url: "https://evil.example" } }, "workweek"),
+      /connected server page/,
+    );
+    assert.equal(features({ ...event, senderFrame: { url: "https://evil.example" } }), null);
+    h.setUrl("https://evil.example");
+    await assert.rejects(extend(event, "workweek"), /connected server page/);
+    assert.deepEqual(h.calls.arcaExtends, ["overnight"]);
+  });
+
+  it("rejects Arca extension when the desktop feature is disabled", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: "https://workspace.cloud.databricks.com/omnigent",
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canExtendArca, false);
+    const result = await h.ipc.get("omnigent:arca-extend")(event, "overnight");
+    assert.equal(result.ok, false);
+    assert.deepEqual(h.calls.arcaExtends, []);
+  });
+
+  it("rejects Arca extension on a local server even with internal features", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: "http://localhost:6767", internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canExtendArca, false);
+    assert.equal((await h.ipc.get("omnigent:arca-extend")(event, "overnight")).ok, false);
+    assert.deepEqual(h.calls.arcaExtends, []);
+  });
+});
+
+describe("dbcert refresh IPC", () => {
+  const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+
+  it("shares one sign-in between concurrent clicks", async (t) => {
+    let finish;
+    const refreshOptions = [];
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertRefreshResult: (options) => {
+        refreshOptions.push({ ...options });
+        return pending;
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const refresh = h.ipc.get("omnigent:dbcert-refresh");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const first = refresh(event, { skipArcaSync: true });
+    const second = refresh(event, { skipArcaSync: true });
+    finish({ ok: true });
+    assert.deepEqual(await Promise.all([first, second]), [{ ok: true }, { ok: true }]);
+    assert.equal(h.calls.dbcertRefreshes, 1);
+    assert.deepEqual(await refresh(event), { ok: true });
+    assert.equal(h.calls.dbcertRefreshes, 2);
+    assert.deepEqual(refreshOptions, [{ skipArcaSync: true }, { skipArcaSync: true }]);
+    assert.equal(h.calls.dbcertSyncs, 1);
+  });
+
+  for (const localFirst of [false, true]) {
+    it(`shares renewal but preserves host sync (local-first=${localFirst})`, async (context) => {
+      let finishRenewal;
+      let finishSync;
+      const pendingRenewal = new Promise((resolve) => {
+        finishRenewal = resolve;
+      });
+      const pendingSync = new Promise((resolve) => {
+        finishSync = resolve;
+      });
+      const harness = loadNavigationHarness({
+        serverUrl,
+        internalFeatures: true,
+        dbcertRefreshResult: () => pendingRenewal,
+        dbcertSyncResult: () => pendingSync,
+      });
+      context.after(harness.cleanup);
+      harness.api.registerIpc();
+      const refresh = harness.ipc.get("omnigent:dbcert-refresh");
+      const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+      const first = refresh(event, { skipArcaSync: localFirst });
+      const second = refresh(event, { skipArcaSync: !localFirst });
+      const anotherHost = refresh(event);
+      let hostDone = false;
+      anotherHost.then(() => {
+        hostDone = true;
+      });
+      assert.equal(harness.calls.dbcertRefreshes, 1);
+      assert.equal(harness.calls.dbcertSyncs, 0);
+      finishRenewal({ ok: true });
+      assert.deepEqual(await (localFirst ? first : second), { ok: true });
+      assert.equal(harness.calls.dbcertSyncs, 1);
+      assert.equal(hostDone, false);
+      let lateLocalResult;
+      const lateLocal = refresh(event, { skipArcaSync: true }).then((result) => {
+        lateLocalResult = result;
+        return result;
+      });
+      await new Promise((resolve) => {
+        setImmediate(resolve);
+      });
+      assert.deepEqual(lateLocalResult, { ok: true });
+      assert.equal(hostDone, false);
+      finishSync({ ok: true });
+      assert.deepEqual(await Promise.all([first, second, anotherHost, lateLocal]), [
+        { ok: true },
+        { ok: true },
+        { ok: true },
+        { ok: true },
+      ]);
+      assert.equal(harness.calls.dbcertRefreshes, 1);
+      assert.deepEqual(await refresh(event), { ok: true });
+      assert.equal(harness.calls.dbcertRefreshes, 2);
+    });
+  }
+
+  for (const renewalFails of [false, true]) {
+    it(`surfaces a joined refresh failure without another sign-in (renewal=${renewalFails})`, async (context) => {
+      let finish;
+      const failure = { ok: false, error: renewalFails ? "Sign-in canceled" : "Sync failed" };
+      const pending = new Promise((resolve) => {
+        finish = resolve;
+      });
+      const harness = loadNavigationHarness({
+        serverUrl,
+        internalFeatures: true,
+        dbcertRefreshResult: () => pending,
+        dbcertSyncResult: failure,
+      });
+      context.after(harness.cleanup);
+      harness.api.registerIpc();
+      const refresh = harness.ipc.get("omnigent:dbcert-refresh");
+      const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+      const local = refresh(event, { skipArcaSync: true });
+      const host = refresh(event);
+      finish(renewalFails ? failure : { ok: true });
+      assert.deepEqual(await local, renewalFails ? failure : { ok: true });
+      assert.deepEqual(await host, failure);
+      assert.equal(harness.calls.dbcertRefreshes, 1);
+      assert.equal(harness.calls.dbcertSyncs, renewalFails ? 0 : 1);
+    });
+  }
+
+  it("refuses pages other than the connected server's", async (t) => {
+    const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await assert.rejects(
+      h.ipc.get("omnigent:dbcert-refresh")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example" },
+      }),
+      /connected server page/,
+    );
+    assert.equal(h.calls.dbcertRefreshes, 0);
+    await assert.rejects(
+      h.ipc.get("omnigent:dbcert-check")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example" },
+      }),
+      /connected server page/,
+    );
+    assert.equal(h.calls.dbcertPreflights, 0);
+  });
+
+  it("shares status checks without starting sign-in", async (t) => {
+    let finish;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertPreflightResult: () => pending,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const check = h.ipc.get("omnigent:dbcert-check");
+    const first = check(event);
+    const second = check(event);
+    assert.equal(h.calls.dbcertRefreshes, 0);
+    assert.equal(h.calls.dbcertPreflights, 1);
+    finish({ ok: true, valid: false });
+    assert.deepEqual(await Promise.all([first, second]), [
+      { ok: true, valid: false },
+      { ok: true, valid: false },
+    ]);
+    assert.deepEqual(await check(event), { ok: true, valid: false });
+    assert.equal(h.calls.dbcertPreflights, 2);
+    assert.equal(h.calls.dbcertRefreshes, 0);
+  });
+
+  it("rechecks pending status after renewal without clearing fresh verification", async (context) => {
+    let finishStaleCheck;
+    let finishFreshCheck;
+    const pendingChecks = [
+      new Promise((resolve) => {
+        finishStaleCheck = resolve;
+      }),
+      new Promise((resolve) => {
+        finishFreshCheck = resolve;
+      }),
+    ];
+    const harness = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertPreflightResult: () => pendingChecks.shift(),
+    });
+    context.after(harness.cleanup);
+    harness.api.registerIpc();
+    const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+    const check = harness.ipc.get("omnigent:dbcert-check");
+    let staleResult;
+    const stale = check(event).then((result) => {
+      staleResult = result;
+      return result;
+    });
+    assert.deepEqual(
+      await harness.ipc.get("omnigent:dbcert-refresh")(event, { skipArcaSync: true }),
+      { ok: true },
+    );
+    const fresh = check(event);
+    assert.equal(harness.calls.dbcertPreflights, 2);
+    finishStaleCheck({ ok: true, valid: false });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(staleResult, undefined);
+    const joined = check(event);
+    assert.equal(harness.calls.dbcertPreflights, 2);
+    finishFreshCheck({ ok: true, valid: true });
+    assert.deepEqual(await Promise.all([stale, fresh, joined]), [
+      { ok: true, valid: true },
+      { ok: true, valid: true },
+      { ok: true, valid: true },
+    ]);
+  });
+
+  for (const [what, options] of [
+    ["a local server", { serverUrl: "http://localhost:6767", internalFeatures: true }],
+    ["a machine without Databricks-internal features", { serverUrl }],
+  ]) {
+    it(`refuses ${what}`, async (t) => {
+      const h = loadNavigationHarness(options);
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+      assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canRefreshDbcert, false);
+      assert.equal((await h.ipc.get("omnigent:dbcert-refresh")(event)).ok, false);
+      assert.equal(h.calls.dbcertRefreshes, 0);
+      assert.equal((await h.ipc.get("omnigent:dbcert-check")(event)).ok, false);
+      assert.equal(h.calls.dbcertPreflights, 0);
+    });
+  }
+});
 
 describe("Arca auto-connect wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
@@ -1111,6 +1501,37 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
+  it("signs in through the browser from an account URL whose workspace rejected its session", async (t) => {
+    const accountPick = "https://spog.cloud.databricks.com/?o=123";
+    let rejected = false;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin, { storedOrigin = origin } = {}) => {
+        if (rejected) return storedOrigin;
+        rejected = true;
+        throw Object.assign(new Error("rejected"), { errorCode: "SESSION_REJECTED" });
+      },
+    });
+    t.after(h.cleanup);
+    const workspaceOrigin = new URL(workspace).origin;
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ server_labels: { [workspaceOrigin]: accountPick } }),
+    );
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace), /rejected/);
+    const connect = () => h.api.loadServerUrl(h.win, accountPick, undefined, { interactive: true });
+    await connect();
+    await connect();
+    assert.deepEqual(
+      h.calls.auth.slice(1).map((call) => [call[2].storedOrigin, call[2].useStoredCredentials]),
+      [
+        [workspaceOrigin, false],
+        [workspaceOrigin, true],
+      ],
+    );
+  });
+
   it("signs a workspace out from the server picker, in every window on it", async (t) => {
     const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
     t.after(h.cleanup);
@@ -1149,14 +1570,11 @@ describe("Databricks auth mode wiring", () => {
     const origin = new URL(workspace).origin;
     assert.deepEqual(h.calls.forgottenTokens, [origin]);
     assert.equal(h.api.windows.get(other).origin, null);
-    assert.match(
-      new URLSearchParams(otherLoads.at(-1)[1].search).get("error"),
-      /^You're signed out of /,
-    );
+    assert.equal(new URLSearchParams(otherLoads.at(-1)[1].search).get("error"), null);
     assert.ok(h.calls.cookiesRemoved.some(([, name]) => name === "DBAUTH"));
     assert.equal(h.api.windows.get(h.win).origin, null);
     const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
-    assert.equal(params.get("error"), `You're signed out of ${new URL(workspace).host}.`);
+    assert.equal(params.get("error"), null);
     assert.equal(params.get("url"), workspace);
   });
 
@@ -1172,6 +1590,7 @@ describe("Databricks auth mode wiring", () => {
     item.click();
     await tick();
     assert.deepEqual(h.calls.forgottenTokens, [new URL(workspace).origin]);
+    assert.equal(new URLSearchParams(h.calls.loadFile.at(-1)[1].search).get("error"), null);
     // Back on the setup page, there's nothing to sign out of.
     assert.equal(item.enabled, false);
   });
@@ -1307,7 +1726,7 @@ describe("Databricks auth mode wiring", () => {
     await tick();
     assert.equal(h.overlay.hint, null, "the reconnect was cancelled");
     const params = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
-    assert.equal(params.get("error"), `You're signed out of ${new URL(workspace).host}.`);
+    assert.equal(params.get("error"), null);
   });
 
   it("clears the cookie and says so when forgetting the token fails", async (t) => {
@@ -1397,7 +1816,7 @@ describe("Databricks auth mode wiring", () => {
   ]) {
     it(`shows "${hint}" over the page while retrying, then "${final}"`, async (t) => {
       const finals = [];
-      // [40]: retrying, then Cancel; []: retries ran out.
+      // [40]: retrying, then Cancel; []: the fast retries ran out.
       for (const retries of [[40], []]) {
         const h = loadNavigationHarness({
           serverUrl: workspace,
@@ -1415,7 +1834,8 @@ describe("Databricks auth mode wiring", () => {
         } else h.emit("did-fail-load", -105, "ERR", `${workspace}/c/1`, true);
         // oxlint-disable-next-line no-await-in-loop
         await wait();
-        if (retries.length) {
+        // Network failures keep retrying past the fast retries; only Cancel stops them.
+        if (retries.length || failure !== serverError) {
           // The page stays underneath the overlay.
           assert.equal(h.overlay.hint, hint);
           assert.deepEqual(h.calls.loadFile, []);
@@ -1452,6 +1872,55 @@ describe("Databricks auth mode wiring", () => {
     assert.equal(h.calls.auth[1][2].interactive, false);
     assert.deepEqual(h.calls.loadURL[1], [`${workspace}/c/deep-linked`]);
   });
+
+  for (const v2 of [false, true]) {
+    it(`opens a clean selector without stored credentials, then signs in on Connect (v2=${v2})`, async (t) => {
+      const origin = new URL(workspace).origin;
+      const workspaceNetwork = createWorkspaceNetwork(origin, {
+        oauth: {
+          getValidStoredToken: async () => {
+            throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+          },
+          runInteractiveLogin: async () => {
+            workspaceNetwork.browserSignIns++;
+            return { tokens: { access_token: "token" }, issuerOrigin: origin };
+          },
+        },
+      });
+      const h = loadNavigationHarness({
+        isPackaged: true,
+        env: { OMNIGENT_SERVER_SELECTOR_V2: v2 ? "1" : "0" },
+        savedServerUrl: workspace,
+        serverUrl: workspace,
+        managedServers: v2 ? [workspace] : [],
+        databricksMode: "browser",
+        network: workspaceNetwork,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createWindow();
+      await until(() => h.calls.loadFile.length === 1, "the server selector");
+      const [page, options] = h.calls.loadFile[0];
+      const params = new URLSearchParams(options.search);
+      assert.equal(path.basename(page), v2 ? "server-selector-v2.html" : "index.html");
+      assert.equal(params.get("error"), null);
+      assert.equal(params.get("url"), workspace);
+      assert.equal(params.get("step"), "server");
+      assert.equal(h.api.windows.get(h.win).origin, null);
+      assert.deepEqual(h.calls.loadURL, []);
+      assert.equal(workspaceNetwork.sessionCreates, 0);
+      assert.equal(workspaceNetwork.browserSignIns, 0);
+
+      await h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } },
+        workspace,
+      );
+      assert.equal(workspaceNetwork.browserSignIns, 1);
+      assert.equal(workspaceNetwork.sessionCreates, 1);
+      assert.deepEqual(h.calls.loadURL, [[workspace]]);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
+    });
+  }
 
   it("upgrades a saved HTTP workspace before restoring authentication", async (t) => {
     const target = "https://workspace.cloud.databricks.com/omnigent?o=123";
@@ -1730,6 +2199,35 @@ describe("Databricks auth mode wiring", () => {
     assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
   });
 
+  it("attributes an account-first landing failure to the resolved workspace", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const account = "https://accounts.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl: account,
+      databricksMode: "browser",
+      ensureSession: async () => new URL(workspace).origin,
+      loadURL: async () => {
+        throw new Error("landing failed");
+      },
+    });
+    t.after(h.cleanup);
+    await assert.rejects(
+      h.api.loadServerUrl(h.win, account, undefined, { interactive: true }),
+      /landing failed/,
+    );
+    assert.ok(
+      events.some(
+        ([event, fields]) =>
+          event === "connection_result" &&
+          fields.outcome === "failed" &&
+          fields.origin === new URL(workspace).origin,
+      ),
+    );
+  });
+
   it("reports authentication and cancels only the owning setup window's matching request", async (t) => {
     let signal;
     const h = loadNavigationHarness({
@@ -1875,6 +2373,29 @@ describe("Databricks auth mode wiring", () => {
 });
 
 describe("browser permission wiring", () => {
+  it("grants fullscreen only to the pinned server's top-level page", (t) => {
+    const serverUrl = "https://server.example/omnigent";
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.api.registerPermissions();
+    const ses = h.electron.session.defaultSession;
+    const request = (permission, requestingUrl) => {
+      let granted;
+      ses.request(h.webContents, permission, (value) => (granted = value), { requestingUrl });
+      return granted;
+    };
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), true);
+    assert.equal(request("fullscreen", `${serverUrl}/c/session`), true);
+    assert.equal(request("fullscreen", "https://foreign.example/video"), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", "https://foreign.example"), false);
+    assert.equal(ses.check(null, "fullscreen", serverUrl), false);
+    assert.equal(request("clipboard-read", serverUrl), false);
+    h.setUrl("https://foreign.example");
+    assert.equal(request("fullscreen", serverUrl), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), false);
+  });
+
   it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
@@ -1888,6 +2409,7 @@ describe("browser permission wiring", () => {
           const ses = {
             setPermissionRequestHandler: (handler) => (ses.request = handler),
             setPermissionCheckHandler: (handler) => (ses.check = handler),
+            webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
           };
           sessions.set(partition, ses);
         }
@@ -1935,6 +2457,130 @@ describe("browser permission wiring", () => {
       assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
       assert.equal(h.electron.session.defaultSession.request, undefined);
       assert.equal(h.electron.session.defaultSession.check, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("guards each agent partition's document requests through its own Chromium session", async () => {
+    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+    try {
+      const sessions = new Map();
+      const dns = { "lvh.me": "127.0.0.1", "example.com": "93.184.215.14" };
+      h.electron.session.fromPartition = (partition) => {
+        if (!sessions.has(partition)) {
+          const ses = {
+            installs: [],
+            lookups: [],
+            dns: { ...dns },
+            setPermissionRequestHandler() {},
+            setPermissionCheckHandler() {},
+            webRequest: {
+              onBeforeRequest: (filter, fn) => ses.installs.push(["request", filter, fn]),
+              onBeforeSendHeaders: (filter, fn) => ses.installs.push(["sendHeaders", filter, fn]),
+              onHeadersReceived: (filter, fn) => ses.installs.push(["headers", filter, fn]),
+            },
+            resolveHost: async (host) => {
+              ses.lookups.push(host);
+              return {
+                endpoints: ses.dns[host] ? [{ address: ses.dns[host], family: "ipv4" }] : [],
+              };
+            },
+            resolveProxy: async () => "DIRECT",
+          };
+          sessions.set(partition, ses);
+        }
+        return sessions.get(partition);
+      };
+      let nextId = 1;
+      const partitions = [];
+      h.electron.createWebContentsView = function (opts) {
+        partitions.push(opts.webPreferences.partition);
+        const wc = Object.assign(new EventEmitter(), {
+          id: nextId++,
+          setWindowOpenHandler() {},
+          loadURL() {},
+        });
+        return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+      };
+      const registry = h.api.createBrowserRegistryForWindow(h.win);
+      const agent = registry.openOrNavigate("conv", "https://example.com/", undefined, {
+        agent: true,
+      }).entry.view.webContents;
+      registry.openOrNavigate("browser-tab:conv:t1", "https://example.com/");
+      assert.equal(partitions[0], partitions[1], "a session's tabs share one partition");
+      const ses = sessions.get(partitions[0]);
+      assert.deepEqual(
+        // main.js runs in its own vm realm, so copy its arrays before deepEqual.
+        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        [
+          ["request", ["mainFrame", "subFrame", "object"]],
+          ["sendHeaders", ["mainFrame", "subFrame", "object"]],
+          ["headers", ["mainFrame", "subFrame", "object"]],
+        ],
+        "installed once per partition, for document requests only",
+      );
+      // Round-trip through JSON so objects from main.js's vm realm compare.
+      const decide = (kind, details, session = ses, view = agent) =>
+        new Promise((resolve) => {
+          const [, , fn] = session.installs.find(([k]) => k === kind);
+          fn({ webContentsId: view.id, ...details }, (response) =>
+            resolve(JSON.parse(JSON.stringify(response))),
+          );
+        });
+      // Each listener forwards the registry's decision; the address and proxy
+      // matrices live in the policy and registry tests.
+      const next = "https://example.com/next";
+      assert.deepEqual(await decide("request", { url: next }), { cancel: false });
+      assert.deepEqual(await decide("request", { url: "http://lvh.me:8899/" }), { cancel: true });
+      assert.deepEqual(await decide("sendHeaders", { url: next, requestHeaders: {} }), {
+        requestHeaders: { "Cache-Control": "no-cache" },
+      });
+      assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }), { cancel: true });
+      ses.resolveProxy = async () => {
+        throw new Error("proxy lookup failed");
+      };
+      assert.deepEqual(
+        await decide("headers", { url: next, ip: "10.0.0.2" }),
+        { cancel: true },
+        "a failed check cancels",
+      );
+      const firstHop = await registry.checkAgentNavigation("conv", "http://lvh.me:8899/", null);
+      assert.equal(firstHop.ok, false, "the IPC first hop resolves through the same session");
+      const otherAgent = registry.openOrNavigate("other-conv", "https://example.com/", undefined, {
+        agent: true,
+      }).entry.view.webContents;
+      assert.notEqual(partitions[2], partitions[0], "conversations use independent partitions");
+      const otherSession = sessions.get(partitions[2]);
+      assert.notEqual(otherSession, ses);
+      assert.deepEqual(
+        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        "each independent session receives all document hooks",
+      );
+      otherSession.dns["example.com"] = "127.0.0.1";
+      ses.lookups.length = 0;
+      otherSession.lookups.length = 0;
+      assert.deepEqual(await decide("request", { url: next }, otherSession, otherAgent), {
+        cancel: true,
+      });
+      assert.deepEqual(otherSession.lookups, ["example.com"]);
+      assert.deepEqual(ses.lookups, [], "the second session never resolves through the first");
+      assert.deepEqual(await decide("request", { url: next }), { cancel: false });
+      assert.deepEqual(ses.lookups, ["example.com"]);
+      assert.deepEqual(
+        otherSession.lookups,
+        ["example.com"],
+        "the first session stays independent",
+      );
+      assert.deepEqual(
+        await decide("sendHeaders", { url: next, requestHeaders: {} }, otherSession, otherAgent),
+        { requestHeaders: { "Cache-Control": "no-cache" } },
+      );
+      assert.deepEqual(
+        await decide("headers", { url: next, ip: "127.0.0.1" }, otherSession, otherAgent),
+        { cancel: true },
+      );
     } finally {
       h.cleanup();
     }
@@ -3013,7 +3659,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     return h;
   }
 
-  it("retries every 5s for a minute, then every 10s for another, counting attempts", (t) => {
+  it("retries every 5s for a minute, every 10s for another, then every minute", (t) => {
     const h = loadNavigationHarness();
     t.after(h.cleanup);
     // Attempts, not elapsed time: timers keep running through sleep.
@@ -3021,6 +3667,8 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
       [...h.api.reconnectDelaysMs()],
       [...Array(12).fill(5_000), ...Array(6).fill(10_000)],
     );
+    // Only network failures use the minute-long retries.
+    assert.equal(h.api.reconnectSlowDelayMs(), 60_000);
   });
 
   const setupEvent = (h) => ({
@@ -3092,7 +3740,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, []);
   });
 
-  it("reopens the mounted page after Connect while offline, once retries ran out", async (t) => {
+  it("reopens the mounted page after a Cancel, then Connect while offline", async (t) => {
     let online = false;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => {
@@ -3113,7 +3761,9 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     h.api.registerIpc();
     failLoad(h);
     await wait(1);
-    // Retries ran out: the setup form keeps the mounted URL for the next Connect.
+    h.overlay.cancel();
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    // The setup form keeps the mounted URL for the next Connect.
     assert.equal(h.overlay.hint, null);
     assert.equal(setupParams(h).url, workspace);
     h.api.setReconnectDelaysMs([20]);
@@ -3127,6 +3777,45 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadURL, [[workspace]]);
     assert.equal(h.overlay.hint, null);
   });
+
+  it("waits while offline without using up retries", async (t) => {
+    const h = browserHarness(t, [20], {
+      ensureSession: async () => {
+        throw Object.assign(new Error("HTTP 503"), { status: 503 });
+      },
+    });
+    h.connectivity.online = false;
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await wait(100);
+    // Several checks passed while offline; none spent the one retry.
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.overlay.hint, "Databricks isn't responding.");
+    h.connectivity.online = true;
+    await until(() => h.calls.auth.length === 2, "the retry once online");
+    // That was the one retry, so the server error now shows the setup page.
+    await until(() => h.calls.loadFile.length === 1, "the setup page");
+    assert.equal(h.overlay.hint, null);
+  });
+
+  for (const event of ["resume", "unlock-screen"]) {
+    it(`starts the fast retries over on ${event}`, async (t) => {
+      const h = browserHarness(t, [20], {
+        ensureSession: async () => {
+          throw new TypeError("fetch failed");
+        },
+      });
+      h.api.setReconnectSlowDelayMs(60_000);
+      await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+      await until(() => h.calls.auth.length === 2, "the fast retry");
+      // The next retry is a minute away.
+      await wait(60);
+      assert.equal(h.calls.auth.length, 2);
+      h.powerMonitor.emit(event);
+      await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+      assert.equal(h.overlay.hint, "Check your network connection.");
+      assert.deepEqual(h.calls.loadFile, []);
+    });
+  }
 
   it("returns a failed deep link to its conversation", async (t) => {
     let first = true;
@@ -3254,13 +3943,11 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       },
       () => {},
     );
-  for (const [trigger, drop, vpnReturns] of [
-    ["the session cookie is removed", (_h, network) => network.removeCookie(), true],
-    ["the workspace redirects to login", loginRedirect, true],
-    ["the session cookie is removed", (_h, network) => network.removeCookie(), false],
+  for (const [trigger, drop] of [
+    ["the session cookie is removed", (_h, network) => network.removeCookie()],
+    ["the workspace redirects to login", loginRedirect],
   ]) {
-    const outcome = vpnReturns ? "reconnects by itself when the VPN returns" : "gives up";
-    it(`${outcome} after ${trigger} off the VPN`, async (t) => {
+    it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
       const { h, network } = await connected(t, [30, 30, 30]);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
@@ -3272,27 +3959,40 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       assert.deepEqual(h.calls.loadFile, []);
       // Connect, the blocked renewal, then one blocked background retry.
       await until(() => network.sessionCreates === 3, "a blocked retry");
-      if (vpnReturns) {
-        network.verdict = "allow";
-        await until(() => h.calls.loadURL.length === 2, "the reconnect");
-        // Back on the page the user was on; setup never showed.
-        assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
-        assert.equal(h.api.windows.get(h.win).origin, origin);
-        assert.equal(h.overlay.hint, null);
-        assert.deepEqual(h.calls.loadFile, []);
-      } else {
-        await until(() => h.calls.loadFile.length === 1, "the final setup page");
-        assert.deepEqual(shown(h), { error: `${blocked}, then click Connect.`, url: workspace });
-        assert.equal(h.overlay.hint, null);
-      }
+      network.verdict = "allow";
+      await until(() => h.calls.loadURL.length === 2, "the reconnect");
+      // Back on the page the user was on; setup never showed.
+      assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+      assert.equal(h.api.windows.get(h.win).origin, origin);
+      assert.equal(h.overlay.hint, null);
+      assert.deepEqual(h.calls.loadFile, []);
       const settled = network.sessionCreates;
       await wait(100);
       assert.equal(network.sessionCreates, settled);
-      assert.equal(h.calls.loadURL.length, vpnReturns ? 2 : 1);
+      assert.equal(h.calls.loadURL.length, 2);
       assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
       assert.equal(network.browserSignIns, 0);
     });
   }
+
+  it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    h.api.setReconnectSlowDelayMs(20);
+    h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    // Connect, the blocked renewal, the one fast retry, then slower ones past it.
+    await until(() => network.sessionCreates >= 6, "retries past the fast schedule");
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    assert.deepEqual(h.calls.loadFile, []);
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${workspace}/c/456`]);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(network.browserSignIns, 0);
+  });
 
   it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
     const { h, network } = await connected(t, [30, 30, 30]);
@@ -3329,6 +4029,62 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       h.calls.auth.map((call) => call[2].interactive),
       [false, false, true, false, false],
     );
+    assert.equal(network.browserSignIns, 0);
+  });
+
+  // The organization-provided server: an account URL naming the workspace sign-in lands on.
+  const accountPick = "https://spog.cloud.databricks.com/?o=123";
+  async function accountPickHarness(t) {
+    const network = createWorkspaceNetwork(origin, {
+      oauth: {
+        // Tokens are stored per workspace, never under the account origin.
+        getValidStoredToken: async (tokenOrigin) => {
+          if (tokenOrigin === origin) return "token";
+          throw Object.assign(new Error("no stored token"), { errorCode: "NO_STORED_TOKEN" });
+        },
+      },
+    });
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      network,
+    });
+    t.after(h.cleanup);
+    // An earlier Connect to the pick landed on this workspace.
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ server_labels: { [origin]: accountPick } }));
+    h.api.registerIpc();
+    const connect = () =>
+      h.ipc.get("omnigent:set-server-url")(
+        { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } },
+        accountPick,
+        { requestId: "connect" },
+      );
+    return { h, network, connect };
+  }
+
+  it("connects an account URL to the workspace it reached before, without the browser", async (t) => {
+    const { h, network, connect } = await accountPickHarness(t);
+    assert.equal((await connect()).reconnecting, undefined);
+    assert.equal(network.browserSignIns, 0);
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+    // Relaunch restores the workspace, where the sign-in is stored.
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).server_url, workspace);
+  });
+
+  it("reconnects an account URL's workspace once the VPN is back", async (t) => {
+    const { h, network, connect } = await accountPickHarness(t);
+    h.api.setReconnectDelaysMs([20]);
+    h.api.setReconnectSlowDelayMs(20);
+    network.verdict = "blocked";
+    assert.equal((await connect()).reconnecting, true);
+    assert.equal(h.overlay.hint, `${blocked}.`);
+    await until(() => network.sessionCreates === 2, "a blocked retry");
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 1, "the reconnect");
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+    assert.equal(h.overlay.hint, null);
     assert.equal(network.browserSignIns, 0);
   });
 
@@ -3392,7 +4148,33 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
 // detach, so pinWindow must close the window's browser registry when the origin
 // changes — else the native WebContentsView dangles over the setup/welcome page.
 describe("browser-view teardown on server change (src/main.js)", () => {
-  it("offers conditional reconnect guidance only for missing identity on a gated managed target", async (t) => {
+  it("advertises Arca preview recovery to version-skewed server UI", async (t) => {
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+
+    assert.deepEqual(
+      JSON.parse(
+        JSON.stringify(
+          await h.ipc.get("omnigent:get-desktop-features")({
+            sender: h.webContents,
+            senderFrame: { url: serverUrl },
+          }),
+        ),
+      ),
+      {
+        databricksInternalFeatures: true,
+        canExtendArca: true,
+        canRefreshDbcert: true,
+        arcaPreviewRecovery: true,
+        // Internal-feature fixtures simulate macOS on every test host.
+        chromeCookieImport: true,
+      },
+    );
+  });
+
+  it("points old renderers at their visible Run on Arca action", async (t) => {
     for (const [serverUrl, internalFeatures, expected] of [
       ["https://account.databricks.com/omnigent?o=123", true, true],
       ["https://account.databricks.com/omnigent?o=123", false, false],
@@ -3402,10 +4184,10 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       t.after(h.cleanup);
       h.api.registerIpc();
       const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
-      const event = { sender: h.webContents };
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
       for (const url of ["http://localhost:5173", "https://127.0.0.1", "http://[::1]"]) {
         if (expected) {
-          assert.match(hint(event, url), /If this session runs on Arca.*Reconnect to Arca/);
+          assert.match(hint(event, url), /New session > Host > Run on Arca/);
         } else {
           assert.equal(hint(event, url), null);
         }
@@ -3437,10 +4219,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const eligible = h.browserRegistryDeps().isArcaAgentContext;
     const hint = h.browserIpcDeps().getAgentNavigationHintForEvent;
     assert.equal(eligible(context), false);
-    assert.match(hint({ sender: h.webContents }, "http://localhost"), /Reconnect to Arca/);
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    assert.match(hint(event, "http://localhost"), /New session > Host > Run on Arca/);
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
-    assert.equal(hint({ sender: h.webContents }, "http://localhost"), null);
+    assert.equal(hint(event, "http://localhost"), null);
     assert.equal(eligible({ ...context, sourceHostId: "b".repeat(32) }), false);
     h.api.setWindowServerUrl(h.win, serverUrl.replace("123", "456"));
     assert.deepEqual(h.browserRegistryCalls.closeAll, ["server-changed"]);
@@ -3449,6 +4232,314 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       eligible(h.browserIpcDeps().getAgentContextForEvent({ sender: h.webContents }, hostId)),
       false,
     );
+  });
+
+  it("uses consent to recapture a source host that differs from the remembered host", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: true },
+      arcaResult: {
+        ok: true,
+        alreadyRunning: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId: "b".repeat(32) },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
+    assert.equal(
+      await deps.recoverAgentNavigationForEvent(
+        event,
+        "http://localhost:5173",
+        "b".repeat(32),
+        hostId,
+        true,
+      ),
+      false,
+    );
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    await until(() => h.calls.arcaConnects.length === 1, "consented identity recapture");
+    await until(
+      () =>
+        deps.getAgentNavigationHintForEvent(
+          event,
+          "http://localhost:5173",
+          "b".repeat(32),
+          hostId,
+          true,
+        ) === null,
+      "captured source identity",
+    );
+  });
+
+  for (const [name, sourceIsArcaHost] of [
+    ["a sandbox source", false],
+    ["an older renderer without the flag", undefined],
+  ]) {
+    it(`does not offer mismatch recovery for ${name}`, async (t) => {
+      const serverUrl = "https://account.databricks.com/omnigent?o=123";
+      const rememberedHostId = "a".repeat(32);
+      const sourceHostId = "b".repeat(32);
+      const h = loadNavigationHarness({
+        serverUrl,
+        internalFeatures: true,
+        arcaPath: "/usr/local/bin/arca",
+        arcaConsentResult: { ok: true },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const deps = h.browserIpcDeps();
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+      assert.equal(
+        await deps.recoverAgentNavigationForEvent(
+          event,
+          "http://localhost:5173",
+          sourceHostId,
+          rememberedHostId,
+          sourceIsArcaHost,
+        ),
+        false,
+      );
+      assert.deepEqual(h.calls.arcaConsentRuns, []);
+      assert.deepEqual(h.calls.arcaConnects, []);
+      assert.match(
+        deps.getAgentNavigationHintForEvent(
+          event,
+          "http://localhost:5173",
+          sourceHostId,
+          rememberedHostId,
+          sourceIsArcaHost,
+        ),
+        /can't be verified as Arca/,
+      );
+    });
+  }
+
+  it("does not run recovery without a source-session host", async (t) => {
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: true },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", null, hostId),
+      false,
+    );
+    assert.deepEqual(h.calls.arcaConsentRuns, []);
+    assert.match(
+      deps.getAgentNavigationHintForEvent(event, "http://localhost:5173", null, hostId),
+      /can't be verified as Arca/,
+    );
+  });
+
+  it("returns immediately and shares one consent prompt across agent retries", async (t) => {
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    let settleConsent;
+    const consent = new Promise((resolve) => {
+      settleConsent = resolve;
+    });
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: () => consent,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const deps = h.browserIpcDeps();
+    const recover = deps.recoverAgentNavigationForEvent;
+    const hint = deps.getAgentNavigationHintForEvent;
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
+    assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
+    assert.deepEqual(h.calls.arcaConnects, []);
+    assert.match(hint(event, "http://localhost:5173", hostId, hostId), /Finish the Arca reconnect/);
+    assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    settleConsent({ ok: false, canceled: true });
+    await until(
+      () => /declined/.test(hint(event, "http://localhost:5173", hostId, hostId)),
+      "decline cooldown hint",
+    );
+    assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+  });
+
+  it("keeps opted-in preview recovery silent", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: false, canceled: true },
+      arcaResult: {
+        ok: true,
+        alreadyRunning: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await h
+        .browserIpcDeps()
+        .recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId),
+      true,
+    );
+    assert.deepEqual(h.calls.arcaConsentRuns, []);
+    assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
+  });
+
+  it("retries a failed launch-time connect during opted-in preview recovery", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    let attempts = 0;
+    const h = loadNavigationHarness({
+      serverUrl,
+      databricksMode: "browser",
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaResult: () =>
+        ++attempts === 1
+          ? { ok: false, error: "temporary failure" }
+          : { ok: true, identity: { serverUrl: arcaTarget(serverUrl), hostId } },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
+    await h.api.loadServerUrl(h.win, serverUrl);
+    await until(() => h.calls.arcaConnects.length === 1, "failed launch-time connect");
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await h
+        .browserIpcDeps()
+        .recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId),
+      true,
+    );
+    assert.deepEqual(h.calls.arcaConnects, [serverUrl, serverUrl]);
+  });
+
+  it("denies opted-in recovery when the captured identity is for another host", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaResult: {
+        ok: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId: "b".repeat(32) },
+      },
+    });
+    t.after(h.cleanup);
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ arca_auto_connect: true }));
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(
+      await h
+        .browserIpcDeps()
+        .recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId),
+      false,
+    );
+    assert.deepEqual(h.calls.arcaConsentRuns, []);
+    assert.deepEqual(h.calls.arcaConnects, [serverUrl]);
+  });
+
+  it("captures consented recovery in the background for the agent's next retry", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: true },
+      arcaResult: {
+        ok: true,
+        identity: { serverUrl: arcaTarget(serverUrl), hostId },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    const deps = h.browserIpcDeps();
+    assert.equal(
+      await deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId),
+      false,
+    );
+    assert.equal(h.calls.arcaConsentRuns.length, 1);
+    assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
+    assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
+    await until(() => h.calls.arcaConnects.length === 1, "consented recovery run");
+    await until(
+      () =>
+        deps.getAgentNavigationHintForEvent(event, "http://localhost:5173", hostId, hostId) ===
+        null,
+      "captured Arca identity",
+    );
+  });
+
+  it("allows another consent attempt after a failed run", async (t) => {
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    let attempts = 0;
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaPath: "/usr/local/bin/arca",
+      arcaConsentResult: { ok: true },
+      arcaResult: () => ({ ok: false, error: `failed ${++attempts}` }),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const recover = () =>
+      deps.recoverAgentNavigationForEvent(event, "http://localhost:5173", hostId, hostId);
+
+    assert.equal(await recover(), false);
+    await until(() => h.calls.arcaConnects.length === 1, "first failed recovery");
+    await until(
+      () =>
+        !/Finish the Arca reconnect/.test(
+          deps.getAgentNavigationHintForEvent(event, "http://localhost:5173", hostId, hostId),
+        ),
+      "first recovery settlement",
+    );
+    assert.equal(await recover(), false);
+    await until(() => h.calls.arcaConnects.length === 2, "second failed recovery");
+    assert.equal(h.calls.arcaConsentRuns.length, 2);
   });
 
   it("closes the window's browserRegistry when pinWindow changes origin", () => {
@@ -3783,7 +4874,7 @@ describe("OIDC system-browser sign-in wiring", () => {
     assert.deepEqual(h.calls.loadURL.at(-1), [`${server}/c/1`]);
   });
 
-  it("signs out in place and says so on the connect screen", async (t) => {
+  it("signs out in place and returns to the connect screen without an error", async (t) => {
     const h = loadNavigationHarness({
       serverUrl: server,
       manifest: oidcManifest,
@@ -3801,7 +4892,8 @@ describe("OIDC system-browser sign-in wiring", () => {
     await settle();
     assert.equal(prevented, true);
     assert.equal(h.calls.oidc.signOut, 1);
-    assert.equal(setupQuery(h).get("error"), "You're signed out of omni.example.");
+    assert.equal(setupQuery(h).get("url"), server);
+    assert.equal(setupQuery(h).get("error"), null);
   });
 
   it("signs out from the server picker, as the app's own sign-out does", async (t) => {
@@ -3820,7 +4912,26 @@ describe("OIDC system-browser sign-in wiring", () => {
     assert.equal(await h.ipc.get("omnigent:sign-out-of-server")(pageEvent), true);
     await settle();
     assert.equal(h.calls.oidc.signOut, 1);
-    assert.equal(setupQuery(h).get("error"), "You're signed out of omni.example.");
+    assert.equal(setupQuery(h).get("url"), server);
+    assert.equal(setupQuery(h).get("error"), null);
+  });
+
+  it("still reports an incomplete sign-out when clearing the session cookie fails", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed") },
+      acceptedSessions: new Set(["renewed"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, server);
+    h.electron.session.defaultSession.cookies.remove = async () => {
+      throw new Error("cookie store unavailable");
+    };
+    assert.equal(await h.api.signOutOfServer(h.win), false);
+    await settle();
+    assert.equal(setupQuery(h).get("url"), server);
+    assert.match(setupQuery(h).get("error"), /^Couldn't finish signing out of /);
   });
 
   it("enables Sign Out only once the browser sign-in finished", async (t) => {
@@ -3939,6 +5050,37 @@ describe("OIDC system-browser sign-in wiring", () => {
       assert.equal(h.api.windows.get(h.win).authKind, null, url);
     }
     /* oxlint-enable no-await-in-loop */
+  });
+});
+
+describe("find bar teardown (src/main.js)", () => {
+  function openBar() {
+    const h = loadNavigationHarness();
+    const stops = [];
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = (action) => stops.push(action);
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    return { h, stops, bar: h.findBars[0] };
+  }
+
+  it("clears the search and refocuses the parent when the bar closes", (t) => {
+    const { h, stops, bar } = openBar();
+    t.after(h.cleanup);
+    bar.close();
+    assert.deepEqual(stops, ["clearSelection"]);
+    assert.equal(h.calls.focused, 1);
+  });
+
+  it("skips the parent's webContents once Cmd+W has destroyed them", (t) => {
+    const { h, bar } = openBar();
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => true;
+    h.webContents.stopFindInPage = () => {
+      throw new TypeError("Object has been destroyed");
+    };
+    assert.doesNotThrow(() => bar.close());
+    assert.equal(h.calls.focused, undefined);
   });
 });
 

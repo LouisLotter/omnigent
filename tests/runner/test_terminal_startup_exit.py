@@ -135,22 +135,33 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
         runtime_name,
         exited.value,
     )
-    assert events == [
-        ("failed-child", {"type": "session.status", "status": "failed", "error": error})
-    ]
+    [(event_session, event)] = events
+    assert event_session == "failed-child"
+    context = event["failure_context"]
+    assert context["failure_id"] == error["error_id"]
+    assert context["failure_source"] == "native_terminal_start"
+    assert context["exception_type"] == "TerminalExitedDuringLaunch"
+    assert context["native_launch_code_origin"].startswith("omnigent.")
+    assert "private-startup-token" not in str(context)
+    assert event == {
+        "type": "session.status",
+        "status": "failed",
+        "error": error,
+        "failure_context": context,
+    }
     assert error["code"] == "native_terminal_start_failed"
     message = error["message"]
-    if role == CODEX_NATIVE_TERMINAL_ROLE:
-        assert "Codex terminal exited with status 2 before becoming available." in message
-        assert "see the runner log" not in message
-    else:
-        assert f"Native {runtime_name} terminal failed to start" in message
-    if role == CODEX_NATIVE_TERMINAL_ROLE and capture == "1":
-        assert "unexpected argument '--invalid'" in message
-        assert "[REDACTED]" in message
-    else:
+    if capture == "1":
+        assert "Agent CLI rejected its launch arguments" in message
         assert "unexpected argument" not in message
-        assert "Codex startup terminal output:" not in message
+        assert "startup terminal output:" not in message
+    else:
+        assert (
+            f"{runtime_name} terminal exited with status 2 before becoming available." in message
+        )
+        assert "unexpected argument" not in message
+        assert "startup terminal output:" not in message
+    assert "see the runner log" not in message
     assert "private-startup-token" not in message
     assert "thread discovery timed out" not in message
     assert len(message) < 4500
