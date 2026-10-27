@@ -99,8 +99,8 @@ HOST_STATUS: dict[str, int] = {
 }
 
 AGENT_KIND: dict[str, int] = {
-    "template": 1,
-    "session": 2,
+    "server": 1,
+    "user": 2,
 }
 
 POLICY_SCOPE: dict[str, int] = {
@@ -112,6 +112,7 @@ SCHEDULED_TASK_STATE: dict[str, int] = {
     "active": 1,
     "paused": 2,
     "deleted": 3,
+    "completed": 4,
 }
 
 SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
@@ -125,6 +126,7 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "succeeded": 3,
     "failed": 4,
     "skipped": 5,
+    "starting": 6,
 }
 
 

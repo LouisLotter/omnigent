@@ -1,7 +1,7 @@
 import {
   FolderDotIcon,
   FolderPlusIcon,
-  ArrowLeftIcon,
+  CornerLeftUpIcon,
   EyeIcon,
   EyeOffIcon,
   CheckIcon,
@@ -481,7 +481,9 @@ export function WorkspacePicker({
     isPlaceholderData,
     refetch: refetchListing,
   } = useHostFilesystem(hostId, path);
-  const navigationPending = Boolean(isLoading || isFetching || isPlaceholderData);
+  // A background refetch of a cached listing keeps its rows on screen; only a
+  // first load or a navigation still showing the previous folder is pending.
+  const navigationPending = Boolean(isLoading || isPlaceholderData);
 
   // Resolve the host's home dir independently of where the picker is
   // browsing, so a typed "~"-relative path can be expanded even when the
@@ -730,7 +732,7 @@ export function WorkspacePicker({
       >
         <PickerIconButton
           label="Up one level"
-          icon={<ArrowLeftIcon className={showGitDialog ? "size-4" : "size-5"} />}
+          icon={<CornerLeftUpIcon className={showGitDialog ? "size-4" : "size-5"} />}
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
           testId="workspace-picker-up"
@@ -744,11 +746,11 @@ export function WorkspacePicker({
             testId="workspace-picker-workspace"
           />
         )}
-        <div className="min-w-0 flex-1 px-1" data-testid="workspace-picker-breadcrumbs">
+        <div className="min-w-0 flex-1" data-testid="workspace-picker-breadcrumbs">
           {!pathEditing && (
             <div
               className={cn(
-                "flex min-w-0 items-center gap-1 overflow-hidden text-base font-medium",
+                "flex min-w-0 items-center gap-px overflow-hidden text-base font-medium",
                 showGitDialog && "font-normal leading-[1.6]",
               )}
             >
@@ -757,7 +759,7 @@ export function WorkspacePicker({
                 return (
                   <div
                     key={item.path || "home"}
-                    className={cn("flex min-w-0 items-center gap-1", !isLast && "shrink-0")}
+                    className={cn("flex min-w-0 items-center gap-px", !isLast && "shrink-0")}
                   >
                     {index > 0 && breadcrumbItems[index - 1].path !== "/" && (
                       <span className="shrink-0 text-muted-foreground" aria-hidden>
@@ -824,40 +826,42 @@ export function WorkspacePicker({
             data-testid="workspace-picker-path-input"
           />
         </div>
-        <PickerIconButton
-          label="New folder"
-          icon={<FolderPlusIcon className="size-4" />}
-          onClick={openNewFolder}
-          disabled={!canCreateFolder}
-          testId="workspace-picker-new-folder"
-        />
-        <PickerIconButton
-          label={showHidden ? "Hide hidden files" : "Show hidden files"}
-          icon={
-            showHidden ? (
-              <EyeIcon className={showGitDialog ? "size-4" : "size-5"} />
-            ) : (
-              <EyeOffIcon className={showGitDialog ? "size-4" : "size-5"} />
-            )
-          }
-          onClick={() => setShowHidden((v) => !v)}
-          testId="workspace-picker-show-hidden"
-        />
-        <PickerIconButton
-          label="Refresh"
-          icon={<RefreshCwIcon className={showGitDialog ? "size-4" : "size-5"} />}
-          onClick={refreshListing}
-          disabled={hostId === null || navigationPending || worktreesFetching}
-          testId="workspace-picker-refresh"
-        />
-        {onClose && (
+        <div className="flex items-center gap-px">
           <PickerIconButton
-            label="Close"
-            icon={<XIcon className={showGitDialog ? "size-4" : "size-5"} />}
-            onClick={onClose}
-            testId="workspace-picker-close"
+            label="New folder"
+            icon={<FolderPlusIcon className="size-4" />}
+            onClick={openNewFolder}
+            disabled={!canCreateFolder}
+            testId="workspace-picker-new-folder"
           />
-        )}
+          <PickerIconButton
+            label={showHidden ? "Hide hidden files" : "Show hidden files"}
+            icon={
+              showHidden ? (
+                <EyeIcon className={showGitDialog ? "size-4" : "size-5"} />
+              ) : (
+                <EyeOffIcon className={showGitDialog ? "size-4" : "size-5"} />
+              )
+            }
+            onClick={() => setShowHidden((v) => !v)}
+            testId="workspace-picker-show-hidden"
+          />
+          <PickerIconButton
+            label="Refresh"
+            icon={<RefreshCwIcon className={showGitDialog ? "size-4" : "size-5"} />}
+            onClick={refreshListing}
+            disabled={hostId === null || navigationPending || isFetching || worktreesFetching}
+            testId="workspace-picker-refresh"
+          />
+          {onClose && (
+            <PickerIconButton
+              label="Close"
+              icon={<XIcon className={showGitDialog ? "size-4" : "size-5"} />}
+              onClick={onClose}
+              testId="workspace-picker-close"
+            />
+          )}
+        </div>
       </div>
       <div
         className={cn(
@@ -874,7 +878,7 @@ export function WorkspacePicker({
             data-testid="workspace-picker-search-row"
           >
             <div
-              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30"
+              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input"
               data-testid="workspace-picker-search-field"
             >
               <SearchIcon
@@ -1130,9 +1134,7 @@ export function WorkspacePicker({
             <Button
               type="button"
               variant="outline"
-              size="sm"
               onClick={onClose}
-              className="rounded-lg px-3 font-normal"
               data-testid="workspace-picker-cancel"
             >
               Cancel
@@ -1141,7 +1143,6 @@ export function WorkspacePicker({
           {onSelect && (
             <Button
               type="button"
-              size="sm"
               disabled={
                 currentAbsolute === "" ||
                 currentAbsolute === null ||
@@ -1150,7 +1151,6 @@ export function WorkspacePicker({
               }
               onClick={handleSelect}
               title={`Confirm folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
-              className="shrink-0 rounded-lg px-3 font-normal"
               data-testid="workspace-picker-select"
             >
               Confirm

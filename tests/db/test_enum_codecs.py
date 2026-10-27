@@ -111,11 +111,12 @@ def test_shipped_codes_are_stable() -> None:
     assert ec.POLICY_TYPE == {"python": 1, "url": 2}
     assert ec.POLICY_SCOPE == {"default": 1, "session": 2}
     assert ec.HOST_STATUS == {"online": 1, "offline": 2}
-    assert ec.AGENT_KIND == {"template": 1, "session": 2}
+    assert ec.AGENT_KIND == {"server": 1, "user": 2}
     assert ec.SCHEDULED_TASK_STATE == {
         "active": 1,
         "paused": 2,
         "deleted": 3,
+        "completed": 4,
     }
     assert ec.SCHEDULED_TASK_EXECUTION_TARGET == {
         "connected_host": 1,
@@ -127,4 +128,5 @@ def test_shipped_codes_are_stable() -> None:
         "succeeded": 3,
         "failed": 4,
         "skipped": 5,
+        "starting": 6,
     }

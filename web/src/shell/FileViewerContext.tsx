@@ -11,6 +11,8 @@ import { createContext, useContext } from "react";
 export interface FilePosition {
   line: number;
   column?: number;
+  /** Last line of a cited range (`file.ts:10-20`), greater than `line`. */
+  endLine?: number;
 }
 
 export type OpenFileOptions = Partial<FilePosition>;
@@ -25,7 +27,7 @@ interface FileViewerContextType {
   openFile: (path: string, options?: OpenFileOptions) => void;
   /** The mounted viewer confirms dirty navigation before selection or URL changes. */
   registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
-  /** Open GitHub in the workspace rail or mobile drawer. */
+  /** Open Pull Requests in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
@@ -66,7 +68,7 @@ export function useFileViewer(): ((path: string, options?: OpenFileOptions) => v
 }
 
 /**
- * Returns a callback that opens the GitHub rail tab or mobile drawer, or `null`
+ * Returns a callback that opens the Pull Requests rail tab or mobile drawer, or `null`
  * when used outside AppShell (tests, Storybook).
  */
 export function useOpenGithubTab(): (() => void) | null {

@@ -1,6 +1,6 @@
-"""E2E: the read-only GitHub rail tab, driven entirely from stubbed responses.
+"""E2E: the read-only Pull Requests rail tab, driven entirely from stubbed responses.
 
-The GitHub tab's data comes from the runner-backed resource endpoints
+The tab's data comes from the runner-backed resource endpoints
 (``/v1/sessions/{id}/resources/github*``), which normally shell out to ``gh``
 and ``git`` in the workspace. Here every one of those endpoints is intercepted
 with ``page.route`` and answered with canned JSON, so the test exercises the
@@ -9,11 +9,11 @@ without a real ``gh``/``git`` (which a CI workspace has no PR for anyway).
 
 Three behaviours are pinned:
 
-1. Opening the GitHub rail tab renders the associated PR (title + number), its
+1. Opening the Pull Requests rail tab renders the associated PR (title + number), its
    CI checks as labeled pills, and the branch-vs-base file tree — with a
    single-child directory chain (``src`` → ``app``) compacted into one row.
 2. Composer metadata stays aligned and visually grouped, and its PR link opens
-   GitHub on desktop and mobile with one or several PRs at different text sizes.
+   the tab on desktop and mobile with one or several PRs at different text sizes.
 3. A host predating the ``/resources/github`` route 404s "Resource 'github'
    not found", which the panel renders as an actionable "update your host"
    empty state rather than the generic "unavailable" one.
@@ -54,21 +54,29 @@ _INFO = {
         "url": "https://example.com/pr/4242",
         "is_draft": False,
         "author": "octocat",
+        "reviewers": [
+            {"login": "alice", "kind": "user", "state": "APPROVED"},
+            {"login": "platform", "kind": "team", "state": "PENDING"},
+        ],
         "base_ref": "main",
         "head_ref": "feature/github-tab",
         "checks": {
             "passing": 3,
             "failing": 1,
             "pending": 0,
-            "total": 4,
+            "cancelled": 1,
+            "skipped": 1,
+            "total": 6,
             "runs": [
                 {"name": "unit", "bucket": "passing", "url": None},
                 {"name": "lint", "bucket": "passing", "url": None},
                 {"name": "types", "bucket": "passing", "url": None},
                 {"name": "e2e", "bucket": "failing", "url": None},
+                {"name": "superseded build", "bucket": "cancelled", "url": None},
+                {"name": "optional deploy", "bucket": "skipped", "url": None},
             ],
         },
-        # The Summary tab renders the description (markdown) and comments.
+        # The Summary tab renders the description (markdown); comments get their own tab.
         "body": "## Summary\n\nAdds the GitHub tab to the workspace rail.",
         "comments": [
             {
@@ -167,36 +175,107 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The GitHub tab lands on Summary; Changes shows the compacted file tree."""
+    """The Pull Requests tab lands on Summary; Comments and Changes are one click away."""
     base_url, session_id = seeded_session
     _stub_github(page)
     page.goto(f"{base_url}/c/{session_id}")
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
 
     # PR header (shared across both inner tabs): title, number, and state.
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="Team platform: Pending")).to_be_visible()
+
+    # A host without tracking controls puts the provider beside the repo.
+    icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
+    repository = rail.get_by_text("acme/app ·", exact=False).bounding_box()
+    assert icon is not None and repository is not None
+    assert abs(icon["y"] - repository["y"]) < 10
 
     # CI checks on their own line as labeled pills; a zero bucket shows nothing.
     expect(rail.get_by_text("Checks")).to_be_visible()
     expect(rail.get_by_text(re.compile(r"3\s*passed"))).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*failed"))).to_be_visible()
+    for label, job in [("cancelled", "superseded build"), ("skipped", "optional deploy")]:
+        pill = rail.get_by_role("button", name=f"1 {label}", exact=True)
+        expect(pill).to_be_visible()
+        expect(pill).to_have_class(re.compile(r"\bbg-muted\b"))
+        expect(pill).to_have_class(re.compile(r"\btext-muted-foreground\b"))
+        pill.hover()
+        expect(page.get_by_text(job, exact=True)).to_be_visible()
+        expect(page.get_by_text("e2e", exact=True)).not_to_be_visible()
+        rail.get_by_text("Checks", exact=True).hover()
+        expect(page.get_by_text(job, exact=True)).not_to_be_visible()
 
-    # Summary is the default tab: the PR description + a comment render there.
+    # Summary is the default tab: the PR description renders there.
     expect(rail.get_by_text(re.compile(r"Adds the GitHub tab"))).to_be_visible()
+    expect(rail.get_by_text("Nice work!")).to_have_count(0)
+
+    # Comments have their own tab, labeled with the count. Scope to the inner
+    # "Pull request" tablist — the rail's own tab bar also has a "Changes" tab.
+    pr_tabs = rail.get_by_role("tablist", name="Pull request")
+    pr_tabs.get_by_role("tab", name="Comments 1", exact=True).click()
     expect(rail.get_by_text("Nice work!")).to_be_visible()
 
-    # Switching to Changes reveals the sidebar file tree. Scope to the inner
-    # "Pull request" tablist — the rail's own tab bar also has a "Changes" tab.
-    # The src → app single-child chain compacts into one "src/app" folder row
-    # (exact — the diff section header carries the full path and would substring).
-    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    # Switching to Changes reveals the sidebar file tree. The src → app
+    # single-child chain compacts into one "src/app" folder row (exact — the
+    # diff section header carries the full path and would substring).
+    pr_tabs.get_by_role("tab", name="Changes").click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
+
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Summary").click()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+def test_pr_diff_retry_keeps_associations(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    failed = True
+
+    def diff(route: Route) -> None:
+        if failed:
+            route.fulfill(
+                status=400, json={"error": {"message": "GitHub could not load the PR diff."}}
+            )
+        else:
+            route.fulfill(json=_PR_DIFF)
+
+    page.route(re.compile(r"/resources/github/diff(?:\?|$)"), diff)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
+        "tab", name="Changes", exact=True
+    ).click()
+    expect(panel.get_by_role("alert")).to_have_text("GitHub could not load the PR diff.")
+    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    expect(panel.get_by_text("No changes vs base.")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-error.png"))
+    failed = False
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(panel.get_by_role("alert")).to_have_count(0)
+    expect(panel.locator("diffs-container")).to_have_count(1)
+    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-recovered.png"))
 
 
 @pytest.mark.parametrize(
@@ -332,12 +411,16 @@ def test_composer_pr_link_opens_github_tab(
         if is_mobile:
             expect(panel).to_have_attribute("data-state", "open")
         else:
-            expect(panel.get_by_role("tab", name="GitHub")).to_have_attribute(
+            expect(panel.get_by_role("tab", name="Pull Requests")).to_have_attribute(
                 "aria-selected", "true"
             )
         expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
         expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
-        expect(panel.get_by_text("Nice work!", exact=True)).to_be_visible()
+        expect(
+            panel.get_by_role("tablist", name="Pull request").get_by_role(
+                "tab", name="Comments 1", exact=True
+            )
+        ).to_be_visible()
         if pr_count > 1:
             expect(panel.get_by_role("combobox", name="Session pull request")).to_have_text(
                 f"example.com/acme/app #{_PR_NUMBER}"
@@ -350,14 +433,16 @@ def test_composer_pr_link_opens_github_tab(
         expect(panel).to_have_attribute("data-state", "closed")
         expect(pr_link).to_be_in_viewport()
 
-    expected_font_size = font_size * 0.9 * (14 / 13 if is_mobile else 1)
+    expected_font_size = font_size * 0.9
     for test_id, actual_font_size in font_sizes.items():
         assert actual_font_size == pytest.approx(expected_font_size, abs=0.01), (
             f"{test_id} should use the caption size at {font_size}px preference: {font_sizes}"
         )
     reference_center = centers["composer-workspace-dir.icon"]
-    assert bar_bounds["height"] == pytest.approx(37, abs=0.1)
-    assert reference_center == pytest.approx(bar_bounds["y"] + 19, abs=0.5)
+    expected_bar_height = 28 if is_mobile else 37
+    expected_center_offset = 14 if is_mobile else 19
+    assert bar_bounds["height"] == pytest.approx(expected_bar_height, abs=0.1)
+    assert reference_center == pytest.approx(bar_bounds["y"] + expected_center_offset, abs=0.5)
     for name, center in centers.items():
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
@@ -406,7 +491,7 @@ def test_github_tab_prompts_to_update_outdated_host(
 
     Pins the full old-host chain end to end: the 404 body → ``githubNotFoundReason``
     → the ``host_outdated`` state → the actionable empty state, rather than the
-    generic "GitHub isn't available" one.
+    generic "Pull requests aren't available" one.
     """
     base_url, session_id = seeded_session
     _stub_github_outdated_host(page)
@@ -414,8 +499,136 @@ def test_github_tab_prompts_to_update_outdated_host(
 
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tab", name="Pull Requests").click()
 
-    expect(rail.get_by_text("Update your host to use GitHub")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text("Update your host to use the Pull Requests tab")).to_be_visible(
+        timeout=30_000
+    )
     # The hint names the version floor so the user knows what to update to.
     expect(rail.get_by_text(re.compile(r"0\.13\.0 or later"))).to_be_visible()
+
+
+def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A secondary remote's warning leaves the GitHub empty state actionable."""
+    base_url, session_id = seeded_session
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "pr": None,
+                "prs": [],
+                "tracking_available": True,
+                "discovery_warnings": ["GitLab discovery failed. Refresh to retry."],
+            }
+        ),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name="Pull Requests").click()
+    expect(rail.get_by_text("No open PR for", exact=False)).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("status")).to_have_text("GitLab discovery failed. Refresh to retry.")
+    rail.get_by_role("button", name="Link a PR", exact=True).click()
+    expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+def test_post_top_level_pr_comment(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """The same composer posts and retains drafts through every PR-panel entry point."""
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    pr_url = _INFO["pr"]["url"]
+    comments = [
+        {
+            **_INFO["pr"]["comments"][0],
+            "body": f"Earlier comment {index + 1}",
+            "url": f"{pr_url}#comment-{index}",
+        }
+        for index in range(30)
+    ]
+    info = {
+        **_INFO,
+        "selected_pr_url": pr_url,
+        "capabilities": {"comment_posting": True},
+        "selected_account": "octocat",
+        "pr": {**_INFO["pr"], "comments": comments},
+    }
+    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    posts = []
+
+    def post_comment(route: Route) -> None:
+        posts.append(route.request.post_data_json)
+        comment = {
+            "author": "octocat",
+            "body": posts[-1]["body"],
+            "created_at": "2026-10-26T12:00:00Z",
+            "url": pr_url + "#issuecomment-99",
+        }
+        info["pr"]["comments"].append(comment)
+        route.fulfill(json={"object": "session.github.pr_comment", "comment": comment})
+
+    page.route(re.compile(r"/resources/github/comments$"), post_comment)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Comments 30", exact=True).click()
+    textbox = panel.get_by_role("textbox", name="New PR comment")
+    post_button = panel.get_by_role("button", name="Post comment", exact=True)
+    expect(textbox).to_be_in_viewport()
+    expect(post_button).to_be_in_viewport()
+    feed = panel.get_by_role("region", name="PR comments", exact=True)
+    assert feed.evaluate("el => el.scrollHeight > el.clientHeight")
+    composer_top = textbox.evaluate("el => el.getBoundingClientRect().top")
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Earlier comment 30", exact=True)).to_be_in_viewport()
+    assert textbox.evaluate("el => el.getBoundingClientRect().top") == pytest.approx(
+        composer_top, abs=1
+    )
+    feed.evaluate("el => { el.scrollTop = 0; }")
+    expect(panel.get_by_text("Earlier comment 1", exact=True)).to_be_in_viewport()
+    textbox.fill("Preview paragraph.\n\n" * 80)
+    panel.get_by_role("tab", name="Preview", exact=True).click()
+    expect(post_button).to_be_in_viewport()
+    assert feed.evaluate("el => el.clientHeight") > 0
+    if mobile:
+        page.set_viewport_size({"width": 390, "height": 540})
+        expect(post_button).to_be_in_viewport()
+        assert feed.evaluate("el => el.clientHeight") > 0
+        page.set_viewport_size({"width": 390, "height": 900})
+    panel.get_by_role("tab", name="Write", exact=True).click()
+    textbox.fill("**Thanks for reviewing!**")
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    tabs.get_by_role("tab", name="Comments 30", exact=True).click()
+    expect(textbox).to_have_value("**Thanks for reviewing!**")
+    panel.get_by_role("tab", name="Preview", exact=True).click()
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"comment-{entry}-preview.png"))
+    panel.get_by_role("button", name="Post comment", exact=True).click()
+    expect(tabs.get_by_role("tab", name="Comments 31", exact=True)).to_be_visible()
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    panel.get_by_role("tab", name="Write", exact=True).click()
+    expect(textbox).to_have_value("")
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_in_viewport()
+    expect(post_button).to_be_in_viewport()
+    assert posts == [{"pr_url": pr_url, "body": "**Thanks for reviewing!**"}]
+    page.screenshot(path=str(tmp_path / f"comment-{entry}-posted.png"))

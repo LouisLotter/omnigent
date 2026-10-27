@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from packaging.version import Version
@@ -32,6 +33,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
 
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
@@ -233,6 +236,31 @@ def test_login_probe_caches_positive_verdicts_with_ttl(
     assert len(runs) == 2
 
 
+def test_invalidate_probe_caches_forces_fresh_login_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual readiness refreshes must not reuse a cached login verdict."""
+    hi.invalidate_harness_probe_caches()
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    hi.invalidate_harness_probe_caches()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+    hi.invalidate_harness_probe_caches()
+
+
 def test_login_probe_never_caches_negative_verdicts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -288,8 +316,7 @@ def test_version_probe_caches_by_binary_signature(
 ) -> None:
     """``--version`` parses cache against (path, mtime, size); failures don't.
 
-    The output is a pure function of the binary bytes, so a swap (upgrade)
-    must re-probe and an unchanged binary must never be probed twice.
+    A changed executable must re-probe even while the cached version is fresh.
     """
     binary = tmp_path / "fake-cli"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -318,6 +345,93 @@ def test_version_probe_caches_by_binary_signature(
     os.utime(binary, ns=(1, 1))
     assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
     assert len(runs) == 3
+
+
+@pytest.mark.parametrize("refresh", ["expiry", "manual", "install"])
+def test_version_probe_refreshes_an_unchanged_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: str
+) -> None:
+    """Upgrading a launcher's delegated executable must restore readiness."""
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    now = 100.0
+    monkeypatch.setattr(hi, "time", SimpleNamespace(monotonic=lambda: now))
+    version = "0.1.0"
+    probes = 0
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal probes
+        if argv == [str(binary), "--version"]:
+            probes += 1
+            return subprocess.CompletedProcess(argv, 0, f"codex-cli {version}\n", "")
+        assert argv == hi.harness_install_command(OPENAI_FAMILY)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    version = spec.min_version
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert probes == 1
+    if refresh == "expiry":
+        now += 60.0
+    elif refresh == "manual":
+        hi.invalidate_harness_probe_caches()
+    else:
+        assert hi.try_install_harness_cli(OPENAI_FAMILY).installed
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == version
+    assert probes == 2
+
+
+@pytest.mark.parametrize("returncode", [1, -15])
+@pytest.mark.parametrize("output_stream", ["stdout", "stderr"])
+def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    output_stream: str,
+) -> None:
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    runs = 0
+    repaired = False
+
+    def run_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal runs
+        runs += 1
+        if repaired:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=f"codex-cli {spec.min_version}\n", stderr=""
+            )
+        diagnostic = "Error: missing optional dependency\nNode.js v22.18.0\n"
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=returncode,
+            stdout=diagnostic if output_stream == "stdout" else "",
+            stderr=diagnostic if output_stream == "stderr" else "",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", run_probe)
+
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") == spec
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] is None
+    assert runs == 3
+
+    # Repairing a dependency need not change the launcher's file signature.
+    repaired = True
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.missing_harness_cli("codex-native") is None
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == spec.min_version
+    assert runs == 4
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -1085,7 +1199,7 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["claude", "auth", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/claude", "auth", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1112,7 +1226,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["codex", "login", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/codex", "login", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1143,7 +1257,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["cursor-agent", "status", "--format", "json"]
+        assert argv == ["/usr/bin/cursor-agent", "status", "--format", "json"]
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
