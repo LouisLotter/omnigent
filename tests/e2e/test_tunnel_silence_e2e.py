@@ -179,7 +179,9 @@ def topology(tmp_path: Path, isolated_mock_llm_server_url: str) -> Iterator[_Top
         yield _Topology(stack, host, proxy, events, client, isolated_mock_llm_server_url)
 
 
-def _drop_runner_then_pause(topology: _Topology, pause_s: float) -> float:
+def _drop_runner_then_pause(
+    topology: _Topology, pause_s: float, *, runner: ConnectionInfo | None = None
+) -> float:
     """Drop the runner's tunnel, then pause everything just before its deadline.
 
     The drop comes right after a server ping, and the pause starts a second
@@ -187,10 +189,16 @@ def _drop_runner_then_pause(topology: _Topology, pause_s: float) -> float:
 
     :returns: Seconds from the drop until the runner's new tunnel opened.
     """
-    [runner] = topology.wait_for_server_messages(("runner.tunnel",), newer_than_s=1).values()
+    pause_in_s = TUNNEL_SILENCE_TIMEOUT_S - 1
+    if runner is None:
+        [runner] = topology.wait_for_server_messages(("runner.tunnel",), newer_than_s=1).values()
+    else:
+        age_s = runner.last_s2c_message_age_s
+        assert age_s is not None and 0 <= age_s < 10, age_s
+        pause_in_s -= age_s
     dropped_at, dropped_wall = time.monotonic(), time.time()
     assert topology.proxy.ping_only({"runner.tunnel"}) == 1
-    time.sleep(TUNNEL_SILENCE_TIMEOUT_S - 1)
+    time.sleep(pause_in_s)
     with frozen(topology.processes(), topology.events):
         time.sleep(pause_s)
     topology.wait_gave_up(runner, timeout=_RECONNECT_S)
@@ -290,11 +298,18 @@ def test_an_extended_runner_grace_keeps_a_turn_through_a_longer_outage(
     session_id = create_runner_bound_session(
         client, agent_name=agent_name, runner_id=topology.stack.runner_id
     )
+    # Align before opening the model gate: a later ping wait can push the blocked
+    # model call past its 120 s request timeout during the 100 s tunnel outage.
+    topology.wait_for_server_messages(("runner.tunnel",), newer_than_s=1)
+    prepared_at = time.monotonic()
     _send_user_message(client, session_id)
-    _poll_until(lambda: _gate_pending(mock), timeout=60, what="the turn to reach the model")
+    _poll_until(lambda: _gate_pending(mock), timeout=10, what="the turn to reach the model")
+    assert time.monotonic() - prepared_at < 10
 
     # Fifteen seconds past the 40 s budget, so the outage clearly crosses upstream's grace.
-    outage_s = _drop_runner_then_pause(topology, _PAUSE_S + 15)
+    outage_s = _drop_runner_then_pause(
+        topology, _PAUSE_S + 15, runner=topology.tunnel("runner.tunnel")
+    )
     assert RUNNER_LIVENESS_TTL_S < outage_s < _RUNNER_GRACE_S
 
     release_mock_gate(mock)
