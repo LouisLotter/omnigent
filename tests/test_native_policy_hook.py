@@ -13,6 +13,7 @@ from omnigent.native.native_policy_hook import (
     fail_ask_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    parse_evaluation_response,
     post_evaluate_with_retry,
 )
 
@@ -292,18 +293,84 @@ def test_user_prompt_submit_blocking_actions_emit_decision_block(action: str) ->
     assert output == {"decision": "block", "reason": "no prod mutations"}
 
 
-def test_user_prompt_submit_block_defaults_reason() -> None:
+@pytest.mark.parametrize("reason", [None, "", "  \n", 7, ["a list"]])
+def test_user_prompt_submit_block_defaults_reason(reason: object) -> None:
     """
-    A block with no reason still carries a non-empty reason.
+    A block with no usable reason still carries a non-empty text reason.
 
     Both harnesses drop a block whose reason is empty (the block is treated
-    as invalid), so a missing reason must be defaulted or the gate would
+    as invalid), and Codex cannot read a reason that is not text, so a
+    missing, blank or non-string reason must be defaulted or the gate would
     silently fail open.
     """
-    output = evaluation_response_to_hook_output(
-        "UserPromptSubmit", {"result": "POLICY_ACTION_DENY"}
-    )
+    verdict: dict[str, object] = {"result": "POLICY_ACTION_DENY"}
+    if reason is not None:
+        verdict["reason"] = reason
+    output = evaluation_response_to_hook_output("UserPromptSubmit", verdict)
     assert output == {"decision": "block", "reason": "Denied by policy"}
+
+
+@pytest.mark.parametrize("action", ["POLICY_ACTION_DENY", "POLICY_ACTION_ASK"])
+@pytest.mark.parametrize("reason", [None, "", "  \n", 7])
+def test_pre_tool_use_deny_always_carries_a_reason(action: str, reason: object) -> None:
+    """
+    A PreToolUse deny carries a non-empty text reason even when the policy gave none.
+
+    Codex treats a deny without a non-empty ``permissionDecisionReason`` as
+    invalid hook output and runs the tool, so a reasonless DENY would fail
+    open there.
+    """
+    verdict: dict[str, object] = {"result": action}
+    if reason is not None:
+        verdict["reason"] = reason
+    output = evaluation_response_to_hook_output("PreToolUse", verdict)
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Denied by policy",
+        }
+    }
+
+
+def test_pre_tool_use_deny_reason_is_trimmed() -> None:
+    """Surrounding whitespace is dropped from the policy's reason."""
+    output = evaluation_response_to_hook_output(
+        "PreToolUse", {"result": "POLICY_ACTION_DENY", "reason": "  no rm \n"}
+    )
+    assert output is not None
+    assert output["hookSpecificOutput"]["permissionDecisionReason"] == "no rm"
+
+
+@pytest.mark.parametrize(
+    ("body", "problem"),
+    [
+        (b"", "empty Omnigent response"),
+        (b"not json", "malformed Omnigent response"),
+        (b"\xff\xfe\xfa", "malformed Omnigent response"),
+        (b'["POLICY_ACTION_ALLOW"]', "Omnigent response carried no policy verdict"),
+        (b'"POLICY_ACTION_ALLOW"', "Omnigent response carried no policy verdict"),
+        (b"{}", "Omnigent response carried no policy verdict"),
+        (b'{"result": 3}', "Omnigent response carried no policy verdict"),
+    ],
+)
+def test_parse_evaluation_response_rejects_unusable_bodies(body: bytes, problem: str) -> None:
+    """
+    A body that is not an object with a string ``result`` is not a verdict.
+
+    Callers fail closed on these, so each must come back as a problem rather
+    than as a response the caller would read as "no opinion".
+    """
+    assert parse_evaluation_response(body) == (None, problem)
+
+
+def test_parse_evaluation_response_returns_the_verdict() -> None:
+    """A well-formed EvaluationResponse is returned as decoded."""
+    body = b'{"result": "POLICY_ACTION_DENY", "reason": "no rm"}'
+    assert parse_evaluation_response(body) == (
+        {"result": "POLICY_ACTION_DENY", "reason": "no rm"},
+        None,
+    )
 
 
 @pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"])
@@ -334,8 +401,9 @@ def test_fail_closed_pre_tool_use_denies() -> None:
     assert hook_specific["hookEventName"] == "PreToolUse"
     assert hook_specific["permissionDecision"] == "deny"
     # A deny is inert without a reason on the consuming harnesses, so one
-    # must always be present.
+    # must always be present, and it tells the reader the tool did not run.
     assert hook_specific["permissionDecisionReason"]
+    assert "was not run" in hook_specific["permissionDecisionReason"]
 
 
 def test_fail_closed_user_prompt_submit_fails_closed() -> None:

@@ -134,6 +134,22 @@ class _RaisesIfCalled:
         )
 
 
+class _ExplodingHttpxClient(_RaisesIfCalled):
+    """HTTP client stub whose POST fails with an error the hook does not expect."""
+
+    def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+        """
+        Raise an unexpected, non-HTTP error.
+
+        :param url: Target URL (unused).
+        :param json: Request body (unused).
+        :returns: Never returns.
+        :raises RuntimeError: Always.
+        """
+        del url, json
+        raise RuntimeError("unexpected")
+
+
 @pytest.fixture
 def bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """
@@ -399,21 +415,87 @@ def test_missing_policy_config_is_fail_open(
     assert captured.out == ""
 
 
-@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
-def test_pre_tool_use_fails_closed_when_verdict_unavailable(
+def _assert_codex_enforced_deny(hook_stdout: str) -> str:
+    """
+    Assert *hook_stdout* is a ``PreToolUse`` deny that Codex enforces.
+
+    Codex blocks the tool only for ``permissionDecision: "deny"`` with a
+    non-empty ``permissionDecisionReason``. It rejects ``"ask"`` (and a deny
+    without a reason) as unsupported output, marks the hook failed and runs
+    the tool, so anything else here would fail open.
+
+    :param hook_stdout: What the hook wrote to stdout.
+    :returns: The deny reason, for further assertions.
+    """
+    result = json.loads(hook_stdout)
+    assert set(result) == {"hookSpecificOutput"}, result
+    hook_specific = result["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+    assert hook_specific["permissionDecision"] == "deny", result
+    reason = hook_specific["permissionDecisionReason"]
+    assert isinstance(reason, str) and reason.strip(), result
+    return reason
+
+
+def _govern_session(bridge_dir: Path, route: str) -> None:
+    """
+    Make the session governed through the relay or the direct server path.
+
+    :param bridge_dir: The session's bridge directory.
+    :param route: ``"relay"`` (a ``tool_relay.json`` naming the session) or
+        ``"direct"`` (``policy_hook.json`` with a server URL).
+    :returns: None.
+    """
+    if route == "relay":
+        from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
+
+        (bridge_dir / _TOOL_RELAY_FILE).write_text(
+            json.dumps(
+                {
+                    "url": "http://127.0.0.1:19999",
+                    "token": "relay-tok",
+                    "session_id": "conv_active",
+                }
+            )
+        )
+    else:
+        write_policy_hook_config(
+            bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={}
+        )
+
+
+@pytest.mark.parametrize("route", ["direct", "relay"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "connect_error",
+        "connect_timeout",
+        "read_timeout",
+        "dropped_connection",
+        "non_2xx",
+        "bad_request",
+        "empty_body",
+        "malformed_json",
+        "non_object_json",
+        "no_verdict",
+    ],
+)
+def test_pre_tool_use_denies_when_verdict_unavailable(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     mode: str,
+    route: str,
 ) -> None:
     """
-    A governed PreToolUse call denies when no usable verdict is returned.
+    A governed PreToolUse call is denied when no usable verdict comes back.
 
     For native harnesses this hook is the sole TOOL_CALL enforcement point,
-    so a server outage / non-2xx / empty / malformed response must fail
-    CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
+    so an unreachable / timed-out / failing server or an unusable answer must
+    fail CLOSED with the deny Codex enforces, never ``ask``, which Codex
+    rejects before running the tool anyway.
     """
-    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    _govern_session(bridge_dir, route)
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
 
@@ -429,9 +511,90 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
-    assert result["hookSpecificOutput"]["permissionDecisionReason"]
+    reason = _assert_codex_enforced_deny(captured.out)
+    # The person and the model are told the call did not run and why.
+    assert reason.startswith(native_policy_hook._EVAL_UNAVAILABLE_REASON)
+    assert "Detail: " in reason
+
+
+def test_pre_tool_use_denies_when_the_hook_itself_fails(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An error inside the hook denies the call instead of crashing.
+
+    Codex treats a hook that exits non-zero as failed and runs the tool, so
+    an unexpected error on a governed PreToolUse must still answer deny.
+    """
+    _govern_session(bridge_dir, "relay")
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExplodingHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    reason = _assert_codex_enforced_deny(captured.out)
+    assert "RuntimeError" in reason
+    assert "RuntimeError: unexpected" in captured.err
+
+
+def test_user_prompt_submit_blocks_when_the_hook_itself_fails(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An error inside the hook blocks a governed prompt, as an outage does."""
+    _govern_session(bridge_dir, "relay")
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExplodingHttpxClient)
+
+    _run_hook(bridge_dir, {"hook_event_name": "UserPromptSubmit", "prompt": "hi"}, monkeypatch)
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["decision"] == "block"
+    assert result["reason"].strip()
+
+
+@pytest.mark.parametrize("reason", [None, "", "   ", 42])
+def test_pre_tool_use_deny_without_a_usable_reason_still_blocks(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reason: object,
+) -> None:
+    """
+    A DENY whose policy gives no reason is still enforced by Codex.
+
+    Codex ignores a deny without a non-empty reason (and fails a non-string
+    one), then runs the tool, so the hook supplies a default reason.
+    """
+    _govern_session(bridge_dir, "relay")
+    verdict: dict[str, object] = {"result": "POLICY_ACTION_DENY"}
+    if reason is not None:
+        verdict["reason"] = reason
+    body = json.dumps(verdict)
+
+    class _ReasonlessDenyClient(_DenyHttpxClient):
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(200, text=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ReasonlessDenyClient)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    assert _assert_codex_enforced_deny(capsys.readouterr().out) == "Denied by policy"
 
 
 def test_user_prompt_submit_fails_closed_on_error(

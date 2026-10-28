@@ -74,9 +74,13 @@ _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 # body). Mirrors the runner-side fail-closed default in
 # ``omnigent.runner.policy_proxy._evaluate_policy_via_omnigent``.
 _EVAL_UNAVAILABLE_REASON = (
-    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
-    "Omnigent server); failing closed for this tool call."
+    "Omnigent could not check this tool call against its policies (the policy "
+    "service could not be reached or gave no usable answer), so the tool was not "
+    "run. Try again in a moment."
 )
+# Reason given for a DENY (or a stray ASK) verdict whose policy names none:
+# Codex ignores a deny without a non-empty reason and runs the tool.
+_DENIED_BY_POLICY_REASON = "Denied by policy"
 _EVAL_UNAVAILABLE_REQUEST_REASON = (
     "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
     "Omnigent server); failing closed for this request."
@@ -417,7 +421,9 @@ def evaluation_response_to_hook_output(
         rewrite on PostToolUse, or an unknown action).
     """
     action = eval_response.get("result", "POLICY_ACTION_UNSPECIFIED")
-    reason = eval_response.get("reason")
+    raw_reason = eval_response.get("reason")
+    # A blank or non-string reason counts as none: both harnesses read it as text.
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
 
     if hook_event == _USER_PROMPT_SUBMIT:
         # DENY blocks the prompt; a stray ASK fails closed (also block) since
@@ -428,7 +434,7 @@ def evaluation_response_to_hook_output(
         if action in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK"):
             return {
                 "decision": "block",
-                "reason": reason or "Denied by policy",
+                "reason": reason or _DENIED_BY_POLICY_REASON,
             }
         return None
 
@@ -449,13 +455,15 @@ def evaluation_response_to_hook_output(
         decision = decision_map.get(str(action))
         if decision is None:
             return None
-        output: dict[str, object] = {
-            "hookEventName": _PRE_TOOL_USE,
-            "permissionDecision": decision,
+        # Codex rejects a deny without a non-empty reason as invalid output and
+        # runs the tool, so a deny always carries one.
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": _PRE_TOOL_USE,
+                "permissionDecision": decision,
+                "permissionDecisionReason": reason or _DENIED_BY_POLICY_REASON,
+            }
         }
-        if decision == "deny" and reason:
-            output["permissionDecisionReason"] = reason
-        return {"hookSpecificOutput": output}
 
     if hook_event == _POST_TOOL_USE:
         if action == "POLICY_ACTION_DENY" and reason:
@@ -558,9 +566,11 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
     pre-turn enforcement gate for native sessions; a server hiccup must not
     let an over-budget or otherwise-blocked request proceed silently.
 
-    Use this for harnesses whose native TUI has an interactive approval UI
-    (claude-native, codex-native). For headless harnesses where no approval
-    UI is available, prefer :func:`fail_closed_hook_output`.
+    Use this only for harnesses that honor ``permissionDecision: "ask"`` from
+    a ``PreToolUse`` hook (claude-native). Codex rejects ``"ask"`` as an
+    unsupported decision, marks the hook failed and runs the tool, so
+    codex-native — like headless harnesses with no approval UI — uses
+    :func:`fail_closed_hook_output`.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
     :param detail: Optional diagnostic string appended to the ask reason
@@ -583,6 +593,32 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
             },
         }
     return fail_closed_hook_output(hook_event, detail)
+
+
+def parse_evaluation_response(body: bytes) -> tuple[dict[str, object], None] | tuple[None, str]:
+    """
+    Decode a ``/policies/evaluate`` response body into a usable verdict.
+
+    A usable verdict is a JSON object whose ``result`` is a string. Anything
+    else — an empty body, invalid JSON, a list or scalar, or an object with
+    no ``result`` — is not a verdict, and the caller fails closed on it, as
+    the runner's policy proxy and the relay's Claude hook endpoint do.
+
+    :param body: Raw response body, e.g.
+        ``b'{"result": "POLICY_ACTION_DENY", "reason": "no rm"}'``.
+    :returns: ``(verdict, None)`` for a usable verdict; otherwise
+        ``(None, problem)`` with a short description such as
+        ``"empty Omnigent response"``.
+    """
+    if not body:
+        return None, "empty Omnigent response"
+    try:
+        decoded = json.loads(body)
+    except ValueError:
+        return None, "malformed Omnigent response"
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("result"), str):
+        return None, "Omnigent response carried no policy verdict"
+    return decoded, None
 
 
 def post_evaluate_with_retry(
