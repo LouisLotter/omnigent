@@ -2577,6 +2577,11 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # While no settings layer names a renderer, Claude may open a "Try the new
+    # fullscreen renderer?" dialog at startup that fires no hook. Naming the
+    # default renderer skips it; a renderer the person chose still wins.
+    if read_user_tui_renderer() is None:
+        settings["tui"] = "default"
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -8011,6 +8016,24 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def _read_user_claude_settings() -> _JsonObject | None:
+    """
+    Read the user's own ``~/.claude/settings.json``, never writing it.
+
+    :returns: The parsed settings object, or ``None`` when the file is
+        missing, unreadable, not JSON, or not a JSON object.
+    """
+    try:
+        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def read_user_status_line_command() -> str | None:
     """
     Return the user's globally-configured statusLine shell command, if any.
@@ -8024,15 +8047,8 @@ def read_user_status_line_command() -> str | None:
         ``~/.claude/settings.json``'s ``statusLine.command``, or
         ``None`` when no global statusLine is configured / readable.
     """
-    try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
+    parsed = _read_user_claude_settings()
+    if parsed is None:
         return None
     status_line = parsed.get("statusLine")
     if not isinstance(status_line, dict):
@@ -8040,6 +8056,26 @@ def read_user_status_line_command() -> str | None:
     command = status_line.get("command")
     if isinstance(command, str) and command.strip():
         return command
+    return None
+
+
+def read_user_tui_renderer() -> str | None:
+    """
+    Return the terminal renderer the user chose in their Claude settings, if any.
+
+    Our per-session ``--settings`` outranks the user's settings file, so we
+    only name a renderer (to skip Claude's fullscreen-renderer startup offer)
+    when the user has not chosen one themselves.
+
+    :returns: ``tui`` from ``~/.claude/settings.json``, e.g.
+        ``"fullscreen"``, or ``None`` when unset, blank or unreadable.
+    """
+    parsed = _read_user_claude_settings()
+    if parsed is None:
+        return None
+    renderer = parsed.get("tui")
+    if isinstance(renderer, str) and renderer.strip():
+        return renderer
     return None
 
 
@@ -8053,15 +8089,8 @@ def read_user_effort_level() -> str | None:
     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
     """
-    try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
+    parsed = _read_user_claude_settings()
+    if parsed is None:
         return None
     effort = parsed.get("effortLevel")
     if isinstance(effort, str) and effort in CLAUDE_EFFORTS:

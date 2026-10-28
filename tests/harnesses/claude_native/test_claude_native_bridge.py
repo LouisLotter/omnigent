@@ -3904,6 +3904,59 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+@pytest.mark.parametrize(
+    "user_settings",
+    [None, {"model": "opus"}, {"tui": ""}, {"tui": None}, ["not", "an", "object"]],
+    ids=["missing", "no-tui", "blank-tui", "null-tui", "not-an-object"],
+)
+def test_augment_claude_args_names_the_default_renderer(
+    user_settings: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch names the default renderer when the user has not chosen one.
+
+    While no settings layer sets ``tui``, Claude Code can open "Try the new
+    fullscreen renderer?" at startup. Like the trust and MCP gates it fires
+    no hook, so a host-spawned terminal sits on it and the first message
+    fails. Naming a renderer in the invocation-local sidecar skips it.
+    """
+    user_settings_path = tmp_path / "user" / "settings.json"
+    if user_settings is not None:
+        user_settings_path.parent.mkdir()
+        user_settings_path.write_text(json.dumps(user_settings), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", user_settings_path)
+
+    args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("tui") == "default"
+
+
+@pytest.mark.parametrize("renderer", ["fullscreen", "default"])
+def test_augment_claude_args_keeps_the_users_own_renderer(
+    renderer: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A renderer the user chose is left alone.
+
+    The sidecar outranks ``~/.claude/settings.json``, so writing ``tui`` there
+    would silently undo a person's "fullscreen" choice; the sidecar omits it.
+    """
+    user_settings_path = tmp_path / "settings.json"
+    user_settings_path.write_text(json.dumps({"tui": renderer}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", user_settings_path)
+
+    args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+
+    settings = _load_invocation_settings(args)
+    assert "tui" not in settings
+    assert claude_native_bridge.read_user_tui_renderer() == renderer
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:
