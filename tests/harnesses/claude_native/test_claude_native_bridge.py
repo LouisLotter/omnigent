@@ -3936,16 +3936,29 @@ def test_augment_claude_args_names_the_default_renderer(
 
 
 @pytest.mark.parametrize(
-    ("custom_dir_settings", "home_settings", "expected_tui"),
+    ("config_dir", "renderer_files", "expected_tui"),
     [
-        (None, {"tui": "fullscreen"}, "default"),
-        ({"tui": "fullscreen"}, None, None),
+        ("<abs>/custom", ["home/settings.json"], "default"),
+        ("<abs>/custom", ["custom/settings.json"], None),
+        ("", ["workspace/settings.json"], None),
+        ("", ["home/settings.json", "runner/settings.json"], "default"),
+        ("rel", ["workspace/rel/settings.json"], None),
+        ("rel", ["runner/rel/settings.json"], "default"),
+        ("~/cfg", ["workspace/~/cfg/settings.json"], None),
     ],
-    ids=["choice-only-in-home", "choice-in-custom-dir"],
+    ids=[
+        "absolute-dir-choice-only-in-home",
+        "absolute-dir-choice",
+        "empty-value-reads-the-workspace",
+        "empty-value-ignores-home-and-runner-dirs",
+        "relative-value-reads-from-the-workspace",
+        "relative-value-ignores-the-runner-dir",
+        "tilde-is-not-expanded",
+    ],
 )
 def test_augment_claude_args_reads_the_renderer_from_claudes_config_dir(
-    custom_dir_settings: dict[str, str] | None,
-    home_settings: dict[str, str] | None,
+    config_dir: str,
+    renderer_files: list[str],
     expected_tui: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3954,22 +3967,28 @@ def test_augment_claude_args_reads_the_renderer_from_claudes_config_dir(
     With ``CLAUDE_CONFIG_DIR`` set, the renderer choice is read where Claude reads it.
 
     The runner passes ``CLAUDE_CONFIG_DIR`` through to Claude, which then
-    loads ``settings.json`` from that directory, not ``~/.claude``. Reading
-    the wrong file would leave the offer showing or undo the person's choice.
+    loads ``settings.json`` joined to it: an empty or relative value is
+    relative to Claude's working directory (not the runner's), and ``~`` is
+    not expanded. Reading another file would leave the offer showing or undo
+    the person's renderer choice.
     """
-    custom_dir = tmp_path / "custom-claude"
-    custom_dir.mkdir()
-    if custom_dir_settings is not None:
-        custom_settings = json.dumps(custom_dir_settings)
-        (custom_dir / "settings.json").write_text(custom_settings, encoding="utf-8")
-    home_settings_path = tmp_path / "home" / "settings.json"
-    home_settings_path.parent.mkdir()
-    if home_settings is not None:
-        home_settings_path.write_text(json.dumps(home_settings), encoding="utf-8")
-    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", home_settings_path)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom_dir))
+    for name in ("home", "workspace", "runner", "custom"):
+        (tmp_path / name).mkdir()
+    for relative in renderer_files:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"tui": "fullscreen"}), encoding="utf-8")
+    home_settings = tmp_path / "home" / "settings.json"
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", home_settings)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", config_dir.replace("<abs>", str(tmp_path)))
+    monkeypatch.chdir(tmp_path / "runner")
 
-    args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        workspace=tmp_path / "workspace",
+    )
 
     assert _load_invocation_settings(args).get("tui") == expected_tui
 
@@ -12263,7 +12282,7 @@ def test_statusline_shell_command_captures_and_chains(
     chain_out = tmp_path / "chain_out.json"
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.read_user_status_line_command",
-        lambda: f"cat > {chain_out}",
+        lambda cwd=None: f"cat > {chain_out}",
     )
     args = augment_claude_args((), bridge_dir=tmp_path)
     settings = _load_invocation_settings(args)
