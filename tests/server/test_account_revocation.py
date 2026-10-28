@@ -10,6 +10,7 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS
 from tests.server.helpers import build_agent_bundle
 from tests.server.test_accounts import _build_accounts_app, _login
 
@@ -761,7 +762,12 @@ async def test_stale_schedule_cannot_contact_replacement_host(
             return registry.register(
                 connected_id,
                 object(),
-                HostHelloFrame(version="0.15.0", frame_protocol_version=1, name="scheduled-host"),
+                HostHelloFrame(
+                    version="0.15.0",
+                    frame_protocol_version=1,
+                    name="scheduled-host",
+                    capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
+                ),
                 owner,
             )
 
@@ -913,7 +919,12 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
         conn = registry.register(
             host_id,
             object(),
-            HostHelloFrame(version="0.15.0", frame_protocol_version=1, name="review-host"),
+            HostHelloFrame(
+                version="0.15.0",
+                frame_protocol_version=1,
+                name="review-host",
+                capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
+            ),
             "alice",
         )
     tasks = SqlAlchemyScheduledTaskStore(str(stores["account_store"]._engine.url))
@@ -1254,7 +1265,12 @@ def test_http_launch_rechecks_revocation_before_binding(setup_app, monkeypatch, 
         conn = registry.register(
             host_id,
             object(),
-            HostHelloFrame(version="0.15.0", frame_protocol_version=1, name="launch-host"),
+            HostHelloFrame(
+                version="0.15.0",
+                frame_protocol_version=1,
+                name="launch-host",
+                capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
+            ),
             host_owner,
         )
 
@@ -1355,7 +1371,10 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
                         "type": "websocket.receive",
                         "text": encode_host_frame(
                             HostHelloFrame(
-                                version="0.15.0", frame_protocol_version=1, name=host_id
+                                version="0.15.0",
+                                frame_protocol_version=1,
+                                name=host_id,
+                                capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
                             )
                         ),
                     }

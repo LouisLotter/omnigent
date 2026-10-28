@@ -11569,6 +11569,7 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     from omnigent.server.routes._session_create_validation import (
+        require_host_launch_compatibility,
         resolve_project_session_create,
     )
 
@@ -11953,6 +11954,12 @@ async def _create_session_from_existing_agent(
         runner_id=inherited_runner_id,
         host_registry=getattr(request.app.state, "host_registry", None),
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+    )
+
+    require_host_launch_compatibility(
+        host_id=body.host_id,
+        inherited_runner_id=inherited_runner_id,
+        host_registry=getattr(request.app.state, "host_registry", None),
     )
 
     selected_harness = (

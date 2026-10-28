@@ -38,6 +38,7 @@ from omnigent.entities import Conversation
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -172,7 +173,12 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="laptop",
+            capabilities=list(HOST_CAPABILITIES),
+        )
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
@@ -4504,3 +4510,80 @@ async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
     side_chat_after = store.get_conversation(side_chat_id)
     assert side_chat_after is not None and side_chat_after.runner_id == replacement
     assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]
+
+
+@pytest.mark.parametrize("unbound_after_clear", [False, True])
+async def test_legacy_host_relaunch_refuses_before_binding_or_retiring_runners(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    unbound_after_clear: bool,
+) -> None:
+    """A legacy host never sees the launch that could kill a /clear successor."""
+    from unittest.mock import Mock
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS
+    from omnigent.server.routes._sessions import helpers
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    sid = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    if unbound_after_clear:
+        store.clear_runner_id(sid)
+    before = store.get_conversation(sid)
+    assert before is not None
+    conn = app.state.host_registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.remove(CAP_RUNNER_REPLACEMENT_TARGETS)
+    send = Mock(wraps=app.state.host_registry.send_text)
+    stop = Mock()
+    monkeypatch.setattr(app.state.host_registry, "send_text", send)
+    monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", stop)
+
+    with pytest.raises(OmnigentError, match="Update Omnigent") as caught:
+        await helpers._launch_runner_on_host_impl(before, store, app.state.host_registry, conn)
+
+    assert caught.value.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+    assert store.get_conversation(sid).runner_id == before.runner_id
+    assert not conn.pending_launches
+    send.assert_not_called()
+    stop.assert_not_called()
+    assert app.state.host_registry.get(_HOST_ID) is conn
+
+
+@pytest.mark.parametrize("harness", [None, "claude-native"], ids=["sdk", "native"])
+async def test_legacy_host_keeps_existing_runner_usable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+) -> None:
+    """The launch compatibility gate leaves already connected runners usable."""
+    from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness=harness)
+    conn = app.state.host_registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.remove(CAP_RUNNER_REPLACEMENT_TARGETS)
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store)
+    runners.live.add(session["runner_id"])
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+    )
+    try:
+        response = await _post_hello(client, session["id"])
+        launched = await _expect_no_launch(comm, budget_s=budget(0.2))
+    finally:
+        await runners.client.aclose()
+    assert response.status_code < 300, response.text
+    assert not launched
+    assert store.get_conversation(session["id"]).runner_id == session["runner_id"]
+    assert f"/v1/sessions/{session['id']}/events" in [path for path, _ in runners.posts]

@@ -32,6 +32,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -158,6 +159,7 @@ async def _sandbox_host(
     assert accepted["type"] == "websocket.accept", f"tunnel refused: {accepted!r}"
     hello = encode_host_frame(
         HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
             version="0.1.0-test",
             frame_protocol_version=1,
             name=host_name,

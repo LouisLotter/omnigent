@@ -10,11 +10,16 @@ sentinel — rather than tripping the ``require_access`` unauthenticated guard.
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
-from omnigent.server.routes._session_create_validation import validate_session_agent
+from omnigent.server.routes._session_create_validation import (
+    require_host_launch_compatibility,
+    validate_session_agent,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -22,6 +27,19 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+
+
+@pytest.mark.parametrize(
+    "host_id,inherited_runner_id", [(None, None), ("old-host", "connected-runner")]
+)
+def test_create_without_new_host_launch_does_not_require_replacement_support(
+    host_id, inherited_runner_id
+):
+    registry = Mock()
+    require_host_launch_compatibility(
+        host_id=host_id, inherited_runner_id=inherited_runner_id, host_registry=registry
+    )
+    registry.get.assert_not_called()
 
 
 @pytest.fixture()

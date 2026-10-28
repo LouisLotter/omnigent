@@ -42,6 +42,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -167,6 +168,7 @@ def _make_hello(name: str) -> str:
     """Encode a HostHelloFrame the fake sandbox host registers with."""
     return encode_host_frame(
         HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,

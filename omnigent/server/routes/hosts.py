@@ -930,6 +930,7 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        host_registry.require_runner_replacement_support(conn)
         if agent_store is not None and agent_cache is not None:
             from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
 

@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import importlib.util
 import tomllib
+from pathlib import Path
 
 import pytest
 
-from scripts.build_subpackages import (
-    LEGAL_FILES,
-    PACKAGE_DIRS,
-    REPO_ROOT,
-    staged_package,
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# Avoid the tests/scripts package shadowing the repository's namespace package.
+_SPEC = importlib.util.spec_from_file_location(
+    "_build_subpackages_under_test", REPO_ROOT / "scripts" / "build_subpackages.py"
 )
+assert _SPEC is not None and _SPEC.loader is not None
+_build_subpackages = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_build_subpackages)
+LEGAL_FILES = _build_subpackages.LEGAL_FILES
+PACKAGE_DIRS = _build_subpackages.PACKAGE_DIRS
+staged_package = _build_subpackages.staged_package
 
 
 @pytest.mark.parametrize("package_name", PACKAGE_DIRS)

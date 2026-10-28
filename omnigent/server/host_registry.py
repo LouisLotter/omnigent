@@ -38,9 +38,11 @@ from omnigent.db.account_authority import (
     current_account_user,
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     CAP_OPERATION_RECORDS,
+    CAP_RUNNER_REPLACEMENT_TARGETS,
     OPERATION_RECORD_RETENTION_S,
     HostHelloFrame,
     HostMcpServersResultFrame,
@@ -953,6 +955,17 @@ class HostRegistry:
             reported = self._interactive_shells.get(_canonical_host_id(host_id))
         return list(reported) if reported is not None else None
 
+    @staticmethod
+    def require_runner_replacement_support(conn: HostConnection) -> None:
+        """Refuse launches a legacy host could use to stop another session's runner."""
+        if CAP_RUNNER_REPLACEMENT_TARGETS not in conn.hello.capabilities:
+            raise OmnigentError(
+                "This computer cannot safely select which session runner to replace. "
+                "Update Omnigent on the computer and restart its host before starting "
+                "another session runner. Existing connected runners can continue.",
+                code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
+            )
+
     async def admit_launch(
         self,
         conn: HostConnection,
@@ -962,6 +975,7 @@ class HostRegistry:
         transfer_from_host_id: str | None = None,
     ) -> None:
         """Reauthorize immediately before a new runner binding is created."""
+        self.require_runner_replacement_support(conn)
         if self.admission_gate is not None:
             await self.admission_gate(conn.host_id, "runner_launch")
         if self.launch_authorizer is not None:

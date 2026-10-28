@@ -876,3 +876,35 @@ async def test_request_whose_tunnel_closed_stays_unknown_without_the_same_host_p
         assert new.outbound_queue.empty()
         assert new.pending_installs == {}
     assert "req_1" in old.inflight_unanswered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capable", [False, True])
+async def test_launch_admission_requires_explicit_runner_replacement_support(
+    capable: bool,
+) -> None:
+    """An old host remains connected but cannot receive unsafe launch requests."""
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS
+
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.capabilities = [CAP_RUNNER_REPLACEMENT_TARGETS] if capable else []
+    conn = registry.register("host_compat", FakeWebSocket(), hello, owner="alice")
+    registry.admission_gate = AsyncMock()
+    registry.launch_authorizer = Mock()
+    if capable:
+        await registry.admit_launch(conn, "session-a")
+        registry.admission_gate.assert_awaited_once()
+        registry.launch_authorizer.assert_called_once()
+    else:
+        with pytest.raises(OmnigentError, match="Update Omnigent") as caught:
+            await registry.admit_launch(conn, "session-a")
+        assert caught.value.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+        registry.admission_gate.assert_not_awaited()
+        registry.launch_authorizer.assert_not_called()
+    assert registry.get("host_compat") is conn
+    assert conn.retirement_reason is None
+    assert conn.outbound_queue.empty()

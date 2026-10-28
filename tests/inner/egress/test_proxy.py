@@ -1805,9 +1805,10 @@ async def test_upstream_ca_pinned_at_construction_not_reread_per_request(
 
     monkeypatch.setattr(loop, "getaddrinfo", _stub_getaddrinfo)
 
-    # Read the MITM CA into memory once so the client's trust survives
-    # the file deletion that simulates the attacker's mutation.
-    ca_bundle_pem = bundle_path.read_text()
+    # The client only needs the MITM CA. The combined upstream bundle may
+    # contain non-ASCII system-store comments that ssl's cadata rejects.
+    # Keep client trust in memory while deleting the upstream bundle below.
+    ca_bundle_pem = cert_path.read_text()
 
     try:
         # Baseline: with the bundle present, the proxy builds the

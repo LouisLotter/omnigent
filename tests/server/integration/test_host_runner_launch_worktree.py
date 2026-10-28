@@ -30,6 +30,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import (
+    CAP_RUNNER_REPLACEMENT_TARGETS,
     HostCreateWorktreeFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -156,7 +157,12 @@ async def register_host(
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
-            hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="wt-host"),
+            hello=HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="wt-host",
+                capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
+            ),
             owner=RESERVED_USER_LOCAL,
         )
         cap = _HostCapture()
@@ -286,6 +292,45 @@ async def _launch(
     if git is not None:
         body["git"] = git
     return await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=body)
+
+
+async def test_old_host_is_refused_before_worktree_or_binding_side_effects(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old computer cannot safely interpret explicit runner replacement targets."""
+    captured = register_host()
+    session_id = await _bare_session(client, "old-host-launch")
+    registry = app.state.host_registry
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities = []
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(session_id)
+    assert before is not None
+
+    def unexpected_send(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("unsupported launch sent a host request before refusal")
+
+    monkeypatch.setattr(registry, "send_text", unexpected_send)
+    response = await _launch(client, session_id, git={"branch_name": "feature/unsafe"})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_capability_mismatch"
+    assert "update" in response.text.lower()
+    assert captured.create == captured.launch == captured.remove == []
+    after = store.get_conversation(session_id)
+    assert after is not None
+    assert (after.runner_id, after.host_id, after.workspace, after.git_branch, after.labels) == (
+        before.runner_id,
+        before.host_id,
+        before.workspace,
+        before.git_branch,
+        before.labels,
+    )
 
 
 async def test_launch_runner_with_git_creates_worktree_and_persists_branch(

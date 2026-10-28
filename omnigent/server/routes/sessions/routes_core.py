@@ -1400,7 +1400,16 @@ def register_core_routes(
             tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
         )
 
+        from omnigent.server.routes._session_create_validation import (
+            require_host_launch_compatibility,
+        )
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
+
+        require_host_launch_compatibility(
+            host_id=parsed_metadata.host_id,
+            inherited_runner_id=inherited_runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+        )
 
         inference_snapshot, inference_model = await prepare_create_inference(
             request,

@@ -216,11 +216,13 @@ class _OpenShellClient:
         """Create a sandbox from *image*, wait until ready, return its name."""
         from openshell._proto import openshell_pb2
 
-        template_kwargs: dict[str, object] = {"image": image}
-        if self._driver_config is not None:
-            template_kwargs["driver_config"] = self._driver_config
+        template = (
+            openshell_pb2.SandboxTemplate(image=image)
+            if self._driver_config is None
+            else openshell_pb2.SandboxTemplate(image=image, driver_config=self._driver_config)
+        )
         spec = openshell_pb2.SandboxSpec(
-            template=openshell_pb2.SandboxTemplate(**template_kwargs),
+            template=template,
             environment=env or {},
             providers=self._providers,
         )

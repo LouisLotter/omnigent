@@ -10605,11 +10605,13 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
 ) -> None:
     from types import SimpleNamespace
 
+    from omnigent.server.host_registry import HostRegistry
     from omnigent.server.routes import _host_filesystem
 
     sent: list[str] = []
     connection = SimpleNamespace(host_id="test-host", pending_fs_requests={})
-    registry = SimpleNamespace(send_text=lambda _connection, frame: sent.append(frame))
+    registry = HostRegistry()
+    monkeypatch.setattr(registry, "send_text", lambda _connection, frame: sent.append(frame))
     real_write = _host_filesystem.write_workspace_from_host
 
     async def write_without_reply(**kwargs: Any) -> dict[str, Any]:

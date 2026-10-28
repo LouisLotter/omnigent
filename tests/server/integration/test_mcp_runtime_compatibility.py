@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import CAP_MCP_REGISTRY
+from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_RUNNER_REPLACEMENT_TARGETS
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL
@@ -29,11 +29,25 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("upload", [False, True])
-@pytest.mark.parametrize("capable,selected", [(False, True), (False, False), (True, True)])
+@pytest.mark.parametrize(
+    "capable,selected,replacement_capable",
+    [(False, True, True), (False, False, True), (True, True, True), (True, False, False)],
+)
 async def test_create_checks_host_before_persistence(
-    client, app, launch_registry, register_worktree_host, monkeypatch, upload, capable, selected
+    client,
+    app,
+    launch_registry,
+    register_worktree_host,
+    monkeypatch,
+    upload,
+    capable,
+    selected,
+    replacement_capable,
 ):
-    capture = register_worktree_host(capabilities=[CAP_MCP_REGISTRY] if capable else [])
+    capabilities = [CAP_MCP_REGISTRY] if capable else []
+    if replacement_capable:
+        capabilities.append(CAP_RUNNER_REPLACEMENT_TARGETS)
+    capture = register_worktree_host(capabilities=capabilities)
     source = await create_test_session(client)
     store = get_conversation_store()
     create = Mock(wraps=store.create_session_with_agent)
@@ -55,11 +69,14 @@ async def test_create_checks_host_before_persistence(
         response = await client.post(
             "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
         )
-    if selected and not capable:
+    if (selected and not capable) or not replacement_capable:
         assert response.status_code == 503, response.text
         assert response.json()["error"]["code"] == ErrorCode.RUNNER_CAPABILITY_MISMATCH
-        assert "restart the host and session runner" in response.text
-        assert "tracker" in response.text
+        if replacement_capable:
+            assert "restart the host and session runner" in response.text
+            assert "tracker" in response.text
+        else:
+            assert "Update Omnigent on the computer" in response.text
         create.assert_not_called()
         assert not capture.create and not capture.launches
     else:
@@ -70,7 +87,7 @@ async def test_create_checks_host_before_persistence(
 async def test_reconnect_refuses_before_changing_binding(
     client, app, launch_registry, register_worktree_host
 ):
-    capture = register_worktree_host(capabilities=[])
+    capture = register_worktree_host(capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS])
     session = await create_test_session(client)
     sid = session["id"]
     attached = await client.post(
@@ -106,7 +123,7 @@ async def test_reconnect_refuses_before_changing_binding(
 async def test_new_host_does_not_mask_old_runner_when_editing(
     client, app, launch_registry, register_worktree_host, method
 ):
-    register_worktree_host(capabilities=[CAP_MCP_REGISTRY])
+    register_worktree_host(capabilities=[CAP_MCP_REGISTRY, CAP_RUNNER_REPLACEMENT_TARGETS])
     session = await create_test_session(client)
     sid = session["id"]
     url = f"/v1/sessions/{sid}/agent/mcp-servers"
@@ -201,7 +218,7 @@ async def test_managed_incompatible_host_settles_launch_and_cleans_up(
     )
     from omnigent.server.routes._sessions import orchestration
 
-    capture = register_worktree_host(capabilities=[])
+    capture = register_worktree_host(capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS])
     session = await create_test_session(client)
     sid = session["id"]
     assert (
@@ -267,7 +284,7 @@ async def test_registry_checks_include_nested_agents_and_preserve_replica_routin
 async def test_bundle_edit_is_guarded_and_removing_registry_service_is_allowed(
     client, app, launch_registry, register_worktree_host, tmp_path
 ):
-    register_worktree_host(capabilities=[])
+    register_worktree_host(capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS])
     session = await create_test_session(client)
     sid = session["id"]
     url = f"/v1/sessions/{sid}/agent"
@@ -310,7 +327,7 @@ async def test_guards_use_app_stores_without_runtime_globals(
 ):
     from omnigent.runtime import _globals
 
-    register_worktree_host(capabilities=[])
+    register_worktree_host(capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS])
     plain = await create_test_session(client, name="plain-agent")
     session = await create_test_session(client)
     sid = session["id"]

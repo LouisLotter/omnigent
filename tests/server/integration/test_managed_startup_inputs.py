@@ -19,7 +19,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities.conversation import ErrorData
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -564,7 +564,13 @@ async def test_host_refusal_keeps_startup_input_without_repeated_launches(
     env.app.state.host_registry.register(
         conv.host_id,
         AsyncMock(),
-        HostHelloFrame(version="test", frame_protocol_version=1, name="startup-test", runners=[]),
+        HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
+            version="test",
+            frame_protocol_version=1,
+            name="startup-test",
+            runners=[],
+        ),
         owner=None,
         registered_with_managed_token=True,
     )
@@ -654,7 +660,13 @@ def _connect_host(env: _Env, host_id: str) -> Any:
     return env.app.state.host_registry.register(
         host_id,
         AsyncMock(),
-        HostHelloFrame(version="test", frame_protocol_version=1, name="startup-test", runners=[]),
+        HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
+            version="test",
+            frame_protocol_version=1,
+            name="startup-test",
+            runners=[],
+        ),
         owner=None,
         registered_with_managed_token=True,
     )

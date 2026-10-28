@@ -30,6 +30,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostStatFrame,
@@ -153,7 +154,10 @@ async def register_host(
             host_id=_HOST_ID,
             ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
             hello=HostHelloFrame(
-                version="0.1.0-test", frame_protocol_version=1, name="bundle-host"
+                capabilities=list(HOST_CAPABILITIES),
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="bundle-host",
             ),
             owner=RESERVED_USER_LOCAL,
         )

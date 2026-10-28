@@ -40,6 +40,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     CAP_OPERATION_RECORDS,
+    CAP_RUNNER_REPLACEMENT_TARGETS,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -6457,6 +6458,7 @@ async def test_host_diagnostics_correlate_real_socket_closes_and_reset_on_reconn
     # One host process: the same incarnation on every reconnect.
     assert hellos[0].incarnation and hellos[0].incarnation == hellos[1].incarnation
     assert CAP_OPERATION_RECORDS in hellos[0].capabilities
+    assert CAP_RUNNER_REPLACEMENT_TARGETS in hellos[0].capabilities
     for hello, (start, end) in zip(hellos, (rows[:2], rows[2:]), strict=True):
         assert hello.connection_id
         assert start["connection_id"] == end["connection_id"] == hello.connection_id

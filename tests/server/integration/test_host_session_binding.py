@@ -22,6 +22,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -77,6 +78,7 @@ def _make_hello(
     """
     return encode_host_frame(
         HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,

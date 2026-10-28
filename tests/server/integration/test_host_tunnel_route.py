@@ -20,6 +20,7 @@ from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
+    CAP_RUNNER_REPLACEMENT_TARGETS,
     CAP_SKILL_CONTENT,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
@@ -118,6 +119,7 @@ def _make_hello(
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,
+            capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
             runners=runners or [],
             connection_id=connection_id,
         )

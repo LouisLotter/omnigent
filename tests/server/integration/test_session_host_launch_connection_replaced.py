@@ -50,6 +50,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostStatFrame,
@@ -172,6 +173,7 @@ async def test_inline_launch_connection_replaced_at_enqueue_returns_bound_sessio
                 _HOST_ID,
                 _DeadHostWS(),
                 HostHelloFrame(
+                    capabilities=list(HOST_CAPABILITIES),
                     version="0.1.0-test",
                     frame_protocol_version=1,
                     name="laptop-reconnect",

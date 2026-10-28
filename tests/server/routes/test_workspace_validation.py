@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from omnigent.host.frames import (
+    HOST_CAPABILITIES,
     HostHelloFrame,
     HostStatFrame,
     decode_host_frame,
@@ -59,6 +60,7 @@ def _hello_frame() -> HostHelloFrame:
     :returns: Hello frame with default version + empty runners.
     """
     return HostHelloFrame(
+        capabilities=list(HOST_CAPABILITIES),
         version="0.1.0-test",
         frame_protocol_version=1,
         name="ws-test-host",

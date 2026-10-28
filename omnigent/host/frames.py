@@ -73,6 +73,8 @@ CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
+# The host retires only explicitly named runners during a session launch.
+CAP_RUNNER_REPLACEMENT_TARGETS = "runner_replacement_targets"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host answers ``host.quiesce`` with its live runners and host operations:
 CAP_QUIESCE = "quiesce"
@@ -99,6 +101,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_QUIESCE,
     CAP_OPERATION_RECORDS,
     CAP_REFRESH_HARNESSES,
+    CAP_RUNNER_REPLACEMENT_TARGETS,
 ]
 
 

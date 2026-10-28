@@ -399,6 +399,19 @@ async def _authorize_host_for_workspace(
     return host.name
 
 
+def require_host_launch_compatibility(
+    *, host_id: str | None, inherited_runner_id: str | None, host_registry: Any | None
+) -> None:
+    """Reject an incompatible new launch before creating a session or worktree."""
+    if host_id is None or inherited_runner_id is not None or host_registry is None:
+        return
+    from omnigent.server.host_registry import HostRegistry
+
+    connection = host_registry.get(host_id)
+    if connection is not None:
+        HostRegistry.require_runner_replacement_support(connection)
+
+
 async def _canonical_workspace_or_invalid_input(
     *,
     host_registry: Any,

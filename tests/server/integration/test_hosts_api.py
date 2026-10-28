@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -61,6 +62,7 @@ def _make_hello(
     """
     return encode_host_frame(
         HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,
@@ -1340,7 +1342,12 @@ async def test_launch_runner_403_wrong_owner(
                 "receive_text": lambda self: "",
             },
         )(),
-        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="alice-laptop"),
+        HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
+            version="0.1.0",
+            frame_protocol_version=1,
+            name="alice-laptop",
+        ),
         owner="alice@test.com",
     )
     conv = conv_store.create_conversation(agent_id=None)
@@ -1408,7 +1415,12 @@ async def test_launch_runner_validates_workspace_boundary(
             (),
             {"send_text": lambda self, d: None, "receive_text": lambda self: ""},
         )(),
-        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="laptop"),
+        HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
+            version="0.1.0",
+            frame_protocol_version=1,
+            name="laptop",
+        ),
         owner="local",
     )
     conv = conv_store.create_conversation(agent_id=None)
@@ -1527,7 +1539,12 @@ def _register_fake_host(registry: HostRegistry, host_id: str, owner: str) -> Non
                 "receive_text": lambda self: "",
             },
         )(),
-        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name=host_id),
+        HostHelloFrame(
+            capabilities=list(HOST_CAPABILITIES),
+            version="0.1.0",
+            frame_protocol_version=1,
+            name=host_id,
+        ),
         owner=owner,
     )
 
