@@ -115,7 +115,9 @@ class _Stores:
             host_id=host_id, runner_id=runner_id, live_status="running"
         )
         if host_id is not None:
-            self.hosts[host_id] = SimpleNamespace(sandbox_id=sandbox_id, sandbox_provider=provider)
+            self.hosts[host_id] = SimpleNamespace(
+                user_id="alice", sandbox_id=sandbox_id, sandbox_provider=provider
+            )
 
     def get_conversation(self, session_id: str) -> SimpleNamespace | None:
         self.read_workspaces.append(current_workspace_id())
@@ -259,6 +261,34 @@ async def test_completed_turn_requests_one_checkpoint_once_its_end_holds(
 
     # The ended turn's long-turn timer is gone with it.
     await harness.time.advance_to(5000)
+    assert harness.reasons == ["turn_completed"]
+
+
+async def test_checkpoint_uses_the_host_owners_credential(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    """Capability discovery is unbound, but saving acts as the host owner."""
+    seen: list[str] = []
+
+    class OwnerLauncher(_CheckpointLauncher):
+        owner_credential_provider = "acme"
+
+        def bind_owner_credential(self, resolve: Callable[[], object]) -> None:
+            self.resolve = resolve
+
+        def checkpoint(self, sandbox_id: str, *, reason: str) -> str | None:
+            assert self.resolve() == {"owner": "alice"}
+            return super().checkpoint(sandbox_id, reason=reason)
+
+    harness = make_harness(launcher_type=OwnerLauncher)
+    harness.scheduler._deployment.owner_credentials = {
+        "acme": lambda owner: seen.append(owner) or {"owner": owner}
+    }
+    harness.stores.add_session("conv1")
+    harness.publish("conv1", "running", "idle")
+    await harness.time.advance_to(_DEBOUNCE_S)
+
+    assert seen == ["alice"]
     assert harness.reasons == ["turn_completed"]
 
 

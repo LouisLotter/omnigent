@@ -323,7 +323,7 @@ class TurnCheckpointScheduler:
     async def _call(self, key: _Key, host: _HostSaves, reason: CheckpointReason) -> None:
         try:
             await self._run_sync(self._checkpoint, host.target, reason)
-        except Exception:  # noqa: BLE001 - a failed save must never reach the status path
+        except Exception:
             _logger.warning(
                 "checkpoint request for managed host %s failed",
                 host.target.host_id,
@@ -377,7 +377,7 @@ class TurnCheckpointScheduler:
         """
         try:
             targets = await self._run_sync(self._resolve_targets, session_id, require_busy)
-        except Exception:  # noqa: BLE001 - best effort; retried by the caller or the next turn
+        except Exception:
             _logger.warning(
                 "could not resolve the managed host of session %s for checkpoints",
                 session_id,
@@ -445,7 +445,7 @@ class TurnCheckpointScheduler:
                     continue
                 try:
                     launcher = entry.launcher_factory()
-                except Exception:  # noqa: BLE001 - one broken provider must not disable the rest
+                except Exception:
                     settled = False
                     if index not in self._unbuildable_entries:
                         self._unbuildable_entries.add(index)
@@ -558,5 +558,5 @@ def note_status(session_id: str, previous_status: str | None, status: str) -> No
         return
     try:
         scheduler.note_status(session_id, previous_status, status)
-    except Exception:  # noqa: BLE001 - must never break the status publish
+    except Exception:
         _logger.warning("checkpoint scheduling failed for session %s", session_id, exc_info=True)

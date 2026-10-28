@@ -878,3 +878,41 @@ def test_record_positions_cover_rebuilt_and_compacted_records() -> None:
         index=0,
     )
     assert positions[compacted] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_unavailable", [False, True])
+async def test_background_resume_copy_reconciles_original_without_rewriting_it(
+    saved_transcript: Path, post_unavailable: bool
+) -> None:
+    """A resume copy cannot skip undelivered items in the live original transcript."""
+    saved_transcript.write_bytes(
+        _line(_user("u-1", "first question")) + _line(_assistant("a-1", "saved answer"))
+    )
+    original_bytes = saved_transcript.read_bytes()
+    server = _FakeServer(
+        [_stored(_parsed(saved_transcript)["u-1:0:message"])],
+        fail_post=(lambda _source_id: httpx.Response(503)) if post_unavailable else None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server.handle), base_url="https://example.com"
+    ) as client:
+        call = claude_native._prepare_claude_resume_transcript(
+            client,
+            session_id=_SESSION_ID,
+            external_session_id="resume-copy",
+            source_external_session_id=_CLAUDE_SESSION_ID,
+            resume_copy=True,
+            workspace=_WORKSPACE,
+        )
+        if post_unavailable:
+            with pytest.raises(claude_native.ClaudeTranscriptUnreconciledError):
+                await call
+            assert not saved_transcript.with_name("resume-copy.jsonl").exists()
+        else:
+            resumed = await call
+            assert resumed is not None
+            assert "saved answer" in resumed.path.read_text()
+            assert resumed.path.with_suffix(".omnigent-resume-copy").is_file()
+            assert server.posts == ["a-1:0:message"]
+    assert saved_transcript.read_bytes() == original_bytes

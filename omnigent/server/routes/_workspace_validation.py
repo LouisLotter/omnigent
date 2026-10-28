@@ -153,7 +153,7 @@ async def _ask_host_stat(
             raise WorkspaceValidationError(
                 f"host '{host_conn.host_id}' disconnected during stat"
             ) from exc
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise WorkspaceValidationError(
                 f"host '{host_conn.host_id}' did not respond to stat within {_STAT_TIMEOUT_S:.0f}s"
             ) from exc

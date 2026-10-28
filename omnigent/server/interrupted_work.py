@@ -74,7 +74,7 @@ async def record_runner_incarnation(
             conversation.id,
             {RUNNER_INCARNATION_LABEL_KEY: incarnation},
         )
-    except Exception:  # noqa: BLE001 — a stale label only makes the next check stricter
+    except Exception:
         _logger.warning(
             "Could not record the runner incarnation of session %s",
             conversation.id,
@@ -103,7 +103,7 @@ def _unanswered_tool_call(
     """Blocking body of :func:`unanswered_tool_call`."""
     try:
         return _scan_current_turn(conversation_store, session_id)[1]
-    except Exception:  # noqa: BLE001 — naming the tool is best effort
+    except Exception:
         _logger.warning(
             "Could not read the transcript of session %s",
             session_id,
@@ -160,7 +160,7 @@ def _answered_call(
             if not page.has_more or not page.data:
                 return None
             after = page.data[-1].id
-    except Exception:  # noqa: BLE001 — without evidence the outcome stays unknown
+    except Exception:
         _logger.warning(
             "Could not look for the result of session %s's interrupted call",
             session_id,
@@ -373,7 +373,7 @@ async def _settle_once(session_id: str, conversation_store: ConversationStore) -
         complete, unanswered = await asyncio.to_thread(
             _scan_current_turn, conversation_store, session_id
         )
-    except Exception:  # noqa: BLE001 — without a complete scan the outcome stays unknown
+    except Exception:
         _logger.warning(
             "Could not read the transcript of session %s",
             session_id,
@@ -401,7 +401,7 @@ async def _settle_once(session_id: str, conversation_store: ConversationStore) -
         written = await asyncio.to_thread(
             conversation_store.set_labels_if, session_id, updates, expected
         )
-    except Exception:  # noqa: BLE001 — the record stays unknown
+    except Exception:
         _logger.warning(
             "Could not settle the interrupted outcome of session %s",
             session_id,

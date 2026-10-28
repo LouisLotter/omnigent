@@ -22,6 +22,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import persistent_hosts
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -63,6 +64,7 @@ async def env(runtime_init: None, db_uri: str, tmp_path: Path) -> AsyncIterator[
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
     app = create_app(
+        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "harness_install"}),
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=conversations,
@@ -246,6 +248,7 @@ _MESSAGE = {
         "file_edit",
         "shell",
         "host_files",
+        "harness_refresh",
         "runner_launch",
     ],
 )
@@ -281,6 +284,7 @@ async def test_every_entry_path_refuses_new_work_with_the_reason(env: _Env, entr
             {"command": "true"},
         ),
         "host_files": ("GET", f"/v1/hosts/{HOST_ID}/filesystem?path=~", None),
+        "harness_refresh": ("POST", f"/v1/hosts/{HOST_ID}/harnesses/refresh", None),
         "runner_launch": (
             "POST",
             f"/v1/hosts/{HOST_ID}/runners",

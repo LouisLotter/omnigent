@@ -138,6 +138,8 @@ def git_repo(tmp_path: Path) -> Iterator[Path]:
     repo = (tmp_path / "myrepo").resolve()
     repo.mkdir()
     _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "commit.gpgSign", "false")
+    _git(repo, "config", "tag.gpgSign", "false")
     (repo / "README.md").write_text("hi")
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "init")

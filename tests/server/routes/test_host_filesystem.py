@@ -22,6 +22,7 @@ from omnigent.server.routes._host_filesystem import (
     HostFsError,
     HostFsUnavailableError,
     read_workspace_from_host,
+    write_workspace_from_host,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -97,7 +98,7 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
         conn.outbound_queue.put_nowait(None)
         try:
             await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             drain_task.cancel()
 
 
@@ -214,3 +215,24 @@ async def test_read_connection_lost_raises_unavailable() -> None:
             session_id="conv_x",
             params={},
         )
+
+
+async def test_write_uses_the_callers_timeout(host_setup: HostRegistry) -> None:
+    """An operation's timeout still applies when the proxy uses result replay."""
+    conn = host_setup.get(_HOST_ID)
+    assert conn is not None
+    # This fixture only answers reads, leaving this write deliberately pending.
+    with pytest.raises(HostFsUnavailableError, match="did not respond to fs write"):
+        await asyncio.wait_for(
+            write_workspace_from_host(
+                host_registry=host_setup,
+                host_conn=conn,
+                op="github_attachment_upload",
+                workspace="/workspace",
+                session_id="conv_x",
+                params={},
+                timeout=0.01,
+            ),
+            timeout=1.0,
+        )
+    assert conn.pending_fs_requests == {}

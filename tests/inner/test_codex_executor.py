@@ -168,7 +168,9 @@ class _FakeProcess:
         self.stderr = _FakePipe()
         self.returncode: int | None = None
         self.terminated = False
-        self.pid = 12345
+        # Above Linux's PID_MAX_LIMIT (2**22), so the real terminate_tree these
+        # tests reach can never signal a live process on the test machine.
+        self.pid = 2**22 + 1
 
     def terminate(self) -> None:
         self.terminated = True
@@ -4573,7 +4575,6 @@ def test_materialize_codex_provider_config_references_static_key_from_key_file(
 ) -> None:
     """A static provider key goes to a private key file; config.toml only names it."""
     import stat
-
     import tomllib
 
     from omnigent.inner.codex_executor import materialize_codex_provider_config
@@ -4727,6 +4728,47 @@ def test_materialize_codex_provider_config_failed_config_write_removes_new_key(
 
     assert sorted(path.name for path in key_file.parent.iterdir()) == ["codex-home"]
     assert list(codex_home.iterdir()) == []
+
+
+def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+    tmp_path: Path,
+) -> None:
+    """Unity Gateway providers name Codex and Omnigent (plus ug for its own table)."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import (
+        _databricks_codex_config_overrides,
+        materialize_codex_provider_config,
+    )
+
+    gateway_url = "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        f'[model_providers.Databricks]\nbase_url = "{gateway_url}"\n\n'
+        "[model_providers.Databricks.http_headers]\n"
+        'User-Agent = "ucode/0.1.0 codex/0.145.0"\n\n'
+        '[model_providers.other]\nbase_url = "https://openrouter.ai/api/v1"\n'
+    )
+
+    materialize_codex_provider_config(
+        codex_home,
+        _databricks_codex_config_overrides(
+            model="system.ai.gpt-5-5", base_url=gateway_url, auth_command="printf token"
+        ),
+    )
+
+    providers = tomllib.loads((codex_home / "config.toml").read_text())["model_providers"]
+    assert providers["Databricks"]["http_headers"] == {
+        "User-Agent": "ucode/0.1.0 codex/0.145.0",
+        "Databricks-Custom-Coding-Agent": "codex",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert providers["omnigent_databricks"]["http_headers"] == {
+        "Databricks-Custom-Coding-Agent": "codex",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert "http_headers" not in providers["other"]
 
 
 # ---------------------------------------------------------------------------

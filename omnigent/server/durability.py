@@ -49,6 +49,6 @@ async def commits_durable(barrier: DurabilityBarrier | None) -> bool:
         return True
     try:
         return bool(await barrier())
-    except Exception:  # noqa: BLE001 — an unconfirmed write is retried, never acknowledged
+    except Exception:
         _logger.warning("Could not confirm that recorded writes are durable", exc_info=True)
         return False

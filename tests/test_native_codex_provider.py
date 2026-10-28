@@ -11,10 +11,10 @@ parser; config + ambient are isolated so resolution is deterministic.
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 import yaml
 
 from omnigent.errors import OmnigentError

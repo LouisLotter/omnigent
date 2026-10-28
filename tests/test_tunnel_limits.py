@@ -96,6 +96,22 @@ def test_silence_deadline_outlasts_the_server_ping_and_beats_its_liveness_budget
         assert app_level_dead_after_s > TUNNEL_SILENCE_TIMEOUT_S + TUNNEL_SILENCE_GRACE_S
 
 
+def test_runner_server_silence_allows_pings_and_reconnect_within_grace() -> None:
+    from omnigent.runner.transports.ws_tunnel import serve
+    from omnigent.server.routes import runner_tunnel, sessions
+
+    assert TUNNEL_SILENCE_TIMEOUT_S == 1.5 * runner_tunnel.PING_INTERVAL_S
+    assert TUNNEL_SILENCE_TIMEOUT_S >= serve._STABLE_CONNECTION_DURATION_S
+    assert (
+        TUNNEL_SILENCE_TIMEOUT_S
+        + TUNNEL_SILENCE_GRACE_S
+        + serve._GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S
+        + serve._INITIAL_RECONNECT_DELAY_S * (1 + serve._RECONNECT_JITTER_FRACTION)
+        + serve._RUNNER_TUNNEL_OPEN_TIMEOUT_S
+        < sessions.RUNNER_DISCONNECT_GRACE_S
+    )
+
+
 def test_uvicorn_tunnel_kwargs_name_real_uvicorn_options() -> None:
     """Every key is an option uvicorn accepts, carrying the budget's value.
 

@@ -58,7 +58,7 @@ def test_extends_the_hosts_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == ["sbx1"]
@@ -70,7 +70,7 @@ def test_provider_without_keep_alive_is_skipped(monkeypatch: pytest.MonkeyPatch)
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="kubernetes"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="kubernetes"),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert launcher.calls == ["sbx1"]  # attempted, error swallowed
@@ -183,7 +183,9 @@ def test_a_host_on_an_unoffered_provider_is_skipped(
         list_conversations_by_runner_id=lambda _rid: [SimpleNamespace(host_id="host1")]
     )
     hosts = SimpleNamespace(
-        get_host=lambda _hid: SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal")
+        get_host=lambda _hid: SimpleNamespace(
+            user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"
+        )
     )
     # Deployment no longer offers 'modal'. A default-returning resolver would
     # hand back some other provider's config; for_provider says None.
@@ -231,7 +233,7 @@ def test_inflight_is_released_even_when_the_provider_raises(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
     )
     monkeypatch.setattr(managed_host_keepalive, "_inflight", {"r1"})
     managed_host_keepalive._keep_alive_for_runner("r1")
@@ -270,7 +272,7 @@ def test_successful_keepalive_logs_at_info_on_the_server_logger(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
     )
     with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
         managed_host_keepalive._keep_alive_for_runner("r1")
@@ -289,7 +291,7 @@ def test_soft_failed_keepalive_suppresses_the_success_info(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
     )
     with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
         managed_host_keepalive._keep_alive_for_runner("r1")
@@ -311,7 +313,7 @@ def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.Monk
     _wire(
         monkeypatch,
         launcher=_Launcher(),
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="modal"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     # now cached at modal's slower cadence
@@ -329,10 +331,44 @@ def test_keepalive_interval_is_a_provider_setting(monkeypatch: pytest.MonkeyPatc
     _wire(
         monkeypatch,
         launcher=_Launcher(),
-        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="cloud"),
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="cloud"),
         keepalive_interval_s=120.0,
     )
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert managed_host_keepalive.keepalive_interval_s("r1") == 120.0
     monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "30")
     assert resolve_managed_keepalive_interval_s("cloud", configured_s=120.0) == 30.0
+
+
+def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An owner-identity launcher (e.g. Databricks Sandboxes run as their owner)
+    # refreshes with the host owner's credential, never a server identity.
+    class _OwnerLauncher(_Launcher):
+        owner_credential_provider = "databricks"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.bound: list[object] = []
+
+        def bind_owner_credential(self, resolve: object) -> None:
+            self.bound.append(resolve)
+
+    launcher = _OwnerLauncher()
+    seen: list[str] = []
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="databricks"),
+    )
+    managed_host_keepalive._sandbox_config.owner_credentials = {  # type: ignore[union-attr]
+        "databricks": lambda user: seen.append(user)
+    }
+
+    managed_host_keepalive._keep_alive_for_runner("r1")
+
+    assert launcher.calls == ["sbx1"]
+    (resolve,) = launcher.bound
+    resolve()  # type: ignore[operator]
+    assert seen == ["alice"]

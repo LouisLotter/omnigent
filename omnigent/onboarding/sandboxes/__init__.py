@@ -11,6 +11,7 @@ from __future__ import annotations
 import click
 
 from omnigent.onboarding.sandboxes.base import (
+    OwnerCredentialMissingError,
     RemoteCommandResult,
     RemoteProcess,
     SandboxCapabilityError,
@@ -67,6 +68,7 @@ __all__ = [
     "GitCloneOptions",
     "HostContext",
     "HostSandboxStatus",
+    "OwnerCredentialMissingError",
     "RemoteCommandResult",
     "RemoteProcess",
     "RepoWorkspace",

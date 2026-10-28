@@ -159,7 +159,7 @@ class _HostLifecycle:
         for observer in list(self.observers):
             try:
                 observer(stage, error)
-            except Exception:  # noqa: BLE001 — progress reporting never breaks a wake.
+            except Exception:
                 _logger.warning("wake progress observer failed", exc_info=True)
 
 
@@ -563,7 +563,7 @@ async def _wait_admitting(state: _HostLifecycle, host: Host, deadline: float) ->
                 await asyncio.wait_for(asyncio.shield(recovery), remaining)
             except TimeoutError:
                 pass
-            except Exception:  # noqa: BLE001 — admission stays closed; it is asked again.
+            except Exception:
                 _logger.warning(
                     "sleep outcome for host %s unresolved", host.host_id, exc_info=True
                 )
@@ -622,7 +622,7 @@ async def _fresh_report(
         report = await asyncio.to_thread(launcher.admission, host.sandbox_id)
     except SandboxGoneError:
         raise
-    except Exception:  # noqa: BLE001 — an unanswered refresh is "unknown", never a refusal.
+    except Exception:
         _logger.warning("admission report for host %s failed", host.host_id, exc_info=True)
         return None
     if report is None or state.epoch != epoch:
@@ -941,7 +941,7 @@ async def _call_launcher(host: Host, method: Callable[..., Any], *args: Any) -> 
         raise _unavailable(f"{host.name} could not wake: {exc.message}") from exc
     except SandboxGoneError:
         raise
-    except Exception:  # noqa: BLE001 — a lost reply: the status loop finds out.
+    except Exception:
         _logger.warning("launcher call for host %s failed", host.host_id, exc_info=True)
 
 
@@ -961,7 +961,7 @@ async def _claim_start(
             raise _unavailable(f"{host.name} could not start: {exc.message}") from exc
         except SandboxGoneError:
             raise
-        except Exception:  # noqa: BLE001 — a lost reply; the same operation returns its outcome.
+        except Exception:
             _logger.warning("start claim for host %s failed", host.host_id, exc_info=True)
         if time.monotonic() >= deadline:
             raise _unavailable(f"{host.name}: computer status unknown; try again shortly")
@@ -1013,7 +1013,7 @@ async def _arm_and_start(
         raise _unavailable(f"{host.name} could not start: {exc.message}") from exc
     except SandboxGoneError:
         raise
-    except Exception:  # noqa: BLE001 — a lost reply; the status shows whether it arrived.
+    except Exception:
         _logger.warning("start_host for host %s failed", host.host_id, exc_info=True)
         delivered = False
     state.publish("connecting")
@@ -1118,7 +1118,7 @@ async def _call_suspend(
 ) -> SuspendResult:
     try:
         return await asyncio.to_thread(launcher.suspend, sandbox_id, operation_id=operation_id)
-    except Exception:  # noqa: BLE001 — a lost reply means the stop may have begun.
+    except Exception:
         _logger.warning("suspend %s of sandbox %s failed", operation_id, sandbox_id, exc_info=True)
         return SuspendResult(outcome="unknown")
 
@@ -1181,7 +1181,7 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                 # No intent is recorded: none was written, so nothing stopped and
                 # the token is unchanged, or its outcome is already recorded.
                 outcome = "abandoned"
-                return outcome  # noqa: RET504 — ``finally`` reads the outcome.
+                return outcome
             outcome = "unknown"
             state.unknown_suspend_operation = operation_id
             result = await _call_suspend(launcher, host.sandbox_id, operation_id)
@@ -1203,7 +1203,7 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                     _host_registry.deregister(host_id)
                     state.new_generation()
             outcome = result.outcome
-            return outcome  # noqa: RET504 — ``finally`` reads the outcome.
+            return outcome
         finally:
             if outcome != "unknown":
                 state.unknown_suspend_operation = None
@@ -1225,7 +1225,7 @@ async def _sleep_intent_recorded(state: _HostLifecycle, host_id: str, operation_
             recorded = await asyncio.shield(state.pending_intent)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — the write may have committed; the store knows.
+        except Exception:
             _logger.warning("sleep intent write for host %s failed", host_id, exc_info=True)
         else:
             state.pending_intent = None
@@ -1371,7 +1371,7 @@ class PersistentHostIdleMonitor:
                     outcomes[host_id] = await sleep_if_idle(
                         host_id, only_operation=state.unknown_suspend_operation
                     )
-                except Exception:  # noqa: BLE001 — admission stays closed until the next sweep.
+                except Exception:
                     _logger.warning("sleep outcome for host %s unresolved", host_id, exc_info=True)
                     outcomes[host_id] = "unknown"
         for host_id in _host_registry.online_host_ids():

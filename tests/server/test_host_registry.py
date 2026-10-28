@@ -757,6 +757,7 @@ async def test_closed_connection_answers_every_waiting_request_with_its_outcome(
     registry = HostRegistry()
     conn = registry.register("host_ops", FakeWebSocket(), _make_hello(), owner="bob")
     loop = asyncio.get_running_loop()
+    assert "pending_harness_refreshes" in _READ_PENDING_MAPS
     waiting = {name: loop.create_future() for name in _MUTATING_PENDING_MAPS + _READ_PENDING_MAPS}
     for name, future in waiting.items():
         getattr(conn, name)["req_1"] = future
