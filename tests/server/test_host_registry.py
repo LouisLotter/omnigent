@@ -880,18 +880,23 @@ async def test_request_whose_tunnel_closed_stays_unknown_without_the_same_host_p
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("capable", [False, True])
+@pytest.mark.parametrize("refresh_capable", [False, True])
 async def test_launch_admission_requires_explicit_runner_replacement_support(
     capable: bool,
+    refresh_capable: bool,
 ) -> None:
     """An old host remains connected but cannot receive unsafe launch requests."""
     from unittest.mock import AsyncMock, Mock
 
     from omnigent.errors import ErrorCode, OmnigentError
-    from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS
+    from omnigent.host.frames import CAP_REFRESH_HARNESSES, CAP_RUNNER_REPLACEMENT_TARGETS
 
     registry = HostRegistry()
     hello = _make_hello()
+    hello.version = "0.20.0"
     hello.capabilities = [CAP_RUNNER_REPLACEMENT_TARGETS] if capable else []
+    if refresh_capable:
+        hello.capabilities.append(CAP_REFRESH_HARNESSES)
     conn = registry.register("host_compat", FakeWebSocket(), hello, owner="alice")
     registry.admission_gate = AsyncMock()
     registry.launch_authorizer = Mock()

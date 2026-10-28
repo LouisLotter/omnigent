@@ -2,14 +2,10 @@
 
 import asyncio
 import json
-import sys
 import unittest
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.executor import (
     ExecutorConfig,

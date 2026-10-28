@@ -1,13 +1,9 @@
 """Tests for the Policy type hierarchy and PolicyEngine."""
 
 import asyncio
-import sys
 import unittest
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.datamodel import AgentDef, ExecutorSpec
 from omnigent.inner.executor import MockExecutor

@@ -5045,14 +5045,14 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        sessionStatus: lifecycleIsCurrent(state) ? session.status : state.sessionStatus,
+        sessionStatus: lifecycleIsCurrent(state, session) ? session.status : state.sessionStatus,
         // Mid-turn first open: the snapshot carries the in-flight turn's
         // `activeResponseId`, and the turn-start `running` edge that would
         // have opened the streaming lifecycle is long gone from the SSE
         // stream. Open it here — mirroring `reconnectStatusPatch` — so the
         // live turn's bubble renders streaming (trace expanded, tool
         // spinners live) instead of prematurely settled and folded.
-        ...(lifecycleIsCurrent(state) &&
+        ...(lifecycleIsCurrent(state, session) &&
         session.status === "running" &&
         session.activeResponseId != null &&
         state.activeResponse?.responseId !== session.activeResponseId
@@ -5068,7 +5068,7 @@ async function bindStream(
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
-        ...(lifecycleIsCurrent(state)
+        ...(lifecycleIsCurrent(state, session)
           ? {
               backgroundTaskCount: session.backgroundTaskCount ?? 0,
               backgroundTasks: session.backgroundTasks ?? [],
@@ -5304,17 +5304,27 @@ function launchSnapshotPatch(
 }
 
 /** Keep an older lifecycle snapshot behind a new turn or local message/Stop. */
-function captureSnapshotLifecycle(id: string, get: Getter): (state: ChatState) => boolean {
+function captureSnapshotLifecycle(
+  id: string,
+  get: Getter,
+): (state: ChatState, session: Session) => boolean {
   const before = get();
   const workGeneration = stopNoticeGenerations.get(id) ?? 0;
-  return (state) =>
+  return (state, session) =>
     (stopNoticeGenerations.get(id) ?? 0) === workGeneration &&
-    state.sessionStatus === before.sessionStatus &&
-    state.status === before.status &&
-    // A reconnect can replay the same turn header while history is loading.
-    state.activeResponse?.responseId === before.activeResponse?.responseId &&
-    state.activeResponse?.state === before.activeResponse?.state &&
-    state.backgroundTaskCount === before.backgroundTaskCount;
+    ((state.sessionStatus === before.sessionStatus &&
+      state.status === before.status &&
+      state.activeResponse?.responseId === before.activeResponse?.responseId &&
+      state.activeResponse?.state === before.activeResponse?.state &&
+      state.backgroundTaskCount === before.backgroundTaskCount) ||
+      // A cold stream replays response.created before its matching snapshot.
+      // Recover the session's running/background state without reopening a turn
+      // that finished locally or crossing a newer message/Stop generation.
+      (session.status === "running" &&
+        session.activeResponseId != null &&
+        state.status === "streaming" &&
+        state.activeResponse?.state === "streaming" &&
+        state.activeResponse.responseId === session.activeResponseId));
 }
 
 /**
@@ -5336,23 +5346,27 @@ function reconnectStatusPatch(
   session: Session,
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  includeLifecycle: boolean,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
-    sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
     ...launchSnapshotPatch(session, s),
     // A `session.model` missed in the gap would otherwise hold a first
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
   };
-  // Recover the background-shell tally across the gap too, so the spinner
-  // returns to "N background tasks still running" rather than vanishing on reconnect.
-  patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
-  patch.backgroundTasks = session.backgroundTasks ?? [];
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  // Model/startup/usage reconciliation has its own rules and must not be lost
+  // just because newer local work makes this snapshot's turn lifecycle stale.
+  if (!includeLifecycle) return patch;
+  patch.sessionStatus = session.status;
+  // Recover the background-shell tally across the gap too, so the spinner
+  // returns to "N background tasks still running" rather than vanishing on reconnect.
+  patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
+  patch.backgroundTasks = session.backgroundTasks ?? [];
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
   // outlives it), so it settles the local send lifecycle like `idle` — it must
   // NOT reopen a streaming response. The server keeps `active_response_id`
@@ -5480,7 +5494,7 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => {
-    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
+    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch, true);
     const spinners = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     const blocks =
       snapshotInterruptedWorkCard(
@@ -5716,7 +5730,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
-  lifecycleIsCurrent: (state: ChatState) => boolean,
+  lifecycleIsCurrent: (state: ChatState, session: Session) => boolean,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -5757,9 +5771,12 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
-    const statusPatch = lifecycleIsCurrent(s)
-      ? reconnectStatusPatch(session, s, launchBeforeFetch)
-      : {};
+    const statusPatch = reconnectStatusPatch(
+      session,
+      s,
+      launchBeforeFetch,
+      lifecycleIsCurrent(s, session),
+    );
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -5919,7 +5936,7 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...(lifecycleIsCurrent(s) ? reconnectStatusPatch(session, s, launchBeforeFetch) : {}),
+      ...reconnectStatusPatch(session, s, launchBeforeFetch, lifecycleIsCurrent(s, session)),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).

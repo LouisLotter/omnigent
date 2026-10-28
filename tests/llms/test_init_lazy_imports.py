@@ -9,63 +9,73 @@ The fix in ``omnigent/llms/__init__.py`` switches to a
 ``__getattr__`` shim so ``Client`` and ``get_model_context_window``
 are resolved lazily on first access. This test guards against
 re-introducing the cycle by re-importing the affected modules
-in a fresh interpreter-style namespace and asserting both the
+in a fresh interpreter and asserting both the
 short-form and long-form import paths work.
 """
 
 from __future__ import annotations
 
-import importlib
+import subprocess
 import sys
+from pathlib import Path
+from textwrap import dedent
+
+from tests.budgets import budget
 
 
-def _purge(prefix: str) -> None:
-    """Drop any already-loaded modules under ``prefix`` so a fresh
-    ``import`` exercises the module-load order again."""
-    for mod_name in list(sys.modules):
-        if mod_name == prefix or mod_name.startswith(prefix + "."):
-            sys.modules.pop(mod_name, None)
+def _run_fresh(body: str) -> None:
+    """Probe a cold import without replacing modules held by collected tests.
+
+    Removing sessions from this process's module cache leaves older references
+    behind: facade patches then target a different module from its lazy proxies.
+    """
+    root = Path(__file__).resolve().parents[2]
+    probe = f"import sys\nsys.path.insert(0, {str(root)!r})\n" + dedent(body)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=budget(30),
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_sessions_routes_import_does_not_trigger_cycle() -> None:
-    """The original failure shape: importing the server routes module
-    triggered ``reasoning_effort`` -> ``llms.errors`` -> ``llms.__init__``
-    -> ``llms.client`` -> ``reasoning_effort`` re-entry."""
-    _purge("omnigent.llms")
-    _purge("omnigent.util.reasoning_effort")
-    _purge("omnigent.server.routes.sessions")
-    importlib.import_module("omnigent.server.routes.sessions")
+    """Importing routes must not re-enter reasoning_effort through llms.client."""
+    _run_fresh("import omnigent.server.routes.sessions")
 
 
 def test_short_form_import_still_works() -> None:
-    """``from omnigent.llms import Client`` must keep working
-    after the lazy-attribute switch."""
-    _purge("omnigent.llms")
-    from omnigent.llms import Client, get_model_context_window
+    """The short-form imports keep working after the lazy-attribute switch."""
+    _run_fresh("""
+        from omnigent.llms import Client, get_model_context_window
 
-    assert Client is not None
-    assert callable(get_model_context_window)
+        assert Client is not None
+        assert callable(get_model_context_window)
+        """)
 
 
 def test_module_only_import_does_not_load_client() -> None:
-    """Importing ``omnigent.llms`` by itself should NOT eagerly pull
-    in ``client.py`` -- that's the whole point of the lazy shim."""
-    _purge("omnigent.llms")
-    importlib.import_module("omnigent.llms")
-    assert "omnigent.llms.client" not in sys.modules, (
-        "omnigent.llms.client was imported eagerly; lazy shim regressed"
-    )
+    """Importing llms alone must not eagerly load client.py."""
+    _run_fresh("""
+        import omnigent.llms
+
+        assert "omnigent.llms.client" not in sys.modules, (
+            "omnigent.llms.client was imported eagerly; lazy shim regressed"
+        )
+        """)
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:
-    """The ``__getattr__`` shim should preserve normal AttributeError
-    semantics for unknown names."""
-    _purge("omnigent.llms")
-    import omnigent.llms as llms_pkg
+    """The lazy shim preserves normal AttributeError semantics."""
+    _run_fresh("""
+        import omnigent.llms as llms_pkg
 
-    try:
-        llms_pkg.does_not_exist  # noqa: B018
-    except AttributeError as e:
-        assert "does_not_exist" in str(e)
-    else:
-        raise AssertionError("expected AttributeError")
+        try:
+            llms_pkg.does_not_exist
+        except AttributeError as error:
+            assert "does_not_exist" in str(error)
+        else:
+            raise AssertionError("expected AttributeError")
+        """)

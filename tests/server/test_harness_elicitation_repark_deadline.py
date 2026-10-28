@@ -161,7 +161,14 @@ async def test_repost_of_an_answered_question_reuses_its_outcome_without_reapply
     )
     monkeypatch.setattr(orchestration, "resolve_ask_timeout", lambda engine, result: 5.0)
     applied: list[object] = []
-    engine = SimpleNamespace(apply_label_writes=applied.append, apply_state_updates=applied.append)
+
+    def apply_state_updates(updates: object, *, approved: bool = False) -> None:
+        assert approved
+        applied.append(updates)
+
+    engine = SimpleNamespace(
+        apply_label_writes=applied.append, apply_state_updates=apply_state_updates
+    )
     result = SimpleNamespace(
         reason="Approve?",
         deciding_policy="ask-bash",
@@ -205,7 +212,8 @@ async def test_remembered_outcome_matches_the_whole_request_and_only_after_its_w
     )
     monkeypatch.setattr(orchestration, "resolve_ask_timeout", lambda engine, result: 5.0)
 
-    def fail(_updates: object) -> None:
+    def fail(_updates: object, *, approved: bool = False) -> None:
+        assert approved
         raise RuntimeError("state write failed")
 
     engine = SimpleNamespace(apply_label_writes=lambda labels: None, apply_state_updates=fail)

@@ -961,7 +961,8 @@ class HostRegistry:
         if CAP_RUNNER_REPLACEMENT_TARGETS not in conn.hello.capabilities:
             raise OmnigentError(
                 "This computer cannot safely select which session runner to replace. "
-                "Update Omnigent on the computer and restart its host before starting "
+                "Update Omnigent on the computer to the compatible build provided by "
+                "your server operator and restart its host before starting "
                 "another session runner. Existing connected runners can continue.",
                 code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
             )

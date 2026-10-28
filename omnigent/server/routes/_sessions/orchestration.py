@@ -8183,9 +8183,10 @@ async def _dispatch_session_event_to_runner_impl(
     """
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
-    if body.type == "message":
+    if body.type == "message" and startup_input is None:
         disconnect_outcome.note_user_turn(conv.id)
         # A new message supersedes a Stop still waiting for the runner.
+        # A saved startup input only becomes new work when its claim wins below.
         note_new_input(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
@@ -8307,6 +8308,9 @@ async def _dispatch_session_event_to_runner_impl(
             conversation_store, session_id
         ):
             return _SessionEventDispatchResult(item_id=None, pending_id=None)
+        if startup_input is not None:
+            disconnect_outcome.note_user_turn(conv.id)
+            note_new_input(conv.id)
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8543,6 +8547,9 @@ async def _dispatch_session_event_to_runner_impl(
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id, delivery=delivery)
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None)
+    if startup_input is not None and body.type == "message":
+        disconnect_outcome.note_user_turn(conv.id)
+        note_new_input(conv.id)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,

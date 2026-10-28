@@ -1045,3 +1045,125 @@ async def test_waking_a_host_worker_sets_its_event(startup_env: _Env) -> None:
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "startup-probe",
+        CLAUDE_NATIVE_CODING_AGENT.agent_name,
+        CODEX_NATIVE_CODING_AGENT.agent_name,
+    ],
+)
+async def test_losing_startup_claim_does_not_supersede_a_waiting_stop(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Another replica's stale delivery is not a new turn and cannot cancel Stop."""
+    from omnigent.runtime import disconnect_outcome
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+    from tests.debug_log_helpers import capture_debug_rows
+
+    env = startup_env
+    session_id = await _create(env, name=name)
+    entry = _bind(env, session_id)
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    winner = StartupInputContext(env.app, Headers(), None, entry.id)
+    assert await winner.claim(env.conv_store, session_id)
+    stale = StartupInputContext(env.app, Headers(), None, entry.id)
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    looking_up = asyncio.Event()
+    release_lookup = asyncio.Event()
+
+    async def held_lookup(*_: Any, **__: Any) -> httpx.AsyncClient:
+        looking_up.set()
+        await release_lookup.wait()
+        return runner
+
+    monkeypatch.setattr(routes_events, "_get_runner_client", held_lookup)
+    stop = asyncio.create_task(
+        env.client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
+    )
+    try:
+        await asyncio.wait_for(looking_up.wait(), timeout=5)
+        with capture_debug_rows("server") as rows:
+            disconnect_outcome.note_disconnect_failure_cleared(
+                session_id, failure_code="runner_disconnected"
+            )
+            await sessions._dispatch_session_event_to_runner(
+                session_id,
+                conv,
+                SessionEventInput.model_validate(_INPUT),
+                env.conv_store,
+                runner,
+                agent_name=name,
+                file_store=None,
+                artifact_store=None,
+                native_terminal_ready=True,
+                startup_input=stale,
+            )
+            assert not stale.submitted
+            assert not forwarded, "the losing claim must not forward another message"
+            disconnect_outcome.observe_event(
+                session_id, {"type": "response.output_text.delta", "delta": "still running"}
+            )
+            release_lookup.set()
+            response = await stop
+        assert response.status_code == 202, response.text
+        assert response.json()["delivery"] == "delivered", response.text
+        assert [event["type"] for event in forwarded] == ["interrupt"]
+        outcomes = [row for row in rows if row["event_name"] == "session_turn_failure_outcome"]
+        assert [row["attributes"]["outcome"] for row in outcomes] == ["turn_resumed"]
+    finally:
+        release_lookup.set()
+        if not stop.done():
+            stop.cancel()
+        await asyncio.gather(stop, return_exceptions=True)
+        await runner.aclose()
+
+
+async def test_retry_interrupted_work_drains_saved_input_without_an_extra_continuation(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The saved prompt is the next turn; Retry must not also synthesize a recovery turn."""
+    from omnigent.server.routes.sessions import routes_events
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    assert env.conv_store.transition_pending_input(
+        session_id, entry.id, expected="in_progress", status="failed"
+    )
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    env.conv_store.set_labels(
+        session_id,
+        {
+            "omnigent.last_task_error_code": "interrupted_outcome_unknown",
+            "omnigent.last_task_error_message": "The old runner stopped during a tool call.",
+        },
+    )
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    try:
+        response = await env.client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
+        )
+        assert response.status_code == 202, response.text
+        assert response.json()["queued"] is True
+        initialize.assert_awaited_once()
+        assert initialize.await_args.kwargs["continuation_requested"] is True
+        assert initialize.await_args.kwargs["suppress_recovery_turn"] is True
+        assert not [event for event in forwarded if event.get("type") == "message"]
+        startup = env.app.state.startup_inputs
+        queued = env.conv_store.list_pending_inputs(session_id)[0]
+        await startup._deliver(env.app, session_id, queued)
+        await startup._deliver(env.app, session_id, queued)
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1 and _TEXT in json.dumps(turns[0])
+    finally:
+        await runner.aclose()

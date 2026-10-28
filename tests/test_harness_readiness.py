@@ -65,6 +65,7 @@ def test_configured_harness_map_exposes_pi_native(monkeypatch: pytest.MonkeyPatc
     gained the credential axis) rather than a bare ``False``.
     """
     monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hr, "harness_cli_binary", lambda _key: None)
     cmap = hr.configured_harness_map()
     assert cmap.get("pi-native") == "binary-missing"
     assert cmap.get("pi") == "binary-missing"

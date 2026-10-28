@@ -1348,7 +1348,9 @@ class _ChildExited(Exception):
 
 
 @pytest.fixture
-def child_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, object]]]:
+def child_sink(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> Iterator[list[dict[str, object]]]:
     """Attach a capturing debug-log sink to the runner logger, as a child would.
 
     Delivery is slowed to model a real upload in flight, so rows only arrive
@@ -1372,6 +1374,7 @@ def child_sink(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, objec
     monkeypatch.setattr(sys, "excepthook", sys.__excepthook__)
     monkeypatch.setattr(_zygote.os, "_exit", _raise_child_exited)
     runner_logger = logging.getLogger("omnigent.runner._entry")
+    caplog.set_level(logging.INFO, logger=runner_logger.name)
     dl.attach_debug_log_sink([runner_logger], source="runner", level=logging.INFO, send=_slow_send)
     sink = dl._active_sink
     assert sink is not None

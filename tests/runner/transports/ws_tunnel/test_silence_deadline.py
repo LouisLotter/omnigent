@@ -19,7 +19,6 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import _serve_tunnel_once, serve_tunnel
-from omnigent.util import tunnel_silence
 from omnigent.util.tunnel_silence import TunnelSilenceTimeoutError
 from tests.budgets import budget
 
@@ -30,7 +29,7 @@ _GRACE_S = 0.05
 @pytest.fixture(autouse=True)
 def _short_silence_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(serve_module, "tunnel_silence_timeout_s", lambda: _DEADLINE_S)
-    monkeypatch.setattr(tunnel_silence, "TUNNEL_SILENCE_GRACE_S", _GRACE_S)
+    monkeypatch.setattr(serve_module, "TUNNEL_SILENCE_GRACE_S", _GRACE_S)
 
 
 async def _no_requests_app(_scope: Any, _receive: Any, _send: Any) -> None:

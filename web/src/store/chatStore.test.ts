@@ -2493,6 +2493,71 @@ describe("chatStore — switchTo", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it.each(["streaming", "completed", "failed Stop"])(
+    "reconciles a cold snapshot after same-turn replay only while %s",
+    async (phase) => {
+      const id = "conv_bind_same_turn";
+      seedSession(id);
+      const sink = pushableStream();
+      let releaseSnapshot!: (response: Response) => void;
+      const snapshot = new Promise<Response>((resolve) => {
+        releaseSnapshot = resolve;
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === `/v1/sessions/${id}`) return snapshot;
+        if (path === `/v1/sessions/${id}/stream`)
+          return mockResponse(null, { bodyStream: sink.stream });
+        if (path === `/v1/sessions/${id}/events` && init?.method === "POST") {
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const binding = useChatStore.getState().switchTo(id);
+      await tick();
+      sink.push(
+        sse("response.created", { id: "replayed_response", status: "in_progress", output: [] }),
+      );
+      await tick();
+      expect(useChatStore.getState()).toMatchObject({
+        sessionStatus: "idle",
+        status: "streaming",
+        activeResponse: { responseId: "replayed_response", state: "streaming" },
+      });
+      if (phase === "completed") {
+        sink.push(
+          sse("response.completed", { id: "replayed_response", status: "completed", output: [] }),
+        );
+      } else if (phase === "failed Stop") {
+        useChatStore.getState().stop();
+      }
+      await tick();
+      const localResponse = useChatStore.getState().activeResponse;
+      releaseSnapshot(
+        mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          status: "running",
+          active_response_id: "replayed_response",
+          background_task_count: 2,
+          created_at: 0,
+          items: [],
+          labels: {},
+        }),
+      );
+      await binding;
+      expect(useChatStore.getState()).toMatchObject({
+        activeResponse: localResponse,
+        sessionStatus: phase === "streaming" ? "running" : "idle",
+        backgroundTaskCount: phase === "streaming" ? 2 : 0,
+      });
+      if (phase === "failed Stop") expect(stopNotices.get(id)).toBe("request_failed");
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+      await tick();
+    },
+  );
+
   it.each(["new turn", "failed Stop"])(
     "keeps a %s ahead of the initial binding snapshot",
     async (change) => {
@@ -15575,6 +15640,12 @@ describe("chatStore — startStreamPump reconnect loop", () => {
                 agent_id: "agent_xyz",
                 status: snapshotStatus,
                 active_response_id: "old_response",
+                llm_model: "recovered-model",
+                context_window: 128000,
+                last_total_tokens: 900,
+                total_cost_usd: 1.25,
+                mcp_startup: null,
+                sandbox_status: null,
                 created_at: 0,
                 items: [],
                 labels: {},
@@ -15594,6 +15665,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         blocks: itemsToBlocks(windowItems),
         hasMoreHistory: true,
         oldestItemId: windowItems[0]!.id,
+        sessionModelSeeded: true,
+        llmModel: "seed-model",
+        mcpStartup: { safe: { status: "starting", error: null } },
+        sandboxStatus: { stage: "starting", error: null },
         status: "streaming",
         sessionStatus: "running",
         activeResponse: { responseId: "old_response", state: "streaming", error: null },
@@ -15617,6 +15692,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       releaseFetch!();
       await drainAsync(4);
       expect(useChatStore.getState().activeResponse).toEqual(newerResponse);
+      expect(useChatStore.getState()).toMatchObject({
+        llmModel: "recovered-model",
+        sessionModelSeeded: false,
+        contextWindow: 128000,
+        tokensUsed: 900,
+        sessionCostUsd: 1.25,
+        mcpStartup: null,
+        sandboxStatus: null,
+      });
       expect(useChatStore.getState().sessionStatus).toBe(
         change === "new turn" ? "running" : "idle",
       );

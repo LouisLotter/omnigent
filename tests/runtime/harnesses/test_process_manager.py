@@ -1791,6 +1791,8 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
     import subprocess
     import textwrap
 
+    from omnigent.inner._proc import process_alive
+
     parent_script = textwrap.dedent(
         f"""
         import asyncio
@@ -1821,14 +1823,15 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
     )
     runner_pid = int(proc.stdout.strip().splitlines()[-1])
 
+    # An orphan may remain a zombie until init reaps it; it has already exited.
     try:
         for _ in range(60):
-            if not _pid_alive(runner_pid):
+            if not process_alive(runner_pid):
                 break
             await asyncio.sleep(0.1)
-        assert not _pid_alive(runner_pid)
+        assert not process_alive(runner_pid)
     finally:
-        if _pid_alive(runner_pid):
+        if process_alive(runner_pid):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(runner_pid, signal.SIGKILL)
 

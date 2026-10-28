@@ -1,24 +1,18 @@
 """Tests for OpenAIAgentsSDKExecutor with a fake Agents SDK module."""
 
 import asyncio
+import base64
 import contextlib
-import sys
 import types
 import unittest
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import databricks.sdk.config as _sdk_config_mod
 import httpx
 import pytest
 from agents.usage import InputTokensDetails, Usage
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import base64
-
-import databricks.sdk.config as _sdk_config_mod
 
 from omnigent.inner.executor import (
     ExecutorConfig,

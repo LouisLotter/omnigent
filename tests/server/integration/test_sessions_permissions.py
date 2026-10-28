@@ -24,7 +24,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
@@ -230,7 +230,12 @@ def _register_online_host(app: FastAPI, host_id: str, owner: str) -> None:
             (),
             {"send_text": lambda self, d: None, "receive_text": lambda self: ""},
         )(),
-        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name=host_id),
+        HostHelloFrame(
+            version="0.1.0",
+            frame_protocol_version=1,
+            name=host_id,
+            capabilities=HOST_CAPABILITIES,
+        ),
         owner=owner,
     )
 
