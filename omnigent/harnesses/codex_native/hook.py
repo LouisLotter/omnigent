@@ -18,22 +18,9 @@ import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.harnesses.codex_native.bridge import (
-    read_bridge_state,
-    read_codex_config_model,
-    read_policy_hook_config,
-)
-from omnigent.native.native_policy_hook import (
-    evaluation_response_to_hook_output,
-    fail_closed_hook_output,
-    hook_payload_to_evaluation_request,
-    parse_evaluation_response,
-    policy_hook_reauth,
-    post_evaluate_with_retry,
-    read_relay_policy_config,
-    relay_policy_evaluate_url,
-)
-
+# Only the standard library at module level: ``observe-tool`` runs after every
+# tool call under a short Codex timeout, so the bridge and the policy client
+# (httpx) are imported inside the subcommands that use them.
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
 
@@ -113,6 +100,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         e.g. ``["--bridge-dir", "/tmp/x"]``.
     :returns: Process exit code. Always ``0``.
     """
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+    from omnigent.native.native_policy_hook import fail_closed_hook_output
+
     args = _parse_evaluate_policy_args(argv)
     raw = sys.stdin.read()
     try:
@@ -160,6 +150,21 @@ def _evaluate_policy_hook_output(
         verdict does not constrain the call, or a ``PostToolUse`` verdict
         was unavailable.
     """
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_model,
+        read_policy_hook_config,
+    )
+    from omnigent.native.native_policy_hook import (
+        evaluation_response_to_hook_output,
+        fail_closed_hook_output,
+        hook_payload_to_evaluation_request,
+        parse_evaluation_response,
+        policy_hook_reauth,
+        post_evaluate_with_retry,
+        read_relay_policy_config,
+        relay_policy_evaluate_url,
+    )
+
     raw_event = payload.get("hook_event_name", "")
     hook_event = raw_event if isinstance(raw_event, str) else ""
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
@@ -271,6 +276,7 @@ def _main_route_turn(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — the block is expressed via
         the JSON on stdout, never via the exit code.
     """
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
     from omnigent.runner.turn_routing import (
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,
@@ -491,6 +497,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     )
     from omnigent.harnesses.codex_native.bridge import (
         mirror_applied_codex_settings,
+        read_bridge_state,
         read_codex_config_effort,
         read_unmirrored_codex_settings,
     )

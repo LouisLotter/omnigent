@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -715,6 +716,33 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
         "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
     )
     assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
+
+
+def test_observe_tool_runs_without_the_policy_client(tmp_path: Path) -> None:
+    """
+    ``observe-tool`` dispatches before the bridge and httpx are imported.
+
+    Codex runs it after every tool call under a short timeout; on a busy
+    machine those imports alone outlasted it and Codex showed a failed hook.
+    """
+    probe = (
+        "import sys\n"
+        "from omnigent.harnesses.codex_native import hook\n"
+        "hook.main(['observe-tool', '--bridge-dir', sys.argv[1]])\n"
+        "heavy = ('httpx', 'omnigent.harnesses.codex_native.bridge',"
+        " 'omnigent.native.native_policy_hook')\n"
+        "print(','.join(name for name in heavy if name in sys.modules))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(tmp_path)],
+        input=json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Bash"}),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", result.stdout
 
 
 # ── route-turn (first-message model routing) ────────────────────────
