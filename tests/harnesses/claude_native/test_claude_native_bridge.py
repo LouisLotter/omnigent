@@ -3927,11 +3927,51 @@ def test_augment_claude_args_names_the_default_renderer(
         user_settings_path.parent.mkdir()
         user_settings_path.write_text(json.dumps(user_settings), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", user_settings_path)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
 
     settings = _load_invocation_settings(args)
     assert settings.get("tui") == "default"
+
+
+@pytest.mark.parametrize(
+    ("custom_dir_settings", "home_settings", "expected_tui"),
+    [
+        (None, {"tui": "fullscreen"}, "default"),
+        ({"tui": "fullscreen"}, None, None),
+    ],
+    ids=["choice-only-in-home", "choice-in-custom-dir"],
+)
+def test_augment_claude_args_reads_the_renderer_from_claudes_config_dir(
+    custom_dir_settings: dict[str, str] | None,
+    home_settings: dict[str, str] | None,
+    expected_tui: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With ``CLAUDE_CONFIG_DIR`` set, the renderer choice is read where Claude reads it.
+
+    The runner passes ``CLAUDE_CONFIG_DIR`` through to Claude, which then
+    loads ``settings.json`` from that directory, not ``~/.claude``. Reading
+    the wrong file would leave the offer showing or undo the person's choice.
+    """
+    custom_dir = tmp_path / "custom-claude"
+    custom_dir.mkdir()
+    if custom_dir_settings is not None:
+        custom_settings = json.dumps(custom_dir_settings)
+        (custom_dir / "settings.json").write_text(custom_settings, encoding="utf-8")
+    home_settings_path = tmp_path / "home" / "settings.json"
+    home_settings_path.parent.mkdir()
+    if home_settings is not None:
+        home_settings_path.write_text(json.dumps(home_settings), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", home_settings_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(custom_dir))
+
+    args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+
+    assert _load_invocation_settings(args).get("tui") == expected_tui
 
 
 @pytest.mark.parametrize("renderer", ["fullscreen", "default"])
@@ -3949,6 +3989,7 @@ def test_augment_claude_args_keeps_the_users_own_renderer(
     user_settings_path = tmp_path / "settings.json"
     user_settings_path.write_text(json.dumps({"tui": renderer}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", user_settings_path)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
 
@@ -7836,6 +7877,7 @@ def test_read_user_status_line_command_returns_string(
         encoding="utf-8",
     )
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     assert claude_native_bridge.read_user_status_line_command() == "bun run hud"
 
@@ -7847,6 +7889,7 @@ def test_read_user_status_line_command_returns_none_when_unset(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_status_line_command() is None
 
 
@@ -7858,6 +7901,7 @@ def test_read_user_effort_level_returns_configured_level(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": effort}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() == effort
 
 
@@ -7868,6 +7912,7 @@ def test_read_user_effort_level_returns_none_when_unset(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -7878,6 +7923,7 @@ def test_read_user_effort_level_rejects_unrecognized_value(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "ultra"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -7887,6 +7933,7 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     """Missing settings.json → None; absence of config must not raise."""
     missing = tmp_path / "does-not-exist" / "settings.json"
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", missing)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() is None
 
 

@@ -8018,13 +8018,21 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
 
 def _read_user_claude_settings() -> _JsonObject | None:
     """
-    Read the user's own ``~/.claude/settings.json``, never writing it.
+    Read the user's own Claude settings file, never writing it.
+
+    The file Claude loads: ``settings.json`` in ``$CLAUDE_CONFIG_DIR`` when
+    set (the runner passes it through to the terminal), else
+    ``~/.claude/settings.json``.
 
     :returns: The parsed settings object, or ``None`` when the file is
         missing, unreadable, not JSON, or not a JSON object.
     """
+    configured_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+        if configured_dir:
+            raw = (Path(configured_dir).expanduser() / "settings.json").read_text(encoding="utf-8")
+        else:
+            raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
     except OSError:
         return None
     try:
@@ -8067,8 +8075,9 @@ def read_user_tui_renderer() -> str | None:
     only name a renderer (to skip Claude's fullscreen-renderer startup offer)
     when the user has not chosen one themselves.
 
-    :returns: ``tui`` from ``~/.claude/settings.json``, e.g.
-        ``"fullscreen"``, or ``None`` when unset, blank or unreadable.
+    :returns: ``tui`` from the user's settings file (see
+        :func:`_read_user_claude_settings`), e.g. ``"fullscreen"``, or
+        ``None`` when unset, blank or unreadable.
     """
     parsed = _read_user_claude_settings()
     if parsed is None:
