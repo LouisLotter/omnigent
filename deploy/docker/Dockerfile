@@ -364,9 +364,9 @@ RUN set -eu; \
 # state. Pinned + SHA256-verified per arch, like agy above; to bump, update
 # GH_VERSION and both SHA256s from the release's `gh_<ver>_checksums.txt` at
 # https://github.com/cli/cli/releases.
-ARG GH_VERSION=2.100.0
-ARG GH_SHA256_AMD64=e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be
-ARG GH_SHA256_ARM64=ea4e7a581a32ccad6cc7923cb1576ac5859ba4b9a16ab22eb8f8a96e78e2e961
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256_AMD64=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+ARG GH_SHA256_ARM64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
 RUN set -eu; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \

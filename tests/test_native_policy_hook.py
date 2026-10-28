@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -13,7 +15,9 @@ from omnigent.native.native_policy_hook import (
     fail_ask_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    parse_evaluation_response,
     post_evaluate_with_retry,
+    read_relay_policy_config,
 )
 
 
@@ -292,18 +296,111 @@ def test_user_prompt_submit_blocking_actions_emit_decision_block(action: str) ->
     assert output == {"decision": "block", "reason": "no prod mutations"}
 
 
-def test_user_prompt_submit_block_defaults_reason() -> None:
+@pytest.mark.parametrize("reason", [None, "", "  \n", 7, ["a list"]])
+def test_user_prompt_submit_block_defaults_reason(reason: object) -> None:
     """
-    A block with no reason still carries a non-empty reason.
+    A block with no usable reason still carries a non-empty text reason.
 
     Both harnesses drop a block whose reason is empty (the block is treated
-    as invalid), so a missing reason must be defaulted or the gate would
+    as invalid), and Codex cannot read a reason that is not text, so a
+    missing, blank or non-string reason must be defaulted or the gate would
     silently fail open.
     """
-    output = evaluation_response_to_hook_output(
-        "UserPromptSubmit", {"result": "POLICY_ACTION_DENY"}
-    )
+    verdict: dict[str, object] = {"result": "POLICY_ACTION_DENY"}
+    if reason is not None:
+        verdict["reason"] = reason
+    output = evaluation_response_to_hook_output("UserPromptSubmit", verdict)
     assert output == {"decision": "block", "reason": "Denied by policy"}
+
+
+@pytest.mark.parametrize("action", ["POLICY_ACTION_DENY", "POLICY_ACTION_ASK"])
+@pytest.mark.parametrize("reason", [None, "", "  \n", 7])
+def test_pre_tool_use_deny_always_carries_a_reason(action: str, reason: object) -> None:
+    """
+    A PreToolUse deny carries a non-empty text reason even when the policy gave none.
+
+    Codex treats a deny without a non-empty ``permissionDecisionReason`` as
+    invalid hook output and runs the tool, so a reasonless DENY would fail
+    open there.
+    """
+    verdict: dict[str, object] = {"result": action}
+    if reason is not None:
+        verdict["reason"] = reason
+    output = evaluation_response_to_hook_output("PreToolUse", verdict)
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Denied by policy",
+        }
+    }
+
+
+def test_pre_tool_use_deny_reason_is_trimmed() -> None:
+    """Surrounding whitespace is dropped from the policy's reason."""
+    output = evaluation_response_to_hook_output(
+        "PreToolUse", {"result": "POLICY_ACTION_DENY", "reason": "  no rm \n"}
+    )
+    assert output is not None
+    assert output["hookSpecificOutput"]["permissionDecisionReason"] == "no rm"
+
+
+@pytest.mark.parametrize(
+    ("body", "problem"),
+    [
+        (b"", "empty Omnigent response"),
+        (b"not json", "malformed Omnigent response"),
+        (b"\xff\xfe\xfa", "malformed Omnigent response"),
+        (b'["POLICY_ACTION_ALLOW"]', "Omnigent response carried no policy verdict"),
+        (b'"POLICY_ACTION_ALLOW"', "Omnigent response carried no policy verdict"),
+        (b"{}", "Omnigent response carried no policy verdict"),
+        (b'{"result": 3}', "Omnigent response carried no policy verdict"),
+        (b'{"result": ""}', "Omnigent response carried no policy verdict"),
+        (b'{"result": "POLICY_ACTION_DNEY"}', "Omnigent response carried no policy verdict"),
+        (b'{"result": []}', "Omnigent response carried no policy verdict"),
+        (b'{"result": {}}', "Omnigent response carried no policy verdict"),
+    ],
+)
+def test_parse_evaluation_response_rejects_unusable_bodies(body: bytes, problem: str) -> None:
+    """
+    A body that is not an object with a string ``result`` is not a verdict.
+
+    Callers fail closed on these, so each must come back as a problem rather
+    than as a response the caller would read as "no opinion".
+    """
+    assert parse_evaluation_response(body) == (None, problem)
+
+
+def test_parse_evaluation_response_returns_the_verdict() -> None:
+    """A well-formed EvaluationResponse is returned as decoded."""
+    body = b'{"result": "POLICY_ACTION_DENY", "reason": "no rm"}'
+    assert parse_evaluation_response(body) == (
+        {"result": "POLICY_ACTION_DENY", "reason": "no rm"},
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "POLICY_ACTION_ALLOW",
+        "POLICY_ACTION_DENY",
+        "POLICY_ACTION_ASK",
+        "POLICY_ACTION_UNSPECIFIED",
+    ],
+)
+def test_parse_evaluation_response_accepts_every_action_the_server_sends(action: str) -> None:
+    """Each action the evaluate endpoint answers with is a usable verdict."""
+    verdict, problem = parse_evaluation_response(f'{{"result": "{action}"}}'.encode())
+    assert problem is None
+    assert verdict == {"result": action}
+
+
+@pytest.mark.parametrize("content", ['["not", "an", "object"]', '"text"', "not json"])
+def test_read_relay_policy_config_ignores_an_unusable_file(tmp_path: Path, content: str) -> None:
+    """A relay file that is not a JSON object means no relay, not a crashed hook."""
+    (tmp_path / "tool_relay.json").write_text(content, encoding="utf-8")
+    assert read_relay_policy_config(tmp_path) is None
 
 
 @pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"])
@@ -334,8 +431,9 @@ def test_fail_closed_pre_tool_use_denies() -> None:
     assert hook_specific["hookEventName"] == "PreToolUse"
     assert hook_specific["permissionDecision"] == "deny"
     # A deny is inert without a reason on the consuming harnesses, so one
-    # must always be present.
+    # must always be present, and it tells the reader the tool did not run.
     assert hook_specific["permissionDecisionReason"]
+    assert "was not run" in hook_specific["permissionDecisionReason"]
 
 
 def test_fail_closed_user_prompt_submit_fails_closed() -> None:
@@ -806,6 +904,74 @@ def test_post_evaluate_with_retry_stops_reparking_at_the_callers_budget(
     assert resp is None
     assert error is not None and error.startswith("request error")
     assert len(silent_poll_client.bodies) == 3
+
+
+@pytest.mark.parametrize("sever", ["remote_protocol_error", "read_error", "504", "silent"])
+def test_post_evaluate_with_retry_never_outlasts_the_callers_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    sever: str,
+) -> None:
+    """
+    However the held polls end, the whole call returns within the caller's budget.
+
+    A harness kills a hook that outlives its own timeout, and Codex then runs
+    the tool. The hook must give up first, with an error its caller turns
+    into a deny, so no poll, re-park or backoff may run past the budget.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        """
+        Advance the fake clock instead of waiting.
+
+        :param seconds: Delay the loop asked for.
+        :returns: None.
+        """
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    gateway_cap = native_policy_hook._EVALUATE_POLICY_HELD_POLL_FLOOR_S + 290.0
+    posts: list[float] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: httpx.Timeout) -> None:
+            del headers
+            self._read_timeout = timeout.read or 0.0
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(clock["t"])
+            assert len(posts) < 10_000, "the retry loop did not stop"
+            request = httpx.Request("POST", url)
+            if sever == "silent" or self._read_timeout < gateway_cap:
+                clock["t"] += self._read_timeout
+                raise httpx.ReadTimeout("no answer", request=request)
+            clock["t"] += gateway_cap
+            if sever == "504":
+                return httpx.Response(504, request=request)
+            if sever == "read_error":
+                raise httpx.ReadError("connection reset", request=request)
+            raise httpx.RemoteProtocolError("gateway severed the poll", request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(native_policy_hook, "LONG_POLL_READ_TIMEOUT_S", 1000.0)
+    budget = 3000.0
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, budget, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None
+    assert clock["t"] <= budget, f"returned at {clock['t']}s, after the {budget}s budget"
+    assert len(posts) > 1, "held polls were re-parked before the budget ran out"
 
 
 def test_post_evaluate_with_retry_slow_429_spends_the_budget(

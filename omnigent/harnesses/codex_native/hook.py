@@ -18,21 +18,9 @@ import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from omnigent.harnesses.codex_native.bridge import (
-    read_bridge_state,
-    read_codex_config_model,
-    read_policy_hook_config,
-)
-from omnigent.native.native_policy_hook import (
-    evaluation_response_to_hook_output,
-    fail_ask_hook_output,
-    hook_payload_to_evaluation_request,
-    policy_hook_reauth,
-    post_evaluate_with_retry,
-    read_relay_policy_config,
-    relay_policy_evaluate_url,
-)
-
+# Only the standard library at module level: ``observe-tool`` runs after every
+# tool call under a short Codex timeout, so the bridge and the policy client
+# (httpx) are imported inside the subcommands that use them.
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
 
@@ -44,6 +32,12 @@ if TYPE_CHECKING:
 # ``ask_timeout``. Kept in lockstep with the Claude-native hook's
 # ``_EVALUATE_POLICY_TIMEOUT_S``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
+# Hard limit on one evaluate-policy run, from when it starts waiting. Codex
+# kills a hook that outlives its ``hooks.json`` timeout and then runs the tool,
+# so past this limit the hook answers fail-closed itself, whatever the network
+# is doing. It sits between the request budget (plus its retry tail) and the
+# Codex timeout (``app_server._POLICY_HOOK_TIMEOUT_SECONDS``).
+_ANSWER_DEADLINE_S = _EVALUATE_POLICY_TIMEOUT_S + 240.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -88,19 +82,23 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     for native sessions, which drops the prompt before the model runs).
 
     Failure handling is phase-aware (mirroring the runner-side default
-    from PR #163), shared with the Claude-native hook. Once the session is
-    known to be governed (an active session id and a configured
-    ``ap_server_url``) and the round-trip to ``/policies/evaluate`` cannot
-    yield a usable verdict — server unreachable, non-2xx, or an empty /
-    malformed body — a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails
+    from PR #163). Once the session is known to be governed (bridge state
+    plus a policy relay or a configured ``ap_server_url``) and the
+    round-trip to ``/policies/evaluate`` cannot yield a usable verdict —
+    server unreachable, non-2xx, an empty / malformed body, or an error
+    inside this hook — a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails
     CLOSED with a ``deny`` (this hook is the sole enforcement point for
-    native tools), while ``UserPromptSubmit`` and ``PostToolUse`` fail
-    OPEN. Conditions that mean the session simply is not governed — no
-    bridge state, no ``ap_server_url``, an unparseable payload, or an
-    ``mcp__omnigent__*`` tool already gated on the relay path — still
-    return exit 0 with no output ("no opinion") so non-Omnigent tool calls
-    are never blocked. The complementary fail-loud guard — asserting the
-    hook is actually registered and trusted — lives at session startup in
+    native tools) and ``UserPromptSubmit`` blocks, while ``PostToolUse``
+    fails OPEN. Codex honors only ``deny`` with a non-empty reason from a
+    ``PreToolUse`` hook: it rejects ``ask`` (and a bare ``allow``) as
+    unsupported, marks the hook failed and runs the tool, so the fallback
+    is never ``ask``, unlike the Claude-native hook's. Conditions that mean
+    the session simply is not governed — no bridge state, no relay or
+    ``ap_server_url``, an unparseable payload, or an ``mcp__omnigent__*``
+    tool already gated on the relay path — still return exit 0 with no
+    output ("no opinion") so non-Omnigent tool calls are never blocked.
+    The complementary fail-loud guard — asserting the hook is actually
+    registered and trusted — lives at session startup in
     :mod:`omnigent.harnesses.codex_native.app_server`, not here, because a
     silently-skipped hook cannot report its own absence.
 
@@ -108,6 +106,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         e.g. ``["--bridge-dir", "/tmp/x"]``.
     :returns: Process exit code. Always ``0``.
     """
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+    from omnigent.native.native_policy_hook import fail_closed_hook_output
+
     args = _parse_evaluate_policy_args(argv)
     raw = sys.stdin.read()
     try:
@@ -123,13 +124,138 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     state = read_bridge_state(bridge_dir)
     if state is None:
         return 0
-    session_id = state.session_id
 
-    hook_event = payload.get("hook_event_name", "")
+    hook_event = str(payload.get("hook_event_name", ""))
+    answer = _DeadlineAnswer(
+        _ANSWER_DEADLINE_S,
+        fail_closed_hook_output(hook_event, "no policy answer before the hook's deadline"),
+    )
+    try:
+        hook_output = _evaluate_policy_hook_output(bridge_dir, state.session_id, payload)
+    except Exception as exc:  # noqa: BLE001 - a crashed hook is a failed hook, and Codex runs the tool
+        print(
+            f"omnigent codex evaluate-policy hook: failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        hook_output = fail_closed_hook_output(
+            hook_event, f"the policy hook failed ({type(exc).__name__})"
+        )
+    answer.write(hook_output)
+    return 0
+
+
+class _DeadlineAnswer:
+    """
+    The hook's single answer on stdout: the verdict, or a fallback at a deadline.
+
+    A daemon timer writes the fallback and ends the process if the verdict has
+    not been written by then, so a slow network can never keep the hook past
+    the harness timeout; whichever comes first is the only output.
+
+    :param deadline_s: Seconds from now until the fallback is written.
+    :param fallback: Hook output to write at the deadline, or ``None`` to
+        write nothing (an event that fails open).
+    """
+
+    def __init__(self, deadline_s: float, fallback: dict[str, object] | None) -> None:
+        import threading
+
+        self._fallback = fallback
+        self._lock = threading.Lock()
+        self._written = False
+        self._timer = threading.Timer(deadline_s, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def write(self, hook_output: dict[str, object] | None) -> None:
+        """
+        Write the verdict unless the deadline already answered.
+
+        :param hook_output: Hook output for stdout, or ``None`` for none.
+        :returns: None.
+        """
+        with self._lock:
+            if self._written:
+                return
+            self._written = True
+            self._timer.cancel()
+            _write_hook_output(hook_output)
+
+    def _expire(self) -> None:
+        """
+        Write the fallback and end the process before the harness kills it.
+
+        :returns: None.
+        """
+        with self._lock:
+            if self._written:
+                return
+            self._written = True
+            print("omnigent codex evaluate-policy hook: deadline reached", file=sys.stderr)
+            _write_hook_output(self._fallback)
+        _exit_process(0)
+
+
+def _write_hook_output(hook_output: dict[str, object] | None) -> None:
+    """
+    Write one hook output to stdout and flush it.
+
+    :param hook_output: Hook output, or ``None`` to write nothing.
+    :returns: None.
+    """
+    if hook_output is not None:
+        sys.stdout.write(json.dumps(hook_output))
+    sys.stdout.flush()
+
+
+def _exit_process(code: int) -> None:
+    """
+    End the hook process at once, from any thread.
+
+    :param code: Process exit code, e.g. ``0``.
+    :returns: None.
+    """
+    import os
+
+    os._exit(code)
+
+
+def _evaluate_policy_hook_output(
+    bridge_dir: Path, session_id: str, payload: dict[str, object]
+) -> dict[str, object] | None:
+    """
+    Evaluate one governed-session hook payload and shape Codex's answer.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param session_id: Omnigent session id from the bridge state, e.g.
+        ``"conv_abc"``.
+    :param payload: Decoded Codex hook payload.
+    :returns: Hook output for stdout, or ``None`` for "no opinion": the
+        session is not governed, the event carries no policy meaning, the
+        verdict does not constrain the call, or a ``PostToolUse`` verdict
+        was unavailable.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_model,
+        read_policy_hook_config,
+    )
+    from omnigent.native.native_policy_hook import (
+        evaluation_response_to_hook_output,
+        fail_closed_hook_output,
+        hook_payload_to_evaluation_request,
+        parse_evaluation_response,
+        policy_hook_reauth,
+        post_evaluate_with_retry,
+        read_relay_policy_config,
+        relay_policy_evaluate_url,
+    )
+
+    raw_event = payload.get("hook_event_name", "")
+    hook_event = raw_event if isinstance(raw_event, str) else ""
     eval_request = hook_payload_to_evaluation_request(hook_event, payload)
     if eval_request is None:
         # Unrecognized hook event or an mcp__omnigent__* tool (relay-enforced).
-        return 0
+        return None
 
     # Stamp the live model from this session's config.toml (what an in-TUI
     # ``/model`` writes) onto the request so the cost-budget gate evaluates
@@ -139,12 +265,6 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     model = read_codex_config_model(bridge_dir)
     if model:
         context["model"] = model
-
-    def _fail_closed(detail: str | None = None) -> int:
-        out = fail_ask_hook_output(hook_event, detail)
-        if out is not None:
-            sys.stdout.write(json.dumps(out))
-        return 0
 
     # Prefer the relay (non-expiring local token); fall back to direct server
     # call when the relay isn't up yet (first-call race) or not configured.
@@ -160,10 +280,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     else:
         config = read_policy_hook_config(bridge_dir)
         if config is None:
-            return 0
+            return None
         ap_server_url = config.get("ap_server_url")
         if not isinstance(ap_server_url, str) or not ap_server_url:
-            return 0
+            return None
         raw_headers = config.get("ap_auth_headers")
         headers = {}
         if isinstance(raw_headers, dict):
@@ -181,24 +301,14 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         reauth=reauth,
     )
     if resp is None:
-        return _fail_closed(api_error or (reauth.failure_reason if reauth else None))
-    if not resp.content:
-        print("omnigent codex evaluate-policy hook: empty Omnigent response", file=sys.stderr)
-        return _fail_closed()
-
-    try:
-        eval_response = resp.json()
-    except json.JSONDecodeError:
-        print(
-            "omnigent codex evaluate-policy hook: malformed Omnigent response",
-            file=sys.stderr,
+        return fail_closed_hook_output(
+            hook_event, api_error or (reauth.failure_reason if reauth else None)
         )
-        return _fail_closed()
-
-    hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
-    if hook_output is not None:
-        sys.stdout.write(json.dumps(hook_output))
-    return 0
+    eval_response, problem = parse_evaluation_response(resp.content)
+    if eval_response is None:
+        print(f"omnigent codex evaluate-policy hook: {problem}", file=sys.stderr)
+        return fail_closed_hook_output(hook_event, problem)
+    return evaluation_response_to_hook_output(hook_event, eval_response)
 
 
 def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:
@@ -251,6 +361,7 @@ def _main_route_turn(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — the block is expressed via
         the JSON on stdout, never via the exit code.
     """
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
     from omnigent.runner.turn_routing import (
         ADVERTISEMENT_FILE,
         HOOK_REQUEST_TIMEOUT_S,
@@ -471,6 +582,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     )
     from omnigent.harnesses.codex_native.bridge import (
         mirror_applied_codex_settings,
+        read_bridge_state,
         read_codex_config_effort,
         read_unmirrored_codex_settings,
     )

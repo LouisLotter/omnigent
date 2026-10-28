@@ -74,9 +74,22 @@ _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 # body). Mirrors the runner-side fail-closed default in
 # ``omnigent.runner.policy_proxy._evaluate_policy_via_omnigent``.
 _EVAL_UNAVAILABLE_REASON = (
-    "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
-    "Omnigent server); failing closed for this tool call."
+    "Omnigent could not check this tool call against its policies (the policy "
+    "service could not be reached or gave no usable answer), so the tool was not "
+    "run. Try again in a moment."
 )
+# Every ``result`` the evaluate endpoint sends; UNSPECIFIED means "no policy applies".
+_POLICY_ACTIONS = frozenset(
+    {
+        "POLICY_ACTION_ALLOW",
+        "POLICY_ACTION_DENY",
+        "POLICY_ACTION_ASK",
+        "POLICY_ACTION_UNSPECIFIED",
+    }
+)
+# Reason given for a DENY (or a stray ASK) verdict whose policy names none:
+# Codex ignores a deny without a non-empty reason and runs the tool.
+_DENIED_BY_POLICY_REASON = "Denied by policy"
 _EVAL_UNAVAILABLE_REQUEST_REASON = (
     "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
     "Omnigent server); failing closed for this request."
@@ -123,6 +136,8 @@ def read_relay_policy_config(
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
         return None
     url = data.get("url")
     token = data.get("token")
@@ -417,7 +432,9 @@ def evaluation_response_to_hook_output(
         rewrite on PostToolUse, or an unknown action).
     """
     action = eval_response.get("result", "POLICY_ACTION_UNSPECIFIED")
-    reason = eval_response.get("reason")
+    raw_reason = eval_response.get("reason")
+    # A blank or non-string reason counts as none: both harnesses read it as text.
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
 
     if hook_event == _USER_PROMPT_SUBMIT:
         # DENY blocks the prompt; a stray ASK fails closed (also block) since
@@ -428,7 +445,7 @@ def evaluation_response_to_hook_output(
         if action in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK"):
             return {
                 "decision": "block",
-                "reason": reason or "Denied by policy",
+                "reason": reason or _DENIED_BY_POLICY_REASON,
             }
         return None
 
@@ -449,13 +466,15 @@ def evaluation_response_to_hook_output(
         decision = decision_map.get(str(action))
         if decision is None:
             return None
-        output: dict[str, object] = {
-            "hookEventName": _PRE_TOOL_USE,
-            "permissionDecision": decision,
+        # Codex rejects a deny without a non-empty reason as invalid output and
+        # runs the tool, so a deny always carries one.
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": _PRE_TOOL_USE,
+                "permissionDecision": decision,
+                "permissionDecisionReason": reason or _DENIED_BY_POLICY_REASON,
+            }
         }
-        if decision == "deny" and reason:
-            output["permissionDecisionReason"] = reason
-        return {"hookSpecificOutput": output}
 
     if hook_event == _POST_TOOL_USE:
         if action == "POLICY_ACTION_DENY" and reason:
@@ -558,9 +577,11 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
     pre-turn enforcement gate for native sessions; a server hiccup must not
     let an over-budget or otherwise-blocked request proceed silently.
 
-    Use this for harnesses whose native TUI has an interactive approval UI
-    (claude-native, codex-native). For headless harnesses where no approval
-    UI is available, prefer :func:`fail_closed_hook_output`.
+    Use this only for harnesses that honor ``permissionDecision: "ask"`` from
+    a ``PreToolUse`` hook (claude-native). Codex rejects ``"ask"`` as an
+    unsupported decision, marks the hook failed and runs the tool, so
+    codex-native — like headless harnesses with no approval UI — uses
+    :func:`fail_closed_hook_output`.
 
     :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
     :param detail: Optional diagnostic string appended to the ask reason
@@ -583,6 +604,34 @@ def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str
             },
         }
     return fail_closed_hook_output(hook_event, detail)
+
+
+def parse_evaluation_response(body: bytes) -> tuple[dict[str, object], None] | tuple[None, str]:
+    """
+    Decode a ``/policies/evaluate`` response body into a usable verdict.
+
+    A usable verdict is a JSON object whose ``result`` is one of the actions
+    the server sends. Anything else — an empty body, invalid JSON, a list or
+    scalar, or an object whose ``result`` is missing, blank or unknown — is
+    not a verdict, and the caller fails closed on it, as the runner's policy
+    proxy and the relay's Claude hook endpoint do for a missing ``result``.
+
+    :param body: Raw response body, e.g.
+        ``b'{"result": "POLICY_ACTION_DENY", "reason": "no rm"}'``.
+    :returns: ``(verdict, None)`` for a usable verdict; otherwise
+        ``(None, problem)`` with a short description such as
+        ``"empty Omnigent response"``.
+    """
+    if not body:
+        return None, "empty Omnigent response"
+    try:
+        decoded = json.loads(body)
+    except ValueError:
+        return None, "malformed Omnigent response"
+    action = decoded.get("result") if isinstance(decoded, dict) else None
+    if not isinstance(action, str) or action not in _POLICY_ACTIONS:
+        return None, "Omnigent response carried no policy verdict"
+    return decoded, None
 
 
 def post_evaluate_with_retry(
@@ -625,8 +674,12 @@ def post_evaluate_with_retry(
     attempt waits at most :data:`LONG_POLL_READ_TIMEOUT_S` for an answer: a
     poll that stays silent that long (a half-open connection, or a person who
     has not answered yet) re-POSTs the same id, which re-parks it, until
-    ``read_timeout`` has passed in total. The caller is responsible for
-    fail-closed handling on ``None``.
+    ``read_timeout`` has passed in total; the last poll waits only for what is
+    left of it. A fast failure after that still gets the transient budget, so
+    the call returns within ``read_timeout`` plus that budget and one attempt's
+    timeouts, and a harness timeout that much longer always gets an answer to
+    fail closed on. The caller is responsible for fail-closed handling on
+    ``None``.
 
     :param url: Absolute URL of the evaluate endpoint.
     :param headers: Auth headers for the Omnigent server.
@@ -660,13 +713,17 @@ def post_evaluate_with_retry(
     deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     poll_read_timeout = min(read_timeout, LONG_POLL_READ_TIMEOUT_S)
-    timeout = httpx.Timeout(
-        read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S, read=poll_read_timeout
-    )
     answer_deadline = time.monotonic() + read_timeout
     reauthed = False
     last_error: str = "unknown error"
     while True:
+        # A poll waits no longer than what is left of the caller's answer budget.
+        remaining_s = answer_deadline - time.monotonic()
+        timeout = httpx.Timeout(
+            read_timeout,
+            connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S,
+            read=min(poll_read_timeout, remaining_s) if remaining_s > 0 else poll_read_timeout,
+        )
         retry_delay_s = backoff_s
         attempt_started = time.monotonic()
         held_poll_severed = False
@@ -767,8 +824,10 @@ def post_evaluate_with_retry(
                 isinstance(exc, httpx.ReadTimeout) and time.monotonic() < answer_deadline
             )
             held_poll_severed = (
-                isinstance(exc, _HELD_POLL_SEVER_ERRORS) or unanswered_poll
-            ) and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                (isinstance(exc, _HELD_POLL_SEVER_ERRORS) or unanswered_poll)
+                and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                and time.monotonic() < answer_deadline
+            )
             if not held_poll_severed:
                 print(
                     f"omnigent {hook_label}: Omnigent request failed: {exc}",

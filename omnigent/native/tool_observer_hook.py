@@ -9,6 +9,12 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# The hook bounds its own relay wait (``_RELAY_TIMEOUT_S`` per socket step), so
+# the harness timeout only has to cover interpreter start-up, which takes
+# seconds on a CPU-starved machine; a timeout there shows as a failed hook.
+HOOK_TIMEOUT_S = 10
+_RELAY_TIMEOUT_S = 1
+
 
 def hook_settings(bridge_dir: Path, python: str, module: str) -> dict[str, object]:
     """Use each harness's existing owned hook module and trust registration."""
@@ -17,7 +23,7 @@ def hook_settings(bridge_dir: Path, python: str, module: str) -> dict[str, objec
         "command": shlex.join(
             [python, "-I", "-m", module, "observe-tool", "--bridge-dir", str(bridge_dir)]
         ),
-        "timeout": 3,
+        "timeout": HOOK_TIMEOUT_S,
     }
 
 
@@ -43,7 +49,7 @@ def main(argv: list[str]) -> int:
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=1) as response:
+        with urllib.request.urlopen(request, timeout=_RELAY_TIMEOUT_S) as response:
             response.read()
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"omnigent tool observer: {type(exc).__name__}", file=sys.stderr)

@@ -168,7 +168,10 @@ _POLICY_HOOK_MODULE = "omnigent.harnesses.codex_native.hook"
 # arrives — exactly the bug that let sub-agent tool calls slip past the cost
 # gate. Held at a day so the server-side ``ask_timeout`` is the single cap,
 # mirroring claude-native's ``PermissionRequest`` hook (``timeout: 86400``).
-_POLICY_HOOK_TIMEOUT_SECONDS = 86400
+# Codex waits a few minutes past the hook's own day-long budget: a hook Codex
+# kills counts as failed and the tool runs, so the hook must be the one to give
+# up, answering deny.
+_POLICY_HOOK_TIMEOUT_SECONDS = 86400 + 300
 # Hook trust statuses that allow a hook to execute (see codex
 # ``hook_trust_status``). Anything else means the hook is silently
 # skipped — which for a policy gate is a fail-open we must reject.

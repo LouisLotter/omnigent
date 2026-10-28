@@ -3904,6 +3904,119 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+@pytest.mark.parametrize(
+    "user_settings",
+    [None, {"model": "opus"}, {"tui": ""}, {"tui": None}, ["not", "an", "object"]],
+    ids=["missing", "no-tui", "blank-tui", "null-tui", "not-an-object"],
+)
+def test_augment_claude_args_names_the_default_renderer(
+    user_settings: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch names the default renderer when the user has not chosen one.
+
+    While no settings layer sets ``tui``, Claude Code can open "Try the new
+    fullscreen renderer?" at startup. Like the trust and MCP gates it fires
+    no hook, so a host-spawned terminal sits on it and the first message
+    fails. Naming a renderer in the invocation-local sidecar skips it.
+    """
+    user_settings_path = tmp_path / "user" / "settings.json"
+    if user_settings is not None:
+        user_settings_path.parent.mkdir()
+        user_settings_path.write_text(json.dumps(user_settings), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", user_settings_path)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("tui") == "default"
+
+
+@pytest.mark.parametrize(
+    ("config_dir", "renderer_files", "expected_tui"),
+    [
+        ("<abs>/custom", ["home/settings.json"], "default"),
+        ("<abs>/custom", ["custom/settings.json"], None),
+        ("", ["workspace/settings.json"], None),
+        ("", ["home/settings.json", "runner/settings.json"], "default"),
+        ("rel", ["workspace/rel/settings.json"], None),
+        ("rel", ["runner/rel/settings.json"], "default"),
+        ("~/cfg", ["workspace/~/cfg/settings.json"], None),
+    ],
+    ids=[
+        "absolute-dir-choice-only-in-home",
+        "absolute-dir-choice",
+        "empty-value-reads-the-workspace",
+        "empty-value-ignores-home-and-runner-dirs",
+        "relative-value-reads-from-the-workspace",
+        "relative-value-ignores-the-runner-dir",
+        "tilde-is-not-expanded",
+    ],
+)
+def test_augment_claude_args_reads_the_renderer_from_claudes_config_dir(
+    config_dir: str,
+    renderer_files: list[str],
+    expected_tui: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With ``CLAUDE_CONFIG_DIR`` set, the renderer choice is read where Claude reads it.
+
+    The runner passes ``CLAUDE_CONFIG_DIR`` through to Claude, which then
+    loads ``settings.json`` joined to it: an empty or relative value is
+    relative to Claude's working directory (not the runner's), and ``~`` is
+    not expanded. Reading another file would leave the offer showing or undo
+    the person's renderer choice.
+    """
+    for name in ("home", "workspace", "runner", "custom"):
+        (tmp_path / name).mkdir()
+    for relative in renderer_files:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"tui": "fullscreen"}), encoding="utf-8")
+    home_settings = tmp_path / "home" / "settings.json"
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", home_settings)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", config_dir.replace("<abs>", str(tmp_path)))
+    monkeypatch.chdir(tmp_path / "runner")
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        workspace=tmp_path / "workspace",
+    )
+
+    assert _load_invocation_settings(args).get("tui") == expected_tui
+
+
+@pytest.mark.parametrize("renderer", ["fullscreen", "default"])
+def test_augment_claude_args_keeps_the_users_own_renderer(
+    renderer: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A renderer the user chose is left alone.
+
+    The sidecar outranks ``~/.claude/settings.json``, so writing ``tui`` there
+    would silently undo a person's "fullscreen" choice; the sidecar omits it.
+    """
+    user_settings_path = tmp_path / "settings.json"
+    user_settings_path.write_text(json.dumps({"tui": renderer}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", user_settings_path)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    args = augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
+
+    settings = _load_invocation_settings(args)
+    assert "tui" not in settings
+    assert claude_native_bridge.read_user_tui_renderer() == renderer
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:
@@ -7783,6 +7896,7 @@ def test_read_user_status_line_command_returns_string(
         encoding="utf-8",
     )
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     assert claude_native_bridge.read_user_status_line_command() == "bun run hud"
 
@@ -7794,6 +7908,7 @@ def test_read_user_status_line_command_returns_none_when_unset(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_status_line_command() is None
 
 
@@ -7805,6 +7920,7 @@ def test_read_user_effort_level_returns_configured_level(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": effort}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() == effort
 
 
@@ -7815,6 +7931,7 @@ def test_read_user_effort_level_returns_none_when_unset(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -7825,6 +7942,7 @@ def test_read_user_effort_level_rejects_unrecognized_value(
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "ultra"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -7834,6 +7952,7 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     """Missing settings.json → None; absence of config must not raise."""
     missing = tmp_path / "does-not-exist" / "settings.json"
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", missing)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     assert claude_native_bridge.read_user_effort_level() is None
 
 
@@ -12163,7 +12282,7 @@ def test_statusline_shell_command_captures_and_chains(
     chain_out = tmp_path / "chain_out.json"
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.read_user_status_line_command",
-        lambda: f"cat > {chain_out}",
+        lambda cwd=None: f"cat > {chain_out}",
     )
     args = augment_claude_args((), bridge_dir=tmp_path)
     settings = _load_invocation_settings(args)

@@ -5,7 +5,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -132,6 +134,22 @@ class _RaisesIfCalled:
             "evaluate-policy POSTed to Omnigent when it should have short-circuited "
             "(missing bridge state or policy_hook config)."
         )
+
+
+class _ExplodingHttpxClient(_RaisesIfCalled):
+    """HTTP client stub whose POST fails with an error the hook does not expect."""
+
+    def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+        """
+        Raise an unexpected, non-HTTP error.
+
+        :param url: Target URL (unused).
+        :param json: Request body (unused).
+        :returns: Never returns.
+        :raises RuntimeError: Always.
+        """
+        del url, json
+        raise RuntimeError("unexpected")
 
 
 @pytest.fixture
@@ -399,21 +417,87 @@ def test_missing_policy_config_is_fail_open(
     assert captured.out == ""
 
 
-@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "empty_body", "malformed_json"])
-def test_pre_tool_use_fails_closed_when_verdict_unavailable(
+def _assert_codex_enforced_deny(hook_stdout: str) -> str:
+    """
+    Assert *hook_stdout* is a ``PreToolUse`` deny that Codex enforces.
+
+    Codex blocks the tool only for ``permissionDecision: "deny"`` with a
+    non-empty ``permissionDecisionReason``. It rejects ``"ask"`` (and a deny
+    without a reason) as unsupported output, marks the hook failed and runs
+    the tool, so anything else here would fail open.
+
+    :param hook_stdout: What the hook wrote to stdout.
+    :returns: The deny reason, for further assertions.
+    """
+    result = json.loads(hook_stdout)
+    assert set(result) == {"hookSpecificOutput"}, result
+    hook_specific = result["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+    assert hook_specific["permissionDecision"] == "deny", result
+    reason = hook_specific["permissionDecisionReason"]
+    assert isinstance(reason, str) and reason.strip(), result
+    return reason
+
+
+def _govern_session(bridge_dir: Path, route: str) -> None:
+    """
+    Make the session governed through the relay or the direct server path.
+
+    :param bridge_dir: The session's bridge directory.
+    :param route: ``"relay"`` (a ``tool_relay.json`` naming the session) or
+        ``"direct"`` (``policy_hook.json`` with a server URL).
+    :returns: None.
+    """
+    if route == "relay":
+        from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
+
+        (bridge_dir / _TOOL_RELAY_FILE).write_text(
+            json.dumps(
+                {
+                    "url": "http://127.0.0.1:19999",
+                    "token": "relay-tok",
+                    "session_id": "conv_active",
+                }
+            )
+        )
+    else:
+        write_policy_hook_config(
+            bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={}
+        )
+
+
+@pytest.mark.parametrize("route", ["direct", "relay"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "connect_error",
+        "connect_timeout",
+        "read_timeout",
+        "dropped_connection",
+        "non_2xx",
+        "bad_request",
+        "empty_body",
+        "malformed_json",
+        "non_object_json",
+        "no_verdict",
+    ],
+)
+def test_pre_tool_use_denies_when_verdict_unavailable(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     mode: str,
+    route: str,
 ) -> None:
     """
-    A governed PreToolUse call denies when no usable verdict is returned.
+    A governed PreToolUse call is denied when no usable verdict comes back.
 
     For native harnesses this hook is the sole TOOL_CALL enforcement point,
-    so a server outage / non-2xx / empty / malformed response must fail
-    CLOSED (deny) instead of "no opinion" — the bypass reported in #536.
+    so an unreachable / timed-out / failing server or an unusable answer must
+    fail CLOSED with the deny Codex enforces, never ``ask``, which Codex
+    rejects before running the tool anyway.
     """
-    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
+    _govern_session(bridge_dir, route)
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
 
@@ -429,9 +513,284 @@ def test_pre_tool_use_fails_closed_when_verdict_unavailable(
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    result = json.loads(captured.out)
-    assert result["hookSpecificOutput"]["permissionDecision"] == "ask", result
-    assert result["hookSpecificOutput"]["permissionDecisionReason"]
+    reason = _assert_codex_enforced_deny(captured.out)
+    # The person and the model are told the call did not run and why.
+    assert reason.startswith(native_policy_hook._EVAL_UNAVAILABLE_REASON)
+    assert "Detail: " in reason
+
+
+def test_pre_tool_use_denies_when_the_hook_itself_fails(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An error inside the hook denies the call instead of crashing.
+
+    Codex treats a hook that exits non-zero as failed and runs the tool, so
+    an unexpected error on a governed PreToolUse must still answer deny.
+    """
+    _govern_session(bridge_dir, "relay")
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExplodingHttpxClient)
+
+    exit_code = _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    reason = _assert_codex_enforced_deny(captured.out)
+    assert "RuntimeError" in reason
+    assert "RuntimeError: unexpected" in captured.err
+
+
+@pytest.mark.parametrize("silence", ["unanswered", "severed"])
+def test_pre_tool_use_denies_before_codex_gives_up_on_the_hook(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    silence: str,
+) -> None:
+    """
+    A server that never answers ends in a deny before Codex's hook timeout.
+
+    Codex kills a hook that outlives the ``timeout`` in ``hooks.json`` and
+    runs the tool, so the hook's own wait — every poll, re-park and backoff —
+    must end first, on a fake clock here.
+    """
+    from omnigent.harnesses.codex_native.app_server import _POLICY_HOOK_TIMEOUT_SECONDS
+
+    _govern_session(bridge_dir, "relay")
+    clock = {"t": 0.0}
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    posts: list[float] = []
+
+    class _NeverAnswers(_RaisesIfCalled):
+        def __init__(self, *, headers: dict[str, str], timeout: httpx.Timeout) -> None:
+            del headers
+            self._read_timeout = timeout.read or 0.0
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(clock["t"])
+            assert len(posts) < 100_000, "the hook never stopped waiting"
+            request = httpx.Request("POST", url)
+            held = min(self._read_timeout, 300.0)
+            clock["t"] += held
+            if silence == "severed" and held == 300.0:
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=request)
+            raise httpx.ReadTimeout("no answer", request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _NeverAnswers)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    _assert_codex_enforced_deny(capsys.readouterr().out)
+    hook_budget = codex_native_hook._EVALUATE_POLICY_TIMEOUT_S
+    assert clock["t"] <= hook_budget < _POLICY_HOOK_TIMEOUT_SECONDS
+
+
+def test_pre_tool_use_answers_deny_at_its_deadline_whatever_the_network_does(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A request that never finishes still ends in one deny at the hook's deadline.
+
+    HTTP timeouts bound each socket operation, not a whole request: a server
+    trickling bytes, or a stalled upload, can hold the POST past Codex's hook
+    timeout, after which Codex runs the tool. The hook's own deadline answers
+    deny and ends the process first.
+    """
+    _govern_session(bridge_dir, "relay")
+    released = threading.Event()
+    exits: list[int] = []
+
+    def _exit(code: int) -> None:
+        exits.append(code)
+        released.set()
+
+    class _NeverFinishes(_RaisesIfCalled):
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            assert released.wait(10), "the deadline never fired"
+            raise httpx.ReadError("still trickling", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(codex_native_hook, "_ANSWER_DEADLINE_S", 0.2)
+    monkeypatch.setattr(codex_native_hook, "_exit_process", _exit)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _NeverFinishes)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    # Exactly one answer: the deadline's deny; the late verdict is dropped.
+    reason = _assert_codex_enforced_deny(captured.out)
+    assert "no policy answer before the hook's deadline" in reason
+    assert exits == [0]
+
+
+def test_hook_process_answers_deny_at_its_deadline_against_a_trickling_server(
+    bridge_dir: Path,
+) -> None:
+    """
+    The real hook process prints its deny and exits 0 while a server trickles bytes.
+
+    The server sends one byte of a never-ending response at a time, so no socket
+    read ever times out. The process must still write a parseable deny before
+    exiting through the deadline's ``os._exit``.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    stop = threading.Event()
+
+    class _Trickle(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1000000")
+            self.end_headers()
+            while not stop.wait(0.05):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except OSError:
+                    return
+
+        def log_message(self, *args: object) -> None:
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        relay = {
+            "url": f"http://127.0.0.1:{server.server_address[1]}",
+            "token": "relay-tok",
+            "session_id": "conv_active",
+        }
+        (bridge_dir / "tool_relay.json").write_text(json.dumps(relay))
+        probe = (
+            "import sys\n"
+            "from omnigent.harnesses.codex_native import hook\n"
+            "hook._ANSWER_DEADLINE_S = 1.0\n"
+            "sys.exit(hook.main(['evaluate-policy', '--bridge-dir', sys.argv[1]]))\n"
+        )
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", probe, str(bridge_dir)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        stop.set()
+        server.shutdown()
+        server.server_close()
+
+    assert result.returncode == 0, result.stderr
+    reason = _assert_codex_enforced_deny(result.stdout)
+    assert "no policy answer before the hook's deadline" in reason
+
+
+def test_deadline_answer_keeps_a_verdict_written_in_time(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verdict written before the deadline is the only output; the timer never fires."""
+    exits: list[int] = []
+    monkeypatch.setattr(codex_native_hook, "_exit_process", exits.append)
+    answer = codex_native_hook._DeadlineAnswer(0.05, {"decision": "block", "reason": "late"})
+
+    answer.write({"decision": "block", "reason": "in time"})
+    answer._timer.join(2)
+
+    assert json.loads(capsys.readouterr().out) == {"decision": "block", "reason": "in time"}
+    assert exits == []
+
+
+def test_deadline_answer_writes_nothing_for_an_event_that_fails_open(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At the deadline an event with no fallback (PostToolUse) exits with no output."""
+    exits: list[int] = []
+    monkeypatch.setattr(codex_native_hook, "_exit_process", exits.append)
+    answer = codex_native_hook._DeadlineAnswer(0.01, None)
+
+    answer._timer.join(2)
+    answer.write({"hookSpecificOutput": {"additionalContext": "too late"}})
+
+    assert capsys.readouterr().out == ""
+    assert exits == [0]
+
+
+def test_user_prompt_submit_blocks_when_the_hook_itself_fails(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An error inside the hook blocks a governed prompt, as an outage does."""
+    _govern_session(bridge_dir, "relay")
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExplodingHttpxClient)
+
+    _run_hook(bridge_dir, {"hook_event_name": "UserPromptSubmit", "prompt": "hi"}, monkeypatch)
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["decision"] == "block"
+    assert result["reason"].strip()
+
+
+@pytest.mark.parametrize("reason", [None, "", "   ", 42])
+def test_pre_tool_use_deny_without_a_usable_reason_still_blocks(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reason: object,
+) -> None:
+    """
+    A DENY whose policy gives no reason is still enforced by Codex.
+
+    Codex ignores a deny without a non-empty reason (and fails a non-string
+    one), then runs the tool, so the hook supplies a default reason.
+    """
+    _govern_session(bridge_dir, "relay")
+    verdict: dict[str, object] = {"result": "POLICY_ACTION_DENY"}
+    if reason is not None:
+        verdict["reason"] = reason
+    body = json.dumps(verdict)
+
+    class _ReasonlessDenyClient(_DenyHttpxClient):
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(200, text=body, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ReasonlessDenyClient)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    assert _assert_codex_enforced_deny(capsys.readouterr().out) == "Denied by policy"
 
 
 def test_user_prompt_submit_fails_closed_on_error(
@@ -552,6 +911,33 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
         "http://127.0.0.1:8787/v1/sessions/conv_active/policies/evaluate"
     )
     assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
+
+
+def test_observe_tool_runs_without_the_policy_client(tmp_path: Path) -> None:
+    """
+    ``observe-tool`` dispatches before the bridge and httpx are imported.
+
+    Codex runs it after every tool call under a short timeout; on a busy
+    machine those imports alone outlasted it and Codex showed a failed hook.
+    """
+    probe = (
+        "import sys\n"
+        "from omnigent.harnesses.codex_native import hook\n"
+        "hook.main(['observe-tool', '--bridge-dir', sys.argv[1]])\n"
+        "heavy = ('httpx', 'omnigent.harnesses.codex_native.bridge',"
+        " 'omnigent.native.native_policy_hook')\n"
+        "print(','.join(name for name in heavy if name in sys.modules))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(tmp_path)],
+        input=json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Bash"}),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", result.stdout
 
 
 # ── route-turn (first-message model routing) ────────────────────────

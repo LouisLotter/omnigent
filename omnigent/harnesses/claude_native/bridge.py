@@ -2265,6 +2265,7 @@ def build_hook_settings(
     launch_effort: str | None = None,
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    workspace: Path | None = None,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -2319,6 +2320,9 @@ def build_hook_settings(
         routing round trip (25s worst case on a degraded server) in front of
         every prompt of every native session, to be told every time that the
         session does not route.
+    :param workspace: Claude's working directory, which a relative
+        ``CLAUDE_CONFIG_DIR`` is resolved against when the user's settings are
+        read. ``None`` uses this process's working directory.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -2577,6 +2581,11 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # While no settings layer names a renderer, Claude may open a "Try the new
+    # fullscreen renderer?" dialog at startup that fires no hook. Naming the
+    # default renderer skips it; a renderer the person chose still wins.
+    if read_user_tui_renderer(workspace) is None:
+        settings["tui"] = "default"
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -2594,7 +2603,7 @@ def build_hook_settings(
         f"p=$(cat); printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
     )
-    chain_command = read_user_status_line_command()
+    chain_command = read_user_status_line_command(workspace)
     if chain_command is not None:
         status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
     settings["statusLine"] = {"type": "command", "command": status_command}
@@ -2748,6 +2757,7 @@ def augment_claude_args(
         launch_effort=_arg_value(claude_args, "--effort"),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
+        workspace=workspace,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -8011,7 +8021,39 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
-def read_user_status_line_command() -> str | None:
+def _read_user_claude_settings(cwd: Path | None = None) -> _JsonObject | None:
+    """
+    Read the user's own Claude settings file, never writing it.
+
+    The file Claude loads: ``settings.json`` joined to ``$CLAUDE_CONFIG_DIR``
+    when the variable is set at all (the runner passes it through to the
+    terminal; an empty or relative value is relative to Claude's working
+    directory, and ``~`` is not expanded), else ``~/.claude/settings.json``.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :returns: The parsed settings object, or ``None`` when the file is
+        missing, unreadable, not JSON, or not a JSON object.
+    """
+    configured_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    try:
+        if configured_dir is not None:
+            settings_path = _claude_joined_path(
+                cwd if cwd is not None else Path.cwd(), configured_dir, "settings.json"
+            )
+            raw = settings_path.read_text(encoding="utf-8")
+        else:
+            raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def read_user_status_line_command(cwd: Path | None = None) -> str | None:
     """
     Return the user's globally-configured statusLine shell command, if any.
 
@@ -8020,19 +8062,14 @@ def read_user_status_line_command() -> str | None:
     pre-existing status bar (typically claude-hud), the wrapper chains
     to whatever they had configured globally.
 
+    :param cwd: Claude's working directory (see
+        :func:`_read_user_claude_settings`).
     :returns: The command string from
         ``~/.claude/settings.json``'s ``statusLine.command``, or
         ``None`` when no global statusLine is configured / readable.
     """
-    try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
+    parsed = _read_user_claude_settings(cwd)
+    if parsed is None:
         return None
     status_line = parsed.get("statusLine")
     if not isinstance(status_line, dict):
@@ -8040,6 +8077,29 @@ def read_user_status_line_command() -> str | None:
     command = status_line.get("command")
     if isinstance(command, str) and command.strip():
         return command
+    return None
+
+
+def read_user_tui_renderer(cwd: Path | None = None) -> str | None:
+    """
+    Return the terminal renderer the user chose in their Claude settings, if any.
+
+    Our per-session ``--settings`` outranks the user's settings file, so we
+    only name a renderer (to skip Claude's fullscreen-renderer startup offer)
+    when the user has not chosen one themselves.
+
+    :param cwd: Claude's working directory (see
+        :func:`_read_user_claude_settings`).
+    :returns: ``tui`` from the user's settings file (see
+        :func:`_read_user_claude_settings`), e.g. ``"fullscreen"``, or
+        ``None`` when unset, blank or unreadable.
+    """
+    parsed = _read_user_claude_settings(cwd)
+    if parsed is None:
+        return None
+    renderer = parsed.get("tui")
+    if isinstance(renderer, str) and renderer.strip():
+        return renderer
     return None
 
 
@@ -8053,15 +8113,8 @@ def read_user_effort_level() -> str | None:
     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
     """
-    try:
-        raw = _USER_CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
+    parsed = _read_user_claude_settings()
+    if parsed is None:
         return None
     effort = parsed.get("effortLevel")
     if isinstance(effort, str) and effort in CLAUDE_EFFORTS:

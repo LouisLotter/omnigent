@@ -17,7 +17,9 @@ from omnigent.harnesses.codex_native.app_server import (
     _our_policy_hooks_from_list,
     trust_native_policy_hooks,
 )
-from omnigent.harnesses.codex_native.hook import _EVALUATE_POLICY_TIMEOUT_S
+from omnigent.harnesses.codex_native.hook import _ANSWER_DEADLINE_S, _EVALUATE_POLICY_TIMEOUT_S
+from omnigent.native import native_policy_hook, tool_observer_hook
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from tests.harnesses.codex_native.app_server._support import (
     _CWD,
     _OUR_COMMAND,
@@ -543,6 +545,34 @@ def test_policy_hooks_timeout_outlasts_the_hooks_request_budget() -> None:
     # constant is dropped back to 30), the gate becomes advisory for every
     # native tool call, sub-agent or not.
     assert _POLICY_HOOK_TIMEOUT_SECONDS >= _EVALUATE_POLICY_TIMEOUT_S
+    # Codex must also leave the hook time to give up and answer deny itself: a
+    # hook Codex kills first counts as failed and the tool runs. The hook's own
+    # answer deadline comes after its request budget plus the retry tail (the
+    # transient budget and one attempt's connect, read and backoff), and before
+    # Codex's timeout, with room for the interpreter to start.
+    tail = (
+        native_policy_hook._EVALUATE_POLICY_RETRY_BUDGET_S
+        + native_policy_hook._EVALUATE_POLICY_CONNECT_TIMEOUT_S
+        + LONG_POLL_READ_TIMEOUT_S
+        + native_policy_hook._EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
+    )
+    after_budget = _ANSWER_DEADLINE_S - _EVALUATE_POLICY_TIMEOUT_S
+    assert after_budget > tail
+    assert _POLICY_HOOK_TIMEOUT_SECONDS - _ANSWER_DEADLINE_S >= 30
+
+
+def test_observer_hook_timeout_leaves_room_for_a_slow_start() -> None:
+    """The ``observe-tool`` hook's codex timeout covers a CPU-starved start.
+
+    The hook bounds its own relay wait, so only interpreter start-up can run
+    it past codex's timeout, and codex then shows a failed hook after every
+    tool call. On a container held to 0.1 CPU, start-up alone took 1.4–1.6 s
+    and the old 3 s timeout fired.
+    """
+    settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
+    observer = settings["hooks"]["PostToolUse"][0]["hooks"][1]
+    assert "observe-tool" in observer["command"]
+    assert observer["timeout"] == tool_observer_hook.HOOK_TIMEOUT_S >= 10
 
 
 def test_policy_hooks_register_user_prompt_submit() -> None:
