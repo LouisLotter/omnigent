@@ -19,16 +19,25 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +59,11 @@ class _FakeAgent:
     bundle_location: str | None = None
     session_id: str | None = None
     name: str = "assistant"
+    created_by: str | None = None
+
+    @property
+    def operator_authored(self) -> bool:
+        return self.session_id is None and self.created_by is None
 
 
 class FakeAgentStore:
@@ -99,6 +113,7 @@ class FakeScheduledTaskStore:
     def __init__(self, rows: dict[str, ScheduledTask] | None = None) -> None:
         self._rows = rows or {}
         self.updates: list[dict[str, Any]] = []
+        self.clear_calls: list[tuple[str, str, bool]] = []
         self.runs: list[dict[str, Any]] = []
         self.get_workspace_ids: list[int] = []
         self.update_workspace_ids: list[int] = []
@@ -112,6 +127,14 @@ class FakeScheduledTaskStore:
         self.update_workspace_ids.append(current_workspace_id())
         self.updates.append({"id": scheduled_task_id, **kwargs})
         return self._rows.get(scheduled_task_id)
+
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        row = self._rows.get(scheduled_task_id)
+        cleared = row is not None and row.project_id == project_id
+        self.clear_calls.append((scheduled_task_id, project_id, cleared))
+        if cleared:
+            self.updates.append({"id": scheduled_task_id, "project_id": None})
+        return cleared
 
     def create_run(
         self, run_id: str, scheduled_task_id: str, status: str, scheduled_at: int, **kwargs: Any
@@ -127,6 +150,43 @@ class FakeScheduledTaskStore:
             }
         )
         return None
+
+    def get_running_run_by_conversation(self, conversation_id: str) -> Any:
+        for run in self.runs:
+            if run["conversation_id"] == conversation_id and run["status"] == "running":
+                return SimpleNamespace(id=run["run_id"])
+        return None
+
+    def update_run(self, run_id: str, *, status: str, finished_at: int, **kwargs: Any) -> Any:
+        run = next(run for run in self.runs if run["run_id"] == run_id)
+        run.update(status=status, finished_at=finished_at, **kwargs)
+        return None
+
+
+class FakeStartupInputs:
+    """Records saved prompts and launch failures in call order."""
+
+    def __init__(self, calls: list[str] | None = None) -> None:
+        self.calls = calls if calls is not None else []
+        self.enqueued: list[dict[str, Any]] = []
+        self.launch_failures: list[tuple[str, str]] = []
+
+    async def enqueue(
+        self,
+        session_id: str,
+        event: SessionEventInput,
+        *,
+        user_id: str | None,
+        headers: Headers,
+        first: bool = True,
+    ) -> None:
+        self.calls.append("enqueue")
+        self.enqueued.append(
+            {"session_id": session_id, "event": event, "user_id": user_id, "headers": headers}
+        )
+
+    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+        self.launch_failures.append((session_id, reason))
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
@@ -319,6 +379,9 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         artifact_store=overrides.get("artifact_store"),
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
+        startup_inputs=overrides.get("startup_inputs"),
+        project_store=overrides.get("project_store"),
+        single_user_owner=overrides.get("single_user_owner", RESERVED_USER_LOCAL),
     )
 
 
@@ -458,6 +521,196 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+class FakeProjectStore:
+    def __init__(self, existing: set[tuple[str, str | None]]) -> None:
+        self.existing = existing
+        self.lookups: list[tuple[str, str | None]] = []
+
+    def get(self, project_id: str, *, user_id: str | None) -> SimpleNamespace | None:
+        self.lookups.append((project_id, user_id))
+        found = (project_id, user_id) in self.existing
+        return SimpleNamespace(id=project_id) if found else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_owner", "single_user_owner", "existing", "filed_into"),
+    [
+        ("alice@example.com", RESERVED_USER_LOCAL, {("proj_1", "alice@example.com")}, "proj_1"),
+        ("alice@example.com", RESERVED_USER_LOCAL, {("proj_1", "bob@example.com")}, None),
+        ("alice@example.com", RESERVED_USER_LOCAL, set(), None),
+        # A single-user task stores no owner; its projects belong to "local",
+        # or to no owner on a server without an auth provider.
+        (None, RESERVED_USER_LOCAL, {("proj_1", RESERVED_USER_LOCAL)}, "proj_1"),
+        (None, None, {("proj_1", None)}, "proj_1"),
+    ],
+    ids=["owned", "other-users", "deleted", "single-user-local", "single-user-no-auth"],
+)
+async def test_fired_session_is_filed_into_the_task_project(
+    task_owner: str | None,
+    single_user_owner: str | None,
+    existing: set[tuple[str, str | None]],
+    filed_into: str | None,
+) -> None:
+    conv_store = FakeConversationStore()
+    projects = FakeProjectStore(existing)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=task_owner, project_id="proj_1")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            project_store=projects,
+            single_user_owner=single_user_owner,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] == filed_into
+    # One lookup per fire, as the task's owner.
+    assert projects.lookups == [("proj_1", task_owner or single_user_owner)]
+    # A missing project leaves the session unfiled and is cleared from the task;
+    # the run still starts.
+    assert [run["status"] for run in store.runs] == ["running"]
+    cleared = [u for u in store.updates if u.get("project_id", "unset") is None]
+    assert len(cleared) == (0 if filed_into else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_owner", "single_user_owner", "announced_to"),
+    [
+        ("alice@example.com", RESERVED_USER_LOCAL, ["alice@example.com"]),
+        (None, RESERVED_USER_LOCAL, [RESERVED_USER_LOCAL]),
+        (None, None, [None]),
+    ],
+    ids=["owner", "single-user-local", "single-user-no-auth"],
+)
+async def test_fired_session_is_pushed_to_the_owners_open_tabs(
+    task_owner: str | None,
+    single_user_owner: str | None,
+    announced_to: list[str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open sidebars learn of the run, so a project folder shows it without a reload."""
+    perm = FakePermissionStore()
+    announced: list[tuple[str | None, str, int]] = []
+    monkeypatch.setattr(
+        fire_mod,
+        "_announce_session_added",
+        lambda owner, session_id: announced.append((owner, session_id, len(perm.grants))),
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=task_owner)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    deps = _deps(store, permission_store=perm, single_user_owner=single_user_owner)
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    [session_id] = {session for _, session, _ in announced}
+    assert [owner for owner, _, _ in announced] == announced_to
+    # Announced only once the owner can read it: the stream access-checks it.
+    assert all(grants >= 1 for _, _, grants in announced)
+    assert session_id == store.runs[0]["conversation_id"]
+
+
+@pytest.mark.asyncio
+async def test_fire_keeps_a_project_the_task_moved_to_mid_fire() -> None:
+    stale = _task(project_id="proj_1")
+    store = SequencedScheduledTaskStore([stale, stale])
+    # The row has moved on to another project by the time the fire clears it.
+    store._rows["task_1"] = _task(project_id="proj_2")
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    conv_store = FakeConversationStore()
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, project_store=FakeProjectStore(set())),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # The clear was tried for the stale project and refused, so proj_2 stays.
+    assert store.clear_calls == [("task_1", "proj_1", False)]
+    assert not [u for u in store.updates if "project_id" in u]
+    assert conv_store.created[0]["project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_fire_runs_unfiled_when_clearing_a_deleted_project_fails() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})
+
+    def _fail_clear(scheduled_task_id: str, project_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    store.clear_project_id = _fail_clear
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, project_store=FakeProjectStore(set())),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_fire_without_a_project_store_files_nothing() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """The fire copies another user's agent once and repoints the task, so that
+    user's later changes never reach the runs."""
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_id = generate_agent_id()
+    bundle = build_agent_bundle("orion")
+    location = bundle_location(agent_id, bundle)
+    artifacts.put(location, bundle)
+    agents.create_user_agent(agent_id, "orion", location, owner="alice@example.com")
+    task = _task(user_id="bob@example.com", agent_id=agent_id)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    deps = _deps(store, agent_store=agents, artifact_store=artifacts)
+
+    moved = await fire_mod._own_task_agent(deps, task)
+
+    copy = agents.get(moved.agent_id)
+    assert copy is not None and copy.id != agent_id
+    assert (copy.name, copy.created_by) == ("orion", "bob@example.com")
+    assert store.updates == [{"id": "task_1", "agent_id": copy.id}]
+    assert (await fire_mod._own_task_agent(deps, moved)).agent_id == copy.id
+    assert len(store.updates) == 1, "the owner's own copy is never copied again"
 
 
 @pytest.mark.asyncio
@@ -874,7 +1127,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
         return None
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
-        return None
+        captured["agent_revision"] = kwargs.get("agent_revision")
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -897,12 +1150,15 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
             conversation_store=FakeConversationStore(),
             host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
             host_registry=FakeHostRegistry(online={"host_1"}),
+            agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/rev1")}),
         )
     )
 
     await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
+    # The kickoff names the bundle it runs, so the runner sees a later reinstall.
+    assert captured["agent_revision"] == "ag_1/rev1"
 
 
 @pytest.mark.asyncio
@@ -1492,20 +1748,10 @@ async def test_managed_sandbox_dispatch_failure_records_one_failed_run() -> None
     assert store.runs[0]["error_code"] == "launch_failed"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("dispatch_fails", [False, True])
-async def test_managed_fires_use_regular_launch_with_unchanged_server_config(
-    monkeypatch: pytest.MonkeyPatch, dispatch_fails: bool
-) -> None:
-    """Each fire uses a fresh managed launch with the server's lifecycle settings."""
-    from omnigent.server.managed_hosts import (
-        ManagedLaunchTracker,
-        ManagedSandboxConfig,
-        ManagedSandboxDeployment,
-    )
-    from omnigent.server.routes import sessions
+def _managed_sandbox_config() -> Any:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 
-    config = ManagedSandboxDeployment.single(
+    return ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://server.example.com",
             launcher_factory=lambda: pytest.fail("managed launch is stubbed"),
@@ -1514,69 +1760,136 @@ async def test_managed_fires_use_regular_launch_with_unchanged_server_config(
             host_config={"runner": {"idle_timeout_s": 7200}},
         )
     )
-    conversations = FakeConversationStore()
-    hosts = FakeHostStore()
-    bound: dict[str, _FakeConversation] = {}
+
+
+async def _drain_managed_launches() -> None:
+    """Await the background managed launches fires started."""
+    from omnigent.server.routes import sessions
+
+    await asyncio.gather(*list(sessions._managed_launch_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launch_outcome", ["bound", "tracker_failed", "raised"])
+async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
+    monkeypatch: pytest.MonkeyPatch, launch_outcome: str
+) -> None:
+    """A managed fire saves its prompt before provisioning; a failed launch fails the run."""
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    config = _managed_sandbox_config()
+    calls: list[str] = []
+    startup = FakeStartupInputs(calls)
 
     async def launch(**kwargs: Any) -> None:
-        session_id = kwargs["session_id"]
-        host_id = f"sandbox_host_{session_id}"
-        hosts.hosts[host_id] = _FakeHost(
-            host_id,
-            RESERVED_USER_LOCAL,
-            sandbox_provider="agent_sandbox",
-            sandbox_id=f"sandbox_{session_id}",
-        )
-        bound[session_id] = _FakeConversation(
-            id=session_id,
-            agent_id="ag_1",
-            host_id=host_id,
-            workspace="/home/omnigent/workspace",
-            runner_id=f"runner_{session_id}",
-        )
-        kwargs["tracker"].finish(session_id)
+        calls.append("launch")
+        if launch_outcome == "raised":
+            raise RuntimeError("allocation failed")
+        if launch_outcome == "tracker_failed":
+            kwargs["tracker"].fail(kwargs["session_id"], "provider refused")
+        else:
+            kwargs["tracker"].finish(kwargs["session_id"])
 
     managed_launch = AsyncMock(side_effect=launch)
-    runner_client = object()
-    dispatch = AsyncMock(side_effect=RuntimeError("dispatch failed") if dispatch_fails else None)
-    terminate = AsyncMock()
-    monkeypatch.setattr(conversations, "get_conversation", bound.get)
+    direct_dispatch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
-    monkeypatch.setattr(sessions, "_wait_for_runner_client", AsyncMock(return_value=runner_client))
-    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
-    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", dispatch)
-    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", terminate)
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", direct_dispatch)
     store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
     on_fire = build_on_fire(
         _deps(
             store,
-            conversation_store=conversations,
-            host_store=hosts,
             sandbox_config=config,
             managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
         )
     )
 
     for _ in range(2):
         await on_fire(0, "task_1")
         await _drain()
+        await _drain_managed_launches()
 
-    assert managed_launch.await_count == 2
-    assert len(bound) == 2
-    assert len({conv.host_id for conv in bound.values()}) == 2
+    assert calls == ["enqueue", "launch"] * 2
+    assert len({saved["session_id"] for saved in startup.enqueued}) == 2
+    for saved in startup.enqueued:
+        assert saved["user_id"] == RESERVED_USER_LOCAL
+        assert saved["event"].data["content"] == [{"type": "input_text", "text": "do the thing"}]
+        assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
         assert call.kwargs["repos"] == ()
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
-    assert dispatch.await_count == 2
-    for call in dispatch.await_args_list:
-        assert call.args[1] is bound[call.args[0]]
-        assert call.args[2].data["content"] == [{"type": "input_text", "text": "do the thing"}]
-        assert call.args[4] is runner_client
-    assert [run["status"] for run in store.runs] == ["failed" if dispatch_fails else "running"] * 2
-    terminate.assert_not_awaited()
+    # The saved prompt is delivered by the host's replica, never directly here.
+    direct_dispatch.assert_not_awaited()
+    if launch_outcome == "bound":
+        assert [run["status"] for run in store.runs] == ["running"] * 2
+        assert startup.launch_failures == []
+    else:
+        assert [run["status"] for run in store.runs] == ["failed"] * 2
+        assert {run["error_code"] for run in store.runs} == {"launch_failed"}
+        assert len(startup.launch_failures) == 2
+
+
+@pytest.mark.asyncio
+async def test_managed_launch_that_cannot_start_fails_run_and_saved_prompt() -> None:
+    """A launch that can't be started fails the run and doesn't leave the prompt pending."""
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    startup = FakeStartupInputs()
+    # No tracker: the launch can't be scheduled after the prompt is saved.
+    on_fire = build_on_fire(
+        _deps(store, sandbox_config=_managed_sandbox_config(), startup_inputs=startup)
+    )
+
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(startup.enqueued) == 1
+    assert [run["status"] for run in store.runs] == ["failed"]
+    assert store.runs[0]["error_code"] == "launch_failed"
+    assert [session for session, _ in startup.launch_failures] == [
+        startup.enqueued[0]["session_id"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_managed_fire_does_not_block_next_fire_while_provisioning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fire due while the previous sandbox still provisions runs in its own sandbox."""
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    release = asyncio.Event()
+
+    async def launch(**kwargs: Any) -> None:
+        await release.wait()
+        kwargs["tracker"].finish(kwargs["session_id"])
+
+    managed_launch = AsyncMock(side_effect=launch)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    startup = FakeStartupInputs()
+    run_now = build_run_now(
+        _deps(
+            store,
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
+        )
+    )
+
+    try:
+        for _ in range(2):
+            assert await run_now(0, "task_1") is True
+            await _drain()
+        assert managed_launch.await_count == 2
+        assert [run["status"] for run in store.runs] == ["running"] * 2
+    finally:
+        release.set()
+        await _drain_managed_launches()
 
 
 @pytest.mark.asyncio

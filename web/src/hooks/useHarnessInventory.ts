@@ -32,6 +32,7 @@ export interface InventoryMcpServer {
   detail?: string;
   /** Plugin that bundles the server, e.g. ``"figma"``. */
   plugin?: string;
+  sourceId?: string;
 }
 
 export interface InventorySkill {
@@ -41,12 +42,19 @@ export interface InventorySkill {
   description?: string;
 }
 
+export interface PluginAsset {
+  id: string;
+  name: string;
+}
+
 export interface InventoryPlugin {
   id: string;
   name: string;
   harness: BrandHarness;
   /** Its skill names, without the ``plugin:`` prefix. */
   skills: string[];
+  skill_entries?: PluginAsset[] | null;
+  mcp_entries?: PluginAsset[] | null;
   marketplace?: string;
   version?: string | null;
   description?: string | null;
@@ -72,33 +80,42 @@ export interface HarnessInventory {
   context: HarnessInventoryContext;
   /** Asset kinds the host couldn't report; what did load is still in `context`. */
   unavailable: InventoryAssetKind[];
+  /** The host needs an update before it can report MCP inventory. */
+  mcpUnsupported: boolean;
   /** No MCP servers, skills, or plugins (credentials alone don't count). */
   isEmpty: boolean;
 }
 
 /** Wire shape of `GET /v1/hosts/{host_id}/mcp-servers`. */
-interface McpServerWire {
+export interface HostMcpServer {
   name: string;
   harness: string;
   transport: "stdio" | "http";
   scope: "user";
+  /** Pinned for every user on the host by an organization; not the user's to edit. */
+  managed?: boolean;
   plugin?: string | null;
+  source_id?: string | null;
   url_host?: string | null;
+  /** Account state from the host's sign-in manager; absent when nothing reports one. */
+  auth_status?: "connected" | "sign_in_required" | null;
+  /** Where to finish signing in; only present with `sign_in_required`. */
+  sign_in_url?: string | null;
 }
 
-async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<McpServerWire[]> {
+async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<HostMcpServer[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers`, {
     signal,
   });
   if (!response.ok) {
     throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
   }
-  const body = (await response.json()) as { mcp_servers?: McpServerWire[] };
+  const body = (await response.json()) as { mcp_servers?: HostMcpServer[] };
   if (!Array.isArray(body.mcp_servers)) throw new Error("Invalid host MCP servers response");
   return body.mcp_servers;
 }
 
-type PluginWire = Omit<InventoryPlugin, "id"> & { marketplace: string };
+type PluginWire = Omit<InventoryPlugin, "id"> & { id?: string | null; marketplace: string };
 
 async function fetchPlugins(hostId: string, signal: AbortSignal): Promise<PluginWire[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/plugins`, {
@@ -121,7 +138,7 @@ export function installedHarnesses(host: Host): BrandHarness[] {
   });
 }
 
-function isBrandHarness(value: string): value is BrandHarness {
+export function isBrandHarness(value: string): value is BrandHarness {
   return (BRAND_HARNESSES as readonly string[]).includes(value);
 }
 
@@ -146,7 +163,7 @@ export function buildInventoryContext(
   host: Host,
   harnesses: BrandHarness[],
   skillsByHarness: Partial<Record<BrandHarness, SkillSummary[]>>,
-  mcpServers: McpServerWire[],
+  mcpServers: HostMcpServer[],
 ): HarnessInventoryContext {
   const context: HarnessInventoryContext = { credentials: [], mcps: [], skills: [], plugins: [] };
   for (const harness of harnesses) {
@@ -155,7 +172,7 @@ export function buildInventoryContext(
       const gateway = host.gateway_inference?.[id] === true;
       context.credentials.push({
         harness,
-        source: gateway ? "Databricks AI Gateway" : "Signed in",
+        source: gateway ? "Databricks Unity Gateway" : "Signed in",
       });
     }
     const { plain, plugins } = splitPluginSkills(skillsByHarness[harness] ?? []);
@@ -169,11 +186,14 @@ export function buildInventoryContext(
         .filter(Boolean)
         .join(" · ");
       context.mcps.push({
-        id: `${harness}:${server.plugin ? `plugin:${server.plugin}:` : ""}${server.name}`,
+        id:
+          server.source_id ??
+          `${harness}:${server.plugin ? `plugin:${server.plugin}:` : ""}${server.name}`,
         name: server.name,
         harness,
         detail: detail || undefined,
         plugin: server.plugin ?? undefined,
+        sourceId: server.source_id ?? undefined,
       });
     }
     for (const [name, skills] of plugins) {
@@ -181,6 +201,22 @@ export function buildInventoryContext(
     }
   }
   return context;
+}
+
+/** Read the user-level MCP servers a connected host exposes to its native harnesses. */
+export function useHostMcpServers(
+  hostId: string | null,
+  enabled = true,
+  /** Re-read while this says so, judged from the servers last read (default: never). */
+  refetchInterval: (servers: HostMcpServer[] | undefined) => number | false = () => false,
+) {
+  return useQuery({
+    queryKey: ["host-mcp-servers", hostId],
+    queryFn:
+      enabled && hostId !== null ? ({ signal }) => fetchMcpServers(hostId, signal) : skipToken,
+    staleTime: 30_000,
+    refetchInterval: (query) => refetchInterval(query.state.data),
+  });
 }
 
 /** The server answers 409 while the host's tunnel isn't connected yet. */
@@ -289,7 +325,10 @@ export function useHarnessInventory(
       assembled.plugins = assembled.plugins.filter((plugin) => plugin.harness !== "claude");
       for (const plugin of pluginData ?? []) {
         if (plugin.harness !== "claude" || !harnesses.includes("claude")) continue;
-        assembled.plugins.push({ ...plugin, id: `claude:${plugin.name}@${plugin.marketplace}` });
+        assembled.plugins.push({
+          ...plugin,
+          id: plugin.id ?? `claude:${plugin.name}@${plugin.marketplace}`,
+        });
       }
     }
     return assembled;
@@ -315,6 +354,7 @@ export function useHarnessInventory(
         : "ready",
     context,
     unavailable,
+    mcpUnsupported: online && mcpQuery.error instanceof ApiError && mcpQuery.error.status === 501,
     isEmpty: context.mcps.length + context.skills.length + context.plugins.length === 0,
   };
 }
