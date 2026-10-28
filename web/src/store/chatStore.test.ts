@@ -2493,7 +2493,7 @@ describe("chatStore — switchTo", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each(["streaming", "completed", "failed Stop"])(
+  it.each(["streaming", "completed", "failed Stop", "blocked", "background"])(
     "reconciles a cold snapshot after same-turn replay only while %s",
     async (phase) => {
       const id = "conv_bind_same_turn";
@@ -2530,6 +2530,17 @@ describe("chatStore — switchTo", () => {
         );
       } else if (phase === "failed Stop") {
         useChatStore.getState().stop();
+      } else if (phase === "blocked" || phase === "background") {
+        sink.push(
+          sse("session.status", {
+            conversation_id: id,
+            status: "running",
+            response_id: "replayed_response",
+            ...(phase === "blocked"
+              ? { blocked_on: "permission prompt" }
+              : { background_task_count: 3 }),
+          }),
+        );
       }
       await tick();
       const localResponse = useChatStore.getState().activeResponse;
@@ -2548,8 +2559,9 @@ describe("chatStore — switchTo", () => {
       await binding;
       expect(useChatStore.getState()).toMatchObject({
         activeResponse: localResponse,
-        sessionStatus: phase === "streaming" ? "running" : "idle",
-        backgroundTaskCount: phase === "streaming" ? 2 : 0,
+        sessionStatus: ["streaming", "blocked", "background"].includes(phase) ? "running" : "idle",
+        backgroundTaskCount: phase === "streaming" ? 2 : phase === "background" ? 3 : 0,
+        blockedOn: phase === "blocked" ? "permission prompt" : null,
       });
       if (phase === "failed Stop") expect(stopNotices.get(id)).toBe("request_failed");
       sink.push("data: [DONE]\n\n");
@@ -15611,7 +15623,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       { path: "in-flight fresh window", gapLength: 100, holdWindow: true },
     ].flatMap((path) =>
       ["idle", "running"].flatMap((snapshotStatus) =>
-        ["new turn", "failed Stop"].map((change) => ({ ...path, snapshotStatus, change })),
+        ["new turn", "failed Stop", "completed usage"].map((change) => ({
+          ...path,
+          snapshotStatus,
+          change,
+        })),
       ),
     ),
   )(
@@ -15644,6 +15660,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
                 context_window: 128000,
                 last_total_tokens: 900,
                 total_cost_usd: 1.25,
+                usage_by_model: { "old-model": { input_tokens: 1, total_cost_usd: 1.25 } },
                 mcp_startup: null,
                 sandbox_status: null,
                 created_at: 0,
@@ -15684,10 +15701,29 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         sinks[1]!.push(
           sse("response.created", { id: "new_response", status: "in_progress", output: [] }),
         );
+      } else if (change === "completed usage") {
+        sinks[1]!.push(
+          sse("response.completed", {
+            id: "old_response",
+            status: "completed",
+            output: [],
+            usage: { input_tokens: 1200, output_tokens: 300, total_tokens: 1500 },
+          }),
+        );
+        sinks[1]!.push(sse("session.status", { conversation_id: id, status: "idle" }));
+        sinks[1]!.push(
+          sse("session.usage", {
+            conversation_id: id,
+            context_window: 256000,
+            total_cost_usd: 2.5,
+            usage_by_model: { "live-model": { input_tokens: 1200, total_cost_usd: 2.5 } },
+          }),
+        );
       } else {
         useChatStore.getState().stop();
       }
       await drainAsync();
+      if (change === "completed usage") expect(useChatStore.getState().tokensUsed).toBe(1500);
       const newerResponse = useChatStore.getState().activeResponse;
       releaseFetch!();
       await drainAsync(4);
@@ -15695,9 +15731,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       expect(useChatStore.getState()).toMatchObject({
         llmModel: "recovered-model",
         sessionModelSeeded: false,
-        contextWindow: 128000,
-        tokensUsed: 900,
-        sessionCostUsd: 1.25,
+        contextWindow: change === "completed usage" ? 256000 : 128000,
+        tokensUsed: change === "completed usage" ? 1500 : 900,
+        sessionCostUsd: change === "completed usage" ? 2.5 : 1.25,
+        sessionUsageByModel:
+          change === "completed usage"
+            ? { "live-model": { inputTokens: 1200, totalCostUsd: 2.5 } }
+            : { "old-model": { inputTokens: 1, totalCostUsd: 1.25 } },
         mcpStartup: null,
         sandboxStatus: null,
       });

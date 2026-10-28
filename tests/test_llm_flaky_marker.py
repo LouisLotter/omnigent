@@ -50,6 +50,7 @@ def test_llm_flaky_rotates_model_per_attempt(
     root = str(Path(__file__).resolve().parents[1])
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([root, os.environ.get("PYTHONPATH", "")]))
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
     pytester.makeini("[pytest]\nmarkers = llm_flaky: model-rotation retry self-test\n")
     pytester.makeconftest("""
 from tests.conftest import pytest_collection_modifyitems, pytest_runtest_setup

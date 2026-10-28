@@ -5312,11 +5312,12 @@ function captureSnapshotLifecycle(
   const workGeneration = stopNoticeGenerations.get(id) ?? 0;
   return (state, session) =>
     (stopNoticeGenerations.get(id) ?? 0) === workGeneration &&
+    state.blockedOn === before.blockedOn &&
+    state.backgroundTaskCount === before.backgroundTaskCount &&
     ((state.sessionStatus === before.sessionStatus &&
       state.status === before.status &&
       state.activeResponse?.responseId === before.activeResponse?.responseId &&
-      state.activeResponse?.state === before.activeResponse?.state &&
-      state.backgroundTaskCount === before.backgroundTaskCount) ||
+      state.activeResponse?.state === before.activeResponse?.state) ||
       // A cold stream replays response.created before its matching snapshot.
       // Recover the session's running/background state without reopening a turn
       // that finished locally or crossing a newer message/Stop generation.
@@ -5328,11 +5329,10 @@ function captureSnapshotLifecycle(
 }
 
 /**
- * Session-snapshot state every reconnect path recovers: `sessionStatus`,
- * token/context/cost counters, the MCP startup band, and — when the turn
- * ended during the gap —
- * the terminal `activeResponse` transition the missed `session.status`
- * event would have applied, so "Working…" clears.
+ * Reconcile model/startup metadata and counters unchanged since the fetch.
+ * When `includeLifecycle` permits it, also recover `sessionStatus` and the
+ * terminal `activeResponse` transition missed during the gap, so "Working…"
+ * clears without overriding newer live work.
  *
  * The inverse also matters: when the snapshot shows a turn STILL running and
  * carries its in-flight `activeResponseId`, reopen the streaming
@@ -5347,6 +5347,7 @@ function reconnectStatusPatch(
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
   includeLifecycle: boolean,
+  stateBeforeFetch: ChatState,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
@@ -5355,10 +5356,17 @@ function reconnectStatusPatch(
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
   };
-  if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
-  if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
-  if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
-  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (s.contextWindow === stateBeforeFetch.contextWindow && session.contextWindow != null)
+    patch.contextWindow = session.contextWindow;
+  if (s.tokensUsed === stateBeforeFetch.tokensUsed && session.lastTotalTokens != null)
+    patch.tokensUsed = session.lastTotalTokens;
+  if (s.sessionCostUsd === stateBeforeFetch.sessionCostUsd && session.totalCostUsd != null)
+    patch.sessionCostUsd = session.totalCostUsd;
+  if (
+    s.sessionUsageByModel === stateBeforeFetch.sessionUsageByModel &&
+    session.usageByModel != null
+  )
+    patch.sessionUsageByModel = session.usageByModel;
   // Model/startup/usage reconciliation has its own rules and must not be lost
   // just because newer local work makes this snapshot's turn lifecycle stale.
   if (!includeLifecycle) return patch;
@@ -5494,7 +5502,13 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => {
-    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch, true);
+    const patch = reconnectStatusPatch(
+      session,
+      s,
+      stateBeforeFetch.mcpStartupLaunch,
+      true,
+      stateBeforeFetch,
+    );
     const spinners = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     const blocks =
       snapshotInterruptedWorkCard(
@@ -5731,6 +5745,7 @@ async function rehydrateWindowOnReconnect(
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
   lifecycleIsCurrent: (state: ChatState, session: Session) => boolean,
+  stateBeforeFetch: ChatState,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -5776,6 +5791,7 @@ async function rehydrateWindowOnReconnect(
       s,
       launchBeforeFetch,
       lifecycleIsCurrent(s, session),
+      stateBeforeFetch,
     );
     const blocks =
       reconcileElicitationBlocks(
@@ -5837,7 +5853,8 @@ async function reconcileOnReconnect(
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
 ): Promise<void> {
   if (queryClient === null) return;
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  const stateBeforeFetch = get();
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const lifecycleIsCurrent = captureSnapshotLifecycle(id, get);
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
@@ -5918,6 +5935,7 @@ async function reconcileOnReconnect(
       ignoredNativeMessageIds,
       launchBeforeFetch,
       lifecycleIsCurrent,
+      stateBeforeFetch,
     );
     return;
   }
@@ -5936,7 +5954,13 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch, lifecycleIsCurrent(s, session)),
+      ...reconnectStatusPatch(
+        session,
+        s,
+        launchBeforeFetch,
+        lifecycleIsCurrent(s, session),
+        stateBeforeFetch,
+      ),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
