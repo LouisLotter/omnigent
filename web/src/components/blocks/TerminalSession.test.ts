@@ -2,9 +2,9 @@
 //
 // The full TerminalSession constructor needs a real xterm + WebSocket
 // + DOM container, so it's exercised via manual REPL verification (see
-// TerminalView.test.ts). `openTerminalLink` is the one piece of our own
-// logic the WebLinksAddon delegates to — the click handler that makes
-// terminal URLs clickable — so we pin it here.
+// TerminalView.test.ts). `openTerminalLink` is the click handler the
+// terminal link provider delegates to — the piece that makes terminal URLs
+// open the right way — so we pin it here.
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -94,17 +94,16 @@ describe("openTerminalLink", () => {
     }
   });
 
-  it("prevents the addon's default in-place navigation", () => {
+  it("prevents the click's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
     const preventSpy = vi.spyOn(event, "preventDefault");
 
     openTerminalLink(event, "https://example.com/foo");
 
-    // The WebLinksAddon navigates the current document on click by
-    // default; without preventDefault the click would unload the SPA
-    // (and kill the WebSocket-attached terminal) before window.open's
-    // tab is usable. A failure here means that suppression was dropped.
+    // Without preventDefault the click's default navigation would unload the
+    // SPA (and kill the WebSocket-attached terminal) before window.open's
+    // tab is usable.
     expect(preventSpy).toHaveBeenCalledOnce();
   });
 
@@ -155,10 +154,21 @@ describe("resolveTerminalWorkspaceFileLink", () => {
     ["file:///home/u/ws/src/app.ts:42:7", "src/app.ts", 42],
     ["file:///home/u/ws/src/app.ts#L43", "src/app.ts", 43],
     ["file:///home/u/ws/src/app.ts#L44C3", "src/app.ts", 44],
-    ["file:///home/u/ws/src/app.ts#L45-L50", "src/app.ts", 45],
     ["file:///home/u/ws/Design%20Notes.md#L46", "Design Notes.md", 46],
   ])("resolves %s", (uri, path, line) => {
     expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toEqual({ path, line });
+  });
+
+  it.each([
+    ["file:///home/u/ws/src/app.ts#L45-L50", 45, 50],
+    ["file:///home/u/ws/src/app.ts:45-50", 45, 50],
+    ["file:///home/u/ws/src/app.ts:50-45", 50, undefined],
+  ])("carries the cited range of %s", (uri, line, endLine) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toStrictEqual({
+      path: "src/app.ts",
+      line,
+      ...(endLine ? { endLine } : {}),
+    });
   });
 
   it.each([
@@ -282,7 +292,7 @@ describe("terminalTheme", () => {
 
     // Dark mode should retain the terminal-like contrast the rest of the
     // app expects rather than inheriting the light prompt-band treatment.
-    expect(theme.background).toBe("#131517");
+    expect(theme.background).toBe("#0a0a0a");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
   });

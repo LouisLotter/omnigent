@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tarfile
 from dataclasses import replace
 from pathlib import Path
@@ -96,6 +97,52 @@ def test_session_catalog_matches_invocation_scope(
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
 
 
+@pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])
+def test_session_catalog_handles_host_skill_symlink_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    remove_link: bool,
+) -> None:
+    skills_dir = Path.home() / ".codex" / "skills"
+    local = skills_dir / "local"
+    local.mkdir(parents=True)
+    (local / "SKILL.md").write_text(_skill("local"))
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "SKILL.md").write_text(_skill("changing"))
+    changing = skills_dir / "changing"
+    changing.symlink_to(installed, target_is_directory=True)
+    readlink = os.readlink
+
+    def readlink_during_update(path: str, *, dir_fd: int | None = None) -> str:
+        if path == str(changing):
+            if not remove_link:
+                raise PermissionError("synthetic access denial")
+            # The provider already read SKILL.md; resolve has just seen a symlink.
+            changing.unlink()
+        return readlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "readlink", readlink_during_update)
+    bundle = _bundle(
+        {"skills/bundled/SKILL.md": _skill("bundled")},
+        executor={"config": {"harness": "codex-native"}},
+    )
+    discovery = HostSkillDiscovery(lambda _: _response(bundle))
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+    if not remove_link:
+        with pytest.raises(PermissionError, match="synthetic access denial"):
+            discovery.discover(frame, tmp_path)
+        return
+
+    assert discovery.discover(frame, tmp_path) == [
+        {"name": "bundled", "description": "bundled description"},
+        {"name": "local", "description": "local description"},
+    ]
+    assert "Skipping host skill whose directory disappeared during discovery" in caplog.text
+    assert str(changing) not in caplog.text
+
+
 def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> None:
     child_config = yaml.safe_dump(
         {
@@ -144,6 +191,13 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     directory.mkdir(parents=True)
     (directory / "SKILL.md").write_text(_skill("custom"))
     monkeypatch.setenv(variable, str(config_dir))
+    expected_names = {"custom"}
+    if harness == "claude-native":
+        for tier, name in ((".claude", "native"), (".agents", "portable")):
+            skill = tmp_path / tier / "skills" / name / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(_skill(name))
+            expected_names.add(name)
     discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
     frame = HostSkillsFrame("request", harness, str(tmp_path))
     host_catalog = discovery.discover(frame, tmp_path)
@@ -161,7 +215,7 @@ def test_host_and_runner_discover_the_same_custom_config_directory(
     spec = load(bundle, dest=tmp_path / "runner-bundle", expand_env=False)
     resolved = resolve_session_skills(spec, (tmp_path,), None)
     assert host_catalog == [{"name": s.name, "description": s.description} for s in resolved]
-    assert "custom" in {s["name"] for s in host_catalog}
+    assert {s["name"] for s in host_catalog} == expected_names
 
 
 def test_directory_cache_separates_agent_filters(tmp_path: Path) -> None:

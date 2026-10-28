@@ -72,6 +72,14 @@ Issues with no activity for 30 days are marked `stale` and close after another
 14 days without activity. New activity restarts that inactivity window. Issues
 labeled `pinned`, `security`, or `bug` are exempt.
 
+Pull requests with no activity for 60 days are marked `stale` and close after
+another 14 days without activity. New activity clears the label and restarts
+the inactivity window. This applies to both contributor and maintainer PRs,
+including drafts. PRs labeled `pinned` or `security` are exempt. Source branches
+are kept, and authors can comment `/reopen` to resume work after an automated
+closure. This policy also applies to older PRs that predate the review-state
+labels below.
+
 If a bug is labeled `needs-info`, the automation asks its author for the
 specific missing information and gives them 7 days to respond. An author reply
 triggers another triage pass; the label clears only when the new information is
@@ -126,6 +134,27 @@ source .venv/bin/activate    # or prefix commands with `uv run`
 Repository-only dependencies use PEP 735 groups: `lint` for static checks and
 code generation, `test` for pytest, and `dev` for both. Product capabilities
 remain installable extras. Plain `uv sync` installs neither group by default.
+
+Package mirrors that embargo new releases, such as the Databricks PyPI proxy
+used for internal builds, install omnigent from the requirements declared in
+`pyproject.toml`, not from `uv.lock`. When you raise a dependency floor or add a
+dependency, keep the floor at a release those mirrors already serve and let
+`uv.lock` pin anything newer. With Databricks network access, run
+`just check-internal-mirror` before merging; it resolves through the proxy
+without writing `uv.lock`. The `young-dependency-floor` custom lint fails when a
+floor needs a release inside the uv cooldown. An urgent bump, such as a security
+fix, may keep that floor once the mirror serves the release: suppress the lint
+on the requirement with a `custom-lint: disable-next` comment that says why.
+Adding or changing that waiver keeps the required Maintainer Approval check red
+until a maintainer, the author included, runs `just check-internal-mirror` and
+adds the `dependency-floor-approved` label.
+
+Install the git hooks once per clone so the checks below also run on every
+commit and push (`just ensure` does this as part of setup):
+
+```bash
+just hooks            # or: uv run --no-sync pre-commit install
+```
 
 Common checks:
 
@@ -416,10 +445,17 @@ GitHub requests these reviews automatically. The `main-no-force-push` ruleset
 requires code-owner approval and dismisses stale approvals after changes are
 pushed. This requirement is enforced by GitHub alongside the CI checks.
 
-### Every PR needs an issue
+<a name="every-pr-needs-an-issue"></a>
 
-We require an issue for every pull request. Issues are how work gets
-prioritized, so a PR without one arrives unsorted and waits longer.
+### When a PR needs an issue
+
+We require an issue for contributor-authored pull requests, with the exceptions
+below. Issues are how work gets prioritized, so a PR without one arrives
+unsorted and waits longer.
+
+**Maintainer-authored pull requests are exempt, regardless of the type of
+change.** Maintainers may link an existing issue when useful, but do not need
+to create one solely to satisfy this requirement.
 
 Reference it in the description. Which keyword you use depends on whether the PR
 finishes the issue:
@@ -440,17 +476,17 @@ saying anything about this PR, so pair it with one of the keywords above. The
 reference also has to point at an **issue**: naming another pull request does not
 count, since a PR is not a tracking record.
 
-**No issue for your change yet?** Open one first, then reference it. That is also
-the faster path for anything non-trivial: it lets a maintainer confirm the
-approach before you write code.
+**No issue for your change yet?** If your PR requires one, open it first, then
+reference it. This lets a maintainer confirm the approach before you write code.
 
-The only exceptions are changes with no user-visible behaviour: pure
-**Refactor / chore**, **Docs**, or **Test / CI** work. If that is genuinely what
-your PR is, check that box under *Type of change* and no issue is needed.
-Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
-even when it also touches docs or tests.
+Contributor-authored PRs are also exempt for changes with no user-visible
+behaviour: pure **Refactor / chore**, **Docs**, or **Test / CI** work. If that
+describes your PR, check that box under *Type of change* and no issue is needed.
+Other contributor-authored PRs that fix a bug, add a feature, or change the UI
+need an issue, even when they also touch docs or tests.
 
-A bot comments once on PRs that reference no issue and labels them `needs-issue`.
+A bot comments once on non-exempt PRs that reference no issue and labels them
+`needs-issue`.
 Reference an issue and the label clears automatically. A PR still labeled
 `needs-issue` after **7 days** is closed, the same way and for the same reason as
 `waiting-on-author` below: to keep the review queue readable, not as a judgement
@@ -468,8 +504,8 @@ need to apply them.
 | `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
 
 A third label, `needs-issue`, is separate from these two: it says the PR
-references no issue, not that anyone is waiting on a reply. See [Every PR needs an
-issue](#every-pr-needs-an-issue).
+references no issue, not that anyone is waiting on a reply. See [When a PR needs
+an issue](#when-a-pr-needs-an-issue).
 
 A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
 you push a commit, comment, or reply to a review, that clears automatically and

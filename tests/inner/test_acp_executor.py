@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import sys
@@ -31,6 +32,7 @@ from omnigent.inner.acp_executor import (
     AcpAgentConfig,
     AcpExecutor,
     _is_auth_required_error,
+    _resolve_cwd,
     _unattended_auth_method_id,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -302,6 +304,110 @@ async def test_session_new_server_mode_adopts_returned_id() -> None:
     assert "sessionId" not in captured["params"]  # server assigns it
     assert captured["params"]["cwd"] == ex._cwd
     assert captured["params"]["mcpServers"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_standard_model_config_option() -> None:
+    """ACP config-option categories identify the live model; option ids are agent-defined."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "configOptions": [
+                    {
+                        "id": "active-model",
+                        "category": "model",
+                        "currentValue": "grok-4.6",
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
+    assert ex._model_config_option_id == "active-model"
+
+    # The learned id is what a warm switch targets, not the literal ``model``.
+    calls: list[tuple[str, dict]] = []
+
+    async def switch_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {
+            "result": {
+                "configOptions": [
+                    {"id": "active-model", "category": "model", "currentValue": params["value"]}
+                ]
+            }
+        }
+
+    ex._rpc = switch_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("srv-42", "grok-4.7")
+
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "srv-42", "configId": "active-model", "value": "grok-4.7"},
+        )
+    ]
+    assert ex._active_model == "grok-4.7"
+
+
+def test_config_option_update_prefers_the_model_id_over_its_category() -> None:
+    """Several matching options resolve deterministically: ``model`` wins, else the first."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_config_options(
+        [
+            {"id": "model-tier", "category": "model", "currentValue": "fast"},
+            {"id": "model", "currentValue": "grok-4.6"},
+        ]
+    )
+    assert ex._model_config_option_id == "model"
+    assert ex._active_model == "grok-4.6"
+
+    ex._note_config_options(
+        [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.7"},
+            {"id": "fallback-model", "category": "model", "currentValue": "grok-3"},
+        ]
+    )
+    assert ex._model_config_option_id == "active-model"
+    assert ex._active_model == "grok-4.7"
+
+
+@pytest.mark.asyncio
+async def test_drain_ignores_malformed_session_update_params() -> None:
+    """A ``session/update`` whose ``params`` is not an object is dropped, not fatal."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._queue.put_nowait({"jsonrpc": "2.0", "method": "session/update", "params": [1, 2]})
+    ex._queue.put_nowait({"jsonrpc": "2.0", "method": "session/update"})
+
+    await ex._drain_stale_queue()
+
+    assert ex._queue.empty()
+    assert ex._active_model is None
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_legacy_model_state() -> None:
+    """Grok 1.0.4's preview ``models`` state still reports its real launch model."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "models": {"currentModelId": "grok-4.6", "availableModels": []},
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
 
 
 @pytest.mark.asyncio
@@ -1812,7 +1918,25 @@ for line in sys.stdin:
             "agentCapabilities": {"promptCapabilities": {"image": False}},
         }})
     elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "fake-session-1"}})
+        # The live model is reported before the response, as an agent keying its
+        # model option by category does; the client must not lose it to its drain.
+        update("fake-session-1", {"sessionUpdate": "config_option_update", "configOptions": [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.6"},
+        ]})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "fake-session-1",
+            "models": {"currentModelId": "grok-4.5", "availableModels": []},
+        }})
+    elif method == "session/set_config_option":
+        params = msg["params"]
+        if params.get("configId") == "active-model":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": [
+                {"id": "active-model", "category": "model", "currentValue": params["value"]},
+            ]}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32602, "message": "unknown configId %r" % (params.get("configId"),),
+            }})
     elif method == "session/prompt":
         sid = msg["params"]["sessionId"]
         chunk(sid, "agent_thought_chunk", "planning")
@@ -1836,6 +1960,37 @@ for line in sys.stdin:
             "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
         }})
 """
+
+
+@pytest.mark.asyncio
+async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) -> None:
+    """A model report queued behind ``session/new`` is read before the first switch.
+
+    The fake agent keys its model option ``active-model``; a configured model must
+    reach it under that id on the first turn, not the literal ``model`` fallback.
+    """
+    agent_path = tmp_path / "fake_acp_agent.py"
+    agent_path.write_text(_FAKE_ACP_AGENT)
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Fake", model="grok-4.7"))
+
+    async def elicit(tool_name: str, tool_input: dict) -> bool:
+        return True
+
+    ex._elicitation_handler = elicit  # type: ignore[assignment]
+
+    events = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], "you are a bot"):
+            events.append(ev)
+    finally:
+        await ex.close()
+
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    completions = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completions) == 1
+    assert completions[0].usage["model"] == "grok-4.7"
 
 
 @pytest.mark.asyncio
@@ -1873,7 +2028,12 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
 
     completions = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completions) == 1
-    assert completions[0].usage == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert completions[0].usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "grok-4.6",
+    }
 
     tool_reqs = [e for e in events if isinstance(e, ToolCallRequest)]
     assert tool_reqs[0].name == "shell" and tool_reqs[0].args == {"command": "echo hi"}
@@ -2216,6 +2376,60 @@ def test_spawn_env_still_excludes_undeclared_secret() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_passthrough_reaches_spawned_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+    from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
+
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    runner_env = _build_runner_env(
+        {
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": ",".join(
+                ["XAI_API_KEY", *sorted(RUNNER_AUTH_SECRET_ENV_VARS)]
+            ),
+            "XAI_API_KEY": "canary-xai",
+            "UNRELATED_API_KEY": "canary-unlisted",
+        },
+        server_url="http://server",
+        runner_id="runner_test",
+        binding_token="canary-binding",
+        initial_auth_token="canary-auth",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    monkeypatch.setattr("os.environ", runner_env)
+    worker_env = _build_harness_spawn_env(None)
+    monkeypatch.setattr("os.environ", worker_env)
+    captured = tmp_path / "agent-env.json"
+    command = shlex.join(
+        [
+            sys.executable,
+            "-c",
+            "import json, os, pathlib, sys; "
+            "observed = {'XAI_API_KEY': os.environ.get('XAI_API_KEY'), "
+            "'unrelated_present': 'UNRELATED_API_KEY' in os.environ, "
+            "'runner_auth_present': any(name in os.environ "
+            f"for name in {sorted(RUNNER_AUTH_SECRET_ENV_VARS)!r})}}; "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(observed))",
+            str(captured),
+        ]
+    )
+    executor = AcpExecutor(AcpAgentConfig(command=command))
+    try:
+        await executor._start_process()
+        assert executor._proc is not None
+        assert await asyncio.wait_for(executor._proc.wait(), timeout=10) == 0
+        observed = json.loads(captured.read_text())
+        assert observed["XAI_API_KEY"] == "canary-xai"
+        assert not observed["unrelated_present"]
+        assert not observed["runner_auth_present"]
+    finally:
+        await executor.close()
+
+
+@pytest.mark.asyncio
 async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> None:
     """An agent that never answers ``session/new`` yields a named error.
 
@@ -2373,7 +2587,8 @@ async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
 
     await ex._start_process()
     deadline = time.monotonic() + 10.0
-    while not pid_file.exists():
+    # write_text creates the file before it writes the pid, so wait for content.
+    while not (pid_file.exists() and pid_file.read_text()):
         assert time.monotonic() < deadline, "the fake agent never forked its child"
         await asyncio.sleep(0.05)
     grandchild = int(pid_file.read_text())
@@ -2403,14 +2618,21 @@ def test_spawn_env_env_unset_strips_declared_names(monkeypatch: pytest.MonkeyPat
             command="agent stdio",
             name="Grok",
             env_passthrough=("XAI_API_KEY", "DEEPSEEK_API_KEY"),
-            env_unset=("XAI_API_KEY",),
+            env_unset=("XAI_API_KEY", "GIT_TOKEN", "GIT_USERNAME"),
         )
     )
     monkeypatch.setenv("XAI_API_KEY", "xai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-secret")
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv("GIT_TOKEN", "canary-git")
+    monkeypatch.setenv("GIT_USERNAME", "git-user")
     env = ex._build_spawn_env()
     assert env.get("DEEPSEEK_API_KEY") == "ds-secret"
     assert "XAI_API_KEY" not in env
+    assert {"GIT_TOKEN", "GIT_USERNAME"}.isdisjoint(env)
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "XAI_API_KEY")
+    assert "XAI_API_KEY" not in ex._build_spawn_env()
 
 
 def test_spawn_env_env_unset_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2616,3 +2838,129 @@ async def test_model_reset_without_configured_default_restores_initial_agent_mod
         "model-a",
     ]
     assert ex._active_model == "model-a"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_cwd: deleted-directory guard
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cwd_explicit_missing_raises_with_path(tmp_path: Path) -> None:
+    """An explicit cwd that no longer exists raises RuntimeError naming the path."""
+    missing = str(tmp_path / "gone")
+    with pytest.raises(RuntimeError, match="gone"):
+        _resolve_cwd(missing)
+
+
+def test_resolve_cwd_explicit_valid_returns_unchanged(tmp_path: Path) -> None:
+    """An explicit cwd that exists is returned as-is."""
+    assert _resolve_cwd(str(tmp_path)) == str(tmp_path)
+
+
+def test_resolve_cwd_none_returns_process_cwd(tmp_path: Path) -> None:
+    """No explicit cwd returns the current process working directory."""
+    with patch("omnigent.inner.acp_executor.os.getcwd", return_value=str(tmp_path)):
+        result = _resolve_cwd(None)
+    assert result == str(tmp_path)
+
+
+def test_resolve_cwd_deleted_process_cwd_raises_clear_error() -> None:
+    """No explicit cwd and a deleted process cwd raises RuntimeError with a message."""
+    with patch(
+        "omnigent.inner.acp_executor.os.getcwd",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink", return_value="/deleted/path (deleted)"
+        ):
+            with pytest.raises(RuntimeError, match="deleted"):
+                _resolve_cwd(None)
+
+
+def test_resolve_cwd_deleted_process_cwd_includes_proc_path() -> None:
+    """/proc/self/cwd path is included in the error when readable."""
+    with patch(
+        "omnigent.inner.acp_executor.os.getcwd",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink",
+            return_value="/workspace/project (deleted)",
+        ):
+            with pytest.raises(RuntimeError, match=r"was deleted \(/workspace/project\);"):
+                _resolve_cwd(None)
+
+
+def test_resolve_cwd_deleted_process_cwd_readlink_failure_still_raises() -> None:
+    """RuntimeError is raised even when /proc/self/cwd readlink fails."""
+    with patch(
+        "omnigent.inner.acp_executor.os.getcwd",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink", side_effect=OSError("not available")
+        ):
+            with pytest.raises(RuntimeError, match="deleted"):
+                _resolve_cwd(None)
+
+
+def test_acp_executor_init_raises_on_deleted_explicit_cwd(tmp_path: Path) -> None:
+    """AcpExecutor.__init__ raises RuntimeError when an explicit cwd is missing."""
+    missing = str(tmp_path / "workspace")
+    with pytest.raises(RuntimeError, match="workspace"):
+        AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing)
+
+
+@pytest.mark.asyncio
+async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
+    tmp_path: Path,
+) -> None:
+    """Deleting the cwd after __init__ yields an ExecutorError naming the path.
+
+    Without the guard at the top of _start_process(), the error would be the raw
+    ``asyncio.create_subprocess_exec`` OS error ("[Errno 2] No such file or directory:
+    '/path'"), which lacks ACP-specific context. With the guard, the message says
+    "ACP executor working directory does not exist".
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace))
+    assert ex._cwd == str(workspace)
+
+    # Simulate the workspace being deleted after the executor was constructed.
+    workspace.rmdir()
+
+    events = []
+    async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+        events.append(ev)
+    await ex.close()
+
+    assert events, "expected at least one ExecutorError event"
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
+    msg = error_events[0].message
+    assert "working directory" in msg, f"expected 'working directory' in: {msg!r}"
+    assert str(workspace) in msg, f"expected path in: {msg!r}"
+
+
+@pytest.mark.asyncio
+async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
+    """Relative cwd with deleted process cwd yields a clear 'Runner working directory' error."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".")
+
+    fnfe = FileNotFoundError(2, "No such file or directory")
+    with patch("omnigent.inner.acp_executor.os.getcwd", side_effect=fnfe):
+        with patch(
+            "omnigent.inner.acp_executor.os.readlink",
+            return_value="/workspace/project (deleted)",
+        ):
+            events = []
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                events.append(ev)
+    await ex.close()
+
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert error_events
+    msg = error_events[0].message
+    assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
+    assert "/workspace/project" in msg, f"expected path in: {msg!r}"

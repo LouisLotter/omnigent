@@ -14,8 +14,9 @@ const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
- * inside the sidebar (every browser and non-mac platform) and, on the macOS
- * desktop shell, in the persistent title-bar strip. There it must survive the
+ * inside the sidebar (every browser and non-mac platform, and the macOS shell
+ * below md, where the phone drawer owns it) and, on the macOS desktop shell at
+ * md+, in the persistent title-bar strip. There it must survive the
  * sidebar collapsing — the sidebar goes `md:w-0 md:overflow-hidden` and turns
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the
@@ -99,16 +100,9 @@ export function SidebarHeaderActions({
   );
 }
 
-/**
- * Mobile treatment shared by the two floating icon buttons: a thumb-sized round
- * chip in iOS liquid glass. The look lives in one CSS class
- * (`.sidebar-glass-chip` in index.css) that both chips wear, so Search and
- * Settings can't drift apart — they had, one landing opaque with a heavier
- * shadow than the other. On desktop the class is inert (it is scoped to the
- * mobile breakpoint) and these stay flat 24px ghost icons in the header row.
- */
+/** Shared sizing for the mobile icon-only Search and Settings actions. */
 const SIDEBAR_FLOAT_BUTTON =
-  "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:text-foreground";
+  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:text-foreground";
 
 const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
 
