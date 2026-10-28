@@ -258,6 +258,7 @@ class _OpenShellClient:
                 stdin=stdin,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
+                # OpenShell execs rebuild the environment instead of inheriting image ENV.
                 env={"HOME": _SANDBOX_HOME, MANAGED_SANDBOX_ENV_VAR: "1"},
             ),
         )
