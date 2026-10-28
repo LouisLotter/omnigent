@@ -357,6 +357,8 @@ def test_pre_tool_use_deny_reason_is_trimmed() -> None:
         (b'{"result": 3}', "Omnigent response carried no policy verdict"),
         (b'{"result": ""}', "Omnigent response carried no policy verdict"),
         (b'{"result": "POLICY_ACTION_DNEY"}', "Omnigent response carried no policy verdict"),
+        (b'{"result": []}', "Omnigent response carried no policy verdict"),
+        (b'{"result": {}}', "Omnigent response carried no policy verdict"),
     ],
 )
 def test_parse_evaluation_response_rejects_unusable_bodies(body: bytes, problem: str) -> None:

@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 # ``ask_timeout``. Kept in lockstep with the Claude-native hook's
 # ``_EVALUATE_POLICY_TIMEOUT_S``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
+# Hard limit on one evaluate-policy run, from when it starts waiting. Codex
+# kills a hook that outlives its ``hooks.json`` timeout and then runs the tool,
+# so past this limit the hook answers fail-closed itself, whatever the network
+# is doing. It sits between the request budget (plus its retry tail) and the
+# Codex timeout (``app_server._POLICY_HOOK_TIMEOUT_SECONDS``).
+_ANSWER_DEADLINE_S = _EVALUATE_POLICY_TIMEOUT_S + 240.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,7 +125,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     if state is None:
         return 0
 
-    hook_event = payload.get("hook_event_name", "")
+    hook_event = str(payload.get("hook_event_name", ""))
+    answer = _DeadlineAnswer(
+        _ANSWER_DEADLINE_S,
+        fail_closed_hook_output(hook_event, "no policy answer before the hook's deadline"),
+    )
     try:
         hook_output = _evaluate_policy_hook_output(bridge_dir, state.session_id, payload)
     except Exception as exc:  # noqa: BLE001 - a crashed hook is a failed hook, and Codex runs the tool
@@ -128,11 +138,86 @@ def _main_evaluate_policy(argv: list[str]) -> int:
             file=sys.stderr,
         )
         hook_output = fail_closed_hook_output(
-            str(hook_event), f"the policy hook failed ({type(exc).__name__})"
+            hook_event, f"the policy hook failed ({type(exc).__name__})"
         )
+    answer.write(hook_output)
+    return 0
+
+
+class _DeadlineAnswer:
+    """
+    The hook's single answer on stdout: the verdict, or a fallback at a deadline.
+
+    A daemon timer writes the fallback and ends the process if the verdict has
+    not been written by then, so a slow network can never keep the hook past
+    the harness timeout; whichever comes first is the only output.
+
+    :param deadline_s: Seconds from now until the fallback is written.
+    :param fallback: Hook output to write at the deadline, or ``None`` to
+        write nothing (an event that fails open).
+    """
+
+    def __init__(self, deadline_s: float, fallback: dict[str, object] | None) -> None:
+        import threading
+
+        self._fallback = fallback
+        self._lock = threading.Lock()
+        self._written = False
+        self._timer = threading.Timer(deadline_s, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def write(self, hook_output: dict[str, object] | None) -> None:
+        """
+        Write the verdict unless the deadline already answered.
+
+        :param hook_output: Hook output for stdout, or ``None`` for none.
+        :returns: None.
+        """
+        with self._lock:
+            if self._written:
+                return
+            self._written = True
+            self._timer.cancel()
+            _write_hook_output(hook_output)
+
+    def _expire(self) -> None:
+        """
+        Write the fallback and end the process before the harness kills it.
+
+        :returns: None.
+        """
+        with self._lock:
+            if self._written:
+                return
+            self._written = True
+            print("omnigent codex evaluate-policy hook: deadline reached", file=sys.stderr)
+            _write_hook_output(self._fallback)
+        _exit_process(0)
+
+
+def _write_hook_output(hook_output: dict[str, object] | None) -> None:
+    """
+    Write one hook output to stdout and flush it.
+
+    :param hook_output: Hook output, or ``None`` to write nothing.
+    :returns: None.
+    """
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))
-    return 0
+    sys.stdout.flush()
+
+
+def _exit_process(code: int) -> None:
+    """
+    End the hook process at once, from any thread.
+
+    :param code: Process exit code, e.g. ``0``.
+    :returns: None.
+    """
+    import os
+
+    os._exit(code)
 
 
 def _evaluate_policy_hook_output(

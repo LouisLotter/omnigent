@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -599,6 +600,145 @@ def test_pre_tool_use_denies_before_codex_gives_up_on_the_hook(
     _assert_codex_enforced_deny(capsys.readouterr().out)
     hook_budget = codex_native_hook._EVALUATE_POLICY_TIMEOUT_S
     assert clock["t"] <= hook_budget < _POLICY_HOOK_TIMEOUT_SECONDS
+
+
+def test_pre_tool_use_answers_deny_at_its_deadline_whatever_the_network_does(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A request that never finishes still ends in one deny at the hook's deadline.
+
+    HTTP timeouts bound each socket operation, not a whole request: a server
+    trickling bytes, or a stalled upload, can hold the POST past Codex's hook
+    timeout, after which Codex runs the tool. The hook's own deadline answers
+    deny and ends the process first.
+    """
+    _govern_session(bridge_dir, "relay")
+    released = threading.Event()
+    exits: list[int] = []
+
+    def _exit(code: int) -> None:
+        exits.append(code)
+        released.set()
+
+    class _NeverFinishes(_RaisesIfCalled):
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            assert released.wait(10), "the deadline never fired"
+            raise httpx.ReadError("still trickling", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(codex_native_hook, "_ANSWER_DEADLINE_S", 0.2)
+    monkeypatch.setattr(codex_native_hook, "_exit_process", _exit)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _NeverFinishes)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    captured = capsys.readouterr()
+    # Exactly one answer: the deadline's deny; the late verdict is dropped.
+    reason = _assert_codex_enforced_deny(captured.out)
+    assert "no policy answer before the hook's deadline" in reason
+    assert exits == [0]
+
+
+def test_hook_process_answers_deny_at_its_deadline_against_a_trickling_server(
+    bridge_dir: Path,
+) -> None:
+    """
+    The real hook process prints its deny and exits 0 while a server trickles bytes.
+
+    The server sends one byte of a never-ending response at a time, so no socket
+    read ever times out. The process must still write a parseable deny before
+    exiting through the deadline's ``os._exit``.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    stop = threading.Event()
+
+    class _Trickle(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1000000")
+            self.end_headers()
+            while not stop.wait(0.05):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except OSError:
+                    return
+
+        def log_message(self, *args: object) -> None:
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        relay = {
+            "url": f"http://127.0.0.1:{server.server_address[1]}",
+            "token": "relay-tok",
+            "session_id": "conv_active",
+        }
+        (bridge_dir / "tool_relay.json").write_text(json.dumps(relay))
+        probe = (
+            "import sys\n"
+            "from omnigent.harnesses.codex_native import hook\n"
+            "hook._ANSWER_DEADLINE_S = 1.0\n"
+            "sys.exit(hook.main(['evaluate-policy', '--bridge-dir', sys.argv[1]]))\n"
+        )
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", probe, str(bridge_dir)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        stop.set()
+        server.shutdown()
+        server.server_close()
+
+    assert result.returncode == 0, result.stderr
+    reason = _assert_codex_enforced_deny(result.stdout)
+    assert "no policy answer before the hook's deadline" in reason
+
+
+def test_deadline_answer_keeps_a_verdict_written_in_time(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verdict written before the deadline is the only output; the timer never fires."""
+    exits: list[int] = []
+    monkeypatch.setattr(codex_native_hook, "_exit_process", exits.append)
+    answer = codex_native_hook._DeadlineAnswer(0.05, {"decision": "block", "reason": "late"})
+
+    answer.write({"decision": "block", "reason": "in time"})
+    answer._timer.join(2)
+
+    assert json.loads(capsys.readouterr().out) == {"decision": "block", "reason": "in time"}
+    assert exits == []
+
+
+def test_deadline_answer_writes_nothing_for_an_event_that_fails_open(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At the deadline an event with no fallback (PostToolUse) exits with no output."""
+    exits: list[int] = []
+    monkeypatch.setattr(codex_native_hook, "_exit_process", exits.append)
+    answer = codex_native_hook._DeadlineAnswer(0.01, None)
+
+    answer._timer.join(2)
+    answer.write({"hookSpecificOutput": {"additionalContext": "too late"}})
+
+    assert capsys.readouterr().out == ""
+    assert exits == [0]
 
 
 def test_user_prompt_submit_blocks_when_the_hook_itself_fails(

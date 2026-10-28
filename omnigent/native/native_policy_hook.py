@@ -628,7 +628,8 @@ def parse_evaluation_response(body: bytes) -> tuple[dict[str, object], None] | t
         decoded = json.loads(body)
     except ValueError:
         return None, "malformed Omnigent response"
-    if not isinstance(decoded, dict) or decoded.get("result") not in _POLICY_ACTIONS:
+    action = decoded.get("result") if isinstance(decoded, dict) else None
+    if not isinstance(action, str) or action not in _POLICY_ACTIONS:
         return None, "Omnigent response carried no policy verdict"
     return decoded, None
 
