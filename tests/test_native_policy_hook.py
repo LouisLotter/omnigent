@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -15,6 +17,7 @@ from omnigent.native.native_policy_hook import (
     hook_payload_to_evaluation_request,
     parse_evaluation_response,
     post_evaluate_with_retry,
+    read_relay_policy_config,
 )
 
 
@@ -352,6 +355,8 @@ def test_pre_tool_use_deny_reason_is_trimmed() -> None:
         (b'"POLICY_ACTION_ALLOW"', "Omnigent response carried no policy verdict"),
         (b"{}", "Omnigent response carried no policy verdict"),
         (b'{"result": 3}', "Omnigent response carried no policy verdict"),
+        (b'{"result": ""}', "Omnigent response carried no policy verdict"),
+        (b'{"result": "POLICY_ACTION_DNEY"}', "Omnigent response carried no policy verdict"),
     ],
 )
 def test_parse_evaluation_response_rejects_unusable_bodies(body: bytes, problem: str) -> None:
@@ -371,6 +376,29 @@ def test_parse_evaluation_response_returns_the_verdict() -> None:
         {"result": "POLICY_ACTION_DENY", "reason": "no rm"},
         None,
     )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "POLICY_ACTION_ALLOW",
+        "POLICY_ACTION_DENY",
+        "POLICY_ACTION_ASK",
+        "POLICY_ACTION_UNSPECIFIED",
+    ],
+)
+def test_parse_evaluation_response_accepts_every_action_the_server_sends(action: str) -> None:
+    """Each action the evaluate endpoint answers with is a usable verdict."""
+    verdict, problem = parse_evaluation_response(f'{{"result": "{action}"}}'.encode())
+    assert problem is None
+    assert verdict == {"result": action}
+
+
+@pytest.mark.parametrize("content", ['["not", "an", "object"]', '"text"', "not json"])
+def test_read_relay_policy_config_ignores_an_unusable_file(tmp_path: Path, content: str) -> None:
+    """A relay file that is not a JSON object means no relay, not a crashed hook."""
+    (tmp_path / "tool_relay.json").write_text(content, encoding="utf-8")
+    assert read_relay_policy_config(tmp_path) is None
 
 
 @pytest.mark.parametrize("action", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"])
@@ -874,6 +902,74 @@ def test_post_evaluate_with_retry_stops_reparking_at_the_callers_budget(
     assert resp is None
     assert error is not None and error.startswith("request error")
     assert len(silent_poll_client.bodies) == 3
+
+
+@pytest.mark.parametrize("sever", ["remote_protocol_error", "read_error", "504", "silent"])
+def test_post_evaluate_with_retry_never_outlasts_the_callers_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    sever: str,
+) -> None:
+    """
+    However the held polls end, the whole call returns within the caller's budget.
+
+    A harness kills a hook that outlives its own timeout, and Codex then runs
+    the tool. The hook must give up first, with an error its caller turns
+    into a deny, so no poll, re-park or backoff may run past the budget.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        """
+        Advance the fake clock instead of waiting.
+
+        :param seconds: Delay the loop asked for.
+        :returns: None.
+        """
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    gateway_cap = native_policy_hook._EVALUATE_POLICY_HELD_POLL_FLOOR_S + 290.0
+    posts: list[float] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: httpx.Timeout) -> None:
+            del headers
+            self._read_timeout = timeout.read or 0.0
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(clock["t"])
+            assert len(posts) < 10_000, "the retry loop did not stop"
+            request = httpx.Request("POST", url)
+            if sever == "silent" or self._read_timeout < gateway_cap:
+                clock["t"] += self._read_timeout
+                raise httpx.ReadTimeout("no answer", request=request)
+            clock["t"] += gateway_cap
+            if sever == "504":
+                return httpx.Response(504, request=request)
+            if sever == "read_error":
+                raise httpx.ReadError("connection reset", request=request)
+            raise httpx.RemoteProtocolError("gateway severed the poll", request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    monkeypatch.setattr(native_policy_hook, "LONG_POLL_READ_TIMEOUT_S", 1000.0)
+    budget = 3000.0
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, budget, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None
+    assert clock["t"] <= budget, f"returned at {clock['t']}s, after the {budget}s budget"
+    assert len(posts) > 1, "held polls were re-parked before the budget ran out"
 
 
 def test_post_evaluate_with_retry_slow_429_spends_the_budget(

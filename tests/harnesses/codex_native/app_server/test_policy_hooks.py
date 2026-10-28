@@ -18,7 +18,8 @@ from omnigent.harnesses.codex_native.app_server import (
     trust_native_policy_hooks,
 )
 from omnigent.harnesses.codex_native.hook import _EVALUATE_POLICY_TIMEOUT_S
-from omnigent.native import tool_observer_hook
+from omnigent.native import native_policy_hook, tool_observer_hook
+from omnigent.native.long_poll import LONG_POLL_READ_TIMEOUT_S
 from tests.harnesses.codex_native.app_server._support import (
     _CWD,
     _OUR_COMMAND,
@@ -544,6 +545,18 @@ def test_policy_hooks_timeout_outlasts_the_hooks_request_budget() -> None:
     # constant is dropped back to 30), the gate becomes advisory for every
     # native tool call, sub-agent or not.
     assert _POLICY_HOOK_TIMEOUT_SECONDS >= _EVALUATE_POLICY_TIMEOUT_S
+    # Codex must also leave the hook time to give up and answer deny itself: a
+    # hook Codex kills first counts as failed and the tool runs. After its answer
+    # budget the hook can still spend the transient retry budget plus one
+    # attempt's connect, read and backoff.
+    tail = (
+        native_policy_hook._EVALUATE_POLICY_RETRY_BUDGET_S
+        + native_policy_hook._EVALUATE_POLICY_CONNECT_TIMEOUT_S
+        + LONG_POLL_READ_TIMEOUT_S
+        + native_policy_hook._EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
+    )
+    margin = _POLICY_HOOK_TIMEOUT_SECONDS - _EVALUATE_POLICY_TIMEOUT_S
+    assert margin > tail
 
 
 def test_observer_hook_timeout_leaves_room_for_a_slow_start() -> None:

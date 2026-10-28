@@ -546,6 +546,61 @@ def test_pre_tool_use_denies_when_the_hook_itself_fails(
     assert "RuntimeError: unexpected" in captured.err
 
 
+@pytest.mark.parametrize("silence", ["unanswered", "severed"])
+def test_pre_tool_use_denies_before_codex_gives_up_on_the_hook(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    silence: str,
+) -> None:
+    """
+    A server that never answers ends in a deny before Codex's hook timeout.
+
+    Codex kills a hook that outlives the ``timeout`` in ``hooks.json`` and
+    runs the tool, so the hook's own wait — every poll, re-park and backoff —
+    must end first, on a fake clock here.
+    """
+    from omnigent.harnesses.codex_native.app_server import _POLICY_HOOK_TIMEOUT_SECONDS
+
+    _govern_session(bridge_dir, "relay")
+    clock = {"t": 0.0}
+
+    def _sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    posts: list[float] = []
+
+    class _NeverAnswers(_RaisesIfCalled):
+        def __init__(self, *, headers: dict[str, str], timeout: httpx.Timeout) -> None:
+            del headers
+            self._read_timeout = timeout.read or 0.0
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(clock["t"])
+            assert len(posts) < 100_000, "the hook never stopped waiting"
+            request = httpx.Request("POST", url)
+            held = min(self._read_timeout, 300.0)
+            clock["t"] += held
+            if silence == "severed" and held == 300.0:
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=request)
+            raise httpx.ReadTimeout("no answer", request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _NeverAnswers)
+
+    _run_hook(
+        bridge_dir,
+        {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        monkeypatch,
+    )
+
+    _assert_codex_enforced_deny(capsys.readouterr().out)
+    hook_budget = codex_native_hook._EVALUATE_POLICY_TIMEOUT_S
+    assert clock["t"] <= hook_budget < _POLICY_HOOK_TIMEOUT_SECONDS
+
+
 def test_user_prompt_submit_blocks_when_the_hook_itself_fails(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -78,6 +78,15 @@ _EVAL_UNAVAILABLE_REASON = (
     "service could not be reached or gave no usable answer), so the tool was not "
     "run. Try again in a moment."
 )
+# Every ``result`` the evaluate endpoint sends; UNSPECIFIED means "no policy applies".
+_POLICY_ACTIONS = frozenset(
+    {
+        "POLICY_ACTION_ALLOW",
+        "POLICY_ACTION_DENY",
+        "POLICY_ACTION_ASK",
+        "POLICY_ACTION_UNSPECIFIED",
+    }
+)
 # Reason given for a DENY (or a stray ASK) verdict whose policy names none:
 # Codex ignores a deny without a non-empty reason and runs the tool.
 _DENIED_BY_POLICY_REASON = "Denied by policy"
@@ -127,6 +136,8 @@ def read_relay_policy_config(
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
         return None
     url = data.get("url")
     token = data.get("token")
@@ -599,10 +610,11 @@ def parse_evaluation_response(body: bytes) -> tuple[dict[str, object], None] | t
     """
     Decode a ``/policies/evaluate`` response body into a usable verdict.
 
-    A usable verdict is a JSON object whose ``result`` is a string. Anything
-    else — an empty body, invalid JSON, a list or scalar, or an object with
-    no ``result`` — is not a verdict, and the caller fails closed on it, as
-    the runner's policy proxy and the relay's Claude hook endpoint do.
+    A usable verdict is a JSON object whose ``result`` is one of the actions
+    the server sends. Anything else — an empty body, invalid JSON, a list or
+    scalar, or an object whose ``result`` is missing, blank or unknown — is
+    not a verdict, and the caller fails closed on it, as the runner's policy
+    proxy and the relay's Claude hook endpoint do for a missing ``result``.
 
     :param body: Raw response body, e.g.
         ``b'{"result": "POLICY_ACTION_DENY", "reason": "no rm"}'``.
@@ -616,7 +628,7 @@ def parse_evaluation_response(body: bytes) -> tuple[dict[str, object], None] | t
         decoded = json.loads(body)
     except ValueError:
         return None, "malformed Omnigent response"
-    if not isinstance(decoded, dict) or not isinstance(decoded.get("result"), str):
+    if not isinstance(decoded, dict) or decoded.get("result") not in _POLICY_ACTIONS:
         return None, "Omnigent response carried no policy verdict"
     return decoded, None
 
@@ -661,8 +673,12 @@ def post_evaluate_with_retry(
     attempt waits at most :data:`LONG_POLL_READ_TIMEOUT_S` for an answer: a
     poll that stays silent that long (a half-open connection, or a person who
     has not answered yet) re-POSTs the same id, which re-parks it, until
-    ``read_timeout`` has passed in total. The caller is responsible for
-    fail-closed handling on ``None``.
+    ``read_timeout`` has passed in total; the last poll waits only for what is
+    left of it. A fast failure after that still gets the transient budget, so
+    the call returns within ``read_timeout`` plus that budget and one attempt's
+    timeouts, and a harness timeout that much longer always gets an answer to
+    fail closed on. The caller is responsible for fail-closed handling on
+    ``None``.
 
     :param url: Absolute URL of the evaluate endpoint.
     :param headers: Auth headers for the Omnigent server.
@@ -696,13 +712,17 @@ def post_evaluate_with_retry(
     deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     poll_read_timeout = min(read_timeout, LONG_POLL_READ_TIMEOUT_S)
-    timeout = httpx.Timeout(
-        read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S, read=poll_read_timeout
-    )
     answer_deadline = time.monotonic() + read_timeout
     reauthed = False
     last_error: str = "unknown error"
     while True:
+        # A poll waits no longer than what is left of the caller's answer budget.
+        remaining_s = answer_deadline - time.monotonic()
+        timeout = httpx.Timeout(
+            read_timeout,
+            connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S,
+            read=min(poll_read_timeout, remaining_s) if remaining_s > 0 else poll_read_timeout,
+        )
         retry_delay_s = backoff_s
         attempt_started = time.monotonic()
         held_poll_severed = False
@@ -803,8 +823,10 @@ def post_evaluate_with_retry(
                 isinstance(exc, httpx.ReadTimeout) and time.monotonic() < answer_deadline
             )
             held_poll_severed = (
-                isinstance(exc, _HELD_POLL_SEVER_ERRORS) or unanswered_poll
-            ) and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                (isinstance(exc, _HELD_POLL_SEVER_ERRORS) or unanswered_poll)
+                and time.monotonic() - attempt_started >= _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                and time.monotonic() < answer_deadline
+            )
             if not held_poll_severed:
                 print(
                     f"omnigent {hook_label}: Omnigent request failed: {exc}",
