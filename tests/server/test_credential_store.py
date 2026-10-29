@@ -108,6 +108,38 @@ def test_merge_metadata_leaves_the_secret_ciphertext_alone(db_uri: str) -> None:
     assert store.merge_metadata("ghost", "mcp:tracker", {"needs_reconnect": "x"}) is False
 
 
+def test_merge_metadata_only_marks_the_secret_it_checked(db_uri: str) -> None:
+    cipher = _FakeCipher()
+    store = CredentialStore(db_uri, cipher)
+    store.upsert("bob", "mcp:tracker", secret={"access_token": "old"}, metadata={})
+    mark = {"needs_reconnect": "http_401"}
+    assert not store.merge_metadata(
+        "bob", "mcp:tracker", mark, if_secret_matches={"access_token": "x"}
+    )
+
+    # A reconnect lands after the check decrypted the row and before the write.
+    decrypt = cipher.decrypt
+
+    def replaced_after_check(ciphertext: str, *, context: Any) -> str | None:
+        cipher.decrypt = decrypt
+        store.upsert("bob", "mcp:tracker", secret={"access_token": "new"}, metadata={})
+        return decrypt(ciphertext, context=context)
+
+    cipher.decrypt = replaced_after_check
+    old = {"access_token": "old"}
+    assert not store.merge_metadata("bob", "mcp:tracker", mark, if_secret_matches=old)
+    replaced = store.get("bob", "mcp:tracker")
+    assert replaced is not None and replaced.metadata == {}
+
+    new = {"access_token": "new"}
+    assert store.merge_metadata("bob", "mcp:tracker", mark, if_secret_matches=new)
+    # Already marked: no decrypt and no second write.
+    cipher.decrypt = Mock(side_effect=AssertionError("no cipher call"))
+    assert store.merge_metadata("bob", "mcp:tracker", mark, if_secret_matches=new)
+    marked = store.get("bob", "mcp:tracker")
+    assert marked is not None and marked.metadata == mark
+
+
 def test_update_secret_missing_row_returns_false(db_uri: str) -> None:
     # A refresh racing a disconnect must report the drop, not silently discard
     # the freshly-minted (and now-spent) token.

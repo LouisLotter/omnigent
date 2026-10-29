@@ -329,9 +329,9 @@ from the registry.
 
 A refresh answered `invalid_grant`, or an upstream HTTP 401 to the stored access
 token, marks the saved login in its connection metadata; the encrypted secret is
-unchanged. The mark is written under the refresh lock and only while the record
-still holds the rejected credential, so a concurrent refresh or reconnect is not
-marked. The catalog and status report it as `needs_reconnect`, and Settings and
+unchanged. The mark applies only while the record still holds the rejected
+credential (a compare-and-set on its ciphertext), so a concurrent refresh or
+reconnect is not marked. The catalog and status report it as `needs_reconnect`, and Settings and
 the session picker show that a reconnect is needed. The next call on a marked
 OAuth login refreshes first; the rejected call itself is not retried. Saving a
 new grant, by connecting, reconnecting, updating a token or refreshing, clears it. Invalid provider responses return credential-safe errors;

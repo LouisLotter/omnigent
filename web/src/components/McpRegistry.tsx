@@ -133,12 +133,17 @@ function ServiceConnection({
             disabled={busy}
             onClick={() =>
               void run(async () => {
-                const result = await registryRequest<{ tools: string[] }>(`/${service.id}/test`, {
-                  method: "POST",
-                });
-                setNotice(
-                  `Tool discovery succeeded. Tools: ${result.tools.join(", ") || "none"}. Individual calls may require additional permissions.`,
-                );
+                // A test can mark or clear a rejected login, so re-read the status either way.
+                try {
+                  const result = await registryRequest<{ tools: string[] }>(`/${service.id}/test`, {
+                    method: "POST",
+                  });
+                  setNotice(
+                    `Tool discovery succeeded. Tools: ${result.tools.join(", ") || "none"}. Individual calls may require additional permissions.`,
+                  );
+                } finally {
+                  await onChanged();
+                }
               })
             }
           >

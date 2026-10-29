@@ -39,7 +39,8 @@ describe("MCP account connections", () => {
       .mockResolvedValueOnce({ data: [service] })
       .mockResolvedValueOnce({ connected: true })
       .mockResolvedValueOnce({ data: [{ ...service, connected: true }] })
-      .mockResolvedValueOnce({ tools: ["read_ticket"] });
+      .mockResolvedValueOnce({ tools: ["read_ticket"] })
+      .mockResolvedValueOnce({ data: [{ ...service, connected: true }] });
     render(<McpRegistryConnections />);
     fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
     const input = screen.getByLabelText("Token for Work tracker");
@@ -64,14 +65,36 @@ describe("MCP account connections", () => {
   it("shows a connection failure and keeps the account controls usable", async () => {
     vi.mocked(registryRequest)
       .mockResolvedValueOnce({ data: [{ ...service, connected: true }] })
-      .mockRejectedValueOnce(new Error("Reconnect your account"));
+      .mockRejectedValueOnce(new Error("Reconnect your account"))
+      .mockResolvedValueOnce({ data: [{ ...service, connected: true, needs_reconnect: true }] });
     render(<McpRegistryConnections />);
     fireEvent.click(await screen.findByRole("button", { name: "Test connection" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Reconnect your account");
+    // The failed test marked the login; the status is re-read.
+    expect(await screen.findByText("Reconnect needed")).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "Disconnect" })).not.toBeDisabled(),
     );
   });
+
+  it("re-reads the status after a successful test clears a rejected login", async () => {
+    const oauth = {
+      ...service,
+      auth: "oauth",
+      connect_provider: "mcp-tracker",
+      connected: true,
+    };
+    vi.mocked(registryRequest)
+      .mockResolvedValueOnce({ data: [{ ...oauth, needs_reconnect: true }] })
+      .mockResolvedValueOnce({ tools: ["read_ticket"] })
+      .mockResolvedValueOnce({ data: [{ ...oauth, needs_reconnect: false }] });
+    render(<McpRegistryConnections />);
+    fireEvent.click(await screen.findByRole("button", { name: "Test connection" }));
+    expect(await screen.findByText("Connected")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Tool discovery succeeded");
+    expect(screen.queryByText("Reconnect needed")).toBeNull();
+  });
+
   it("shows that a rejected login needs reconnecting", async () => {
     vi.mocked(registryRequest).mockResolvedValue({
       data: [

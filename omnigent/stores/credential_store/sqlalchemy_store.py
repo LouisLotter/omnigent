@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from typing import Any, cast
 
 from sqlalchemy import delete, select
@@ -241,18 +242,41 @@ class CredentialStore:
         changes: dict[str, Any],
         *,
         account_id: str = "",
+        if_secret_matches: dict[str, str] | None = None,
     ) -> bool:
         """Merge non-secret *changes* into an existing row's metadata.
 
-        The secret ciphertext and ``updated_at`` are untouched, so no cipher call
-        is made. Returns ``False`` when the connection no longer exists.
+        The secret ciphertext and ``updated_at`` are untouched. With
+        *if_secret_matches*, the merge applies only while the stored secret holds
+        those values: the row is decrypted outside the write, which then requires
+        the same ciphertext, so a credential replaced meanwhile is left alone.
+        Returns whether the row's metadata now holds *changes*.
         """
         workspace_id = current_workspace_id()
+        pk = (workspace_id, user_id, provider, account_id)
+        with self._session("merge_metadata_check") as session:
+            row = session.get(SqlConnection, pk)
+            if row is None:
+                return False
+            metadata = _safe_json_obj(row.metadata_json) or {}
+            checked_enc = row.secret_enc
+        if changes.items() <= metadata.items():
+            return True
+        if if_secret_matches is not None:
+            context = _enc_context(workspace_id, user_id, provider, account_id)
+            plaintext = self._cipher.decrypt(checked_enc, context=context)
+            secret = _safe_json_obj(plaintext) if plaintext is not None else None
+            if secret is None or not all(
+                isinstance(secret.get(field), str)
+                and secrets.compare_digest(secret[field].encode(), value.encode())
+                for field, value in if_secret_matches.items()
+            ):
+                return False
 
         def write(session: Session) -> bool:
             require_active_account(session, user_id)
-            row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
-            if row is None:
+            row = session.get(SqlConnection, pk)
+            if row is None or (if_secret_matches is not None and row.secret_enc != checked_enc):
                 return False
             row.metadata_json = json.dumps(
                 {**(_safe_json_obj(row.metadata_json) or {}), **changes}

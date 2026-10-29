@@ -814,20 +814,6 @@ def reject_upstream(monkeypatch, *, before_reject=None) -> list[str]:
     return sent
 
 
-def record_marks_under_lock(monkeypatch, registry, entry, user_id) -> list[bool]:
-    """Record, for each metadata mark, whether the login's refresh lock was held."""
-    lock = registry._login_lock(entry, user_id)
-    merge = registry.store.merge_metadata
-    held = []
-
-    def merge_metadata(*args, **kwargs):
-        held.append(lock.locked())
-        return merge(*args, **kwargs)
-
-    monkeypatch.setattr(registry.store, "merge_metadata", merge_metadata)
-    return held
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "body", "marked"),
@@ -859,11 +845,9 @@ async def test_refresh_invalid_grant_marks_the_login_and_keeps_its_ciphertext(
         "AsyncClient",
         lambda **kwargs: client_type(transport=httpx.MockTransport(token_endpoint), **kwargs),
     )
-    held = record_marks_under_lock(monkeypatch, registry, registry.services["tracker"], "alice")
     with pytest.raises(ConnectionError, match="reconnect the account") as failure:
         await registry.token(registry.services["tracker"], "alice", oauth_app.state)
     assert isinstance(failure.value, McpGrantRejected) is marked
-    assert held == ([True] if marked else [])
     saved = registry.store.get("alice", "mcp:tracker", with_secret=True)
     assert saved.secret == secret
     assert saved.metadata == (
@@ -889,14 +873,12 @@ async def test_unauthorized_call_marks_the_login_and_the_next_call_refreshes_fir
     sent = reject_upstream(monkeypatch)
     refresh = AsyncMock(return_value={"access_token": "private-fresh", "expires_in": 3600})
     monkeypatch.setattr(registry, "exchange", refresh)
-    held = record_marks_under_lock(monkeypatch, registry, entry, "alice")
 
     with pytest.raises(McpUpstreamError, match="HTTP 401") as failure:
         await registry.execute("tracker", "alice", oauth_app.state, tool="read_ticket")
-    # The failed call is neither refreshed nor replayed, and the mark cannot race a refresh.
+    # The failed call is neither refreshed nor replayed.
     assert sent == ["Bearer private-access"]
     refresh.assert_not_awaited()
-    assert held == [True]
     assert registry.store.get("alice", "mcp:tracker").metadata["needs_reconnect"] == "http_401"
 
     assert await registry.token(entry, "alice", oauth_app.state) == "private-fresh"
@@ -916,8 +898,6 @@ async def test_bearer_rejection_shows_in_catalog_until_the_token_is_updated(
 ):
     app = FastAPI()
     app.include_router(create_mcp_registry_router(registry, TestIdentity()), prefix="/v1")
-    merge = Mock(wraps=registry.store.merge_metadata)
-    monkeypatch.setattr(registry.store, "merge_metadata", merge)
     sent = reject_upstream(monkeypatch)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -938,7 +918,6 @@ async def test_bearer_rejection_shows_in_catalog_until_the_token_is_updated(
             assert tested.status_code == 502
             assert "HTTP 401" in tested.json()["detail"]
         assert sent == ["Bearer private-old"] * 2
-        assert merge.call_count == 1
         marked = await catalog_entry()
         assert marked["connected"] is True and marked["needs_reconnect"] is True
         other = await browser.get("/v1/mcp-registry/services", headers={"x-test-user": "bob"})
@@ -989,7 +968,7 @@ async def test_oauth_reconnect_clears_the_mark(oauth_app, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["http_401", "invalid_grant"])
+@pytest.mark.parametrize("failure", ["http_401", "invalid_grant", "http_401_after_check"])
 async def test_rejection_does_not_mark_a_login_replaced_during_the_call(
     oauth_app, monkeypatch, failure
 ):
@@ -1010,8 +989,23 @@ async def test_rejection_does_not_mark_a_login_replaced_during_the_call(
             metadata={"expires_at": time.time() + 3600},
         )
 
-    if failure == "http_401":
-        reject_upstream(monkeypatch, before_reject=reconnect)
+    def reconnect_after_the_check_reads_the_row():
+        decrypt = store._cipher.decrypt
+
+        def checked_then_replaced(ciphertext, *, context):
+            monkeypatch.setattr(store._cipher, "decrypt", decrypt)
+            reconnect()
+            return decrypt(ciphertext, context=context)
+
+        monkeypatch.setattr(store._cipher, "decrypt", checked_then_replaced)
+
+    if failure.startswith("http_401"):
+        reject_upstream(
+            monkeypatch,
+            before_reject=reconnect
+            if failure == "http_401"
+            else reconnect_after_the_check_reads_the_row,
+        )
         with pytest.raises(McpUpstreamError, match="HTTP 401"):
             await registry.execute("tracker", "alice", oauth_app.state, tool="read_ticket")
     else:
@@ -1023,7 +1017,9 @@ async def test_rejection_does_not_mark_a_login_replaced_during_the_call(
         monkeypatch.setattr(registry, "exchange", rejected_refresh)
         with pytest.raises(McpGrantRejected):
             await registry.token(registry.services["tracker"], "alice", oauth_app.state)
-    assert not needs_reconnect(store.get("alice", "mcp:tracker"))
+    saved = store.get("alice", "mcp:tracker", with_secret=True)
+    assert saved.secret["access_token"] == "private-new"
+    assert not needs_reconnect(saved)
 
 
 @pytest.mark.asyncio

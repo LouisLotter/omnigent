@@ -224,8 +224,12 @@ class McpRegistry:
             if not payload or not isinstance(payload.get("token"), str):
                 raise ConnectionError(f"Reconnect {provider.name} in Sandbox Integrations")
             return payload["token"]
+        from omnigent.db.db_models import current_workspace_id
+
         assert self.store is not None
-        async with self._login_lock(service, user_id):
+        key = (current_workspace_id(), user_id, service.id)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
             conn = await asyncio.to_thread(
                 self.store.get, user_id, f"mcp:{service.id}", with_secret=True
             )
@@ -264,34 +268,18 @@ class McpRegistry:
                 return str(tokens["access_token"])
             return str(conn.secret["access_token"])
 
-    def _login_lock(self, service: McpService, user_id: str) -> asyncio.Lock:
-        """The process-local lock serializing refreshes of one saved login."""
-        from omnigent.db.db_models import current_workspace_id
-
-        key = (current_workspace_id(), user_id, service.id)
-        return self._locks.setdefault(key, asyncio.Lock())
-
     async def _mark_needs_reconnect(
         self, service: McpService, user_id: str, field: str, rejected: str, reason: str
     ) -> None:
-        """Mark the saved login, unless it no longer holds the *rejected* credential.
-
-        Callers hold the login's lock, so a concurrent refresh cannot interleave.
-        """
+        """Mark the saved login, unless it no longer holds the *rejected* credential."""
         assert self.store is not None
-        provider = f"mcp:{service.id}"
         try:
-            conn = await asyncio.to_thread(self.store.get, user_id, provider, with_secret=True)
-            current = conn.secret.get(field) if conn is not None and conn.secret else None
-            if (
-                conn is None
-                or not isinstance(current, str)
-                or not secrets.compare_digest(current.encode(), rejected.encode())
-                or conn.metadata.get(NEEDS_RECONNECT) == reason
-            ):
-                return
             await asyncio.to_thread(
-                self.store.merge_metadata, user_id, provider, {NEEDS_RECONNECT: reason}
+                self.store.merge_metadata,
+                user_id,
+                f"mcp:{service.id}",
+                {NEEDS_RECONNECT: reason},
+                if_secret_matches={field: rejected},
             )
         except Exception:  # noqa: BLE001 — keep the caller's failure; store errors are not useful here
             _logger.warning("Could not mark MCP service %s for reconnection", service.id)
@@ -409,10 +397,9 @@ class McpRegistry:
                 failure.status_code,
             )
             if failure.status_code == 401 and token and service.auth in {"oauth", "bearer"}:
-                async with self._login_lock(service, user_id):
-                    await self._mark_needs_reconnect(
-                        service, user_id, "access_token", token, "http_401"
-                    )
+                await self._mark_needs_reconnect(
+                    service, user_id, "access_token", token, "http_401"
+                )
             raise failure from None
 
 
