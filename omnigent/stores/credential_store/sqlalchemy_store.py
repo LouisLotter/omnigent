@@ -234,6 +234,33 @@ class CredentialStore:
             )
         return updated
 
+    def merge_metadata(
+        self,
+        user_id: str,
+        provider: str,
+        changes: dict[str, Any],
+        *,
+        account_id: str = "",
+    ) -> bool:
+        """Merge non-secret *changes* into an existing row's metadata.
+
+        The secret ciphertext and ``updated_at`` are untouched, so no cipher call
+        is made. Returns ``False`` when the connection no longer exists.
+        """
+        workspace_id = current_workspace_id()
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
+            if row is None:
+                return False
+            row.metadata_json = json.dumps(
+                {**(_safe_json_obj(row.metadata_json) or {}), **changes}
+            )
+            return True
+
+        return run_write_transaction(self._session_immediate, "merge_metadata", write)
+
     def get(
         self,
         user_id: str,

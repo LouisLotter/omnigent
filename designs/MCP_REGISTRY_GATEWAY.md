@@ -313,7 +313,7 @@ sequenceDiagram
   G->>R: Credential for workspace / user / service
   R->>R: Acquire process-local refresh lock
   R->>C: Load current grant and expiry
-  alt Access token expires within 30 seconds
+  alt Access token expires within 30 seconds, or the login is marked rejected
     R->>O: Refresh-token exchange
     O-->>R: New access token and optional rotated refresh token
     R->>C: Update existing encrypted connection
@@ -325,7 +325,16 @@ sequenceDiagram
 ```
 
 Refresh locks remain alive while a holder or waiter needs them, then are released
-from the registry. Invalid provider responses return credential-safe errors;
+from the registry.
+
+A refresh answered `invalid_grant`, or an upstream HTTP 401 to the stored access
+token, marks the saved login in its connection metadata; the encrypted secret is
+unchanged. The mark is written under the refresh lock and only while the record
+still holds the rejected credential, so a concurrent refresh or reconnect is not
+marked. The catalog and status report it as `needs_reconnect`, and Settings and
+the session picker show that a reconnect is needed. The next call on a marked
+OAuth login refreshes first; the rejected call itself is not retried. Saving a
+new grant, by connecting, reconnecting, updating a token or refreshing, clears it. Invalid provider responses return credential-safe errors;
 callbacks redirect to sign-in error so the user can start a new flow.
 
 The credential store supplies persistence and encryption; the resolver owns the
@@ -434,7 +443,10 @@ which issuer, audience, scopes and user delegation the external gateway requires
 - No upstream connection pooling or discovery cache. Unavailable/disconnected
   services are omitted from discovery.
 - Non-text result blocks become text/JSON, not native media streams.
-- No automatic retry or refresh-and-replay after a provider 401 or lost response.
+- No automatic retry or refresh-and-replay after a provider 401 or lost response;
+  a 401 only makes the next call refresh first.
+- `needs_reconnect` reflects the last rejection seen. A bearer login stays marked
+  until its token is updated, even if a later call succeeds.
 - Request approval is supported; result-review ASK withholds output without an
   interactive result-review flow. The policy adapter requires session context.
 - User allowlists are not organization/group entitlement management. The gateway

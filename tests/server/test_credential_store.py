@@ -88,6 +88,26 @@ def test_update_secret_and_delete(db_uri: str) -> None:
     assert store.get("bob", "github") is None
 
 
+def test_merge_metadata_leaves_the_secret_ciphertext_alone(db_uri: str) -> None:
+    cipher = _FakeCipher()
+    store = CredentialStore(db_uri, cipher)
+    store.upsert("bob", "mcp:tracker", secret={"access_token": "tok"}, metadata={"expires_at": 9})
+    engine = get_or_create_engine(db_uri)
+    read_row = sa.text("SELECT secret_enc, updated_at FROM connections")
+    with engine.connect() as conn:
+        before = conn.execute(read_row).one()
+    cipher.encrypt = Mock(side_effect=AssertionError("no cipher call"))
+    cipher.decrypt = Mock(side_effect=AssertionError("no cipher call"))
+
+    assert store.merge_metadata("bob", "mcp:tracker", {"needs_reconnect": "http_401"}) is True
+    with engine.connect() as conn:
+        assert conn.execute(read_row).one() == before
+    conn_meta = store.get("bob", "mcp:tracker")
+    assert conn_meta is not None
+    assert conn_meta.metadata == {"expires_at": 9, "needs_reconnect": "http_401"}
+    assert store.merge_metadata("ghost", "mcp:tracker", {"needs_reconnect": "x"}) is False
+
+
 def test_update_secret_missing_row_returns_false(db_uri: str) -> None:
     # A refresh racing a disconnect must report the drop, not silently discard
     # the freshly-minted (and now-spent) token.
