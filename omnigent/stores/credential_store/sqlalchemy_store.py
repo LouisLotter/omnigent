@@ -246,8 +246,8 @@ class CredentialStore:
     ) -> bool:
         """Merge non-secret *changes* into an existing row's metadata.
 
-        The secret ciphertext and ``updated_at`` are untouched. The write is a
-        compare-and-set on the metadata it read, so concurrent merges are not
+        The secret ciphertext and ``updated_at`` are untouched. The write locks
+        the row and requires the metadata it read, so concurrent merges are not
         lost. With *if_secret_matches*, it applies only while the stored secret
         holds those values: the row is decrypted outside the write, which then
         requires the same ciphertext, so a credential replaced meanwhile is left
@@ -270,7 +270,6 @@ class CredentialStore:
         metadata = _safe_json_obj(metadata_json) or {}
         if changes.items() <= metadata.items():
             return True
-        unchanged = [SqlConnection.metadata_json == metadata_json]
         if if_secret_matches is not None:
             context = _enc_context(workspace_id, user_id, provider, account_id)
             plaintext = self._cipher.decrypt(checked_enc, context=context)
@@ -281,18 +280,24 @@ class CredentialStore:
                 for field, value in if_secret_matches.items()
             ):
                 return False
-            unchanged.append(SqlConnection.secret_enc == checked_enc)
         merged = json.dumps({**metadata, **changes})
 
         def write(session: Session) -> bool:
             require_active_account(session, user_id)
-            result = cast(
-                CursorResult[tuple[object]],
-                session.execute(
-                    update(SqlConnection).where(*match, *unchanged).values(metadata_json=merged)
-                ),
-            )
-            return result.rowcount > 0
+            # Compared in Python: some databases compare TEXT case-insensitively.
+            current = session.execute(
+                select(SqlConnection.secret_enc, SqlConnection.metadata_json)
+                .where(*match)
+                .with_for_update()
+            ).first()
+            if (
+                current is None
+                or current.metadata_json != metadata_json
+                or (if_secret_matches is not None and current.secret_enc != checked_enc)
+            ):
+                return False
+            session.execute(update(SqlConnection).where(*match).values(metadata_json=merged))
+            return True
 
         return run_write_transaction(self._session_immediate, "merge_metadata", write)
 
