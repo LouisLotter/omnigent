@@ -32,7 +32,9 @@ export function McpRegistryLaunchPicker({
   const selectedServices = catalog.services.filter((service) => selected.includes(service.id));
   const selectedCount =
     catalog.loading || catalog.error ? selected.length : selectedServices.length;
-  const needsSignInCount = selectedServices.filter((service) => !service.connected).length;
+  const needsSignInCount = selectedServices.filter(
+    (service) => !service.connected || service.needs_reconnect,
+  ).length;
   return (
     <Popover open={open} onOpenChange={(next) => !authorizing && setOpen(next)}>
       <PopoverTrigger asChild>

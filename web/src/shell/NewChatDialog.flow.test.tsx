@@ -680,6 +680,23 @@ describe("NewChatLandingScreen create flow", () => {
     expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
   });
 
+  it("counts a rejected MCP login as needing sign-in", async () => {
+    writeLastMcpServices(["tracker"]);
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        { id: "tracker", title: "Tracker", auth: "oauth", connected: true, needs_reconnect: true },
+      ],
+    });
+    renderLanding([], { enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    const chip = await screen.findByRole("button", {
+      name: "MCP services: 1 selected, 1 needs sign-in",
+    });
+    fireEvent.click(chip);
+    expect(await screen.findByText("Reconnect needed")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+  });
+
   it.each(["retry", "opt out"])(
     "keeps preferences on a catalog failure and allows %s",
     async (recovery) => {

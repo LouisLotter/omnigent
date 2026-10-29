@@ -29,6 +29,19 @@ from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
 
+#: Connection metadata key set when the provider rejects a saved login; the value
+#: names the rejection. Saving a new grant replaces the metadata and clears it.
+NEEDS_RECONNECT = "needs_reconnect"
+
+
+def needs_reconnect(connection: ProviderConnection | None) -> bool:
+    """Whether the provider rejected this saved login since it was stored."""
+    return connection is not None and bool(connection.metadata.get(NEEDS_RECONNECT))
+
+
+class McpGrantRejected(ConnectionError):
+    """The token endpoint answered ``invalid_grant``: the grant is revoked or expired."""
+
 
 class McpUpstreamError(ConnectionError):
     """Credential-safe diagnosis of an upstream request failure."""
@@ -223,13 +236,21 @@ class McpRegistry:
             if conn is None or not conn.secret or not conn.secret.get("access_token"):
                 raise ConnectionError("Connect this MCP account in Settings > MCP")
             expiry = conn.metadata.get("expires_at")
-            if service.oauth and expiry is not None and float(expiry) <= time.time() + 30:
-                refresh = conn.secret.get("refresh_token")
+            refresh = conn.secret.get("refresh_token")
+            expiring = expiry is not None and float(expiry) <= time.time() + 30
+            # A rejected login refreshes before use even if its access token looks current.
+            if service.oauth and (expiring or (refresh and needs_reconnect(conn))):
                 if not refresh:
                     raise ConnectionError("Reconnect this MCP account in Settings > MCP")
-                tokens = await self.exchange(
-                    service, {"grant_type": "refresh_token", "refresh_token": refresh}
-                )
+                try:
+                    tokens = await self.exchange(
+                        service, {"grant_type": "refresh_token", "refresh_token": refresh}
+                    )
+                except McpGrantRejected:
+                    await self._mark_needs_reconnect(
+                        service, user_id, "refresh_token", refresh, "invalid_grant"
+                    )
+                    raise
                 if tokens.get("refresh_token") is None:
                     tokens["refresh_token"] = refresh
                 try:
@@ -246,6 +267,22 @@ class McpRegistry:
                     raise ConnectionError("MCP account disconnected")
                 return str(tokens["access_token"])
             return str(conn.secret["access_token"])
+
+    async def _mark_needs_reconnect(
+        self, service: McpService, user_id: str, field: str, rejected: str, reason: str
+    ) -> None:
+        """Mark the saved login, unless it no longer holds the *rejected* credential."""
+        assert self.store is not None
+        try:
+            await asyncio.to_thread(
+                self.store.merge_metadata,
+                user_id,
+                f"mcp:{service.id}",
+                {NEEDS_RECONNECT: reason},
+                if_secret_matches={field: rejected},
+            )
+        except Exception:  # noqa: BLE001 — keep the caller's failure; store errors are not useful here
+            _logger.warning("Could not mark MCP service %s for reconnection", service.id)
 
     @staticmethod
     def metadata(tokens: dict[str, Any]) -> dict[str, Any]:
@@ -281,7 +318,12 @@ class McpRegistry:
                 "MCP authorization could not reach the provider; try again"
             ) from None
         if response.status_code != 200:
-            raise ConnectionError("MCP authorization failed; reconnect the account")
+            try:
+                error = response.json().get("error")
+            except (ValueError, AttributeError):
+                error = None
+            failure = McpGrantRejected if error == "invalid_grant" else ConnectionError
+            raise failure("MCP authorization failed; reconnect the account")
         try:
             tokens = response.json()
         except ValueError:
@@ -354,6 +396,10 @@ class McpRegistry:
                 failure.kind,
                 failure.status_code,
             )
+            if failure.status_code == 401 and token and service.auth in {"oauth", "bearer"}:
+                await self._mark_needs_reconnect(
+                    service, user_id, "access_token", token, "http_401"
+                )
             raise failure from None
 
 
@@ -370,8 +416,8 @@ class McpOAuthHooks:
     def signing_key(self) -> str:
         return self.registry.state_secret
 
-    def status_fields(self, connection: ProviderConnection | None) -> dict[str, Any]:  # noqa: ARG002
-        return {}
+    def status_fields(self, connection: ProviderConnection | None) -> dict[str, Any]:
+        return {"needs_reconnect": needs_reconnect(connection)}
 
     def begin(self, request: Any, build_state: Any) -> ConnectStart:
         oauth = self.service.oauth

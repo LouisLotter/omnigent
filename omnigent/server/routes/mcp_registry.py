@@ -10,7 +10,12 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.mcp_registry import McpOAuthHooks, McpRegistry, McpUpstreamError
+from omnigent.server.mcp_registry import (
+    McpOAuthHooks,
+    McpRegistry,
+    McpUpstreamError,
+    needs_reconnect,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.connections_base import ConnectionError, create_connection_router
 from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
@@ -50,16 +55,18 @@ def create_mcp_registry_router(
         for service_id in page:
             entry = registry.services[service_id]
             connected = entry.auth == "none"
+            rejected = False
             if entry.auth in {"github", "databricks"}:
                 store = getattr(request.app.state, f"{entry.auth}_store", None)
                 connected = (
                     store is not None and await asyncio.to_thread(store.get, user_id) is not None
                 )
             elif entry.auth in {"oauth", "bearer"} and registry.store is not None:
-                connected = (
-                    await asyncio.to_thread(registry.store.get, user_id, f"mcp:{entry.id}")
-                    is not None
+                connection = await asyncio.to_thread(
+                    registry.store.get, user_id, f"mcp:{entry.id}"
                 )
+                connected = connection is not None
+                rejected = needs_reconnect(connection)
             data.append(
                 {
                     "id": entry.id,
@@ -67,6 +74,7 @@ def create_mcp_registry_router(
                     "description": entry.description,
                     "auth": entry.auth,
                     "connected": connected,
+                    "needs_reconnect": rejected,
                     "tools": entry.tools,
                     "connect_provider": f"mcp-{entry.id}" if entry.oauth else entry.auth,
                 }
