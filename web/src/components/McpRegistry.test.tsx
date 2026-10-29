@@ -72,6 +72,28 @@ describe("MCP account connections", () => {
       expect(screen.getByRole("button", { name: "Disconnect" })).not.toBeDisabled(),
     );
   });
+  it("shows that a rejected login needs reconnecting", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [
+        { ...service, connected: true, needs_reconnect: true },
+        {
+          ...service,
+          id: "wiki",
+          title: "Wiki",
+          auth: "oauth",
+          connect_provider: "mcp-wiki",
+          connected: true,
+          needs_reconnect: true,
+        },
+      ],
+    });
+    render(<McpRegistryConnections />);
+    expect(await screen.findAllByText("Reconnect needed")).toHaveLength(2);
+    expect(screen.queryByText("Connected")).toBeNull();
+    expect(screen.getByRole("button", { name: "Update token" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+    expect(screen.getAllByRole("button", { name: "Disconnect" })).toHaveLength(2);
+  });
 });
 
 describe("MCP service selection", () => {
@@ -144,6 +166,57 @@ describe("MCP service selection", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
     await screen.findByText("Connected");
     expect(toggle).not.toHaveBeenCalled();
+  });
+
+  it("offers Reconnect for a rejected login without re-attaching it", async () => {
+    const oauth = {
+      ...service,
+      auth: "oauth",
+      connect_provider: "mcp-tracker",
+      connected: true,
+      needs_reconnect: true,
+    };
+    const bearer = {
+      ...service,
+      id: "wiki",
+      title: "Wiki",
+      connected: true,
+      needs_reconnect: true,
+    };
+    vi.mocked(registryRequest)
+      .mockResolvedValueOnce({ data: [oauth, bearer] })
+      .mockResolvedValue({ data: [{ ...oauth, needs_reconnect: false }, bearer] });
+    vi.mocked(authorizeRegistryService).mockResolvedValue();
+    const toggle = vi.fn();
+    render(<McpRegistryPicker attached={["tracker", "wiki"]} onToggle={toggle} busy={false} />);
+    expect(await screen.findByText("Reconnect needed")).toBeInTheDocument();
+    expect(screen.getByText("Update your token in settings")).toBeInTheDocument();
+    expect(screen.queryByText("Connected")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    await screen.findByText("Connected");
+    expect(authorizeRegistryService).toHaveBeenCalledWith(
+      oauth,
+      expect.any(AbortSignal),
+      undefined,
+    );
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+    expect(toggle).not.toHaveBeenCalled();
+  });
+
+  it("keeps the Reconnect state when sign-in does not clear it", async () => {
+    const oauth = {
+      ...service,
+      auth: "oauth",
+      connect_provider: "mcp-tracker",
+      connected: true,
+      needs_reconnect: true,
+    };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [oauth] });
+    vi.mocked(authorizeRegistryService).mockResolvedValue();
+    render(<McpRegistryPicker attached={["tracker"]} onToggle={vi.fn()} busy={false} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Account is not connected");
+    expect(screen.getByText("Reconnect needed")).toBeInTheDocument();
   });
 
   it("allows removing disconnected or unavailable services and protects custom server names", async () => {

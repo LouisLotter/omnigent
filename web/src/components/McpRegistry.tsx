@@ -82,8 +82,19 @@ function ServiceConnection({
           <p className="text-sm font-medium">{service.title}</p>
           <p className="text-sm text-muted-foreground">{service.description}</p>
         </div>
-        <span className="text-xs text-muted-foreground">
-          {service.connected ? "Connected" : "Not connected"}
+        <span
+          className={cn(
+            "text-xs",
+            service.needs_reconnect
+              ? "text-amber-600 dark:text-amber-500"
+              : "text-muted-foreground",
+          )}
+        >
+          {service.needs_reconnect
+            ? "Reconnect needed"
+            : service.connected
+              ? "Connected"
+              : "Not connected"}
         </span>
       </div>
       <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
@@ -228,9 +239,9 @@ export function McpRegistryPicker({
     [onAuthorizingChange],
   );
 
-  async function enable(service: RegistryService, workspaceUrl?: string) {
+  async function enable(service: RegistryService, workspaceUrl?: string, reconnect = false) {
     setConnectionError(null);
-    if (service.connected) {
+    if (service.connected && !reconnect) {
       onToggle(service.id, true);
       return;
     }
@@ -245,8 +256,8 @@ export function McpRegistryPicker({
     try {
       await authorizeRegistryService(service, controller.signal, workspaceUrl);
       setWorkspaceService(null);
-      const updated = await refresh();
-      if (!updated?.find((s) => s.id === service.id)?.connected) {
+      const current = (await refresh())?.find((s) => s.id === service.id);
+      if (!current?.connected || current.needs_reconnect) {
         throw new Error("Account is not connected. Please try again.");
       }
       if (!controller.signal.aborted && !attached.includes(service.id)) onToggle(service.id, true);
@@ -288,6 +299,10 @@ export function McpRegistryPicker({
         {services.map((service) => {
           const selected = attached.includes(service.id);
           const tokenNeeded = service.auth === "bearer" && !service.connected;
+          const rejected = service.connected && !!service.needs_reconnect;
+          const signInOffered =
+            selected &&
+            ((!service.connected && !tokenNeeded) || (rejected && service.auth !== "bearer"));
           const conflict = reservedNames?.includes(service.id);
           return (
             <li key={service.id} className="px-3 py-1.5">
@@ -299,7 +314,10 @@ export function McpRegistryPicker({
                     <span
                       className={cn(
                         "block text-xs",
-                        selected && !service.connected && authorizing !== service.id && !conflict
+                        selected &&
+                          (!service.connected || rejected) &&
+                          authorizing !== service.id &&
+                          !conflict
                           ? "text-amber-600 dark:text-amber-500"
                           : "text-muted-foreground",
                       )}
@@ -308,13 +326,17 @@ export function McpRegistryPicker({
                         ? "A custom server already uses this name"
                         : authorizing === service.id
                           ? "Authorizing…"
-                          : service.connected
-                            ? service.auth === "none"
-                              ? "Ready"
-                              : "Connected"
-                            : tokenNeeded
-                              ? "Connect your account in settings"
-                              : "Needs sign-in"}
+                          : rejected
+                            ? service.auth === "bearer"
+                              ? "Update your token in settings"
+                              : "Reconnect needed"
+                            : service.connected
+                              ? service.auth === "none"
+                                ? "Ready"
+                                : "Connected"
+                              : tokenNeeded
+                                ? "Connect your account in settings"
+                                : "Needs sign-in"}
                     </span>
                   </span>
                 </span>
@@ -327,12 +349,12 @@ export function McpRegistryPicker({
                   }
                 />
               </label>
-              {selected && !service.connected && !tokenNeeded && (
+              {signInOffered && (
                 <Button
                   size="sm"
                   variant="link"
                   disabled={busy || authorizing !== null}
-                  onClick={() => void enable(service)}
+                  onClick={() => void enable(service, undefined, true)}
                 >
                   Reconnect
                 </Button>
