@@ -108,6 +108,24 @@ def test_merge_metadata_leaves_the_secret_ciphertext_alone(db_uri: str) -> None:
     assert store.merge_metadata("ghost", "mcp:tracker", {"needs_reconnect": "x"}) is False
 
 
+def test_merge_metadata_does_not_lose_a_concurrent_merge(db_uri: str) -> None:
+    cipher = _FakeCipher()
+    store = CredentialStore(db_uri, cipher)
+    store.upsert("bob", "mcp:tracker", secret={"access_token": "tok"}, metadata={})
+    decrypt = cipher.decrypt
+
+    def merged_meanwhile(ciphertext: str, *, context: Any) -> str | None:
+        cipher.decrypt = decrypt
+        assert store.merge_metadata("bob", "mcp:tracker", {"other": 1})
+        return decrypt(ciphertext, context=context)
+
+    cipher.decrypt = merged_meanwhile
+    check = {"access_token": "tok"}
+    assert not store.merge_metadata("bob", "mcp:tracker", {"m": 1}, if_secret_matches=check)
+    conn = store.get("bob", "mcp:tracker")
+    assert conn is not None and conn.metadata == {"other": 1}
+
+
 def test_merge_metadata_only_marks_the_secret_it_checked(db_uri: str) -> None:
     cipher = _FakeCipher()
     store = CredentialStore(db_uri, cipher)
