@@ -3402,8 +3402,14 @@ function ComposerImpl(
         const service = registryCatalog.services.find((s) => s.id === server.name);
         if (service) {
           row.description = service.description || row.description;
-          row.connection = service.connected ? "connected" : "sign-in-required";
-          if (!service.connected) {
+          // A login the provider rejected still exists but has to be signed in again.
+          row.connection =
+            service.connected && service.needs_reconnect
+              ? "reconnect-required"
+              : service.connected
+                ? "connected"
+                : "sign-in-required";
+          if (row.connection !== "connected") {
             // A token or workspace URL has to be typed, which the panel has no room for.
             row.signIn =
               service.auth === "bearer" || service.auth === "databricks"

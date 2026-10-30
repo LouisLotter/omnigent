@@ -3641,6 +3641,51 @@ describe("Composer MCP status command", () => {
     },
   );
 
+  it("marks a rejected registry login as needing reconnection and reconnects it", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(authorizeRegistryService).mockReset();
+    const rejected = { ...trackerService, connected: true, needs_reconnect: true };
+    const rejectedToken = { ...rejected, id: "wiki", auth: "bearer" as const };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [rejected, rejectedToken] });
+    let finishSignIn!: () => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishSignIn = resolve;
+      }),
+    );
+    renderWithRegistry([
+      { name: "tracker", transport: "registry" },
+      { name: "wiki", transport: "registry" },
+    ]);
+
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    const tracker = await screen.findByTestId("mcp-server-row-tracker");
+    expect(tracker).toHaveTextContent("Reconnect needed");
+    expect(tracker).not.toHaveTextContent("Connected");
+    expect(screen.getByTestId("mcp-server-row-wiki")).toHaveTextContent("Reconnect needed");
+    // A token is retyped in Settings; only the OAuth login reconnects in place.
+    expect(screen.getByRole("link", { name: "Sign in from Settings" })).toHaveAttribute(
+      "href",
+      "/settings/mcp",
+    );
+    expect(screen.getAllByRole("button", { name: "Reconnect" })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    expect(authorizeRegistryService).toHaveBeenCalledWith(
+      rejected,
+      expect.any(AbortSignal),
+      undefined,
+    );
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ ...rejected, needs_reconnect: false }, rejectedToken],
+    });
+    await act(async () => finishSignIn());
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent("Connected"),
+    );
+    expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+  });
+
   it("does not reuse the previous open's catalog when /mcp is reopened", async () => {
     vi.mocked(registryRequest).mockReset();
     vi.mocked(registryRequest).mockResolvedValue({ data: [trackerService] });

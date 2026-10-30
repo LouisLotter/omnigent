@@ -153,15 +153,23 @@ export function rankedSlashCommandNames(
     .sort((a, b) => rank(a) - rank(b));
 }
 
-/** Registry connection state for a `/mcp` row; host and custom rows have none. */
-export type McpServerConnection = "connected" | "sign-in-required" | "unavailable";
+/**
+ * Registry connection state for a `/mcp` row; host and custom rows have none.
+ * `reconnect-required` is a saved login the provider has since rejected.
+ */
+export type McpServerConnection =
+  "connected" | "sign-in-required" | "reconnect-required" | "unavailable";
+
+function needsSignIn(connection?: McpServerConnection): boolean {
+  return connection === "sign-in-required" || connection === "reconnect-required";
+}
 
 /** One row of the `/mcp` inventory. */
 export interface McpServerRow {
   name: string;
   description?: string | null;
   connection?: McpServerConnection;
-  /** How a `sign-in-required` row signs in; absent rows offer no action. */
+  /** How a row that needs sign-in signs in; absent rows offer no action. */
   signIn?: McpSignIn;
 }
 
@@ -181,6 +189,7 @@ export interface McpSignInError {
 const MCP_CONNECTION_LABEL: Record<McpServerConnection, string> = {
   connected: "Connected",
   "sign-in-required": "Sign-in required",
+  "reconnect-required": "Reconnect needed",
   unavailable: "Not available to your account",
 };
 
@@ -213,7 +222,7 @@ interface SlashCommandMenuProps {
   mcpServers?: readonly McpServerRow[];
   mcpServersStatus?: string;
   mcpSettingsHref?: string;
-  /** Start the in-place sign-in for a `sign-in-required` row, by row name. */
+  /** Start the in-place sign-in for a row that needs it, by row name. */
   onMcpSignIn?: (name: string) => void;
   /** Row whose sign-in popup is open, if any. */
   mcpAuthorizingName?: string | null;
@@ -221,7 +230,7 @@ interface SlashCommandMenuProps {
 }
 
 function McpConnectionIcon({ connection }: { connection?: McpServerConnection }) {
-  if (connection === "sign-in-required")
+  if (needsSignIn(connection))
     return (
       <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
     );
@@ -290,7 +299,11 @@ function McpSignInAction({
       onClick={() => onSignIn(server.name)}
     >
       {signingIn && <LoaderCircleIcon aria-hidden="true" className="size-3 animate-spin" />}
-      {signingIn ? "Signing in…" : "Sign in"}
+      {signingIn
+        ? "Signing in…"
+        : server.connection === "reconnect-required"
+          ? "Reconnect"
+          : "Sign in"}
     </button>
   );
 }
@@ -320,7 +333,7 @@ function McpServerRows({
   return (
     <>
       {servers?.map((server) => {
-        const needsSignIn = server.connection === "sign-in-required";
+        const signInNeeded = needsSignIn(server.connection);
         return (
           <div
             key={server.name}
@@ -340,14 +353,14 @@ function McpServerRows({
                   <div
                     className={cn(
                       "text-xs leading-4",
-                      needsSignIn ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
+                      signInNeeded ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
                     )}
                   >
                     {MCP_CONNECTION_LABEL[server.connection]}
                   </div>
                 )}
               </div>
-              {needsSignIn && (
+              {signInNeeded && (
                 <McpSignInAction
                   server={server}
                   signingIn={authorizingName === server.name}
