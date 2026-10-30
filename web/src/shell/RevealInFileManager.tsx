@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   getHostIdentity,
+  isElectronShell,
   onHostStatusChanged,
   revealFile,
   supportsFileReveal,
@@ -44,8 +45,8 @@ function readLocalHostId() {
   });
 }
 
-function subscribeToHostId(listener: () => void) {
-  if (!watchingHost && supportsFileReveal()) {
+function watchHostId(shouldWatch: boolean, listener: () => void) {
+  if (!watchingHost && shouldWatch) {
     watchingHost = true;
     readLocalHostId();
     onHostStatusChanged(readLocalHostId);
@@ -54,6 +55,14 @@ function subscribeToHostId(listener: () => void) {
   return () => {
     hostIdListeners.delete(listener);
   };
+}
+
+const subscribeToHostId = (listener: () => void) => watchHostId(supportsFileReveal(), listener);
+const subscribeToDesktopHostId = (listener: () => void) => watchHostId(isElectronShell(), listener);
+
+/** This machine's host id from the desktop shell; null in a browser or before its first connect. */
+export function useDesktopHostId(): string | null {
+  return useSyncExternalStore(subscribeToDesktopHostId, () => localHostId);
 }
 
 function useLocalHostId(): string | null {
@@ -77,15 +86,17 @@ export function useRevealTarget(path: string | null): RevealTarget | null {
   return { hostId, path: joinPath(joinPath(root, base), path) };
 }
 
+/** This OS's file manager name: "Finder", "File Explorer", or "file manager". */
+export function fileManagerName(): string {
+  const userAgent = navigator.userAgent;
+  if (userAgent.includes("Macintosh")) return "Finder";
+  if (userAgent.includes("Windows")) return "File Explorer";
+  return "file manager";
+}
+
 /** "Show in Finder" for a file (selected in its folder), "Open in Finder" for a folder. */
 export function revealLabel(directory: boolean): string {
-  const userAgent = navigator.userAgent;
-  const app = userAgent.includes("Macintosh")
-    ? "Finder"
-    : userAgent.includes("Windows")
-      ? "File Explorer"
-      : "file manager";
-  return `${directory ? "Open" : "Show"} in ${app}`;
+  return `${directory ? "Open" : "Show"} in ${fileManagerName()}`;
 }
 
 export function revealInFileManager(target: RevealTarget): void {

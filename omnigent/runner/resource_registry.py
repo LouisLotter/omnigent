@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -40,11 +40,16 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR, CLIENT_SURFACES
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
@@ -171,7 +176,7 @@ class TerminalExitEvent:
         specs may contain credentials or other launch-only secrets.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
-    :param exit_status: The inner process's exit code, when tmux captured one
+    :param exit_status: The launched command's exit code, when tmux captured one
         from ``#{pane_dead_status}`` (terminals with ``keep_alive_after_exit``).
         ``None`` when unknown — e.g. the tmux server vanished before the status
         could be read, or the terminal doesn't keep the pane alive after exit.
@@ -179,6 +184,14 @@ class TerminalExitEvent:
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
         finished; ``False`` (the default — last seen ``running``, or never
         observed) keeps a mid-turn crash or boot failure a failure.
+    :param expected_close: ``True`` when Omnigent killed the pane itself to
+        fail the turn (a delivery timeout). That turn reports its own error,
+        so the exit is not a second failure.
+    :param closed_outside_omnigent: ``True`` when tmux reported the Claude
+        session or its server gone and Omnigent had not killed it, e.g. a
+        ``tmux kill-session`` or ``killall tmux`` run on the host.
+    :param terminal_instance_id: Identity of the observed terminal instance.
+    :param lifecycle_context: Content-free evidence captured before exit cleanup.
     """
 
     session_id: str
@@ -192,6 +205,70 @@ class TerminalExitEvent:
     last_output: str | None = None
     exit_status: int | None = None
     session_was_idle: bool = False
+    expected_close: bool = False
+    closed_outside_omnigent: bool = False
+    terminal_instance_id: str | None = None
+    lifecycle_context: dict[str, str] = field(default_factory=dict)
+
+
+def _terminal_lifecycle_context(
+    instance: TerminalInstance | None, resource_role: str | None
+) -> dict[str, str]:
+    """Freeze launch evidence before cleanup without changing exit handling.
+
+    The size-bounded read assumes runner-local temporary storage for bridge files.
+    """
+    if instance is None:
+        return {}
+    context: dict[str, object] = {}
+    if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+        context.update(
+            claude_session_end_reason="unknown",
+            claude_session_end_evidence="not_observed",
+        )
+    try:
+        context.update(instance.lifecycle_trace.snapshot())
+        context["terminal_exit_signal"] = instance.last_exit_signal()
+        if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+            from omnigent.harnesses.claude_native.bridge import bridge_dir_from_launch_args
+            from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
+
+            evidence = read_lifecycle_snapshot(
+                bridge_dir_from_launch_args(instance.args),
+                instance.diagnostic_id,
+                instance.lifecycle_trace.launch_id,
+            )
+            context.update(
+                claude_lifecycle=evidence,
+                claude_lifecycle_read_status=evidence.get("read_status"),
+                claude_session_id=evidence.get("claude_session_id"),
+                claude_session_end_reason=evidence["session_end_reason"],
+                claude_session_end_evidence=evidence["session_end_evidence"],
+                claude_session_end_identity=evidence.get("session_end_identity"),
+                claude_hook_turn_in_progress=evidence.get("hook_turn_in_progress"),
+            )
+            session_end = evidence.get("session_end")
+            if isinstance(session_end, dict):
+                context.update(
+                    claude_session_end_at=session_end.get("recorded_at"),
+                    claude_session_end_last_observed_at=session_end.get("last_recorded_at"),
+                    claude_session_end_event_id=session_end.get("event_id"),
+                    claude_session_end_bridge_session_id=session_end.get("bridge_session_id"),
+                    claude_session_end_reason_status=session_end.get("reason_status"),
+                    claude_session_end_signal=session_end.get("signal"),
+                    claude_session_end_observation_count=session_end.get("observation_count"),
+                    claude_session_end_timestamp_source="hook_received",
+                )
+    except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the terminal outcome.
+        context["lifecycle_capture_failed"] = True
+        context["lifecycle_capture_error_type"] = type(exc).__name__
+    try:
+        return lifecycle_log_attributes(context)
+    except Exception as exc:  # noqa: BLE001 - even serialization must not prevent exit cleanup.
+        return {
+            "lifecycle_capture_failed": "true",
+            "lifecycle_capture_error_type": type(exc).__name__,
+        }
 
 
 def trim_terminal_output(text: str | None) -> str | None:
@@ -212,6 +289,31 @@ def trim_terminal_output(text: str | None) -> str | None:
     if len(body) < len(full):
         return f"... omitted {len(full) - len(body)} earlier character(s) ...\n{body}"
     return body
+
+
+def redacted_terminal_output(text: str | None) -> str | None:
+    """Redact credentials from a whole pane frame, then bound it for telemetry.
+
+    Redacting before trimming keeps a long credential from losing its
+    identifying prefix at the truncation boundary.
+    """
+    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+
+    return trim_terminal_output(sanitize_diagnostic_text(text or ""))
+
+
+def _pane_closed_by_omnigent(private_dir: Path) -> bool:
+    """Whether Omnigent killed the Claude pane in *private_dir* to fail its turn."""
+    from omnigent.harnesses.claude_native.bridge import pane_closed_by_omnigent
+
+    return pane_closed_by_omnigent(private_dir)
+
+
+def _pane_killed_by_omnigent(private_dir: Path) -> bool:
+    """Whether Omnigent itself killed the Claude pane in *private_dir*."""
+    from omnigent.harnesses.claude_native.bridge import pane_killed_by_omnigent
+
+    return pane_killed_by_omnigent(private_dir)
 
 
 def _terminal_exit_diagnostics(
@@ -295,7 +397,7 @@ def _native_input_ready_probe(
         return None
     try:
         return resolve_hook_for_key(agent.key, "input_ready_probe")
-    except Exception:  # noqa: BLE001 - see docstring.
+    except Exception:
         _logger.warning(
             "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
             resource_role,
@@ -400,6 +502,7 @@ class SessionResourceRegistry:
         *,
         per_session_workspace: bool = False,
     ) -> None:
+        self._feature_flags = resolve_feature_flags()
         self._terminal_registry = terminal_registry
         if terminal_registry is not None:
             terminal_registry.environment_resolver = self._resolve_terminal_environment
@@ -407,10 +510,11 @@ class SessionResourceRegistry:
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
+        self._client_surfaces: dict[str, str] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
-        self._is_alive_cache: TTLCache[str, bool] = TTLCache(
+        self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
         )
@@ -442,11 +546,9 @@ class SessionResourceRegistry:
         # which the turn-start hook also writes — deduping against that one
         # would swallow the turn's real ``running``.
         self._published_session_status: dict[str, tuple[str, str | None]] = {}
-        # Live claude-native status-file pollers, per session. Held so a
-        # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
-        # poller keeps its own edge/mtime baselines on the watcher thread, and
-        # clearing the registry's baseline alone would leave those intact.
-        self._status_pollers: dict[str, SessionStatusPoller] = {}
+        # Per-session pollers need re-arming after reconnects or forwarded
+        # idle statuses because they keep their own edge/mtime baselines.
+        self._status_pollers: dict[str, SessionStatusPoller | ClaudeProgramStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
         # lifecycle relationship so the runner can decide whether the owning
@@ -457,6 +559,18 @@ class SessionResourceRegistry:
         # instead of polling. Entries self-remove on completion.
         self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
         self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
+
+    def set_client_surface(self, session_id: str, surface: str | None) -> None:
+        """Retain the session's creating surface across harness and terminal relaunches."""
+        with self._lock:
+            self._client_surfaces[session_id] = (
+                surface if surface is not None and surface in CLIENT_SURFACES else "unknown"
+            )
+
+    def client_surface_env(self, session_id: str) -> dict[str, str]:
+        """Build launch metadata without inheriting another session's client identity."""
+        with self._lock:
+            return {CLIENT_SURFACE_ENV_VAR: self._client_surfaces.get(session_id, "unknown")}
 
     def set_terminal_activity_publisher(
         self,
@@ -569,9 +683,14 @@ class SessionResourceRegistry:
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
-        """Adopt an externally-published *status* as the dedup baseline."""
+        """Adopt an external status and re-arm its file poller after idle."""
         with self._lock:
             self._published_session_status[session_id] = (status, None)
+            poller = self._status_pollers.get(session_id)
+        # A queued turn can hide the idle file edge. Re-arm only for idle so a
+        # stale busy file cannot clear a forwarded failure.
+        if status == "idle" and poller is not None:
+            poller.resync()
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -631,6 +750,7 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
         self._set_session_status_memo(session_id, "running")
+        self._note_terminal_status(session_id, "running", "runner_turn_start")
 
     def note_external_session_status(self, session_id: str, status: str) -> None:
         """Record a terminal-observed external status for exit classification.
@@ -641,11 +761,10 @@ class SessionResourceRegistry:
         clean shutdown, while ``running`` / ``waiting`` still classify a later
         exit as mid-turn.
 
-        Also adopts *status* as the watcher's dedup baseline. The forwarder
-        publishes these edges directly to the server, so without this the
-        watcher would still believe its own last edge is live and swallow the
-        next turn's ``running`` as a duplicate — leaving the session stuck on
-        the hook's ``idle`` with no working indicator for the whole turn.
+        Also adopts *status* as the watcher's dedup baseline and re-arms its
+        status-file poller after ``idle``. The forwarder publishes directly
+        to the server, so both caches must catch up or they can swallow the
+        next turn's ``running`` as a duplicate, leaving it on the hook's ``idle``.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
@@ -655,6 +774,52 @@ class SessionResourceRegistry:
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
+        self._note_terminal_status(session_id, status, "forwarded_status")
+
+    def _note_terminal_status(self, session_id: str, status: str, source: str) -> None:
+        """Attach external status edges to the owning Claude terminal's history."""
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    == CLAUDE_NATIVE_TERMINAL_ROLE
+                ):
+                    entry.instance.lifecycle_trace.note_status(status, source)
+            except Exception as exc:  # noqa: BLE001 - diagnostics cannot affect status handling.
+                _logger.debug("Terminal status telemetry failed (%s)", type(exc).__name__)
+
+    def note_terminal_control_request(self, session_id: str, action: str) -> None:
+        """Record explicit runner requests separately from process exit and cleanup."""
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    != CLAUDE_NATIVE_TERMINAL_ROLE
+                ):
+                    continue
+                entry.instance.lifecycle_trace.note_request(action, "runner_request")
+                if not _logger.isEnabledFor(logging.INFO):
+                    continue
+                _logger.info(
+                    "Native terminal control requested: %s",
+                    action,
+                    extra=debug_event(
+                        "native_terminal_control_requested",
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=entry.instance.diagnostic_id,
+                        action=action,
+                        **_terminal_lifecycle_context(entry.instance, CLAUDE_NATIVE_TERMINAL_ROLE),
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent control requests.
+                _logger.debug("Native terminal control telemetry failed (%s)", type(exc).__name__)
 
     @property
     def terminal_registry(self) -> TerminalRegistry | None:
@@ -753,7 +918,8 @@ class SessionResourceRegistry:
 
         The ``is_alive()`` subprocess probe is cached for a short TTL
         so rapid polling from web clients does not fork a ``tmux
-        has-session`` process on every request.
+        has-session`` process on every request. The result belongs to the
+        probed instance; a replacement at the same resource id needs its own probe.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id,
@@ -774,12 +940,12 @@ class SessionResourceRegistry:
 
             cache_key = f"{session_id}:{terminal_id}"
             cached = self._is_alive_cache.get(cache_key)
-            if cached is not None:
-                return terminal_resource_view(session_id, entry) if cached else None
+            if cached is entry.instance:
+                return terminal_resource_view(session_id, entry)
 
             alive = await entry.instance.is_alive()
             if alive:
-                self._is_alive_cache[cache_key] = True
+                self._is_alive_cache[cache_key] = entry.instance
             else:
                 self._is_alive_cache.pop(cache_key, None)
                 return None
@@ -1148,6 +1314,13 @@ class SessionResourceRegistry:
 
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
+        spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
+        program_status_args = (
+            {"program_status_app": "claude-code"}
+            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+            and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)
+            else {}
+        )
         try:
             instance = await self._terminal_registry.launch(
                 conversation_id=session_id,
@@ -1157,6 +1330,7 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
+                **program_status_args,
             )
         except TerminalExitedDuringLaunch as exc:
             await self._finalize_terminal_exit(
@@ -1345,43 +1519,69 @@ class SessionResourceRegistry:
         last_activity_emit: dict[str, float | None] = {"value": None}
 
         def _publish_status(
-            status: str, blocked_on: str | None = None, *, record_activity: bool = False
+            status: str,
+            blocked_on: str | None = None,
+            *,
+            record_activity: bool = False,
+            failure_activity_epoch: int | None = None,
         ) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
             # are loop-only). Shared by the PTY edges and the claude-native
-            # status-file poller so both go through the same dedup/memo. The
+            # structured-state poller so both go through the same dedup/memo. The
             # dedup baseline lives on the registry, not this closure, so a
             # forwarder's hook-derived edge resyncs it (see
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
+            if status == "failed":
+                if failure_activity_epoch is None:
+                    epoch = self.session_activity_epoch(session_id)
+                    loop.call_soon_threadsafe(
+                        lambda: _publish_status(
+                            status,
+                            blocked_on,
+                            record_activity=record_activity,
+                            failure_activity_epoch=epoch,
+                        )
+                    )
+                    return
+                # A hook or another turn may arrive while the watcher callback is queued.
+                if (
+                    not self.session_turn_is_active(session_id)
+                    or self.session_activity_epoch(session_id) != failure_activity_epoch
+                ):
+                    return
             explicit_activity = record_activity and status in {"running", "waiting"}
             if explicit_activity:
                 self._set_session_status_memo(session_id, status)
             if not self._claim_status_edge(session_id, status, blocked_on):
                 return
+            with contextlib.suppress(Exception):
+                reader = getattr(instance, "program_status", None)
+                instance.lifecycle_trace.note_status(
+                    status,
+                    "program_status"
+                    if record_activity and reader is not None and reader.status is not None
+                    else "claude_status_file"
+                    if record_activity
+                    else "pane_activity",
+                )
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
                 self._set_session_status_memo(session_id, status, record_activity=False)
-            loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+            if status == "failed":
+                status_publisher(session_id, status, blocked_on)
+            else:
+                loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
 
-        def _file_owns_status() -> bool:
-            # Once Claude's own status file is readable it is the session's
-            # status: it reports what Claude is doing, where the pane diff only
-            # infers it from redraws. The pane keeps its activity-badge and
-            # pane-death jobs, but must not publish status alongside the file —
-            # two publishers is what made a post-turn redraw fight the file's
-            # ``idle`` and needed a freshness window to arbitrate.
+        def _structured_status_active() -> bool:
+            # Explicit Claude state owns the indicator; pane changes still drive
+            # activity badges and process-death detection.
             return status_poller is not None and status_poller.active
 
-        # claude-native additionally reads Claude's own ``sessions/<pid>.json``
-        # status (present since Claude Code v2.1.139): it flips on the real
-        # turn edge and knows when a dialog owns the input, neither of which
-        # the PTY frame-diff can see. It supplements the PTY watcher rather
-        # than replacing it — the file is written only on a value *change*, so
-        # it cannot be trusted to re-assert a status it already holds. Built
-        # only for the claude-native role; other native roles stay PTY-only.
+        # Claude reports explicit state through OSC when opted in, with its
+        # sessions/<pid>.json file as fallback. Other roles retain pane inference.
         status_poller = (
             self._build_claude_native_status_poller(
                 session_id=session_id,
@@ -1423,7 +1623,7 @@ class SessionResourceRegistry:
                             expected_socket_path=str(instance.socket_path),
                             expected_tmux_target=instance.tmux_target,
                         )
-                except Exception:  # noqa: BLE001 - keep lifecycle observation running.
+                except Exception:
                     _logger.debug(
                         "Claude auto-mode billing notice acknowledgement failed",
                         exc_info=True,
@@ -1446,6 +1646,8 @@ class SessionResourceRegistry:
                         )
 
         def _on_activity() -> None:
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_activity()
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
             #
@@ -1466,12 +1668,14 @@ class SessionResourceRegistry:
             # Pane changed → the agent is working. Coalesce to the
             # idle→running edge so a continuously-redrawing pane doesn't
             # re-emit ``running`` every poll. Skipped once the status file owns
-            # the session (see :func:`_file_owns_status`) — a post-turn prompt
+            # the session (see :func:`_structured_status_active`) — a post-turn prompt
             # redraw is not a new turn, and the file already said so.
-            if emit_status and not _file_owns_status():
+            if emit_status and not _structured_status_active():
                 _publish_status("running")
 
         def _on_exit() -> None:
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_exit()
             # The pane's process is gone, which the status file cannot report —
             # a killed Claude never unlinks it, so the record survives holding
             # its last value. Retire the poller before classifying the exit so
@@ -1487,6 +1691,9 @@ class SessionResourceRegistry:
                         session_key=session_key,
                         lifecycle=lifecycle,
                         instance=instance,
+                        reached_input_ready=(
+                            native_input_ready if input_ready_probe is not None else None
+                        ),
                     )
                 )
                 self._terminal_exit_tasks.add(task)
@@ -1539,7 +1746,7 @@ class SessionResourceRegistry:
             # file can tell that from a finished one.
             # Edge ordering: the watcher thread runs idle/exit serially, so
             # this idle commits before any later on_exit reads the memo.
-            if not _file_owns_status():
+            if not _structured_status_active():
                 _publish_status("idle")
             # Clear the activity throttle so the next working episode emits
             # its first pulse immediately, keeping the activity badge
@@ -1564,26 +1771,8 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None], None],
-    ) -> SessionStatusPoller:
-        """Build the claude-native ``sessions/<pid>.json`` status poller.
-
-        Keyed primarily by the terminal's pane pid (which equals Claude's
-        pid on this launch path, so the file is ``<pane_pid>.json``), with
-        Claude's own session uuid — read lazily from the bridge state once
-        a hook reports it — as a cross-check and scan fallback.
-
-        Lazy-imported so the generic runner module keeps no claude-native
-        import at load time (mirrors the rest of the native wiring).
-
-        :param session_id: Owning session/conversation id, used to derive
-            the bridge directory holding the captured Claude session uuid.
-        :param instance: The launched terminal instance (exposes
-            ``pane_pid_sync``).
-        :param on_status: Callback fired as ``(status, blocked_on)`` on each
-            transition, where *status* is ``running`` / ``idle`` and
-            *blocked_on* names the dialog the agent is parked on, if any.
-        :returns: A ``SessionStatusPoller`` the watcher drives per tick.
-        """
+    ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
+        """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
@@ -1602,12 +1791,29 @@ class SessionResourceRegistry:
             except Exception:  # noqa: BLE001 - best-effort cross-check; never break the watcher.
                 return None
 
-        return SessionStatusPoller(
+        reader = getattr(instance, "program_status", None)
+        fallback = SessionStatusPoller(
             on_status=on_status,
-            pane_pid_getter=instance.pane_pid_sync,
+            pane_pid_getter=(
+                (lambda: reader.child_pid) if reader is not None else instance.pane_pid_sync
+            ),
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,
         )
+        if reader is not None:
+            from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
+
+            return ClaudeProgramStatusPoller(
+                reader,
+                fallback,
+                on_status,
+                omnigent_session_id=session_id,
+                terminal_instance_id=instance.diagnostic_id,
+                terminal_launch_id=instance.lifecycle_trace.launch_id,
+                turn_is_active=lambda: self.session_turn_is_active(session_id),
+                turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
+            )
+        return fallback
 
     async def _handle_terminal_exit(
         self,
@@ -1617,8 +1823,13 @@ class SessionResourceRegistry:
         session_key: str,
         lifecycle: TerminalLifecycle,
         instance: TerminalInstance | None = None,
+        reached_input_ready: bool | None = None,
     ) -> None:
-        """Clean up and publish lifecycle events for an unexpected terminal exit."""
+        """Clean up and publish lifecycle events for an unexpected terminal exit.
+
+        :param reached_input_ready: Whether a native terminal's input-ready probe
+            ever passed, or ``None`` when the terminal has no probe.
+        """
         terminal_id = terminal_resource_id(terminal_name, session_key)
         current = (
             self._terminal_registry.get(session_id, terminal_name, session_key)
@@ -1656,6 +1867,7 @@ class SessionResourceRegistry:
             lifecycle=lifecycle,
             instance=instance,
             resource_role=observed_role,
+            reached_input_ready=reached_input_ready,
         )
 
     async def _finalize_terminal_exit(
@@ -1668,10 +1880,37 @@ class SessionResourceRegistry:
         instance: TerminalInstance | None,
         resource_role: str | None,
         before_observation: bool = False,
+        reached_input_ready: bool | None = None,
     ) -> None:
         """Preserve exit evidence even when a pane dies before observation starts."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
+        if instance is not None:
+            with contextlib.suppress(Exception):
+                instance.lifecycle_trace.note_exit()
+        lifecycle_context = _terminal_lifecycle_context(instance, resource_role)
+        lifecycle_context.update(
+            terminal_exit_status_source="tmux_pane_dead_status",
+            terminal_exit_status_process="launched_command",
+        )
+        lifecycle_context["session_turn_active_before_exit"] = str(
+            self.session_turn_is_active(session_id)
+        ).lower()
+        lifecycle_context["session_activity_epoch"] = str(self.session_activity_epoch(session_id))
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        expected_close = (
+            instance is not None
+            and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+            and _pane_closed_by_omnigent(instance.private_dir)
+        )
+        closed_outside_omnigent = (
+            instance is not None
+            and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+            and instance.session_killed_by_tmux()
+            and not _pane_killed_by_omnigent(instance.private_dir)
+        )
+        lifecycle_context["terminal_closed_outside_omnigent"] = str(
+            closed_outside_omnigent
+        ).lower()
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1697,17 +1936,25 @@ class SessionResourceRegistry:
             else None
         )
         session_was_idle = session_status_before_exit == "idle"
+        lifecycle_context["session_status_before_exit"] = session_status_before_exit or "unknown"
+        if superseded_by is not None:
+            lifecycle_context.pop("session_turn_active_before_exit", None)
+            lifecycle_context.pop("session_activity_epoch", None)
 
-        # Codex keeps its existing final-screen event. New pre-observation
-        # diagnostics may include recent history only under explicit opt-in.
+        # Codex keeps its existing final-screen event. A native agent that dies
+        # before its input is ready gets one too: with no turn pending, nothing
+        # else records why its launch failed. Pre-observation diagnostics may
+        # include recent history only under explicit opt-in.
+        startup_exit = native_coding_agent_for_harness(resource_role) is not None and (
+            before_observation or reached_input_ready is False
+        )
         redacted_last_output: str | None = None
-        if resource_role == CODEX_NATIVE_TERMINAL_ROLE:
-            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+        output_attributes: dict[str, str] = {}
+        if resource_role == CODEX_NATIVE_TERMINAL_ROLE or startup_exit:
             from omnigent.process_logging import harness_stderr_capture_enabled
 
-            if not before_observation or harness_stderr_capture_enabled():
-                # Redact the complete frame before trimming, so a long credential
-                # cannot lose its identifying prefix at the truncation boundary.
+            output_allowed = not before_observation or harness_stderr_capture_enabled()
+            if output_allowed:
                 raw_output = last_output
                 if instance is not None:
                     raw_output = (
@@ -1715,8 +1962,15 @@ class SessionResourceRegistry:
                         if before_observation
                         else instance.last_pane_text()
                     )
-                redacted_last_output = trim_terminal_output(
-                    sanitize_diagnostic_text(raw_output or "")
+                redacted_last_output = redacted_terminal_output(raw_output)
+            if startup_exit:
+                output_attributes["terminal_exit_during_startup"] = "true"
+                output_attributes["terminal_last_output_status"] = (
+                    "captured"
+                    if redacted_last_output
+                    else "unavailable"
+                    if output_allowed
+                    else "withheld"
                 )
 
         publisher = self._terminal_exit_publisher
@@ -1737,11 +1991,12 @@ class SessionResourceRegistry:
                 terminal_name=terminal_name,
                 terminal_key=session_key,
                 terminal_lifecycle=lifecycle.value,
-                session_status_before_exit=session_status_before_exit or "unknown",
                 terminal_exit_status=exit_status,
                 terminal_last_output=redacted_last_output,
                 before_observation=before_observation,
                 superseded=superseded_by is not None,
+                **output_attributes,
+                **lifecycle_context,
             ),
         )
         if superseded_by is not None:
@@ -1765,6 +2020,10 @@ class SessionResourceRegistry:
                     last_output=last_output,
                     exit_status=exit_status,
                     session_was_idle=session_was_idle,
+                    expected_close=expected_close,
+                    closed_outside_omnigent=closed_outside_omnigent,
+                    terminal_instance_id=instance.diagnostic_id if instance is not None else None,
+                    lifecycle_context=lifecycle_context,
                 )
             )
 
@@ -1786,6 +2045,10 @@ class SessionResourceRegistry:
             session_id,
         ):
             if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                with contextlib.suppress(Exception):
+                    entry.instance.lifecycle_trace.note_request(
+                        "close_terminal", "resource_request"
+                    )
                 _logger.info(
                     "Terminal close requested: session=%s terminal=%s",
                     session_id,
@@ -1796,6 +2059,9 @@ class SessionResourceRegistry:
                         terminal_id=terminal_id,
                         terminal_instance_id=entry.instance.diagnostic_id,
                         terminal_name=entry.terminal_name,
+                        **_terminal_lifecycle_context(
+                            entry.instance, self.terminal_resource_role(session_id, terminal_id)
+                        ),
                     ),
                 )
                 closed = await self._terminal_registry.close(
@@ -1920,6 +2186,7 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
+            self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
             skills_directory = self._codex_skills_dirs.pop(session_id, None)
@@ -1944,7 +2211,11 @@ class SessionResourceRegistry:
 
         if primary is not None:
             try:
-                primary.close()
+                await run_sync_cleanup(
+                    primary.close,
+                    component="runner_primary_os_env",
+                    session_id=session_id,
+                )
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",

@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from fastapi.responses import JSONResponse
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -132,6 +134,10 @@ class _SubagentWorkEntry:
         the parent's inbox.
     :param cancellation_confirmed: Whether a native terminal edge confirmed
         an abort, rather than an interrupt merely being requested.
+    :param launch_timed_out: Whether the recorded ``failed`` came from the
+        launch-liveness reaper rather than from the child itself. Such a
+        failure is a guess ("no start acknowledgment"), so a genuine
+        terminal edge from the child afterwards must replace it.
     """
 
     parent_session_id: str
@@ -147,6 +153,7 @@ class _SubagentWorkEntry:
     completed_at: float | None = None
     delivered: bool = False
     cancellation_confirmed: bool = False
+    launch_timed_out: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -426,6 +433,46 @@ def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
     return agent is not None and wrapper_label == agent.subagent_wrapper_label
 
 
+def latest_wake_eligible_subagent_work(
+    entries: list[_SubagentWorkEntry],
+) -> _SubagentWorkEntry | None:
+    """
+    The most recently completed entry that still owes the parent an inbox wake.
+
+    Stranded-wake recovery nudges an idle parent to drain its inbox, so it must
+    skip codex-native sub-agents: a suppressed thread completing after an
+    independent child would otherwise shadow the child's stranded wake, which
+    the ownership guard then drops.
+
+    :param entries: Candidate work entries for one parent.
+    :returns: The latest wake-eligible entry, or ``None`` when every entry is a
+        codex-native sub-agent.
+    """
+    eligible = [
+        entry for entry in entries if not is_codex_native_subagent_wrapper(entry.wrapper_label)
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
+    )
+
+
+def wrapper_label_from_labels(labels: object) -> str | None:
+    """
+    Return a child's ``omnigent.wrapper`` label from its session labels.
+
+    :param labels: Session labels as the server returns them, e.g.
+        ``{"omnigent.wrapper": "codex-native-ui"}``.
+    :returns: The wrapper label, or ``None`` when absent or not a string.
+    """
+    if not isinstance(labels, Mapping):
+        return None
+    wrapper = labels.get(WRAPPER_LABEL_KEY)
+    return wrapper if isinstance(wrapper, str) and wrapper else None
+
+
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
     """
     Return the dispatch id of a child turn whose result the parent never drained.
@@ -549,7 +596,8 @@ async def _recover_subagent_results_from_server(
         interrupted = status == "in_progress" or (
             status == "failed"
             and isinstance(error, dict)
-            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+            and error.get("code")
+            in {"runner_disconnected", "runner_failed_to_start", RUNNER_PROCESS_CRASH}
         )
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
@@ -558,8 +606,9 @@ async def _recover_subagent_results_from_server(
             child_id in _drained_delivered_subagent_children
         ):
             continue
-        labels = child.get("labels")
-        dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
+        raw_labels = child.get("labels")
+        labels = raw_labels if isinstance(raw_labels, dict) else {}
+        dispatch_id = undelivered_subagent_dispatch_id(labels)
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
@@ -581,6 +630,7 @@ async def _recover_subagent_results_from_server(
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
+            wrapper_label=wrapper_label_from_labels(labels),
             work_id=dispatch_id,
         )
         if interrupted:
@@ -666,6 +716,14 @@ def mark_subagent_work_terminal(
             entry.output = output
             entry.completed_at = time.time()
             entry.delivered = False
+            return _deliver_subagent_completion(entry)
+        # A child-reported terminal state supersedes the reaper's provisional failure.
+        if entry.launch_timed_out and status in ("completed", "failed"):
+            entry.status = status
+            entry.output = output
+            entry.completed_at = time.time()
+            entry.delivered = False
+            entry.launch_timed_out = False
             return _deliver_subagent_completion(entry)
         if entry.delivered:
             return _SubagentDeliveryAck(
@@ -791,6 +849,7 @@ def reap_stalled_subagent_launches(
             entry.parent_session_id,
             entry.child_session_id,
         )
+        entry.launch_timed_out = True
         deliver(
             entry.child_session_id,
             status="failed",
@@ -829,7 +888,7 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+        except Exception:  # the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 
@@ -930,7 +989,7 @@ async def _deliver_subagent_wake_post(
             # failure — httpx does not raise on status by itself.
             resp.raise_for_status()
             return True
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, httpx.HTTPError) as exc:
             if (
                 attribution_created_by is not None
                 and isinstance(exc, httpx.HTTPStatusError)
