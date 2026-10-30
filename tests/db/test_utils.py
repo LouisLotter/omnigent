@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import Engine, create_engine, event, inspect, text
 
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
@@ -952,6 +952,59 @@ def test_transactional_sqlite_ddl_suspends_foreign_keys_and_restores_them(
                 connection.exec_driver_sql("ALTER TABLE parent_new RENAME TO parent")
             assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
             assert connection.exec_driver_sql("SELECT parent_id FROM child").all() == [(1,)]
+            with pytest.raises(RuntimeError), _transactional_sqlite_ddl(connection):
+                raise RuntimeError("migration failed")
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+def _sqlite_engine_with_begin_recipe(uri: str) -> Engine:
+    """An engine applying SQLAlchemy's documented pysqlite BEGIN recipe itself."""
+    engine = create_engine(uri)
+
+    @event.listens_for(engine, "connect")
+    def _no_implicit_transactions(dbapi_connection: Any, _record: object) -> None:
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _begin(connection: Any) -> None:
+        connection.exec_driver_sql("BEGIN")
+
+    return engine
+
+
+@pytest.mark.parametrize(
+    ("driver_mode", "owned", "rolled_back"),
+    [
+        ("legacy", True, True),
+        ("begin-recipe", False, True),
+        ("autocommit-off", False, True),
+        ("autocommit-on", False, False),
+    ],
+)
+def test_transactional_sqlite_ddl_takes_over_only_implicit_driver_transactions(
+    tmp_path: Path, driver_mode: str, owned: bool, rolled_back: bool
+) -> None:
+    """Engines and drivers that control transactions keep doing so; none begins twice."""
+    uri = f"sqlite:///{tmp_path / 'modes.db'}"
+    engine = {
+        "legacy": lambda: create_engine(uri),
+        "begin-recipe": lambda: _sqlite_engine_with_begin_recipe(uri),
+        "autocommit-off": lambda: create_engine(uri, connect_args={"autocommit": False}),
+        "autocommit-on": lambda: create_engine(uri, connect_args={"autocommit": True}),
+    }[driver_mode]()
+    try:
+        with engine.connect() as connection:
+            with _transactional_sqlite_ddl(connection) as transactional:
+                assert transactional is owned
+                with connection.begin() as transaction:
+                    connection.exec_driver_sql("CREATE TABLE attempt (id INTEGER)")
+                    transaction.rollback()
+            if driver_mode != "autocommit-off":
+                # That mode always holds a transaction by design.
+                assert not connection.connection.driver_connection.in_transaction
+        assert ("attempt" not in inspect(engine).get_table_names()) is rolled_back
     finally:
         engine.dispose()
 

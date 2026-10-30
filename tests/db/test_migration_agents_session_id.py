@@ -325,6 +325,77 @@ def test_upgrade_does_not_cascade_delete_conversations(
     clear_engine_cache()
 
 
+@pytest.mark.parametrize(
+    ("connection_setup", "refused"),
+    [("server-engine", True), ("raw-engine", True), ("enforced-foreign-keys", False)],
+)
+def test_session_agent_downgrade_never_orphans_items(
+    tmp_path: Path, connection_setup: str, refused: bool
+) -> None:
+    """The d7a6b3c91f48 downgrade deletes session conversations and relies on cascades.
+
+    Without SQLite foreign-key enforcement, which transactional migrations
+    turn off, it refuses and keeps the revision and rows; with enforcement,
+    the cascade removes the deleted conversation's items.
+    """
+    uri = f"sqlite:///{tmp_path / 'session_agents.db'}"
+    config = _build_alembic_config(uri)
+    raw_engine = sa.create_engine(uri)
+    with raw_engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, "d7a6b3c91f48")
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversations (id, created_at, updated_at, kind) "
+                "VALUES ('session-conversation', 1, 1, 'default')"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO agents (id, created_at, name, bundle_location, version, session_id)"
+                " VALUES ('session-agent', 1, 'session', 'session-agent/b', 1,"
+                " 'session-conversation')"
+            )
+        )
+        conn.execute(sa.text("UPDATE conversations SET agent_id = 'session-agent'"))
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversation_items (id, conversation_id, response_id, created_at,"
+                " status, position, type, data, search_text) VALUES ('item',"
+                " 'session-conversation', 'response', 1, 'completed', 0, 'message', '{}', '')"
+            )
+        )
+
+    engine = _create_engine(uri) if connection_setup == "server-engine" else raw_engine
+    try:
+        with engine.connect() as conn:
+            if connection_setup != "server-engine":
+                # This begins a transaction the caller owns, keeping the driver's behavior.
+                enforced = connection_setup == "enforced-foreign-keys"
+                conn.exec_driver_sql(f"PRAGMA foreign_keys = {int(enforced)}")
+            config.attributes["connection"] = conn
+            if refused:
+                with pytest.raises(RuntimeError, match="1 session-scoped agents exist"):
+                    command.downgrade(config, "c7f2a1d83e49")
+            else:
+                command.downgrade(config, "c7f2a1d83e49")
+                conn.commit()
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            items = conn.execute(sa.text("SELECT COUNT(*) FROM conversation_items")).scalar_one()
+            conversations = conn.execute(
+                sa.text("SELECT COUNT(*) FROM conversations")
+            ).scalar_one()
+            assert conn.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        if refused:
+            assert (version, conversations, items) == ("d7a6b3c91f48", 1, 1)
+        else:
+            assert (version, conversations, items) == ("c7f2a1d83e49", 0, 0)
+    finally:
+        engine.dispose()
+        raw_engine.dispose()
+
+
 def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
     """Downgrade restores session_id from conversations.agent_id and drops kind.
 

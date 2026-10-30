@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import random
+import sqlite3
 import threading
 import time
 import uuid
@@ -315,8 +316,6 @@ def _create_engine(db_uri: str) -> Engine:
         # benefit — the per-session PRAGMA in
         # :func:`make_managed_session_maker` only fires for code
         # paths that go through that helper.
-        import sqlite3
-
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()
@@ -573,28 +572,38 @@ def _transactional_sqlite_ddl(connection: Connection) -> Iterator[bool]:
 
     :param connection: The connection Alembic will run migrations on.
     :returns: A context manager yielding whether DDL is now transactional;
-        ``False`` for other dialects or when the caller already began a
-        transaction, which then keeps the driver's own behavior.
+        ``False`` for other dialects, when the caller already began a
+        transaction, or when the driver's implicit transactions are turned
+        off (``isolation_level=None``, as in SQLAlchemy's own ``BEGIN``
+        recipe, or Python's ``sqlite3`` ``autocommit`` setting); each keeps
+        its own behavior.
     """
     if connection.dialect.name != "sqlite" or connection.in_transaction():
         yield False
         return
-    import sqlite3
-
     driver_connection = cast(sqlite3.Connection, connection.connection.driver_connection)
+    legacy_control = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", None)
+    if (
+        getattr(driver_connection, "autocommit", legacy_control) != legacy_control
+        or driver_connection.isolation_level is None
+        or driver_connection.in_transaction
+    ):
+        yield False
+        return
     (foreign_keys,) = driver_connection.execute("PRAGMA foreign_keys").fetchone()
-    driver_connection.execute("PRAGMA foreign_keys = OFF")
 
     def begin_immediate(transaction_connection: Connection) -> None:
         # Alembic's autocommit_block() begins in AUTOCOMMIT to run outside a transaction.
         if transaction_connection.get_execution_options().get("isolation_level") != "AUTOCOMMIT":
             transaction_connection.exec_driver_sql("BEGIN IMMEDIATE")
 
-    event.listen(connection, "begin", begin_immediate)
     try:
+        driver_connection.execute("PRAGMA foreign_keys = OFF")
+        event.listen(connection, "begin", begin_immediate)
         yield True
     finally:
-        event.remove(connection, "begin", begin_immediate)
+        if event.contains(connection, "begin", begin_immediate):
+            event.remove(connection, "begin", begin_immediate)
         if not connection.invalidated:
             driver_connection.execute(f"PRAGMA foreign_keys = {int(foreign_keys)}")
 
@@ -614,9 +623,11 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     short-circuit silently skipped those migrations, leaving
     existing DBs missing columns that the runtime expects.
 
-    On SQLite the whole upgrade commits or rolls back as one transaction
-    (see :func:`_transactional_sqlite_ddl`), so an interrupted upgrade
-    leaves the database at its starting revision.
+    On SQLite the upgrade commits or rolls back as one transaction (see
+    :func:`_transactional_sqlite_ddl`), so an interrupted upgrade leaves
+    the database at its starting revision, or at the last point where a
+    migration commits progress on purpose through ``autocommit_block()``.
+    The ``create_all`` that follows only adds missing tables.
 
     :param engine: The SQLAlchemy engine bound to the target
         database.
