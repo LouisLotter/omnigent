@@ -83,6 +83,7 @@ Example catalog entry:
   "description": "Read work tickets",
   "auth": "oauth",
   "connected": true,
+  "needs_reconnect": false,
   "tools": ["read_ticket"],
   "connect_provider": "mcp-tracker"
 }
@@ -90,7 +91,11 @@ Example catalog entry:
 
 `auth` is `none`, `bearer`, `oauth`, `github` or `databricks`. `connected` means a
 connection record exists (or auth is unnecessary), not that all tool calls will
-succeed. The test endpoint lists tools; it does not prove invocation permissions.
+succeed. `needs_reconnect` is true when the provider rejected the saved `oauth` or
+`bearer` login since it was saved: a refresh answered `invalid_grant`, or the
+service answered HTTP 401 to the stored access token. The record is kept; a new
+connection or token clears the flag. The test endpoint lists tools; it does not
+prove invocation permissions.
 No URLs, access tokens or refresh tokens are returned. Bearer tokens must be
 nonempty, at most 16,000 characters and contain no whitespace.
 
@@ -100,7 +105,7 @@ Generic OAuth uses the shared connection routes:
 | --- | --- |
 | `GET /v1/connections/mcp-{id}/connect?return_to=/settings/mcp` | Redirect to configured authorization server with signed state and PKCE. Include a deployment base path in `return_to` if present. |
 | `GET /v1/connections/mcp-{id}/callback?code=...&state=...` | Validate the current user and pending flow, exchange the code, save encrypted tokens and redirect with `mcp-{id}=connected` or `error`. |
-| `GET /v1/connections/mcp-{id}/status` | `{"enabled": true, "connected": true, "connected_at": 1780000000}`; timestamp is null when disconnected. |
+| `GET /v1/connections/mcp-{id}/status` | `{"enabled": true, "connected": true, "connected_at": 1780000000, "needs_reconnect": false}`; timestamp is null when disconnected. |
 | `POST /v1/connections/mcp-{id}/disconnect` | Shared router compatibility endpoint, returns `{"disconnected": bool}`. |
 
 Provider timeouts, malformed token JSON and invalid expiry values produce the

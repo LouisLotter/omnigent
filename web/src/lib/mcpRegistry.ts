@@ -8,6 +8,8 @@ export interface RegistryService {
   description: string;
   auth: "none" | "bearer" | "oauth" | "github" | "databricks";
   connected: boolean;
+  /** The provider rejected the saved login; absent from older servers. */
+  needs_reconnect?: boolean;
   tools: string[];
   connect_provider: string;
 }

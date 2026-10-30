@@ -102,9 +102,12 @@ describe("useRegistrySignIn", () => {
     );
   });
 
-  it("reports a service the popup finished for but the catalog still shows disconnected", async () => {
+  it.each([
+    ["disconnected", tracker],
+    ["rejected", { ...tracker, connected: true, needs_reconnect: true }],
+  ])("reports a popup that finished but left the service %s", async (_, after) => {
     vi.mocked(authorizeRegistryService).mockResolvedValue(undefined);
-    const refresh = vi.fn().mockResolvedValue([tracker]);
+    const refresh = vi.fn().mockResolvedValue([after]);
     const { result } = renderHook(() => useRegistrySignIn(refresh));
 
     let outcome!: Promise<boolean>;

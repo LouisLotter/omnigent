@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from typing import Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -233,6 +234,72 @@ class CredentialStore:
                 provider,
             )
         return updated
+
+    def merge_metadata(
+        self,
+        user_id: str,
+        provider: str,
+        changes: dict[str, Any],
+        *,
+        account_id: str = "",
+        if_secret_matches: dict[str, str] | None = None,
+    ) -> bool:
+        """Merge non-secret *changes* into an existing row's metadata.
+
+        The secret ciphertext and ``updated_at`` are untouched. The write locks
+        the row and requires the metadata it read, so concurrent merges are not
+        lost. With *if_secret_matches*, it applies only while the stored secret
+        holds those values: the row is decrypted outside the write, which then
+        requires the same ciphertext, so a credential replaced meanwhile is left
+        alone. Returns whether the row's metadata now holds *changes*.
+        """
+        workspace_id = current_workspace_id()
+        match = (
+            SqlConnection.workspace_id == workspace_id,
+            SqlConnection.user_id == user_id,
+            SqlConnection.provider == provider,
+            SqlConnection.account_id == account_id,
+        )
+        with self._session("merge_metadata_check") as session:
+            row = session.execute(
+                select(SqlConnection.secret_enc, SqlConnection.metadata_json).where(*match)
+            ).first()
+        if row is None:
+            return False
+        checked_enc, metadata_json = row
+        metadata = _safe_json_obj(metadata_json) or {}
+        if changes.items() <= metadata.items():
+            return True
+        if if_secret_matches is not None:
+            context = _enc_context(workspace_id, user_id, provider, account_id)
+            plaintext = self._cipher.decrypt(checked_enc, context=context)
+            secret = _safe_json_obj(plaintext) if plaintext is not None else None
+            if secret is None or not all(
+                isinstance(secret.get(field), str)
+                and secrets.compare_digest(secret[field].encode(), value.encode())
+                for field, value in if_secret_matches.items()
+            ):
+                return False
+        merged = json.dumps({**metadata, **changes})
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            # Compared in Python: some databases compare TEXT case-insensitively.
+            current = session.execute(
+                select(SqlConnection.secret_enc, SqlConnection.metadata_json)
+                .where(*match)
+                .with_for_update()
+            ).first()
+            if (
+                current is None
+                or current.metadata_json != metadata_json
+                or (if_secret_matches is not None and current.secret_enc != checked_enc)
+            ):
+                return False
+            session.execute(update(SqlConnection).where(*match).values(metadata_json=merged))
+            return True
+
+        return run_write_transaction(self._session_immediate, "merge_metadata", write)
 
     def get(
         self,

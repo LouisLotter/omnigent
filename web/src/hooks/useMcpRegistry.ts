@@ -107,7 +107,9 @@ export function useRegistrySignIn(refresh: () => Promise<RegistryService[] | und
         if (updated === undefined) {
           throw new Error("Couldn’t confirm the connection. Please try again.");
         }
-        if (!updated.find((s) => s.id === service.id)?.connected) {
+        // A login the provider rejected is not signed in until the new grant clears the mark.
+        const current = updated.find((s) => s.id === service.id);
+        if (!current?.connected || current.needs_reconnect) {
           throw new Error("Account is not connected. Please try again.");
         }
         return !controller.signal.aborted;
