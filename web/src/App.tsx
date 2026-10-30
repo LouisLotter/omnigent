@@ -52,10 +52,9 @@ const InboxPage = withPageView(
   "inbox",
   lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage }))),
 );
-const CanvasPage = withPageView(
-  "canvas",
-  lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
-);
+// The shell owns the board so selecting a conversation never unmounts it.
+const CanvasLandingPage = withPageView("canvas", () => null);
+const GridPage = withPageView("grid", () => null);
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
@@ -63,6 +62,10 @@ const TasksPage = withPageView(
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
+);
+const TaskDetailPage = withPageView(
+  "tasks.detail",
+  lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -170,16 +173,44 @@ function AppRoutes({ basename }: AppProps) {
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+          <Route
+            path={`${prefix}/grid/:gridId`}
+            element={
+              <FeatureGatedPage feature="grid_sessions_display_ui">
+                <GridPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route
             path={`${prefix}/canvas`}
             element={
               <FeatureGatedPage feature="canvas">
-                <CanvasPage />
+                <CanvasLandingPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/canvas/c/:conversationId`}
+            element={
+              <FeatureGatedPage feature="canvas">
+                <ChatPage />
               </FeatureGatedPage>
             }
           />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          <Route
+            path={`${prefix}/tasks/templates`}
+            element={<TasksPage key="templates" templatesOnly />}
+          />
+          <Route
+            path={`${prefix}/tasks/:taskId`}
+            element={
+              <FeatureGatedPage feature="automations_v2">
+                <TaskDetailPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/usage`}
             element={
