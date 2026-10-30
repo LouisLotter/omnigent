@@ -1226,12 +1226,13 @@ describe("chatStore — switchTo", () => {
         .setEffort("high")
         .catch((error) => error);
       held.emit("running");
-      await vi.waitFor(() => expect(held.responses.length).toBeGreaterThanOrEqual(2));
+      await vi.waitFor(() => expect(held.responses).toHaveLength(2));
       held.emit("idle");
-      await vi.waitFor(() => expect(held.responses.length).toBeGreaterThanOrEqual(3));
+      await vi.waitFor(() => expect(held.responses).toHaveLength(3));
       held.responses.forEach((resolve) => resolve());
 
       expect(await picking).toBeUndefined();
+      expect(held.responses).toHaveLength(3);
       expect(fetchMock).toHaveBeenCalledWith(
         `/v1/sessions/${id}`,
         expect.objectContaining({
