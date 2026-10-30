@@ -93,11 +93,25 @@ def downgrade() -> None:
     different from PR 6's downgrade policy: PR 6 aborts loudly on
     orphaned state, while PR 1 deletes these rows because the data was
     created by PR 1 and has no faithful pre-PR1 form.
+
+    The deletes rely on ``ON DELETE CASCADE`` for the conversations' items
+    and other dependents, so SQLite without foreign-key enforcement, as in
+    a transactional migration, refuses instead of orphaning them.
     """
     bind = op.get_bind()
     session_agent_count = bind.execute(
         sa.text("SELECT COUNT(*) FROM agents WHERE session_id IS NOT NULL"),
     ).scalar_one()
+    if (
+        session_agent_count
+        and bind.dialect.name == "sqlite"
+        and not bind.exec_driver_sql("PRAGMA foreign_keys").scalar()
+    ):
+        raise RuntimeError(
+            f"Cannot downgrade below d7a6b3c91f48 while {session_agent_count} session-scoped "
+            "agents exist: SQLite foreign keys are off, so deleting their conversations would "
+            "orphan the conversations' items. Delete those sessions first."
+        )
     _logger.warning(
         "Downgrading PR1 will delete %s session-scoped agents and their conversations",
         session_agent_count,

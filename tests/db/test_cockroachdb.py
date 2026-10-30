@@ -15,7 +15,7 @@ from omnigent.db.cockroachdb import (
 )
 from omnigent.db.utils import (
     _build_alembic_config,
-    _get_current_db_revision,
+    _get_current_db_heads,
     _get_head_db_revision,
     _initialize_or_verify_schema,
     get_or_create_engine,
@@ -32,7 +32,7 @@ def _crdb_engine(db_uri: str) -> Engine:
 
 def test_cockroachdb_bootstrap_is_at_head(db_uri: str) -> None:
     engine = _crdb_engine(db_uri)
-    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert _get_current_db_heads(engine) == (_get_head_db_revision(db_uri),)
 
 
 def test_cockroachdb_uses_read_committed(db_uri: str) -> None:
@@ -69,11 +69,11 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
         command.downgrade(config, CRDB_BASELINE_REVISION)
         connection.commit()
 
-    assert _get_current_db_revision(engine) == CRDB_BASELINE_REVISION
+    assert _get_current_db_heads(engine) == (CRDB_BASELINE_REVISION,)
 
     _initialize_or_verify_schema(engine, db_uri)
 
-    assert _get_current_db_revision(engine) == head
+    assert _get_current_db_heads(engine) == (head,)
 
 
 def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> None:
@@ -110,7 +110,7 @@ def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> 
             str(row["index_name"])
             for row in connection.execute(text("SHOW INDEXES FROM agents")).mappings()
         }
-    assert _get_current_db_revision(engine) == head
+    assert _get_current_db_heads(engine) == (head,)
     assert _CRDB_BOOTSTRAP_MARKER_TABLE not in inspect(engine).get_table_names()
     assert index_name in found
 
@@ -149,7 +149,7 @@ def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None
             _initialize_or_verify_schema(engine, db_uri)
     finally:
         event.remove(engine, "before_cursor_execute", interrupt_backfill)
-    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert _get_current_db_heads(engine) == ("hh1b2c3d4e5f",)
     assert "account_generation" in {c["name"] for c in inspect(engine).get_columns("users")}
 
     _initialize_or_verify_schema(engine, db_uri)
@@ -158,7 +158,7 @@ def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None
     assert accounts.get_password_hash("migration-user") == "existing-password-hash"
     grant = grants.authorize_access("migration-grant")
     assert grant is not None and grant.account_generation == account.account_generation
-    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert _get_current_db_heads(engine) == (_get_head_db_revision(db_uri),)
 
 
 @pytest.mark.parametrize("failed_attempts", [2, 3])
@@ -206,7 +206,7 @@ def test_project_preferences_copy_retries_serialization_failures(
         event.remove(engine, "before_cursor_execute", fail_copy)
 
     assert attempts == 3
-    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert _get_current_db_heads(engine) == (_get_head_db_revision(db_uri),)
     assert "project_order" not in {c["name"] for c in inspect(engine).get_columns("users")}
     with engine.connect() as connection:
         saved = connection.execute(

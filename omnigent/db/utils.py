@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import random
+import sqlite3
 import threading
 import time
 import uuid
@@ -14,9 +15,9 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
@@ -315,8 +316,6 @@ def _create_engine(db_uri: str) -> Engine:
         # benefit — the per-session PRAGMA in
         # :func:`make_managed_session_maker` only fires for code
         # paths that go through that helper.
-        import sqlite3
-
         @event.listens_for(engine, "connect")
         def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()
@@ -558,6 +557,57 @@ def _build_alembic_config(db_uri: str) -> Config:
     return config
 
 
+@contextmanager
+def _transactional_sqlite_ddl(connection: Connection) -> Iterator[bool]:
+    """
+    Make SQLite schema changes commit or roll back with their transaction.
+
+    pysqlite opens no transaction before DDL, so each schema statement would
+    commit on its own and an interrupted upgrade could not be retried. While
+    active, every transaction the connection begins starts with ``BEGIN
+    IMMEDIATE``, which also makes a concurrent upgrade wait for this one.
+    Foreign keys are off meanwhile, as in SQLite's documented ``ALTER TABLE``
+    procedure: ``PRAGMA foreign_keys`` is a no-op inside a transaction, so
+    migrations can no longer turn them off themselves.
+
+    :param connection: The connection Alembic will run migrations on.
+    :returns: A context manager yielding whether DDL is now transactional;
+        ``False`` for other dialects, when the caller already began a
+        transaction, or when the driver's implicit transactions are turned
+        off (``isolation_level=None``, as in SQLAlchemy's own ``BEGIN``
+        recipe, or Python's ``sqlite3`` ``autocommit`` setting); each keeps
+        its own behavior.
+    """
+    if connection.dialect.name != "sqlite" or connection.in_transaction():
+        yield False
+        return
+    driver_connection = cast(sqlite3.Connection, connection.connection.driver_connection)
+    legacy_control = getattr(sqlite3, "LEGACY_TRANSACTION_CONTROL", None)
+    if (
+        getattr(driver_connection, "autocommit", legacy_control) != legacy_control
+        or driver_connection.isolation_level is None
+        or driver_connection.in_transaction
+    ):
+        yield False
+        return
+    (foreign_keys,) = driver_connection.execute("PRAGMA foreign_keys").fetchone()
+
+    def begin_immediate(transaction_connection: Connection) -> None:
+        # Alembic's autocommit_block() begins in AUTOCOMMIT to run outside a transaction.
+        if transaction_connection.get_execution_options().get("isolation_level") != "AUTOCOMMIT":
+            transaction_connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+    try:
+        driver_connection.execute("PRAGMA foreign_keys = OFF")
+        event.listen(connection, "begin", begin_immediate)
+        yield True
+    finally:
+        if event.contains(connection, "begin", begin_immediate):
+            event.remove(connection, "begin", begin_immediate)
+        if not connection.invalidated:
+            driver_connection.execute(f"PRAGMA foreign_keys = {int(foreign_keys)}")
+
+
 def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     Bring the database schema up to head.
@@ -573,6 +623,12 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     short-circuit silently skipped those migrations, leaving
     existing DBs missing columns that the runtime expects.
 
+    On SQLite the upgrade commits or rolls back as one transaction (see
+    :func:`_transactional_sqlite_ddl`), so an interrupted upgrade leaves
+    the database at its starting revision, or at the last point where a
+    migration commits progress on purpose through ``autocommit_block()``.
+    The ``create_all`` that follows only adds missing tables.
+
     :param engine: The SQLAlchemy engine bound to the target
         database.
     :param db_uri: Database connection string forwarded to
@@ -585,7 +641,7 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
-    current = _get_current_db_revision(engine)
+    current = _get_current_db_heads(engine)
     head = _get_head_db_revision(db_uri)
     _verify_db_revision_is_supported(db_uri, current, head)
 
@@ -692,28 +748,31 @@ def run_migrations_with_retry(
             engine.dispose()
 
 
-def _get_current_db_revision(engine: Engine) -> str | None:
+def _get_current_db_heads(engine: Engine) -> tuple[str, ...]:
     """
-    Return the database's current Alembic revision, or ``None``.
+    Return the database's current Alembic revisions, sorted.
 
-    ``None`` means the database has no ``alembic_version`` table at
-    all — i.e. nothing has ever been migrated against this database.
-    A database that exists at some revision (even if not head) returns
-    that revision string.
+    Empty means nothing has ever been migrated against this database. More
+    than one means it stopped between the branches of a merge, for example
+    in an interrupted upgrade; Alembic upgrades from all of them.
 
     :param engine: SQLAlchemy engine bound to the target database.
-    :returns: The current revision hash (e.g. ``"c9d3a1f2e4b5"``) or
-        ``None`` if the ``alembic_version`` table is absent.
+    :returns: The revision hashes in ``alembic_version``, e.g.
+        ``("c9d3a1f2e4b5",)``, or ``()`` if the table is absent or empty.
     """
     from alembic.runtime.migration import MigrationContext
 
     with query_name_scope("omnigent.database.select_current_revision"):
         inspector = inspect(engine)
         if "alembic_version" not in inspector.get_table_names():
-            return None
+            return ()
         with engine.connect() as connection:
-            ctx = MigrationContext.configure(connection)
-            return ctx.get_current_revision()
+            return tuple(sorted(MigrationContext.configure(connection).get_current_heads()))
+
+
+def _format_revisions(revisions: tuple[str, ...]) -> str:
+    """Render database revisions for logs and errors, e.g. ``'a1', 'b2'``."""
+    return ", ".join(repr(revision) for revision in revisions) or "none"
 
 
 def _get_head_db_revision(db_uri: str) -> str:
@@ -744,11 +803,11 @@ def _get_head_db_revision(db_uri: str) -> str:
 
 def _verify_db_revision_is_supported(
     db_uri: str,
-    current: str | None,
+    current: tuple[str, ...],
     head: str,
 ) -> None:
     """Reject a database revision that is unknown to this build."""
-    if current is None or current == head:
+    if current in ((), (head,)):
         return
 
     from alembic.script import ScriptDirectory
@@ -756,11 +815,11 @@ def _verify_db_revision_is_supported(
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
     try:
-        script.get_revision(current)
+        script.get_revisions(current)
     except CommandError as exc:
         raise RuntimeError(
             "Omnigent database schema is newer than this version of Omnigent "
-            f"(found revision {current!r}, latest supported revision {head!r}). "
+            f"(found revision {_format_revisions(current)}, latest supported revision {head!r}). "
             "Upgrade Omnigent before using this database."
         ) from exc
 
@@ -775,7 +834,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
       head. This covers brand-new SQLite files and freshly created
       Postgres schemas.
     - **At head** — no-op.
-    - **Behind head** — log a warning, attempt an automatic Alembic
+    - **Behind head**, including a database left between the branches
+      of a merge — log a warning, attempt an automatic Alembic
       upgrade to head, then verify that the database reached head.
       If the migration fails, re-raise with context so the server
       still terminates with an actionable error instead of continuing
@@ -794,18 +854,18 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         return
 
     head = _get_head_db_revision(db_uri)
-    current = _get_current_db_revision(engine)
+    current = _get_current_db_heads(engine)
     _verify_db_revision_is_supported(db_uri, current, head)
 
-    if current is None:
+    if not current:
         _run_migrations(engine, db_uri)
         return
 
-    if current != head:
+    if current != (head,):
         _logger.warning(
             "Omnigent database schema is out of date "
-            "(found revision %r, expected %r); attempting automatic migration.",
-            current,
+            "(found revision %s, expected %r); attempting automatic migration.",
+            _format_revisions(current),
             head,
         )
         try:
@@ -813,7 +873,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         except Exception as exc:
             raise RuntimeError(
                 f"Omnigent database schema is out of date "
-                f"(found revision {current!r}, expected {head!r}) "
+                f"(found revision {_format_revisions(current)}, expected {head!r}) "
                 f"and automatic migration failed. Take a backup of your database, then run\n"
                 f"\n"
                 f"    omnigent debug db-upgrade {db_uri!r}\n"
@@ -821,11 +881,12 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
                 f"to inspect or retry the migration manually."
             ) from exc
 
-        migrated = _get_current_db_revision(engine)
-        if migrated != head:
+        migrated = _get_current_db_heads(engine)
+        if migrated != (head,):
             raise RuntimeError(
                 f"Omnigent automatic database migration did not reach head "
-                f"(started at {current!r}, now at {migrated!r}, expected {head!r}). "
+                f"(started at {_format_revisions(current)}, "
+                f"now at {_format_revisions(migrated)}, expected {head!r}). "
                 f"Take a backup of your database, then run\n"
                 f"\n"
                 f"    omnigent debug db-upgrade {db_uri!r}\n"

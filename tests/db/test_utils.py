@@ -9,19 +9,21 @@ from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import Engine, create_engine, event, inspect, text
 
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
-    _get_current_db_revision,
+    _create_engine,
+    _get_current_db_heads,
     _get_head_db_revision,
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
     _run_migrations,
     _shared_read_sessions,
+    _transactional_sqlite_ddl,
     _translate_missing_driver_error,
     build_search_snippet,
     builtin_agent_id,
@@ -690,17 +692,17 @@ def test_initialize_or_verify_schema_initializes_fresh_db(
     engine = create_engine(uri)
     try:
         # Sanity: no alembic_version yet.
-        # A non-None reading here means the test setup is wrong —
+        # A non-empty reading here means the test setup is wrong —
         # the file should be empty before _initialize_or_verify_schema.
-        assert _get_current_db_revision(engine) is None
+        assert _get_current_db_heads(engine) == ()
 
         _initialize_or_verify_schema(engine, uri)
 
-        # After initialization, the DB is at head. If this is None,
+        # After initialization, the DB is at head. If this is empty,
         # the fresh-DB branch didn't actually run migrations; if it's
         # some other revision, head detection is broken.
         head = _get_head_db_revision(uri)
-        assert _get_current_db_revision(engine) == head
+        assert _get_current_db_heads(engine) == (head,)
     finally:
         engine.dispose()
 
@@ -724,7 +726,7 @@ def test_initialize_or_verify_schema_no_op_when_at_head(
         _initialize_or_verify_schema(engine, uri)
         # Still at head after the call. If the revision changed,
         # something inside the no-op branch wrote to the DB.
-        assert _get_current_db_revision(engine) == head
+        assert _get_current_db_heads(engine) == (head,)
     finally:
         engine.dispose()
 
@@ -759,7 +761,7 @@ def test_initialize_or_verify_schema_auto_migrates_when_stale(
     engine = create_engine(uri)
     try:
         _initialize_or_verify_schema(engine, uri)
-        assert _get_current_db_revision(engine) == head
+        assert _get_current_db_heads(engine) == (head,)
     finally:
         engine.dispose()
 
@@ -859,11 +861,190 @@ def test_run_migrations_reports_database_from_newer_build(tmp_path: Path) -> Non
     try:
         with pytest.raises(RuntimeError, match="newer") as exc_info:
             _run_migrations(engine, uri)
-        assert _get_current_db_revision(engine) == future_revision
+        assert _get_current_db_heads(engine) == (future_revision,)
     finally:
         engine.dispose()
 
     assert "Can't locate revision" not in str(exc_info.value)
+
+
+def test_get_current_db_heads_reads_every_revision(tmp_path: Path) -> None:
+    """A database stopped between merge branches holds several revisions."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'heads.db'}")
+    try:
+        assert _get_current_db_heads(engine) == ()
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql("INSERT INTO alembic_version VALUES ('b2'), ('a1')")
+        assert _get_current_db_heads(engine) == ("a1", "b2")
+    finally:
+        engine.dispose()
+
+
+def test_initialize_or_verify_schema_rejects_unknown_revision_among_heads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One revision unknown to this build makes the database newer, beside known ones too."""
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", "deadbeef1234")
+    run_migrations = MagicMock()
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", run_migrations)
+
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("INSERT INTO alembic_version VALUES ('8a4f1e9c2b07')")
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    run_migrations.assert_not_called()
+    assert "found revision '8a4f1e9c2b07', 'deadbeef1234'" in str(exc_info.value)
+
+
+# ── _transactional_sqlite_ddl ───────────────────────────
+
+
+def test_transactional_sqlite_ddl_rolls_back_schema_changes(tmp_path: Path) -> None:
+    """DDL rolls back with its transaction; plain pysqlite commits it on its own."""
+    engine = _create_engine(f"sqlite:///{tmp_path / 'ddl.db'}")
+    try:
+        with engine.connect() as connection:
+            with connection.begin() as transaction:
+                connection.exec_driver_sql("CREATE TABLE plain_ddl (id INTEGER)")
+                transaction.rollback()
+            with _transactional_sqlite_ddl(connection) as transactional:
+                assert transactional is True
+                with connection.begin() as transaction:
+                    connection.exec_driver_sql("CREATE TABLE transactional_ddl (id INTEGER)")
+                    transaction.rollback()
+        tables = set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+    assert "plain_ddl" in tables
+    assert "transactional_ddl" not in tables
+
+
+def test_transactional_sqlite_ddl_suspends_foreign_keys_and_restores_them(
+    tmp_path: Path,
+) -> None:
+    """Rebuilding a referenced table can't cascade, and enforcement returns afterwards."""
+    engine = _create_engine(f"sqlite:///{tmp_path / 'foreign_keys.db'}")
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            conn.exec_driver_sql(
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, "
+                "parent_id INTEGER REFERENCES parent (id) ON DELETE CASCADE)"
+            )
+            conn.exec_driver_sql("INSERT INTO parent VALUES (1)")
+            conn.exec_driver_sql("INSERT INTO child VALUES (1, 1)")
+        with engine.connect() as connection:
+            with _transactional_sqlite_ddl(connection), connection.begin():
+                # The table rebuild of Alembic's batch mode on SQLite.
+                connection.exec_driver_sql("CREATE TABLE parent_new (id INTEGER PRIMARY KEY)")
+                connection.exec_driver_sql("INSERT INTO parent_new SELECT id FROM parent")
+                connection.exec_driver_sql("DROP TABLE parent")
+                connection.exec_driver_sql("ALTER TABLE parent_new RENAME TO parent")
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+            assert connection.exec_driver_sql("SELECT parent_id FROM child").all() == [(1,)]
+            with pytest.raises(RuntimeError), _transactional_sqlite_ddl(connection):
+                raise RuntimeError("migration failed")
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+def _sqlite_engine_with_begin_recipe(uri: str) -> Engine:
+    """An engine applying SQLAlchemy's documented pysqlite BEGIN recipe itself."""
+    engine = create_engine(uri)
+
+    @event.listens_for(engine, "connect")
+    def _no_implicit_transactions(dbapi_connection: Any, _record: object) -> None:
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _begin(connection: Any) -> None:
+        connection.exec_driver_sql("BEGIN")
+
+    return engine
+
+
+@pytest.mark.parametrize(
+    ("driver_mode", "owned", "rolled_back"),
+    [
+        ("legacy", True, True),
+        ("begin-recipe", False, True),
+        ("autocommit-off", False, True),
+        ("autocommit-on", False, False),
+    ],
+)
+def test_transactional_sqlite_ddl_takes_over_only_implicit_driver_transactions(
+    tmp_path: Path, driver_mode: str, owned: bool, rolled_back: bool
+) -> None:
+    """Engines and drivers that control transactions keep doing so; none begins twice."""
+    uri = f"sqlite:///{tmp_path / 'modes.db'}"
+    engine = {
+        "legacy": lambda: create_engine(uri),
+        "begin-recipe": lambda: _sqlite_engine_with_begin_recipe(uri),
+        "autocommit-off": lambda: create_engine(uri, connect_args={"autocommit": False}),
+        "autocommit-on": lambda: create_engine(uri, connect_args={"autocommit": True}),
+    }[driver_mode]()
+    try:
+        with engine.connect() as connection:
+            with _transactional_sqlite_ddl(connection) as transactional:
+                assert transactional is owned
+                with connection.begin() as transaction:
+                    connection.exec_driver_sql("CREATE TABLE attempt (id INTEGER)")
+                    transaction.rollback()
+            if driver_mode != "autocommit-off":
+                # That mode always holds a transaction by design.
+                assert not connection.connection.driver_connection.in_transaction
+        assert ("attempt" not in inspect(engine).get_table_names()) is rolled_back
+    finally:
+        engine.dispose()
+
+
+def test_transactional_sqlite_ddl_keeps_autocommit_blocks_outside_a_transaction(
+    tmp_path: Path,
+) -> None:
+    """Alembic's autocommit_block() still commits each statement at once."""
+    engine = _create_engine(f"sqlite:///{tmp_path / 'autocommit.db'}")
+    try:
+        with engine.connect() as connection, _transactional_sqlite_ddl(connection):
+            connection.execution_options(isolation_level="AUTOCOMMIT")
+            with connection.begin():
+                connection.exec_driver_sql("CREATE TABLE progress (id INTEGER)")
+                assert not connection.connection.driver_connection.in_transaction
+    finally:
+        engine.dispose()
+
+
+def test_transactional_sqlite_ddl_leaves_caller_transactions_and_other_dialects_alone(
+    tmp_path: Path,
+) -> None:
+    """A caller's own transaction keeps the driver's behavior; other dialects are untouched."""
+    engine = _create_engine(f"sqlite:///{tmp_path / 'caller.db'}")
+    statements: list[str] = []
+    event.listen(engine, "before_cursor_execute", lambda *args: statements.append(args[2]))
+    try:
+        with engine.connect() as connection, connection.begin():
+            with _transactional_sqlite_ddl(connection) as transactional:
+                assert transactional is False
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    finally:
+        engine.dispose()
+    assert not any(statement.startswith("BEGIN") for statement in statements)
+
+    other = MagicMock()
+    other.dialect.name = "postgresql"
+    with _transactional_sqlite_ddl(other) as transactional:
+        assert transactional is False
+    other.connection.driver_connection.execute.assert_not_called()
 
 
 # ── slash_command persistence path ────────────────────
