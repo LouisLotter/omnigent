@@ -9,7 +9,7 @@ from alembic import context
 from sqlalchemy import Connection, engine_from_config, pool
 
 from omnigent.db import ConversationBase, OmnigentBase
-from omnigent.db.utils import _set_alembic_database_url
+from omnigent.db.utils import _set_alembic_database_url, _transactional_sqlite_ddl
 
 config = context.config
 
@@ -82,13 +82,16 @@ def run_migrations_online() -> None:
 
 
 def _run_with_connection(connection: Connection) -> None:
-    context.configure(
-        connection=connection,
-        target_metadata=target_metadata,
-        render_as_batch=True,  # required for SQLite ALTER TABLE support
-    )
-    with context.begin_transaction():
-        context.run_migrations()
+    with _transactional_sqlite_ddl(connection) as sqlite_ddl_is_transactional:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,  # required for SQLite ALTER TABLE support
+            # One transaction then covers the whole upgrade, as on PostgreSQL.
+            transactional_ddl=True if sqlite_ddl_is_transactional else None,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 if context.is_offline_mode():

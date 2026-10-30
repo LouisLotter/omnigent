@@ -1,8 +1,12 @@
-"""Upgrade either deployed schema and a restored fork snapshot to one head."""
+"""Upgrade a deployed schema or restored fork snapshot to one head, even when interrupted."""
 
 from __future__ import annotations
 
+import shutil
+import signal
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -14,7 +18,9 @@ from alembic.script import ScriptDirectory
 from deploy.docker.entrypoint import run_migrations
 from omnigent.db.utils import (
     _build_alembic_config,
+    _create_engine,
     _get_current_db_heads,
+    _initialize_or_verify_schema,
     _run_migrations,
 )
 
@@ -22,6 +28,27 @@ _FORK = "lt1b2c3d4e5f"
 _RELEASE = "b2e4f6a8c013"
 _MERGE = "c0201a2b3c4d"
 _ID = bytes.fromhex("0123456789abcdef0123456789abcdef")
+
+# Starts the server's migration and SIGKILLs itself right after a matching statement.
+_KILLED_START = """
+import os, signal, sys
+
+import sqlalchemy as sa
+
+from omnigent.db.utils import _create_engine, _initialize_or_verify_schema
+
+uri, killed_after = sys.argv[1:]
+engine = _create_engine(uri)
+
+
+@sa.event.listens_for(engine, "after_cursor_execute")
+def kill(conn, cursor, statement, parameters, context, executemany):
+    if statement.lstrip().startswith(killed_after):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+_initialize_or_verify_schema(engine, uri)
+"""
 
 
 def _migrate(engine: sa.Engine, revision: str, *, downgrade: bool = False) -> None:
@@ -170,6 +197,27 @@ def _heads(uri: str) -> tuple[str, ...]:
         engine.dispose()
 
 
+def _schema(path: Path) -> list[tuple[str, ...]]:
+    with sqlite3.connect(path) as connection:
+        return connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+
+
+def _interrupt_after_write(engine: sa.Engine, write_number: int) -> list[str]:
+    """Raise right after the engine's *write_number*-th writing statement; return them all."""
+    writes: list[str] = []
+
+    @sa.event.listens_for(engine, "after_cursor_execute")
+    def interrupt(conn, cursor, statement, parameters, context, executemany):
+        if statement.split(None, 1)[0].upper() not in {"SELECT", "PRAGMA", "BEGIN"}:
+            writes.append(statement)
+            if len(writes) == write_number:
+                raise RuntimeError("injected interruption")
+
+    return writes
+
+
 def _assert_upgraded_with_canaries(uri: str) -> None:
     assert _heads(uri) == (_MERGE,)
     engine = sa.create_engine(uri)
@@ -226,6 +274,70 @@ def test_merge_preserves_deployed_data_and_joins_heads(
         _migrate(engine, "head")
     finally:
         engine.dispose()
+
+
+def test_upgrade_interrupted_after_any_statement_resumes_on_next_start(tmp_path: Path) -> None:
+    """An exception anywhere in the upgrade leaves the 0.19 database exactly as it was."""
+    template = tmp_path / "fork.db"
+    _create_fork_database(template)
+    fork_schema = _schema(template)
+    interrupted_write = 0
+    while True:
+        interrupted_write += 1
+        database = tmp_path / f"interrupted-{interrupted_write}.db"
+        shutil.copyfile(template, database)
+        uri = f"sqlite:///{database}"
+        engine = _create_engine(uri)
+        writes = _interrupt_after_write(engine, interrupted_write)
+        try:
+            _initialize_or_verify_schema(engine, uri)
+        except RuntimeError as exc:
+            assert "automatic migration failed" in str(exc)
+            assert str(exc.__cause__) == "injected interruption"
+        else:
+            # The upgrade wrote fewer statements than that, so every one was interrupted.
+            break
+        finally:
+            engine.dispose()
+
+        interrupted_statement = writes[interrupted_write - 1]
+        assert (_heads(uri), _schema(database)) == ((_FORK,), fork_schema), interrupted_statement
+        run_migrations(uri)
+        _assert_upgraded_with_canaries(uri)
+
+    _assert_upgraded_with_canaries(uri)
+    # Six steps, two rebuilt tables: far more interruption points than steps.
+    assert interrupted_write > 20
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX-only")
+@pytest.mark.parametrize(
+    "killed_after",
+    [
+        "CREATE INDEX ix_conversation_metadata_host_id",
+        "CREATE TABLE _alembic_tmp_scheduled_tasks",
+        "DROP TABLE scheduled_tasks",
+        f"UPDATE alembic_version SET version_num='{_MERGE}'",
+    ],
+    ids=["first-schema-change", "after-first-step", "table-dropped", "last-statement"],
+)
+def test_killed_upgrade_resumes_on_next_start(tmp_path: Path, killed_after: str) -> None:
+    """A process killed mid-upgrade leaves a 0.19 database the next start upgrades."""
+    database = tmp_path / "killed.db"
+    uri = _create_fork_database(database)
+    fork_schema = _schema(database)
+
+    killed = subprocess.run(
+        [sys.executable, "-c", _KILLED_START, uri, killed_after],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    assert (_heads(uri), _schema(database)) == ((_FORK,), fork_schema)
+    run_migrations(uri)
+    _assert_upgraded_with_canaries(uri)
 
 
 def _debug_db_upgrade(uri: str) -> None:

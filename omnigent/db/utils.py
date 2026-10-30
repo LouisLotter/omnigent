@@ -14,9 +14,9 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
@@ -558,6 +558,47 @@ def _build_alembic_config(db_uri: str) -> Config:
     return config
 
 
+@contextmanager
+def _transactional_sqlite_ddl(connection: Connection) -> Iterator[bool]:
+    """
+    Make SQLite schema changes commit or roll back with their transaction.
+
+    pysqlite opens no transaction before DDL, so each schema statement would
+    commit on its own and an interrupted upgrade could not be retried. While
+    active, every transaction the connection begins starts with ``BEGIN
+    IMMEDIATE``, which also makes a concurrent upgrade wait for this one.
+    Foreign keys are off meanwhile, as in SQLite's documented ``ALTER TABLE``
+    procedure: ``PRAGMA foreign_keys`` is a no-op inside a transaction, so
+    migrations can no longer turn them off themselves.
+
+    :param connection: The connection Alembic will run migrations on.
+    :returns: A context manager yielding whether DDL is now transactional;
+        ``False`` for other dialects or when the caller already began a
+        transaction, which then keeps the driver's own behavior.
+    """
+    if connection.dialect.name != "sqlite" or connection.in_transaction():
+        yield False
+        return
+    import sqlite3
+
+    driver_connection = cast(sqlite3.Connection, connection.connection.driver_connection)
+    (foreign_keys,) = driver_connection.execute("PRAGMA foreign_keys").fetchone()
+    driver_connection.execute("PRAGMA foreign_keys = OFF")
+
+    def begin_immediate(transaction_connection: Connection) -> None:
+        # Alembic's autocommit_block() begins in AUTOCOMMIT to run outside a transaction.
+        if transaction_connection.get_execution_options().get("isolation_level") != "AUTOCOMMIT":
+            transaction_connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+    event.listen(connection, "begin", begin_immediate)
+    try:
+        yield True
+    finally:
+        event.remove(connection, "begin", begin_immediate)
+        if not connection.invalidated:
+            driver_connection.execute(f"PRAGMA foreign_keys = {int(foreign_keys)}")
+
+
 def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     Bring the database schema up to head.
@@ -572,6 +613,10 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     revision. The previous ``if expected_tables.issubset(...): return``
     short-circuit silently skipped those migrations, leaving
     existing DBs missing columns that the runtime expects.
+
+    On SQLite the whole upgrade commits or rolls back as one transaction
+    (see :func:`_transactional_sqlite_ddl`), so an interrupted upgrade
+    leaves the database at its starting revision.
 
     :param engine: The SQLAlchemy engine bound to the target
         database.

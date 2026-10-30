@@ -12,6 +12,7 @@ from sqlalchemy.engine import Engine
 
 from omnigent.db.utils import (
     _build_alembic_config,
+    _create_engine,
     clear_engine_cache,
     get_or_create_engine,
 )
@@ -238,13 +239,18 @@ def test_agents_session_id_allows_duplicate_names_for_distinct_sessions(
     assert count == 2
 
 
-def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
+@pytest.mark.parametrize("server_engine", [False, True], ids=["raw-engine", "server-engine"])
+def test_upgrade_does_not_cascade_delete_conversations(
+    tmp_path: Path, server_engine: bool
+) -> None:
     """Upgrade must not cascade-delete conversations bound to session-scoped agents.
 
     On SQLite, batch_alter_table drops and recreates the agents table.  If
     PRAGMA foreign_keys is ON, the DROP fires the ON DELETE CASCADE on
     conversations.agent_id → agents.id and silently wipes every conversation
-    that owns an agent.  This test asserts that upgrade preserves them.
+    that owns an agent.  This test asserts that upgrade preserves them, also
+    on the server's engine, which enforces foreign keys and lets Alembic own
+    the transaction.
     """
     db_path = tmp_path / "upgrade_cascade.db"
     uri = f"sqlite:///{db_path}"
@@ -290,9 +296,18 @@ def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
 
     # Run our migration.
     config2 = _build_alembic_config(uri)
-    with raw_engine.begin() as conn:
-        config2.attributes["connection"] = conn
-        command.upgrade(config2, "o1a2b3c4d5e6")
+    if server_engine:
+        engine = _create_engine(uri)
+        try:
+            with engine.connect() as conn:
+                config2.attributes["connection"] = conn
+                command.upgrade(config2, "o1a2b3c4d5e6")
+        finally:
+            engine.dispose()
+    else:
+        with raw_engine.begin() as conn:
+            config2.attributes["connection"] = conn
+            command.upgrade(config2, "o1a2b3c4d5e6")
 
     with raw_engine.begin() as conn:
         conv_ids = list(conn.execute(sa.text("SELECT id FROM conversations")).scalars())
