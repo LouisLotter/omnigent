@@ -109,9 +109,9 @@ def _prepare_crdb_schema_transaction(connection: Any, version: Version) -> None:
     connection.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
 
 
-def _crdb_revision_is_supported(db_uri: str, current: str, head: str) -> bool:
-    """Return whether *current* is on the supported CRDB migration segment."""
-    if current == head:
+def _crdb_revision_is_supported(db_uri: str, current: tuple[str, ...], head: str) -> bool:
+    """Return whether every *current* revision is on the supported CRDB migration segment."""
+    if current == (head,):
         return True
     from alembic.script import ScriptDirectory
 
@@ -120,7 +120,7 @@ def _crdb_revision_is_supported(db_uri: str, current: str, head: str) -> bool:
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
     revisions = script.iterate_revisions(head, CRDB_BASELINE_REVISION)
-    return current in {revision.revision for revision in revisions} | {CRDB_BASELINE_REVISION}
+    return set(current) <= {revision.revision for revision in revisions} | {CRDB_BASELINE_REVISION}
 
 
 def _start_or_resume_crdb_bootstrap(
@@ -275,7 +275,8 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     # Imported lazily: utils imports this module at load time.
     from omnigent.db.utils import (
         _build_alembic_config,
-        _get_current_db_revision,
+        _format_revisions,
+        _get_current_db_heads,
         _get_head_db_revision,
         _run_migrations,
         _verify_db_revision_is_supported,
@@ -284,11 +285,11 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     version = _crdb_server_version(engine)
     _verify_crdb_read_committed(engine, version)
     head = _get_head_db_revision(db_uri)
-    current = _get_current_db_revision(engine)
+    current = _get_current_db_heads(engine)
     tables = set(inspect(engine).get_table_names())
     expected = set(OmnigentBase.metadata.tables) | set(ConversationBase.metadata.tables)
 
-    if current is None:
+    if not current:
         _start_or_resume_crdb_bootstrap(engine, version, tables, expected, head)
         with query_name_scope("omnigent.database.bootstrap_cockroachdb"):
             with engine.connect() as connection:
@@ -311,7 +312,7 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
                 config.attributes["connection"] = connection
                 command.stamp(config, "head")
                 connection.commit()
-            if _get_current_db_revision(engine) != head:
+            if _get_current_db_heads(engine) != (head,):
                 raise RuntimeError(
                     "CockroachDB schema bootstrap did not stamp the expected Alembic head "
                     f"{head!r}. The bootstrap marker was retained for a safe retry."
@@ -322,14 +323,14 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
     _verify_db_revision_is_supported(db_uri, current, head)
     if not _crdb_revision_is_supported(db_uri, current, head):
         raise RuntimeError(
-            f"CockroachDB schema revision {current!r} predates Omnigent's CRDB "
+            f"CockroachDB schema revision {_format_revisions(current)} predates Omnigent's CRDB "
             f"baseline {CRDB_BASELINE_REVISION!r}. Use a new empty database."
         )
-    if current != head:
+    if current != (head,):
         _logger.warning(
-            "CockroachDB schema is out of date (found revision %r, expected %r); "
+            "CockroachDB schema is out of date (found revision %s, expected %r); "
             "attempting automatic migration.",
-            current,
+            _format_revisions(current),
             head,
         )
         # Never echo the raw URI: it may embed a password, and startup
@@ -341,16 +342,17 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
         except Exception as exc:
             raise RuntimeError(
                 "CockroachDB schema migration failed "
-                f"(found revision {current!r}, expected {head!r}). "
+                f"(found revision {_format_revisions(current)}, expected {head!r}). "
                 "Take a backup, then run\n\n"
                 f"    omnigent debug db-upgrade {safe_uri!r}\n\n"
                 "to inspect or retry the migration manually."
             ) from exc
-        migrated = _get_current_db_revision(engine)
-        if migrated != head:
+        migrated = _get_current_db_heads(engine)
+        if migrated != (head,):
             raise RuntimeError(
                 "CockroachDB schema migration did not reach head "
-                f"(started at {current!r}, now at {migrated!r}, expected {head!r}). "
+                f"(started at {_format_revisions(current)}, "
+                f"now at {_format_revisions(migrated)}, expected {head!r}). "
                 "Take a backup, then run\n\n"
                 f"    omnigent debug db-upgrade {safe_uri!r}\n\n"
                 "to inspect or retry the migration manually."

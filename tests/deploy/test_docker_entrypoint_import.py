@@ -110,14 +110,14 @@ def test_run_migrations_preserves_sqlite_startup(tmp_path: Path) -> None:
     from sqlalchemy import create_engine
 
     from deploy.docker.entrypoint import run_migrations
-    from omnigent.db.utils import _get_current_db_revision, _get_head_db_revision
+    from omnigent.db.utils import _get_current_db_heads, _get_head_db_revision
 
     database_url = f"sqlite:///{tmp_path / 'entrypoint.db'}"
     run_migrations(database_url)
 
     engine = create_engine(database_url)
     try:
-        assert _get_current_db_revision(engine) == _get_head_db_revision(database_url)
+        assert _get_current_db_heads(engine) == (_get_head_db_revision(database_url),)
     finally:
         engine.dispose()
 

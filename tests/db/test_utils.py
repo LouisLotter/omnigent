@@ -15,7 +15,7 @@ from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
     _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
-    _get_current_db_revision,
+    _get_current_db_heads,
     _get_head_db_revision,
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
@@ -690,17 +690,17 @@ def test_initialize_or_verify_schema_initializes_fresh_db(
     engine = create_engine(uri)
     try:
         # Sanity: no alembic_version yet.
-        # A non-None reading here means the test setup is wrong —
+        # A non-empty reading here means the test setup is wrong —
         # the file should be empty before _initialize_or_verify_schema.
-        assert _get_current_db_revision(engine) is None
+        assert _get_current_db_heads(engine) == ()
 
         _initialize_or_verify_schema(engine, uri)
 
-        # After initialization, the DB is at head. If this is None,
+        # After initialization, the DB is at head. If this is empty,
         # the fresh-DB branch didn't actually run migrations; if it's
         # some other revision, head detection is broken.
         head = _get_head_db_revision(uri)
-        assert _get_current_db_revision(engine) == head
+        assert _get_current_db_heads(engine) == (head,)
     finally:
         engine.dispose()
 
@@ -724,7 +724,7 @@ def test_initialize_or_verify_schema_no_op_when_at_head(
         _initialize_or_verify_schema(engine, uri)
         # Still at head after the call. If the revision changed,
         # something inside the no-op branch wrote to the DB.
-        assert _get_current_db_revision(engine) == head
+        assert _get_current_db_heads(engine) == (head,)
     finally:
         engine.dispose()
 
@@ -759,7 +759,7 @@ def test_initialize_or_verify_schema_auto_migrates_when_stale(
     engine = create_engine(uri)
     try:
         _initialize_or_verify_schema(engine, uri)
-        assert _get_current_db_revision(engine) == head
+        assert _get_current_db_heads(engine) == (head,)
     finally:
         engine.dispose()
 
@@ -859,11 +859,48 @@ def test_run_migrations_reports_database_from_newer_build(tmp_path: Path) -> Non
     try:
         with pytest.raises(RuntimeError, match="newer") as exc_info:
             _run_migrations(engine, uri)
-        assert _get_current_db_revision(engine) == future_revision
+        assert _get_current_db_heads(engine) == (future_revision,)
     finally:
         engine.dispose()
 
     assert "Can't locate revision" not in str(exc_info.value)
+
+
+def test_get_current_db_heads_reads_every_revision(tmp_path: Path) -> None:
+    """A database stopped between merge branches holds several revisions."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'heads.db'}")
+    try:
+        assert _get_current_db_heads(engine) == ()
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql("INSERT INTO alembic_version VALUES ('b2'), ('a1')")
+        assert _get_current_db_heads(engine) == ("a1", "b2")
+    finally:
+        engine.dispose()
+
+
+def test_initialize_or_verify_schema_rejects_unknown_revision_among_heads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One revision unknown to this build makes the database newer, beside known ones too."""
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", "deadbeef1234")
+    run_migrations = MagicMock()
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", run_migrations)
+
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("INSERT INTO alembic_version VALUES ('8a4f1e9c2b07')")
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    run_migrations.assert_not_called()
+    assert "found revision '8a4f1e9c2b07', 'deadbeef1234'" in str(exc_info.value)
 
 
 # ── slash_command persistence path ────────────────────

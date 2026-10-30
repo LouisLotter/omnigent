@@ -7,7 +7,7 @@ from alembic import command
 from omnigent.db.compression import encode
 from omnigent.db.utils import (
     _build_alembic_config,
-    _get_current_db_revision,
+    _get_current_db_heads,
     _get_head_db_revision,
     _initialize_or_verify_schema,
     get_or_create_engine,
@@ -91,7 +91,7 @@ def test_preferences_migration_round_trip_and_copy_failures(
         sa.event.remove(engine, "before_cursor_execute", fail_copy)
 
     assert attempts == (1 if failed_attempts == 0 else 3)
-    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert _get_current_db_heads(engine) == (_get_head_db_revision(db_uri),)
     assert "project_order" not in {
         column["name"] for column in sa.inspect(engine).get_columns("users")
     }

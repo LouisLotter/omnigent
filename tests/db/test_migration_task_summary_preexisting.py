@@ -33,7 +33,7 @@ from sqlalchemy.engine import Engine
 from omnigent.db.utils import (
     _build_alembic_config,
     _create_engine,
-    _get_current_db_revision,
+    _get_current_db_heads,
     _get_head_db_revision,
     _initialize_or_verify_schema,
     clear_engine_cache,
@@ -52,7 +52,7 @@ def _stamp_at_revision(uri: str, revision: str) -> Engine:
     with engine.connect() as connection:
         config.attributes["connection"] = connection
         command.upgrade(config, revision)
-    assert _get_current_db_revision(engine) == revision
+    assert _get_current_db_heads(engine) == (revision,)
     return engine
 
 
@@ -106,7 +106,7 @@ def test_upgrade_with_preexisting_task_summary_column(tmp_path: Path) -> None:
     # Drive the real server-startup migration path.
     _initialize_or_verify_schema(engine, uri)
 
-    assert _get_current_db_revision(engine) == _get_head_db_revision(uri), (
+    assert _get_current_db_heads(engine) == (_get_head_db_revision(uri),), (
         "database must reach head after reconciling the preexisting column"
     )
     assert _task_summary_present(engine), "task_summary must remain present after upgrade"
@@ -131,5 +131,5 @@ def test_upgrade_adds_missing_task_summary_column(tmp_path: Path) -> None:
 
     _initialize_or_verify_schema(engine, uri)
 
-    assert _get_current_db_revision(engine) == _get_head_db_revision(uri)
+    assert _get_current_db_heads(engine) == (_get_head_db_revision(uri),)
     assert _task_summary_present(engine), "task_summary must be added when absent"

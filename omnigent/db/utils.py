@@ -585,7 +585,7 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     from omnigent.db.db_models import ConversationBase, OmnigentBase
 
-    current = _get_current_db_revision(engine)
+    current = _get_current_db_heads(engine)
     head = _get_head_db_revision(db_uri)
     _verify_db_revision_is_supported(db_uri, current, head)
 
@@ -692,28 +692,31 @@ def run_migrations_with_retry(
             engine.dispose()
 
 
-def _get_current_db_revision(engine: Engine) -> str | None:
+def _get_current_db_heads(engine: Engine) -> tuple[str, ...]:
     """
-    Return the database's current Alembic revision, or ``None``.
+    Return the database's current Alembic revisions, sorted.
 
-    ``None`` means the database has no ``alembic_version`` table at
-    all — i.e. nothing has ever been migrated against this database.
-    A database that exists at some revision (even if not head) returns
-    that revision string.
+    Empty means nothing has ever been migrated against this database. More
+    than one means it stopped between the branches of a merge, for example
+    in an interrupted upgrade; Alembic upgrades from all of them.
 
     :param engine: SQLAlchemy engine bound to the target database.
-    :returns: The current revision hash (e.g. ``"c9d3a1f2e4b5"``) or
-        ``None`` if the ``alembic_version`` table is absent.
+    :returns: The revision hashes in ``alembic_version``, e.g.
+        ``("c9d3a1f2e4b5",)``, or ``()`` if the table is absent or empty.
     """
     from alembic.runtime.migration import MigrationContext
 
     with query_name_scope("omnigent.database.select_current_revision"):
         inspector = inspect(engine)
         if "alembic_version" not in inspector.get_table_names():
-            return None
+            return ()
         with engine.connect() as connection:
-            ctx = MigrationContext.configure(connection)
-            return ctx.get_current_revision()
+            return tuple(sorted(MigrationContext.configure(connection).get_current_heads()))
+
+
+def _format_revisions(revisions: tuple[str, ...]) -> str:
+    """Render database revisions for logs and errors, e.g. ``'a1', 'b2'``."""
+    return ", ".join(repr(revision) for revision in revisions) or "none"
 
 
 def _get_head_db_revision(db_uri: str) -> str:
@@ -744,11 +747,11 @@ def _get_head_db_revision(db_uri: str) -> str:
 
 def _verify_db_revision_is_supported(
     db_uri: str,
-    current: str | None,
+    current: tuple[str, ...],
     head: str,
 ) -> None:
     """Reject a database revision that is unknown to this build."""
-    if current is None or current == head:
+    if current in ((), (head,)):
         return
 
     from alembic.script import ScriptDirectory
@@ -756,11 +759,11 @@ def _verify_db_revision_is_supported(
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
     try:
-        script.get_revision(current)
+        script.get_revisions(current)
     except CommandError as exc:
         raise RuntimeError(
             "Omnigent database schema is newer than this version of Omnigent "
-            f"(found revision {current!r}, latest supported revision {head!r}). "
+            f"(found revision {_format_revisions(current)}, latest supported revision {head!r}). "
             "Upgrade Omnigent before using this database."
         ) from exc
 
@@ -775,7 +778,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
       head. This covers brand-new SQLite files and freshly created
       Postgres schemas.
     - **At head** — no-op.
-    - **Behind head** — log a warning, attempt an automatic Alembic
+    - **Behind head**, including a database left between the branches
+      of a merge — log a warning, attempt an automatic Alembic
       upgrade to head, then verify that the database reached head.
       If the migration fails, re-raise with context so the server
       still terminates with an actionable error instead of continuing
@@ -794,18 +798,18 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         return
 
     head = _get_head_db_revision(db_uri)
-    current = _get_current_db_revision(engine)
+    current = _get_current_db_heads(engine)
     _verify_db_revision_is_supported(db_uri, current, head)
 
-    if current is None:
+    if not current:
         _run_migrations(engine, db_uri)
         return
 
-    if current != head:
+    if current != (head,):
         _logger.warning(
             "Omnigent database schema is out of date "
-            "(found revision %r, expected %r); attempting automatic migration.",
-            current,
+            "(found revision %s, expected %r); attempting automatic migration.",
+            _format_revisions(current),
             head,
         )
         try:
@@ -813,7 +817,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
         except Exception as exc:
             raise RuntimeError(
                 f"Omnigent database schema is out of date "
-                f"(found revision {current!r}, expected {head!r}) "
+                f"(found revision {_format_revisions(current)}, expected {head!r}) "
                 f"and automatic migration failed. Take a backup of your database, then run\n"
                 f"\n"
                 f"    omnigent debug db-upgrade {db_uri!r}\n"
@@ -821,11 +825,12 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
                 f"to inspect or retry the migration manually."
             ) from exc
 
-        migrated = _get_current_db_revision(engine)
-        if migrated != head:
+        migrated = _get_current_db_heads(engine)
+        if migrated != (head,):
             raise RuntimeError(
                 f"Omnigent automatic database migration did not reach head "
-                f"(started at {current!r}, now at {migrated!r}, expected {head!r}). "
+                f"(started at {_format_revisions(current)}, "
+                f"now at {_format_revisions(migrated)}, expected {head!r}). "
                 f"Take a backup of your database, then run\n"
                 f"\n"
                 f"    omnigent debug db-upgrade {db_uri!r}\n"
