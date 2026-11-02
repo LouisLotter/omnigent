@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         ConversationStore,
         FileStore,
     )
+    from omnigent.stores.approval_store import SqlAlchemyApprovalStore
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.terminals import TerminalRegistry
@@ -37,6 +38,8 @@ _file_store: FileStore | None = None
 _artifact_store: ArtifactStore | None = None
 _comment_store: CommentStore | None = None
 _policy_store: PolicyStore | None = None
+# Approver grants, protected policies and the approval ledger; set by the server app.
+_approval_store: SqlAlchemyApprovalStore | None = None
 # Hosts import runtime helpers but do not need server routing configuration.
 _caps: RuntimeCaps | None = None
 _caps_lock = Lock()
@@ -216,8 +219,10 @@ def init(
 
     global _conversation_store, _agent_store
     global _agent_cache, _file_store, _artifact_store, _caps
-    global _terminal_registry, _comment_store, _policy_store
+    global _terminal_registry, _comment_store, _policy_store, _approval_store
     _conversation_store = conversation_store
+    # The server app sets the approval store for the stores it was given.
+    _approval_store = None
     _agent_store = agent_store
     _agent_cache = agent_cache
     _file_store = file_store

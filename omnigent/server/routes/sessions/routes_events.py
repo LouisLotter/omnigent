@@ -88,6 +88,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.approval_authority import gate_approval_answer
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -1653,6 +1654,7 @@ def register_events_routes(
                 agent_store,
                 runner_router,
                 actor=_actor,
+                request=request,
             )
             if _tool_verdict is not None:
                 return _tool_verdict
@@ -2048,7 +2050,27 @@ def register_events_routes(
                 raise OmnigentError(
                     "A runner tunnel cannot answer approvals", code=ErrorCode.FORBIDDEN
                 )
-            _refuse_delegated_credential(request, auth_provider, "answer approvals")
+            approval_data = body.data
+            # A protected approval needs a browser sign-in and an approver;
+            # it resolves once every required approver has answered.
+            gate = await gate_approval_answer(
+                request,
+                session_id=session_id,
+                elicitation_id=(body.data or {}).get("elicitation_id"),
+                action=(body.data or {}).get("action"),
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+            if gate.protected and not gate.final:
+                return {"queued": False, "awaiting": ",".join(gate.awaiting)}
+            if gate.protected:
+                approval_data = {
+                    "elicitation_id": body.data["elicitation_id"],
+                    "action": gate.action,
+                }
+            else:
+                _refuse_delegated_credential(request, auth_provider, "answer approvals")
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -2056,12 +2078,12 @@ def register_events_routes(
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
             await _resolve_elicitation(
-                session_id, body.data, runner_router, conversation_store, decided_by=user_id
+                session_id, approval_data, runner_router, conversation_store, decided_by=user_id
             )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
-                session_id, conv, conversation_store, agent_store, body.data
+                session_id, conv, conversation_store, agent_store, approval_data
             )
             return {"queued": False}
         if body.type == _MCP_ELICITATION_TYPE:

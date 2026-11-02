@@ -39,6 +39,7 @@ from omnigent.policies.schema import (
 from omnigent.policies.types import PolicyLLMClient
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.policies.protected import ProtectedPolicyEntry, build_protected_entries
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -449,6 +450,8 @@ def any_policies_apply(
     if child_spec is not None and child_spec.guardrails and child_spec.guardrails.policies:
         return True
     if default_policies:
+        return True
+    if _protected_rules_exist():
         return True
     if _load_default_policy_specs(policy_store):
         return True
@@ -867,7 +870,12 @@ def build_policy_engine(
     # Fall back to the server's gateway connection for prompt-policy
     # classifiers (else they default to api.openai.com).
     effective_connection_override = connection_override or server_connection
+    protected_owner, protected_entries = _load_protected_policies(
+        conversation_id, conversation_store, known=conv is not None
+    )
     return PolicyEngine(
+        protected_policies=protected_entries,
+        protected_owner=protected_owner,
         policies=[
             _instantiate_policy(
                 s,
@@ -1698,6 +1706,37 @@ def ancestor_ids_from_tree(
         seen.add(parent_id)
         current = parent
     return ancestors
+
+
+def _protected_rules_exist() -> bool:
+    """Whether the server has any enabled protected rule (team or personal)."""
+    from omnigent.runtime import get_approval_store
+
+    store = get_approval_store()
+    return store is not None and store.has_enabled_rules()
+
+
+def _load_protected_policies(
+    conversation_id: str, conversation_store: ConversationStore, *, known: bool
+) -> tuple[str | None, list[ProtectedPolicyEntry]]:
+    """The thread's actual owner and the protected rules governing it.
+
+    Read fresh on every build: a protected rule an administrator or the
+    person just changed governs the next decision.
+
+    :param known: Whether the conversation row exists; an unknown thread has
+        no owner, so only the team's rules apply.
+    """
+    from omnigent.runtime import get_approval_store
+
+    store = get_approval_store()
+    if store is None or not store.has_enabled_rules():
+        return None, []
+    owner_authority = (
+        conversation_store.get_actual_session_owner(conversation_id) if known else None
+    )
+    owner = owner_authority.user_id if owner_authority is not None else None
+    return owner, build_protected_entries(store.rules_for(owner))
 
 
 def _load_default_policy_specs(

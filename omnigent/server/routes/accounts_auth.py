@@ -269,12 +269,23 @@ def create_accounts_auth_router(
     def _reissue_session_cookie(response: Response, user_id: str, generation: str) -> None:
         """Keep the caller signed in after rotating their own account generation."""
         bind_account_authority(user_id, generation)
+        _set_browser_session_cookie(response, user_id, generation)
+
+    def _set_browser_session_cookie(
+        response: Response, user_id: str, generation: str | None
+    ) -> None:
+        """Sign the browser in with a cookie token marked as its own session.
+
+        A token returned in a response body goes to whatever client asked
+        (a CLI, a script); only this cookie carries the browser mark.
+        """
         session_jwt = mint_session_cookie(
             user_id=user_id,
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
+            browser=True,
         )
         _set_session_cookie(
             response,
@@ -378,13 +389,7 @@ def create_accounts_auth_router(
         if generation is None or not account_store.accepts_generation(username, generation):
             return JSONResponse(status_code=401, content={"error": "invalid username or password"})
         resp = JSONResponse(status_code=200, content=body_payload)
-        _set_session_cookie(
-            resp,
-            session_jwt,
-            cookie_name=_session_cookie,
-            secure=_secure,
-            max_age_seconds=_session_max_age,
-        )
+        _set_browser_session_cookie(resp, username, generation)
         _logger.info("auth/login: success for %s", _redact_for_log(username))
         return resp
 
@@ -524,13 +529,7 @@ def create_accounts_auth_router(
                 "user": {"id": user.id, "is_admin": user.is_admin},
             },
         )
-        _set_session_cookie(
-            resp,
-            session_jwt,
-            cookie_name=_session_cookie,
-            secure=_secure,
-            max_age_seconds=_session_max_age,
-        )
+        _set_browser_session_cookie(resp, username, user.account_generation)
         _logger.info(
             "auth/register: %s created via invite (admin=%s)",
             _redact_for_log(username),
@@ -628,13 +627,7 @@ def create_accounts_auth_router(
                 "user": {"id": user.id, "is_admin": user.is_admin},
             },
         )
-        _set_session_cookie(
-            resp,
-            session_jwt,
-            cookie_name=_session_cookie,
-            secure=_secure,
-            max_age_seconds=_session_max_age,
-        )
+        _set_browser_session_cookie(resp, username, user.account_generation)
         _logger.info("auth/setup: first admin %s claimed the instance", _redact_for_log(username))
         return resp
 

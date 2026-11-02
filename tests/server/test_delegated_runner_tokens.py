@@ -151,7 +151,7 @@ def test_browser_approval_runs_the_runners_retry_once(setup_app: Any, tracker: A
 
     assert approved.status_code == 202, approved.text
     assert executed["result"]["content"][0]["text"] == "posted", executed
-    assert repeated["error"]["message"] == "Elicitation not found or already resolved"
+    assert repeated["error"]["message"] == "Approval was already used"
     tracker.call_tool.assert_awaited_once()
     assert tracker.call_tool.await_args.args[2:] == ("post_update", {"text": "hello"})
     assert _approved_posts(stores, session_id) == 1

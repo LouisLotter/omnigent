@@ -22,7 +22,11 @@ from urllib.parse import urlsplit
 import httpx
 import jwt
 
-from omnigent.server.auth import CREDENTIAL_DELEGATION_CLAIM
+from omnigent.server.auth import (
+    BROWSER_SESSION_USE,
+    CREDENTIAL_DELEGATION_CLAIM,
+    CREDENTIAL_USE_CLAIM,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -62,6 +66,7 @@ def mint_session_token(
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
     delegated: str | None = None,
+    browser: bool = False,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -82,6 +87,9 @@ def mint_session_token(
         never included in runner, refresh, or CLI-issued credentials.
     :param delegated: Who the token is handed to on the user's behalf, e.g.
         ``"runner"``; ``None`` for the user's own sign-in.
+    :param browser: Mark the token as a browser's session cookie. Only a
+        token set as that cookie by a sign-in the browser itself completed
+        carries the mark; approvals require it.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -97,6 +105,8 @@ def mint_session_token(
         payload["cli_login_ticket"] = cli_login_ticket
     if delegated is not None:
         payload[CREDENTIAL_DELEGATION_CLAIM] = delegated
+    if browser:
+        payload[CREDENTIAL_USE_CLAIM] = BROWSER_SESSION_USE
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -108,6 +118,7 @@ def mint_session_cookie(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    browser: bool = False,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -118,6 +129,7 @@ def mint_session_cookie(
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback.
+    :param browser: Mark the token as the browser's own session cookie.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
@@ -127,6 +139,7 @@ def mint_session_cookie(
         provider,
         account_generation=account_generation,
         cli_login_ticket=cli_login_ticket,
+        browser=browser,
     )
 
 

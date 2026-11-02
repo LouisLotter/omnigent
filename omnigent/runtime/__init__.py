@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         ConversationStore,
         FileStore,
     )
+    from omnigent.stores.approval_store import SqlAlchemyApprovalStore
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
     from omnigent.terminals import TerminalRegistry
@@ -154,6 +155,28 @@ def get_policy_store() -> PolicyStore | None:
     :returns: The PolicyStore set during :func:`init`, or ``None``.
     """
     return _globals._policy_store
+
+
+def get_approval_store() -> SqlAlchemyApprovalStore | None:
+    """
+    Return the approval store, or ``None`` if the server has none.
+
+    Holds approver grants, protected policies and the protected-approval
+    ledger. Without it only ordinary policies run and approvals follow the
+    session's edit level.
+
+    :returns: The store the server app set, or ``None``.
+    """
+    return _globals._approval_store
+
+
+def set_approval_store(store: SqlAlchemyApprovalStore | None) -> None:
+    """
+    Set the approval store; the server app calls this once at startup.
+
+    :param store: The store, or ``None`` to clear it.
+    """
+    _globals._approval_store = store
 
 
 def get_agent_cache() -> AgentCache:

@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -20,7 +21,13 @@ from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.policies.base import Policy
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.schema import AUTOMATIC_RUNTIME_STATE_KEYS, is_reserved_state_key
-from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.policies.types import ApprovalNeed, EvaluationContext, PolicyResult
+from omnigent.runtime.policies.protected import (
+    PERSONAL_NEED,
+    ProtectedPolicyEntry,
+    evaluate_protected,
+    protected_context,
+)
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     LabelDef,
@@ -103,6 +110,11 @@ class PolicyEngine:
         ``llm:`` config at engine build time. ``None`` when the
         server has no ``llm:`` config — function policies that
         need an LLM will see ``None`` in ``event["llm_client"]``.
+    :param protected_policies: Team and personal protected rules (see
+        :mod:`omnigent.runtime.policies.protected`), evaluated after every
+        other policy on the final content.
+    :param protected_owner: The thread's actual owner, passed to protected
+        rules as a fact.
     """
 
     def __init__(
@@ -125,8 +137,14 @@ class PolicyEngine:
         conversation_store: ConversationStore,
         root_conversation_id: str | None = None,
         llm_client: Any = None,
+        protected_policies: Sequence[ProtectedPolicyEntry] = (),
+        protected_owner: str | None = None,
     ) -> None:
         self.policies = policies
+        # Team and personal protected rules; evaluated after ``policies``.
+        self.protected_policies = list(protected_policies)
+        # The thread's actual owner, a fact protected rules may read.
+        self._protected_owner = protected_owner
         self.label_defs = label_defs
         self.ask_timeout = ask_timeout
         self._conversation_id = conversation_id
@@ -381,6 +399,8 @@ class PolicyEngine:
             # silently dropped per POLICIES.md §9.
             filtered_labels = _filter_writable_labels(result.set_labels, policy.spec)
             if filtered_labels:
+                filtered_labels = _without_server_labels(filtered_labels)
+            if filtered_labels:
                 accumulated.update(filtered_labels)
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
@@ -406,6 +426,24 @@ class PolicyEngine:
                     first_ask_workspace_id = getattr(policy.spec, "workspace_id", None)
                 deciding_ask_policies.append(policy.spec.name)
 
+        # Protected rules run last, on the final content, and only restrict.
+        protected = await self._evaluate_protected(ctx, composed_data, context)
+        if protected.deny is not None:
+            return self._compose_deny(
+                protected.deny[0],
+                protected.deny[1],
+                accumulated,
+                accumulated_state,
+                read_only=read_only,
+            )
+        approval_needs: list[ApprovalNeed] = [
+            ApprovalNeed(PERSONAL_NEED, name) for name in deciding_ask_policies
+        ]
+        for name, reason, need in protected.asks:
+            ask_reasons.append(f"{name}: {reason}")
+            deciding_ask_policies.append(name)
+            approval_needs.append(need)
+
         if ask_reasons:
             # DO NOT apply label writes or state updates here — the ASK
             # verdict is pending user approval. Both are withheld and
@@ -420,6 +458,7 @@ class PolicyEngine:
                 deciding_policies=deciding_ask_policies,
                 deciding_policy_workspace_id=first_ask_workspace_id,
                 data=composed_data,
+                approval_needs=tuple(approval_needs),
             )
         if not read_only:
             self.apply_label_writes(accumulated)
@@ -430,6 +469,20 @@ class PolicyEngine:
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
             data=composed_data,
+        )
+
+    async def _evaluate_protected(
+        self, ctx: EvaluationContext, composed_data: Any, context: dict[str, Any]
+    ) -> Any:
+        """Run the protected rules on the final content with trusted facts only."""
+        from omnigent.runtime.policies.protected import ProtectedVerdict
+
+        if not self.protected_policies:
+            return ProtectedVerdict(None, [])
+        final = composed_data if composed_data is not None else ctx.content
+        facts = protected_facts(ctx, self._protected_owner, self._conversation_id)
+        return await evaluate_protected(
+            self.protected_policies, protected_context(ctx, final, facts), context
         )
 
     def _compose_deny(
@@ -1115,6 +1168,38 @@ async def _dispatch_policy(
             set_labels=None,
         )
     return result
+
+
+def protected_facts(
+    ctx: EvaluationContext, owner: str | None, conversation_id: str
+) -> dict[str, object]:
+    """The facts a protected rule may read: the engine's, then the enforcement site's.
+
+    The enforcement site supplies only server-derived values (the
+    authenticated principal, the turn's initiator, the destination service,
+    the connection generation); none comes from labels or session state.
+    """
+    actor = (ctx.actor or {}).get("run_as") or None
+    facts: dict[str, object] = {
+        "owner": owner,
+        "actor": actor,
+        "initiator": actor,
+        "phase": getattr(ctx.phase, "value", str(ctx.phase)),
+        "tool": ctx.tool_name,
+        "session_id": conversation_id,
+    }
+    facts.update(ctx.protected or {})
+    return facts
+
+
+# Label keys the server writes itself (the turn's actor, archive time, ...);
+# a policy's ``set_labels`` never changes them.
+SERVER_LABEL_PREFIX = "omnigent."
+
+
+def _without_server_labels(set_labels: dict[str, str]) -> dict[str, str]:
+    """Drop writes to server-owned label keys."""
+    return {k: v for k, v in set_labels.items() if not k.startswith(SERVER_LABEL_PREFIX)}
 
 
 def _filter_writable_labels(

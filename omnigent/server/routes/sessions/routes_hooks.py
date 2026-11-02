@@ -1105,6 +1105,12 @@ def register_hooks_routes(
                                 result=gate_result,
                                 conversation_store=conversation_store,
                                 elicitation_id=hook_elicitation_id,
+                                # The MCP call records and consumes its own approval.
+                                **(
+                                    {"approval_owned_by_call": True}
+                                    if mcp_approval_id is not None
+                                    else {}
+                                ),
                             )
                         except ElicitationDeclinedError as exc:
                             # Explicit user decline: interrupt the native

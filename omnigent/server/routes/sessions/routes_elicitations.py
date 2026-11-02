@@ -12,6 +12,7 @@ from fastapi import (
 
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
+    get_approval_store,
     pending_elicitations,
 )
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -23,6 +24,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.approval_authority import gate_approval_answer, may_view_approval
 from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
@@ -74,6 +76,20 @@ def register_elicitations_routes(
 ) -> None:
     """Register the elicitations routes on router."""
 
+    async def _approver_may_view(
+        session_id: str, elicitation_id: str, user_id: str | None
+    ) -> bool:
+        """Whether *user_id* answers this pending protected approval as an approver."""
+        store = get_approval_store()
+        if store is None or auth_provider is None:
+            return False
+        record = await asyncio.to_thread(store.get_verdict, elicitation_id)
+        if record is None or record.session_id != session_id:
+            return False
+        return await asyncio.to_thread(
+            may_view_approval, store, conversation_store, record, user_id
+        )
+
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
         # Internal elicitation flow — hidden from the public API reference.
@@ -88,7 +104,7 @@ def register_elicitations_routes(
         session_id: str,
         elicitation_id: str,
         body: ElicitationResult,
-    ) -> dict[str, bool]:
+    ) -> dict[str, Any]:
         """
         Resolve an outstanding elicitation by its URL (URL-based
         elicitation).
@@ -121,22 +137,57 @@ def register_elicitations_routes(
         :param body: The MCP-shaped verdict — ``action``
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
+        A protected approval (a policy ASK recorded in the approval ledger)
+        is answered by its approvers instead: the thread's person, or the
+        named approvers of the thread, service or team, who need no access to
+        the thread. Only a browser sign-in answers one, and it resolves only
+        once every required approver accepted (or one declined).
+
         :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item.
+            and persists no conversation item. A protected approval still
+            waiting for other approvers adds ``"awaiting"``: the kinds of
+            approval still missing, comma-separated, e.g. ``"team"``.
         :raises OmnigentError: 404 if no session exists; 403 for a
             delegated credential such as a runner's token.
         """
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
+        gate = await gate_approval_answer(
+            request,
+            session_id=session_id,
+            elicitation_id=elicitation_id,
+            action=body.action,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
-        _refuse_delegated_credential(request, auth_provider, "answer approvals")
-        conv = access.conversation
-        if conv is None:
+        if gate.protected:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+            if not gate.final:
+                return {"queued": False, "awaiting": ",".join(gate.awaiting)}
+            _resolve_data: dict[str, Any] = {
+                "elicitation_id": elicitation_id,
+                "action": gate.action,
+            }
+        else:
+            access = await _require_access_and_level(
+                user_id,
+                session_id,
+                ELICITATION_RESOLVE_LEVEL,
+                permission_store,
+                conversation_store,
+            )
+            _refuse_delegated_credential(request, auth_provider, "answer approvals")
+            conv = access.conversation
+            if conv is None:
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if conv is None:
+                    raise _session_not_found()
+            _resolve_data = {
+                "elicitation_id": elicitation_id,
+                **body.model_dump(exclude_none=True),
+            }
         await _resolve_elicitation(
             session_id, _resolve_data, runner_router, conversation_store, decided_by=user_id
         )
@@ -182,13 +233,18 @@ def register_elicitations_routes(
         :raises OmnigentError: 404 if the session does not exist.
         """
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
-        )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        if not await _approver_may_view(session_id, elicitation_id, user_id):
+            access = await _require_access_and_level(
+                user_id,
+                session_id,
+                ELICITATION_RESOLVE_LEVEL,
+                permission_store,
+                conversation_store,
+            )
+            if access.conversation is None:
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if conv is None:
+                    raise _session_not_found()
 
         found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
         if found is None:

@@ -390,6 +390,13 @@ def test_daily_budget_write_obeys_account_lifecycle(
     assert report_cost(alice, session_id, 0.1).status_code == 202
     request_client = alice if actor == "owner" else admin
     if operation == "approval":
+        if actor == "admin":
+            # An administrator approves a member's work only once named its approver.
+            named = admin.post(
+                "/v1/approvers",
+                json={"kind": "session", "resource_id": session_id, "user_id": "admin"},
+            )
+            assert named.status_code == 201, named.text
         verdict = evaluate(request_client, session_id)
         assert verdict["verdict"] == "pending", verdict
         body = {

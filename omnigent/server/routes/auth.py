@@ -589,6 +589,8 @@ def create_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
             cli_login_ticket=authenticated_ticket,
+            # Set only as this browser's cookie; a CLI gets its own token.
+            browser=True,
         )
 
         # Check if this callback fulfills a CLI login ticket.

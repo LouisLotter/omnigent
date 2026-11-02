@@ -157,6 +157,7 @@ from omnigent.stores import (
     ConversationStore,
     FileStore,
 )
+from omnigent.stores.approval_store import SqlAlchemyApprovalStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
@@ -1358,6 +1359,22 @@ def _ensure_default_polly_agent(
     )
 
 
+def _default_approval_store(
+    conversation_store: ConversationStore,
+) -> SqlAlchemyApprovalStore | None:
+    """An approval store on the conversation store's SQL database, if it has one."""
+    location = getattr(conversation_store, "storage_location", None)
+    if not isinstance(location, str) or "://" not in location:
+        return None
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    if not isinstance(conversation_store, SqlAlchemyConversationStore):
+        return None
+    return SqlAlchemyApprovalStore(location)
+
+
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1404,6 +1421,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    approval_store: SqlAlchemyApprovalStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1434,6 +1452,9 @@ def create_app(
         CRUD endpoints.
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
+    :param approval_store: Store for approver grants, protected policies and
+        the approval ledger. ``None`` builds one on the conversation store's
+        database when that is a SQL database.
     :param scheduled_task_store: Store backing the recurring-task
         scheduler. When provided, the FastAPI lifespan
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
@@ -2041,7 +2062,12 @@ def create_app(
     )
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
-    from omnigent.runtime import telemetry
+    from omnigent.runtime import set_approval_store, telemetry
+
+    if approval_store is None:
+        approval_store = _default_approval_store(conversation_store)
+    set_approval_store(approval_store)
+    app.state.approval_store = approval_store
 
     telemetry.instrument_fastapi_app(app)
     # Expose the registry on app.state so integration tests and
@@ -3706,6 +3732,19 @@ def create_app(
         prefix="/v1",
         tags=["policy_registry"],
     )
+    if approval_store is not None:
+        from omnigent.server.routes.approvals import create_approvals_router
+
+        app.include_router(
+            create_approvals_router(
+                approval_store,
+                conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["approvals"],
+        )
     if scheduled_task_store is not None:
         app.include_router(
             create_scheduled_tasks_router(

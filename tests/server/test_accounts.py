@@ -53,6 +53,7 @@ from omnigent.server.passwords import (
     verify_password,
 )
 from omnigent.server.principals import (
+    CredentialKind,
     MachineBinding,
     Principal,
     PrincipalKind,
@@ -455,6 +456,7 @@ def test_runner_token_is_never_a_session_cookie() -> None:
         cookie_secret=_TEST_COOKIE_SECRET,
         ttl_hours=8,
         provider="accounts",
+        browser=True,
     )
 
     runner = _FakeReq(headers={"Authorization": f"Bearer {runner_token}"})
@@ -470,7 +472,9 @@ def test_runner_token_is_never_a_session_cookie() -> None:
         headers={"Authorization": f"Bearer {runner_token}"},
     )
     assert provider.get_user_id(both) == "alice@example.com"
-    assert provider.principal(both) == Principal(PrincipalKind.HUMAN, "alice@example.com")
+    assert provider.principal(both) == Principal(
+        PrincipalKind.HUMAN, "alice@example.com", credential=CredentialKind.BROWSER_SESSION
+    )
     fresh = _FakeReq(headers={"Authorization": f"Bearer {runner_token}"})
     assert UnifiedAuthProvider(source="header").credential_delegation(fresh) is None
 
@@ -495,17 +499,21 @@ def test_legacy_owner_runner_token_is_refused() -> None:
 
 
 @pytest.mark.parametrize(
-    ("claims", "kind"),
+    ("claims", "kind", "credential"),
     [
-        ({}, PrincipalKind.HUMAN),
-        ({"grant_id": "login-grant"}, PrincipalKind.HUMAN),
-        ({"grant_id": "device-grant", "scope": "sessions"}, PrincipalKind.DELEGATED_CLIENT),
-        ({"scope": "sessions"}, PrincipalKind.SERVICE),
+        ({}, PrincipalKind.HUMAN, CredentialKind.SESSION_BEARER),
+        ({"grant_id": "login-grant"}, PrincipalKind.HUMAN, CredentialKind.LOGIN_GRANT),
+        (
+            {"grant_id": "device-grant", "scope": "sessions"},
+            PrincipalKind.DELEGATED_CLIENT,
+            CredentialKind.DEVICE_GRANT,
+        ),
+        ({"scope": "sessions"}, PrincipalKind.SERVICE, CredentialKind.CLIENT_CREDENTIALS),
     ],
     ids=["sign-in", "login-grant", "device-client", "machine-client"],
 )
 def test_authentication_records_who_holds_the_credential(
-    claims: dict[str, str], kind: PrincipalKind
+    claims: dict[str, str], kind: PrincipalKind, credential: CredentialKind
 ) -> None:
     """Every credential shape resolves to its account and to the kind of caller holding it."""
     import time
@@ -522,8 +530,46 @@ def test_authentication_records_who_holds_the_credential(
     for _ in range(2):
         request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
         principal = provider.principal(request)
-        assert principal == Principal(kind, "alice")
+        assert principal == Principal(kind, "alice", credential=credential)
         assert principal.is_human is (kind is PrincipalKind.HUMAN)
+        # None of these is a browser sign-in, so none answers approvals.
+        assert not principal.is_interactive_human
+
+
+@pytest.mark.parametrize(
+    ("browser_mark", "in_cookie", "credential"),
+    [
+        (True, True, CredentialKind.BROWSER_SESSION),
+        (True, False, CredentialKind.SESSION_BEARER),
+        (False, True, CredentialKind.SESSION_BEARER),
+    ],
+    ids=["browser-cookie", "browser-token-as-bearer", "cli-token-as-cookie"],
+)
+def test_only_a_browser_marked_cookie_is_a_browser_session(
+    browser_mark: bool, in_cookie: bool, credential: CredentialKind
+) -> None:
+    """A CLI's stored token stays a CLI token, even copied into the session cookie."""
+    from omnigent.server.oidc import mint_session_cookie
+
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    token = mint_session_cookie(
+        user_id="alice",
+        cookie_secret=_TEST_COOKIE_SECRET,
+        ttl_hours=1,
+        provider="accounts",
+        browser=browser_mark,
+    )
+
+    for _ in range(2):  # the second request reads the cached identity
+        request = (
+            _FakeReq(cookies={cfg.session_cookie_name: token})
+            if in_cookie
+            else _FakeReq(headers={"Authorization": f"Bearer {token}"})
+        )
+        principal = provider.principal(request)
+        assert principal == Principal(PrincipalKind.HUMAN, "alice", credential=credential)
+        assert principal.is_interactive_human is (credential is CredentialKind.BROWSER_SESSION)
 
 
 def test_principal_follows_the_connection_and_clears_on_failed_authentication() -> None:
@@ -538,9 +584,11 @@ def test_principal_follows_the_connection_and_clears_on_failed_authentication() 
     assert provider.principal(tunnel) is None
     header = UnifiedAuthProvider(source="header", local_single_user=True, header_name="X-User")
     assert header.principal(_FakeReq(headers={"X-User": "bob@example.com"})) == Principal(
-        PrincipalKind.HUMAN, "bob@example.com"
+        PrincipalKind.HUMAN, "bob@example.com", credential=CredentialKind.PROXY_HEADER
     )
-    assert header.principal(_FakeReq()) == Principal(PrincipalKind.HUMAN, "local")
+    assert header.principal(_FakeReq()) == Principal(
+        PrincipalKind.HUMAN, "local", credential=CredentialKind.PROXY_HEADER
+    )
 
 
 def test_custom_provider_principal_comes_from_its_delegation() -> None:
@@ -555,7 +603,9 @@ def test_custom_provider_principal_comes_from_its_delegation() -> None:
             return request.headers.get("X-Delegated")
 
     provider = _Provider()
-    assert provider.principal(_FakeReq()) == Principal(PrincipalKind.HUMAN, "carol")
+    assert provider.principal(_FakeReq()) == Principal(
+        PrincipalKind.HUMAN, "carol", credential=CredentialKind.PROXY_HEADER
+    )
     runner = _FakeReq(headers={"X-Delegated": "runner"})
     assert provider.principal(runner) == Principal(
         PrincipalKind.RUNNER, "carol", scopes=default_scopes(PrincipalKind.RUNNER)

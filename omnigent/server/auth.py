@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 from starlette.requests import HTTPConnection
 
 from omnigent.server.principals import (
+    CredentialKind,
     MachineBinding,
     Principal,
     PrincipalKind,
@@ -116,6 +117,12 @@ def delegated_path_allowed(path: str) -> bool:
 CREDENTIAL_DELEGATION_CLAIM = "delegated"
 RUNNER_DELEGATION = "runner"
 
+# JWT claim marking a session token minted for a browser's session cookie.
+# Tokens handed to a CLI or another client lack it, so software that reuses a
+# stored sign-in cannot pass as the person in a browser.
+CREDENTIAL_USE_CLAIM = "use"
+BROWSER_SESSION_USE = "browser"
+
 # Account administration and credential issuance. A delegated credential is
 # not a sign-in on these paths, so it can neither manage accounts nor obtain
 # a person's undelegated credential (device or CLI login consent).
@@ -133,12 +140,27 @@ def _route_path(request: HTTPConnection) -> str:
 
 def _session_token(request: HTTPConnection, cookie_name: str) -> str | None:
     """Return the session JWT: the cookie for browsers, else a Bearer token for CLIs."""
+    return _session_token_and_source(request, cookie_name)[0]
+
+
+def _session_token_and_source(
+    request: HTTPConnection, cookie_name: str
+) -> tuple[str | None, bool]:
+    """Return the session JWT and whether it came from the session cookie."""
     token = request.cookies.get(cookie_name)
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-    return token or None
+    if token:
+        return token, True
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:] or None, False
+    return None, False
+
+
+def _session_credential(payload: dict[str, object], from_cookie: bool) -> CredentialKind:
+    """Classify a person's own session token by where it came from and who it was minted for."""
+    if from_cookie and payload.get(CREDENTIAL_USE_CLAIM) == BROWSER_SESSION_USE:
+        return CredentialKind.BROWSER_SESSION
+    return CredentialKind.SESSION_BEARER
 
 
 # Explicit single-user marker. Set by the managed local-server spawn
@@ -505,7 +527,9 @@ class AuthProvider(ABC):
         if principal is not None:
             return principal
         kind = _delegated_kind(self.credential_delegation(request))
-        return Principal(kind, user_id, scopes=default_scopes(kind))
+        # A provider that records nothing asserts identity the way a trusted proxy does.
+        credential = CredentialKind.PROXY_HEADER if kind is PrincipalKind.HUMAN else None
+        return Principal(kind, user_id, scopes=default_scopes(kind), credential=credential)
 
 
 def _delegated_kind(delegation: object) -> PrincipalKind:
@@ -590,7 +614,7 @@ class UnifiedAuthProvider(AuthProvider):
             if header_strip_prefix is not None
             else resolve_auth_header_strip_prefix()
         )
-        self._cookie_cache: dict[str, tuple[str, float]] = {}
+        self._cookie_cache: dict[str, tuple[str, float, dict[str, object]]] = {}
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
@@ -638,7 +662,9 @@ class UnifiedAuthProvider(AuthProvider):
         :param user_id: The deleted account, e.g. ``"alice"``.
         """
         stale = [
-            key for key, (cached_user, _) in self._cookie_cache.items() if cached_user == user_id
+            key
+            for key, (cached_user, _, _) in self._cookie_cache.items()
+            if cached_user == user_id
         ]
         for key in stale:
             del self._cookie_cache[key]
@@ -821,7 +847,7 @@ class UnifiedAuthProvider(AuthProvider):
         cookie_config = self._cookie_config()
         if cookie_config is None:
             return None
-        token = _session_token(request, cookie_config.session_cookie_name)
+        token, from_cookie = _session_token_and_source(request, cookie_config.session_cookie_name)
         if token is None:
             return None
 
@@ -829,7 +855,10 @@ class UnifiedAuthProvider(AuthProvider):
         cached = self._cookie_cache.get(cache_key)
         if self._account_check is None and cached is not None and cached[1] > time.monotonic():
             # Only a person's own undelegated sign-in is ever cached.
-            record_principal(request, Principal(PrincipalKind.HUMAN, cached[0]))
+            credential = _session_credential(cached[2], from_cookie)
+            record_principal(
+                request, Principal(PrincipalKind.HUMAN, cached[0], credential=credential)
+            )
             return cached[0]
 
         try:
@@ -895,19 +924,28 @@ class UnifiedAuthProvider(AuthProvider):
             if scope is None:
                 # A first-party login grant renews the person's own session.
                 kind = _delegated_kind(delegation)
+                credential = CredentialKind.LOGIN_GRANT
+            elif grant_id is None:
+                kind, credential = PrincipalKind.SERVICE, CredentialKind.CLIENT_CREDENTIALS
             else:
-                kind = (
-                    PrincipalKind.SERVICE if grant_id is None else PrincipalKind.DELEGATED_CLIENT
-                )
-            record_principal(request, Principal(kind, user_id))
+                kind, credential = PrincipalKind.DELEGATED_CLIENT, CredentialKind.DEVICE_GRANT
+            record_principal(request, Principal(kind, user_id, credential=credential))
             return user_id
 
+        claims = {CREDENTIAL_USE_CLAIM: payload.get(CREDENTIAL_USE_CLAIM)}
         if self._account_check is None and delegation is None:
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
-                self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
+                self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining, claims)
 
-        record_principal(request, Principal(_delegated_kind(delegation), user_id))
+        record_principal(
+            request,
+            Principal(
+                _delegated_kind(delegation),
+                user_id,
+                credential=_session_credential(claims, from_cookie),
+            ),
+        )
         return user_id
 
     def _check_machine_token(
@@ -1000,10 +1038,20 @@ class UnifiedAuthProvider(AuthProvider):
                 email = email.removeprefix(self._header_strip_prefix)
             if not email or email in _RESERVED_USERS:
                 return None
-            record_principal(request, Principal(PrincipalKind.HUMAN, email))
+            record_principal(
+                request,
+                Principal(PrincipalKind.HUMAN, email, credential=CredentialKind.PROXY_HEADER),
+            )
             return email
         if self._local_single_user:
-            record_principal(request, Principal(PrincipalKind.HUMAN, RESERVED_USER_LOCAL))
+            record_principal(
+                request,
+                Principal(
+                    PrincipalKind.HUMAN,
+                    RESERVED_USER_LOCAL,
+                    credential=CredentialKind.PROXY_HEADER,
+                ),
+            )
             return RESERVED_USER_LOCAL
         return None
 

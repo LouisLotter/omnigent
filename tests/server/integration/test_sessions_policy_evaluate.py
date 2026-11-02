@@ -1676,7 +1676,8 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
 # Measured (both dialects) for the seed below: one owner grant, one agent
 # declaring one tool_call policy, one conversation, no declared labels, no
 # children. Composition: the handler's conversation load 3, session-policy
-# lookup, agent row, spawn-tree scan 3.
+# lookup, agent row, spawn-tree scan 3, and one read of whether any protected
+# rule is enabled (read fresh so a new team or personal rule governs at once).
 #
 # ACL resolution used to add 3 more (users + the user and public grants). The
 # warm-up request below now also warms the permission store's resolve_access
@@ -1689,7 +1690,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
 # ``conversation=`` argument makes the builder re-read the conversation and
 # pushes this up, which no behavioural assertion can see because both
 # variants return the same verdict.
-_EVALUATE_ROUTE_SQL_BUDGET = 8
+_EVALUATE_ROUTE_SQL_BUDGET = 9
 
 
 @pytest.mark.asyncio
