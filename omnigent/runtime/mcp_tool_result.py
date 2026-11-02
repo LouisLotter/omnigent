@@ -192,6 +192,47 @@ def decode_mcp_image_result(value: object) -> McpImageResult | None:
     return McpImageResult(blocks, is_error) if found_image else None
 
 
+def decode_mcp_media_result(value: object) -> McpImageResult | None:
+    """Recognize the envelope carrying image and audio blocks between server and runner.
+
+    The registry gateway also carries audio in the envelope; the runner saves
+    those blocks as files before anything reaches a harness, whose decoder
+    accepts text and image blocks only.
+
+    :param value: Parsed tool result, e.g. ``json.loads(output)``.
+    :returns: Ordered text, image and audio blocks, or ``None`` for ordinary data.
+    """
+    if not isinstance(value, dict) or set(value) != {_ENVELOPE_KEY, "content", "isError"}:
+        return None
+    version = value[_ENVELOPE_KEY]
+    if type(version) is not int or version != _ENVELOPE_VERSION:
+        return None
+    is_error = value["isError"]
+    content = value["content"]
+    if not isinstance(is_error, bool) or not isinstance(content, list):
+        return None
+    blocks: list[JsonObject] = []
+    found_media = False
+    for block in content:
+        if not isinstance(block, dict) or not all(isinstance(key, str) for key in block):
+            return None
+        kind = block.get("type")
+        if kind == "text":
+            if not isinstance(block.get("text"), str):
+                return None
+        elif kind in ("image", "audio"):
+            mime_type = block.get("mimeType")
+            if not isinstance(block.get("data"), str) or not block["data"]:
+                return None
+            if not isinstance(mime_type, str) or not mime_type.startswith(f"{kind}/"):
+                return None
+            found_media = True
+        else:
+            return None
+        blocks.append(dict(block))
+    return McpImageResult(blocks, is_error) if found_media else None
+
+
 def mcp_response_from_tool_result(result: object) -> JsonObject:
     """
     Convert a shared native-harness tool result into MCP response shape.

@@ -37,6 +37,7 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.mcp_media_files import save_media_result
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -540,6 +541,11 @@ class ProxyMcpManager:
                 text = "\n".join(p for p in parts if p)
                 if is_error:
                     return json.dumps({"error": text})
+                if managed and text:
+                    # Images and audio from a registry service become files the agent can use.
+                    text = save_media_result(
+                        text, session_id=self._session_id, service=service, tool=upstream_name
+                    )
                 return text if text else json.dumps(result)
             return json.dumps(result)
 
