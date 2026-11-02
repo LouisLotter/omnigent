@@ -55,6 +55,7 @@ from omnigent.runner.transports.ws_tunnel.registry import (
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.principals import Principal, PrincipalKind, record_principal
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 
@@ -483,6 +484,7 @@ def create_runner_tunnel_router(
                 # instead of registering an owner-less runner.
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
+        record_principal(ws, Principal(PrincipalKind.RUNNER, tunnel_owner, runner_id=runner_id))
 
         await ws.accept()
         session: RunnerSession | None = None
