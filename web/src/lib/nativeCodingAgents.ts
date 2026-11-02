@@ -82,7 +82,10 @@ export type NativeCodingAgentCapability =
   | "skipPermissions"
   | "modelPicker"
   | "devinMode"
-  | "devinPermission";
+  | "devinPermission"
+  // Reports its effective effort as `reported_reasoning_effort`; without a
+  // report the effort is unknown, never the requested one.
+  | "effortReport";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -118,7 +121,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Claude Code",
     iconKind: "claude",
     sortRank: 10,
-    capabilities: ["permissionMode", "modelPicker"],
+    capabilities: ["permissionMode", "modelPicker", "effortReport"],
     fullySupported: true,
   },
   {

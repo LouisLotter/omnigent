@@ -85,33 +85,50 @@ export function formatStatusEffortLabel(effort: string | null): string | null {
 }
 
 /**
- * Hover-summary rows for a session's effort. The harness's report wins over the
- * request; a native harness with neither shows "Unknown" rather than a guess.
+ * The effort to show as the one a session runs at, or ``null`` when unknown.
+ * A harness that reports its effort never has its request shown in its place.
+ *
+ * @param reported - Effort the harness reports it runs at, or ``null``.
+ * @param requested - The session's requested effort, or ``null``.
+ * @param reportsEffort - Whether the harness reports its effective effort.
+ */
+export function displayedSessionEffort(
+  reported: string | null,
+  requested: string | null,
+  reportsEffort: boolean,
+): string | null {
+  return reported ?? (reportsEffort ? null : requested);
+}
+
+/**
+ * Hover-summary rows for a session's effort: the effective effort, its source,
+ * and the request when it differs. For a harness that reports its effort, a
+ * missing report reads "Unknown"; other harnesses fall back to the request.
  *
  * @param reported - Effort the harness reports it runs at, or ``null``.
  * @param requested - The session's requested effort, or ``null``.
  * @param harnessLabel - Harness display name for the source row, e.g. ``"Claude Code"``.
- * @param native - Whether a native CLI owns the effort when none is requested.
+ * @param reportsEffort - Whether the harness reports its effective effort.
  * @returns Rows such as ``Effort: xHigh`` and ``Effort source: Reported by Claude Code``.
  */
 export function effortSummaryRows(
   reported: string | null,
   requested: string | null,
   harnessLabel: string | null,
-  native: boolean,
+  reportsEffort: boolean,
 ): { label: string; value: string }[] {
+  const effective = displayedSessionEffort(reported, requested, reportsEffort);
+  if (effective === null && !reportsEffort) return [];
+  const rows = [
+    { label: "Effort", value: effective === null ? "Unknown" : normalizeEffortLabel(effective) },
+  ];
   if (reported) {
-    const rows = [
-      { label: "Effort", value: normalizeEffortLabel(reported) },
-      { label: "Effort source", value: `Reported by ${harnessLabel ?? "the harness"}` },
-    ];
-    if (requested && requested !== reported) {
-      rows.push({ label: "Requested effort", value: normalizeEffortLabel(requested) });
-    }
-    return rows;
+    rows.push({ label: "Effort source", value: `Reported by ${harnessLabel ?? "the harness"}` });
   }
-  if (requested) return [{ label: "Effort", value: normalizeEffortLabel(requested) }];
-  return native ? [{ label: "Effort", value: "Unknown" }] : [];
+  if (requested && requested !== effective) {
+    rows.push({ label: "Requested effort", value: normalizeEffortLabel(requested) });
+  }
+  return rows;
 }
 
 /**

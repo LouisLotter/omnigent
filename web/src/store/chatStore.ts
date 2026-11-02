@@ -806,6 +806,13 @@ export interface ConversationState {
    * state only: picks still write ``sessionReasoningEffort``.
    */
   sessionReportedReasoningEffort: string | null;
+  /**
+   * Bumped by every live ``session.reported_reasoning_effort``. A snapshot read
+   * applies its reported effort only when this is unchanged since the read
+   * began, so an older snapshot never replaces a newer report (even one that
+   * returned to the earlier value).
+   */
+  reportedEffortRevision: number;
   sessionModelSeeded: boolean;
   /**
    * Selected host id seeded at optimistic create, so the temp composer can run
@@ -2122,6 +2129,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionModelOverride: null,
   sessionReasoningEffort: null,
   sessionReportedReasoningEffort: null,
+  reportedEffortRevision: 0,
   sessionModelSeeded: false,
   sessionHostId: null,
   costControlModeOverride: null,
@@ -5086,7 +5094,7 @@ async function bindStream(
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
-        sessionReportedReasoningEffort: session.reportedReasoningEffort ?? null,
+        ...snapshotReportedEffortPatch(session, state, stateBeforeFetch),
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd:
           state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
@@ -5338,6 +5346,19 @@ function captureSnapshotLifecycle(
 }
 
 /**
+ * The snapshot's reported effort, explicit `null` included, unless a live report
+ * arrived after `before` was read: that report is newer than the snapshot.
+ */
+function snapshotReportedEffortPatch(
+  session: Session,
+  state: Pick<ConversationState, "reportedEffortRevision">,
+  before: Pick<ConversationState, "reportedEffortRevision">,
+): Partial<ConversationState> {
+  if (state.reportedEffortRevision !== before.reportedEffortRevision) return {};
+  return { sessionReportedReasoningEffort: session.reportedReasoningEffort ?? null };
+}
+
+/**
  * Reconcile model/startup metadata and counters unchanged since the fetch.
  * When `includeLifecycle` permits it, also recover `sessionStatus` and the
  * terminal `activeResponse` transition missed during the gap, so "Working…"
@@ -5364,6 +5385,8 @@ function reconnectStatusPatch(
     // A `session.model` missed in the gap would otherwise hold a first
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
+    // A missed effort report (or clear) is never re-sent; the snapshot repairs it.
+    ...snapshotReportedEffortPatch(session, s, stateBeforeFetch),
   };
   if (s.contextWindow === stateBeforeFetch.contextWindow && session.contextWindow != null)
     patch.contextWindow = session.contextWindow;
@@ -8201,9 +8224,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     case "session_reported_reasoning_effort":
       // The harness's own report of the effort it runs at; display state only.
-      applyToNamedConversation(event.conversationId, {
+      applyToNamedConversation(event.conversationId, (s) => ({
         sessionReportedReasoningEffort: event.reportedReasoningEffort,
-      });
+        reportedEffortRevision: s.reportedEffortRevision + 1,
+      }));
       return;
     case "session_permission_mode":
       // Pane-driven (in-TUI shift+tab) or UI-driven; either way the server

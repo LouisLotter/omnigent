@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   compactModelTriggerLabel,
   defaultModelLabel,
+  displayedSessionEffort,
   effortSummaryRows,
   formatModelEffortStatusLabel,
   formatStatusEffortLabel,
@@ -185,13 +186,23 @@ describe("effortSummaryRows", () => {
     ]);
   });
 
-  it("falls back to the request, then to Unknown only for native harnesses", () => {
-    expect(effortSummaryRows(null, "medium", "Claude Code", true)).toEqual([
-      { label: "Effort", value: "Medium" },
+  it("never shows a request as the effort of a harness that reports it", () => {
+    expect(effortSummaryRows(null, "high", "Claude Code", true)).toEqual([
+      { label: "Effort", value: "Unknown" },
+      { label: "Requested effort", value: "High" },
     ]);
     expect(effortSummaryRows(null, null, "Claude Code", true)).toEqual([
       { label: "Effort", value: "Unknown" },
     ]);
-    expect(effortSummaryRows(null, null, "Claude SDK", false)).toEqual([]);
+    expect(displayedSessionEffort(null, "high", true)).toBeNull();
+    expect(displayedSessionEffort("xhigh", "high", true)).toBe("xhigh");
+  });
+
+  it("keeps the request fallback for harnesses that mirror their effort into it", () => {
+    expect(effortSummaryRows(null, "medium", "Codex", false)).toEqual([
+      { label: "Effort", value: "Medium" },
+    ]);
+    expect(effortSummaryRows(null, null, "Codex", false)).toEqual([]);
+    expect(displayedSessionEffort(null, "medium", false)).toBe("medium");
   });
 });

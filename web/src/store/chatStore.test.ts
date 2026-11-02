@@ -8893,6 +8893,55 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().sessionReportedReasoningEffort).toBeNull();
     });
+
+    it.each([
+      ["hydrates the snapshot's report when nothing newer arrives", undefined, "high"],
+      ["keeps a newer level reported during the bind", "xhigh", "xhigh"],
+      ["keeps a newer clear to unknown over an older level", null, null],
+    ] as const)("%s", async (_label, live, expected) => {
+      seedSession("conv_effort_race", []);
+      let resolveFirstSnapshot: ((response: Response) => void) | null = null;
+      const snapshot = () =>
+        mockResponse({
+          id: "conv_effort_race",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: {},
+          reported_reasoning_effort: "high",
+        });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const isSnapshot =
+          url.split("?")[0] === "/v1/sessions/conv_effort_race" &&
+          (init?.method ?? "GET") === "GET";
+        if (!isSnapshot) return defaultFetchHandler(input, init);
+        if (resolveFirstSnapshot !== null) return Promise.resolve(snapshot());
+        return new Promise<Response>((resolve) => {
+          resolveFirstSnapshot = resolve;
+        });
+      });
+
+      const switchPromise = useChatStore.getState().switchTo("conv_effort_race");
+      await tick();
+      expect(resolveFirstSnapshot).not.toBeNull();
+      if (live !== undefined) {
+        handleSessionEvent(
+          {
+            type: "session_reported_reasoning_effort",
+            conversationId: "conv_effort_race",
+            reportedReasoningEffort: live,
+          },
+          "conv_effort_race",
+        );
+      }
+      resolveFirstSnapshot!(snapshot());
+      await switchPromise;
+      await tick();
+
+      expect(useChatStore.getState().sessionReportedReasoningEffort).toBe(expected);
+    });
   });
 
   describe("session.collaboration_mode", () => {
@@ -14095,6 +14144,61 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       }
     },
   );
+
+  it.each([
+    ["a changed effort", "xhigh"],
+    ["a clear to unknown", null],
+  ] as const)("a reconnect recovers %s reported during the gap", async (_label, snapshotEffort) => {
+    seedSession("conv_effort_gap", []);
+    const sinks = routeStreamOpens(["server-a", "server-b"]);
+    const normalFetch = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_effort_gap" && (init?.method ?? "GET") === "GET") {
+        return Promise.resolve(
+          mockResponse({
+            id: "conv_effort_gap",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: {},
+            pending_elicitations: [],
+            pending_inputs: [],
+            mcp_startup: null,
+            terminal_pending: false,
+            reported_reasoning_effort: snapshotEffort,
+          }),
+        );
+      }
+      return normalFetch(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_effort_gap",
+      abortController: controller,
+      sessionReportedReasoningEffort: "high",
+    });
+    const loop = startStreamPump("conv_effort_gap", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      // The report was published while the stream was down and is never re-sent.
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(50);
+      await drainAsync(2);
+      expect(useChatStore.getState().sessionReportedReasoningEffort).toBe(snapshotEffort);
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
 
   it("suppresses delayed previews after snapshot-only completion recovery", async () => {
     seedSession("conv_native_tombstone", []);
