@@ -55,7 +55,12 @@ from omnigent.runner.transports.ws_tunnel.registry import (
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
-from omnigent.server.principals import Principal, PrincipalKind, record_principal
+from omnigent.server.principals import (
+    Principal,
+    PrincipalKind,
+    record_principal,
+    recorded_principal,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores import ConversationStore
@@ -70,10 +75,10 @@ _RUNNER_RECOVERY_SLOW_SEC = 30.0
 # WebSocket close codes a runner sends on purpose: 1000 normal, 1001 going away.
 _CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
-# Lifetime of a managed runner's minted owner bearer (POST
-# /v1/runners/{id}/token). Short by design: the runner re-mints on demand
-# via its token factory, so a compromised sandbox's credential is usable
-# only briefly, while a live session refreshes indefinitely with no cap.
+# Lifetime of a runner token (POST /v1/runners/{id}/token). Short by design:
+# the runner re-mints on demand via its token factory, so a leaked token is
+# usable only briefly, while a live session refreshes indefinitely with no cap.
+# Every request also checks the token against the runner's current binding.
 _MANAGED_RUNNER_TOKEN_TTL_S = 1800
 
 
@@ -225,7 +230,7 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
-    mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
+    mint_managed_runner_token: Callable[[str, int], tuple[str, int] | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -264,8 +269,11 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
-    :param mint_managed_runner_token: Accounts-mode issuer that validates the
-        saved runner authority and mints under the account lock.
+    :param mint_managed_runner_token: Issuer that resolves the runner's current
+        binding (its thread's single owner, who owns the thread's host) and
+        mints a runner token for it. It returns ``None`` when the binding is
+        absent or held by someone else, and raises ``RUNNER_TOKENS_UNSUPPORTED``
+        when the auth mode cannot mint. ``None`` disables minting.
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
@@ -352,66 +360,55 @@ def create_runner_tunnel_router(
 
     @router.post("/runners/{runner_id}/token")
     async def mint_runner_owner_token(request: Request, runner_id: str) -> dict[str, str | int]:
-        """Mint a short-lived owner bearer for a delegated runner.
+        """Mint or refresh a short-lived runner token.
 
         A host-launched or managed-sandbox runner does not inherit the host
         user's credential; it presents its server-minted tunnel binding token
-        (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a
-        short-lived owner JWT the runner then uses on its HTTP callbacks
-        (which gate on ``require_user``). This is the HTTP analog of the
-        runner tunnel's binding-token handshake: the same SHA-256 gate
-        (``token_bound_runner_id(token) == runner_id``) and the same
-        owner resolution (``resolve_managed_runner_owner``), minting a
-        bearer instead of registering a tunnel.
+        (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a runner
+        token for its HTTP callbacks and tunnel. The token names the runner,
+        its thread, its host and the owner's registration, all read from the
+        server's records; it is never an administrator and never a session
+        cookie. Refresh is the same call.
 
         The binding-token match is required unconditionally — the
         allow-list shortcut honored on some other runner-token checks is
         deliberately NOT accepted here, because this endpoint issues a
-        full owner credential and delegated runners are token-bound.
+        credential and delegated runners are token-bound.
 
         :param request: The incoming FastAPI request (carries the binding
             token header).
         :param runner_id: Token-bound runner id from the path.
         :returns: ``{"token": <jwt>, "expires_at": <epoch seconds>}``.
         :raises OmnigentError: 401 when the binding token is absent,
-            doesn't match ``runner_id``, or resolves to no managed-launch
-            owner; 400 when the active auth mode can't mint server-side
-            (header/proxy, or no auth provider).
+            doesn't match ``runner_id``, or the runner has no valid binding;
+            400 ``runner_tokens_unsupported`` when the active auth mode can't
+            mint server-side (header/proxy, or no auth provider).
         """
         if auth_provider is None:
             # No auth configured: the runner authenticates by binding
             # token alone and needs no bearer — minting is meaningless.
             raise OmnigentError(
                 "runner token minting requires an auth provider",
-                code=ErrorCode.INVALID_INPUT,
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
             )
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token or token_bound_runner_id(token) != runner_id:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-        if mint_managed_runner_token is not None:
-            bearer = await asyncio.to_thread(
-                mint_managed_runner_token, runner_id, _MANAGED_RUNNER_TOKEN_TTL_S
-            )
-            if bearer is None:
-                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-        else:
-            owner: str | None = None
-            if resolve_managed_runner_owner is not None:
-                owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
-            if owner is None:
-                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-            bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
-        if bearer is None:
-            # oidc/accounts mint; header/proxy mode can't (identity is
-            # asserted upstream). Signal clearly rather than 401.
+        if mint_managed_runner_token is None:
             raise OmnigentError(
                 "runner token minting is unsupported in this auth mode",
-                code=ErrorCode.INVALID_INPUT,
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
             )
-        return {
-            "token": bearer,
-            "expires_at": int(time.time()) + _MANAGED_RUNNER_TOKEN_TTL_S,
-        }
+        # The issuer raises RUNNER_TOKENS_UNSUPPORTED when the binding is valid
+        # but the auth mode can't mint (header/proxy): the runner's cue to use
+        # its older bootstrap. Every other refusal stops the runner.
+        minted = await asyncio.to_thread(
+            mint_managed_runner_token, runner_id, _MANAGED_RUNNER_TOKEN_TTL_S
+        )
+        if minted is None:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        bearer, expires_at = minted
+        return {"token": bearer, "expires_at": expires_at}
 
     @router.websocket("/runners/{runner_id}/tunnel")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:
@@ -489,6 +486,11 @@ def create_runner_tunnel_router(
             auth_provider=auth_provider,
             is_loopback=is_loopback,
         )
+        presented = recorded_principal(ws)
+        if presented is not None and presented.is_machine and presented.runner_id != runner_id:
+            # Another runner's token cannot open this runner's tunnel.
+            await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
+            return
         if tunnel_owner is None and auth_provider is not None:
             # A server-managed sandbox runner authenticates with a
             # server-minted binding token (the token-binding gate above
@@ -508,7 +510,10 @@ def create_runner_tunnel_router(
                 # instead of registering an owner-less runner.
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
-        record_principal(ws, Principal(PrincipalKind.RUNNER, tunnel_owner, runner_id=runner_id))
+        if presented is None or not presented.is_machine:
+            record_principal(
+                ws, Principal(PrincipalKind.RUNNER, tunnel_owner, runner_id=runner_id)
+            )
 
         await ws.accept()
         session: RunnerSession | None = None

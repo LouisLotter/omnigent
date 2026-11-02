@@ -31,6 +31,30 @@ class AccountAuthority:
 _authority: ContextVar[AccountAuthority | None] = ContextVar("account_authority", default=None)
 _targets: ContextVar[tuple[AccountAuthority, ...]] = ContextVar("account_targets", default=())
 _account_checks_enabled: ContextVar[bool] = ContextVar("account_checks_enabled", default=True)
+# Set while software (a runner or host) rather than a person holds the request's
+# credential. Such a caller never holds administrator authority and reaches only
+# threads its person owns.
+_machine_principal: ContextVar[bool] = ContextVar("machine_principal", default=False)
+
+
+def bind_machine_principal(machine: bool) -> None:
+    """Record whether this request or job acts through a machine principal."""
+    _machine_principal.set(machine)
+
+
+def machine_principal_active() -> bool:
+    """Whether the current request or job acts through a machine principal."""
+    return _machine_principal.get()
+
+
+@contextmanager
+def machine_principal_scope(machine: bool) -> Iterator[None]:
+    """Run a block as a machine principal (or not), restoring the previous state."""
+    token = _machine_principal.set(machine)
+    try:
+        yield
+    finally:
+        _machine_principal.reset(token)
 
 
 @contextmanager
@@ -56,6 +80,7 @@ def clear_account_authority() -> None:
     """Start authentication without borrowing an earlier identity."""
     _authority.set(None)
     _targets.set(())
+    _machine_principal.set(False)
 
 
 def current_account_user() -> str | None:

@@ -77,16 +77,30 @@ def _normalize(value: object) -> object:
     return bytes(value) if isinstance(value, memoryview) else value
 
 
-def _snapshot(engine: sa.Engine) -> dict[str, list[tuple[object, ...]]]:
-    """Every preserved table's rows, in primary-key order."""
+def _snapshot(
+    engine: sa.Engine, columns: dict[str, list[str]] | None = None
+) -> dict[str, list[tuple[object, ...]]]:
+    """Every preserved table's rows, in primary-key order.
+
+    :param columns: Compare only these columns per table, e.g. those that
+        existed before a later revision added more.
+    """
     metadata = sa.MetaData()
     snapshot = {}
     with engine.connect() as connection:
         for name in _PRESERVED:
             table = sa.Table(name, metadata, autoload_with=connection)
-            rows = connection.execute(sa.select(table).order_by(*table.primary_key.columns)).all()
+            selected = [table.c[column] for column in columns[name]] if columns else list(table.c)
+            rows = connection.execute(
+                sa.select(*selected).order_by(*table.primary_key.columns)
+            ).all()
             snapshot[name] = [tuple(_normalize(value) for value in row) for row in rows]
     return snapshot
+
+
+def _columns(engine: sa.Engine) -> dict[str, list[str]]:
+    inspector = sa.inspect(engine)
+    return {name: [c["name"] for c in inspector.get_columns(name)] for name in _PRESERVED}
 
 
 def _members(engine: sa.Engine) -> list[tuple[int, str, str | None, int, int]]:
@@ -298,12 +312,19 @@ def _sqlite_schema(path: Path) -> list[tuple[str, ...]]:
         ).fetchall()
 
 
-def _assert_upgraded(uri: str, before: dict[str, list[tuple[object, ...]]]) -> None:
+def _assert_upgraded(
+    uri: str, before: dict[str, list[tuple[object, ...]]], columns: dict[str, list[str]]
+) -> None:
+    """A start-up upgrade reached the newest revision, past this one."""
+    from alembic.script import ScriptDirectory
+
     engine = sa.create_engine(uri)
     try:
-        assert _get_current_db_heads(engine) == (_REVISION,)
+        head = ScriptDirectory.from_config(_build_alembic_config(uri)).get_current_head()
+        assert _get_current_db_heads(engine) == (head,)
         assert _members(engine) == [(0, "owner", "owner", 1, 2)]
-        assert _snapshot(engine) == before
+        # Later revisions may add columns; the ones that existed are unchanged.
+        assert _snapshot(engine, columns) == before
     finally:
         engine.dispose()
 
@@ -326,7 +347,7 @@ def test_sqlite_upgrade_interrupted_anywhere_leaves_the_previous_database(tmp_pa
     template = tmp_path / "previous.db"
     template_uri = _fork_database(template)
     engine = sa.create_engine(template_uri)
-    before = _snapshot(engine)
+    before, columns = _snapshot(engine), _columns(engine)
     engine.dispose()
     schema = _sqlite_schema(template)
     interrupted = 0
@@ -357,8 +378,8 @@ def test_sqlite_upgrade_interrupted_anywhere_leaves_the_previous_database(tmp_pa
             _initialize_or_verify_schema(upgraded, uri)
         finally:
             upgraded.dispose()
-        _assert_upgraded(uri, before)
-    _assert_upgraded(uri, before)
+        _assert_upgraded(uri, before, columns)
+    _assert_upgraded(uri, before, columns)
     # Three tables, three indexes, a team and its owner.
     assert interrupted > 8
 
@@ -372,7 +393,7 @@ def test_sqlite_upgrade_killed_mid_way_resumes_on_next_start(tmp_path, killed_af
     database = tmp_path / "killed.db"
     uri = _fork_database(database)
     engine = sa.create_engine(uri)
-    before = _snapshot(engine)
+    before, columns = _snapshot(engine), _columns(engine)
     engine.dispose()
 
     killed = subprocess.run(
@@ -394,4 +415,4 @@ def test_sqlite_upgrade_killed_mid_way_resumes_on_next_start(tmp_path, killed_af
         _initialize_or_verify_schema(engine, uri)
     finally:
         engine.dispose()
-    _assert_upgraded(uri, before)
+    _assert_upgraded(uri, before, columns)

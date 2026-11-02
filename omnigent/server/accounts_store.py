@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable
-from typing import cast
+from typing import TypeVar, cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
@@ -22,7 +22,6 @@ from omnigent.db.account_authority import (
     current_account_user,
     lock_account,
     require_active_account,
-    session_account_owner_query,
 )
 from omnigent.db.db_models import (
     SqlAccountToken,
@@ -51,6 +50,8 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.principals import MachineBinding
+from omnigent.stores.host_store import resolve_runner_binding
 from omnigent.stores.team_store import (
     admin_flag_for_account,
     carry_membership_registration,
@@ -204,6 +205,9 @@ def _to_account_token(row: SqlAccountToken) -> AccountToken:
     )
 
 
+_T = TypeVar("_T")
+
+
 class SqlAlchemyAccountStore:
     """SQLAlchemy-backed persistence for accounts-mode credentials and tokens.
 
@@ -304,61 +308,32 @@ class SqlAlchemyAccountStore:
             return _to_account(row) if row is not None and row.deleted_at is None else None
 
     def with_runner_authority(
-        self, runner_id: str, issue: Callable[[str], str | None]
-    ) -> str | None:
-        """Mint for the session owner while locking both session and host authority."""
-        query = (
-            session_account_owner_query()
-            .add_columns(
-                SqlHost.host_id,
-                SqlHost.user_id.label("host_owner"),
-                SqlHost.account_generation.label("host_generation"),
-                SqlConversationMetadata.id.label("session_id"),
-            )
-            .join(
-                SqlConversationMetadata,
-                and_(
-                    SqlSessionPermission.workspace_id == SqlConversationMetadata.workspace_id,
-                    SqlSessionPermission.conversation_id == SqlConversationMetadata.id,
-                ),
-            )
-            .join(
-                SqlHost,
-                and_(
-                    SqlConversationMetadata.workspace_id == SqlHost.workspace_id,
-                    SqlConversationMetadata.host_id == SqlHost.host_id,
-                ),
-            )
-            .where(
-                SqlHost.workspace_id == current_workspace_id(),
-                SqlHost.deleted_at.is_(None),
-                SqlConversationMetadata.runner_id == runner_id,
-            )
-            .order_by(None)
-            .order_by(SqlConversationMetadata.id, SqlUser.id)
-            .limit(1)
-        )
+        self, runner_id: str, issue: Callable[[MachineBinding], _T | None]
+    ) -> _T | None:
+        """Issue for a runner's binding while holding its owner's account lock.
 
-        def write(session: Session) -> str | None:
-            snapshot = session.execute(query).one_or_none()
-            if snapshot is None:
+        The binding comes from the server's records only: the bound thread's
+        single owner, who must also own the thread's live host under the same
+        registration. Locking the owner's account serializes issuance with
+        account deletion; the binding is read again under that lock.
+
+        :param runner_id: Token-bound runner id.
+        :param issue: Called with the binding under the lock, e.g. to mint.
+        :returns: What *issue* returns, or ``None`` when the runner has no
+            binding, an ambiguous one, or one held by someone else.
+        """
+
+        def write(session: Session) -> _T | None:
+            binding = resolve_runner_binding(session, runner_id)
+            if binding is None:
                 return None
-            owner, generation = snapshot.session_owner, snapshot.session_generation
-            require_active_account(
-                session,
-                owner,
-                generation=generation,
-                related_accounts={snapshot.host_owner: snapshot.host_generation},
-            )
-            # Re-read the binding after acquiring the account lock. Deletion
-            # can remove ownership while the first snapshot waits for that lock.
-            current = session.execute(
-                query.with_for_update().execution_options(populate_existing=True)
-            ).one_or_none()
-            if current != snapshot:
+            require_active_account(session, binding.user_id, generation=binding.account_generation)
+            # Deletion can remove ownership while the first read waits for the lock;
+            # a locking read sees the latest committed binding on every backend.
+            if resolve_runner_binding(session, runner_id, for_update=True) != binding:
                 return None
-            with account_authority_scope(owner, generation):
-                return issue(owner)
+            with account_authority_scope(binding.user_id, binding.account_generation):
+                return issue(binding)
 
         return run_write_transaction(self._session_immediate, "authorize_runner", write)
 

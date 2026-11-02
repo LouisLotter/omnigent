@@ -17,7 +17,11 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
-from omnigent.db.account_authority import account_generation, require_active_account
+from omnigent.db.account_authority import (
+    account_generation,
+    machine_principal_active,
+    require_active_account,
+)
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -483,6 +487,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
+        if machine_principal_active():
+            return False
         with self._session("select_user_admin_status") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.deleted_at is None and row.is_admin
@@ -519,6 +525,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return False
 
         grant = self.get(user_id, conversation_id)
+        if machine_principal_active():
+            return grant is not None and grant.level >= LEVEL_OWNER
         if grant is not None and grant.level >= required_level:
             return True
 
@@ -540,6 +548,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if self.is_admin(user_id):
             return LEVEL_OWNER
         grant = self.get(user_id, conversation_id)
+        if machine_principal_active():
+            return LEVEL_OWNER if grant is not None and grant.level >= LEVEL_OWNER else None
         public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
         levels = [
             level
@@ -617,6 +627,25 @@ class SqlAlchemyPermissionStore(PermissionStore):
         conversation_id: str,
     ) -> ResolvedAccess:
         """Resolve admin flag + user + public grants together. See base class."""
+        access = self._resolve_access(user_id, conversation_id)
+        if not machine_principal_active():
+            return access
+        # A runner or host acts only on threads its person owns: no administrator
+        # override, no share or public grant.
+        owner_level = access.user_grant_level
+        return ResolvedAccess(
+            is_admin=False,
+            user_grant_level=(
+                owner_level if owner_level is not None and owner_level >= LEVEL_OWNER else None
+            ),
+            public_grant_level=None,
+        )
+
+    def _resolve_access(
+        self,
+        user_id: str | None,
+        conversation_id: str,
+    ) -> ResolvedAccess:
         if user_id is None:
             return ResolvedAccess(
                 is_admin=False,

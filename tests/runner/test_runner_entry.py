@@ -28,6 +28,8 @@ from omnigent.native import native_terminal
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
+    RUNNER_TOKEN_REFUSED_EXIT_CODE,
+    RunnerTokenRefusedError,
     _agent_cache_dest,
     _AgentSpecCache,
     _apply_host_interactive_shells,
@@ -35,6 +37,7 @@ from omnigent.runner._entry import (
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
+    _is_unsupported_mint_response,
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
@@ -52,6 +55,7 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    _startup_auth_factory,
     main,
 )
 from omnigent.runner.identity import (
@@ -442,53 +446,77 @@ def test_initial_token_factory_reports_a_fallback_sign_in_pending(
     assert factory.sign_in_pending is True
 
 
-def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
+def test_host_launched_runner_uses_its_runner_token_not_the_host_bearer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After the host bearer is rejected, a managed runner falls back to managed mint.
+    """A delegated runner acts with its own runner token from the first callback.
 
-    When no SDK/OIDC credential is available (managed sandbox with no user
-    credential), the fallback must reach the managed-mint path rather than
-    returning None and bricking all HTTP callbacks.
+    The host's bearer only carries the mint request through a fronting proxy;
+    the runner never presents it as its own credential, so a runner on an
+    administrator's computer never acts with the administrator's sign-in.
     """
-    mint_calls: list[int] = []
+    mints: list[str | None] = []
 
-    def _no_sdk_auth(*args: Any, **kwargs: Any) -> tuple[None, None]:
-        from omnigent.inner.databricks_executor import DatabricksAuthError
-
-        raise DatabricksAuthError("no credential configured")
-
-    def _mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
-        mint_calls.append(1)
-        return "managed-minted-token", time.time() + 3600
+    def _mint(*args: Any, proxy_bearer: str | None = None, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        mints.append(proxy_bearer)
+        return "runner-token", time.time() + 3600
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
     monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
-    monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
-    )
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
+    assert factory() == "runner-token"
+    assert mints == ["host-bootstrap-token"]
+
+    # A rejected runner token is dropped and re-minted, never replaced by the bearer.
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, httpx.Response(401))
+    assert captured == ["Bearer runner-token", "Bearer runner-token"]
+    assert mints == ["host-bootstrap-token", "runner-token"]
+
+
+@pytest.mark.parametrize("status", [400, 404], ids=["unsupported", "not-offered"])
+def test_host_bearer_remains_only_when_the_server_does_not_offer_runner_tokens(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """A server without runner tokens (404, or an "unsupported" 400) keeps the old bootstrap.
+
+    Older servers and header/proxy deployments, Databricks Apps included,
+    keep working: the host bearer bootstraps until rejected, as before.
+    """
+
+    def _refuse(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+        raise httpx.HTTPStatusError(
+            "unsupported",
+            request=request,
+            response=(
+                _unsupported_response(request)
+                if status == 400
+                else httpx.Response(status, request=request)
+            ),
+        )
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
 
     factory = _make_auth_token_factory()
 
     assert isinstance(factory, _InitialAuthTokenFactory)
     assert factory() == "host-bootstrap-token"
-    assert mint_calls == []
-
-    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
-    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
-    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
-
-    # After the initial bearer is rejected, the fallback must mint via the
-    # managed-mint path rather than returning None and bricking callbacks.
-    assert captured == [
-        "Bearer host-bootstrap-token",
-        "Bearer managed-minted-token",
-    ]
-    assert len(mint_calls) >= 1
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
@@ -549,7 +577,7 @@ def _refuse_mint(calls: list[str | None]) -> Any:
         calls.append(proxy_bearer)
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "400", request=request, response=httpx.Response(400, request=request)
+            "400", request=request, response=_unsupported_response(request)
         )
 
     return _mint
@@ -783,7 +811,7 @@ def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
         """Reject the mint the way a no-auth / header-mode server does (400)."""
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "unsupported", request=request, response=httpx.Response(400, request=request)
+            "unsupported", request=request, response=_unsupported_response(request)
         )
 
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuses)
@@ -876,7 +904,7 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
             raise httpx.ConnectError("server not listening yet")
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "no auth provider", request=request, response=httpx.Response(400, request=request)
+            "no auth provider", request=request, response=_unsupported_response(request)
         )
 
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _boot_blip_then_refuse)
@@ -1205,7 +1233,7 @@ def test_declined_latch_from_definitive_refusal_is_not_reset_on_rejection(
         calls.append(1)
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
-            "no auth provider", request=request, response=httpx.Response(400, request=request)
+            "no auth provider", request=request, response=_unsupported_response(request)
         )
 
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
@@ -1273,42 +1301,215 @@ def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
     assert installed is None
 
 
-def test_initial_host_token_re_resolves_to_sdk_when_proxy_auth_fails(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("host_bearer", [True, False], ids=["host-launched", "managed"])
+def test_refused_first_mint_fails_closed_without_any_sign_in(
+    monkeypatch: pytest.MonkeyPatch, status: int, host_bearer: bool
 ) -> None:
-    """When managed mint proxy_auth_fails, _InitialAuthTokenFactory falls back to SDK/OIDC."""
+    """A server that offers runner tokens but refuses this runner stops it.
 
-    class _SdkAuth:
-        def current_token(self) -> str:
-            return "sdk-token"
+    Neither the host's sign-in nor a stored login or SDK credential stands in:
+    that would hand the runner a person's authority exactly when the server
+    said this runner has none.
+    """
+    used: list[str] = []
 
-    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
-        return _SdkAuth(), "https://workspace.cloud.databricks.com"
-
-    def _proxy_rejects(*args: Any, **kwargs: Any) -> tuple[str, float]:
-        request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+    def _refuse(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        request = httpx.Request("POST", "https://omnigent.example.com/v1/runners/r/token")
         raise httpx.HTTPStatusError(
-            "403", request=request, response=httpx.Response(403, request=request)
+            "refused", request=request, response=httpx.Response(status, request=request)
         )
 
-    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
-    monkeypatch.setenv("OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN", "expired-host-bearer")
+    def _record(name: str) -> Any:
+        def _called(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            used.append(name)
+            return None
+
+        return _called
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    if host_bearer:
+        monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "human-host-bearer")
+    else:
+        monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
-    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _proxy_rejects)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", _record("stored-login"))
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", _record("refresh-grant"))
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _record("sdk")
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuse)
+
+    with pytest.raises(RunnerTokenRefusedError) as refused:
+        _make_auth_token_factory()
+
+    assert refused.value.status_code == status
+    assert f"HTTP {status}" in str(refused.value)
+    assert "does not fall back to the computer's sign-in" in str(refused.value)
+    assert used == []
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
+
+
+def _personal_credentials_must_stay_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record any use of a stored login, refresh grant or SDK credential."""
+    used: list[str] = []
+
+    def _record(name: str) -> Any:
+        def _called(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            used.append(name)
+            return "personal-credential"
+
+        return _called
+
+    monkeypatch.setattr("omnigent.cli_auth.load_token", _record("stored-login"))
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", _record("refresh-grant"))
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _record("sdk")
+    )
+    return used
+
+
+def _mint_sequence(outcomes: list[object]) -> Any:
+    """Answer successive mints with a token or an HTTP status; the last answer repeats."""
+
+    def _mint(mint_url: str, *args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+        if isinstance(outcome, str) and outcome != "unsupported":
+            return outcome, time.time() + 3600
+        request = httpx.Request("POST", mint_url)
+        response = (
+            _unsupported_response(request)
+            if outcome == "unsupported"
+            else httpx.Response(int(outcome), request=request)
+        )
+        raise httpx.HTTPStatusError("mint", request=request, response=response)
+
+    return _mint
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("bootstrap", [404, "unsupported"], ids=["not-offered", "unsupported"])
+@pytest.mark.parametrize("minted_first", [True, False], ids=["renewal", "first-mint"])
+def test_compat_bootstrap_never_returns_to_a_sign_in_once_runner_tokens_appear(
+    monkeypatch: pytest.MonkeyPatch, status: int, bootstrap: object, minted_first: bool
+) -> None:
+    """A server that didn't offer runner tokens at boot, then does, keeps the runner on them.
+
+    404 at boot installs the host-bearer bootstrap. Once the server mints (or
+    refuses) a runner token, a refused mint or renewal leaves the runner with
+    no credential: never the host bearer, a stored login or an SDK credential.
+    """
+    used = _personal_credentials_must_stay_untouched(monkeypatch)
+    outcomes: list[object] = (
+        [bootstrap, "runner-token", status]
+        if minted_first
+        else [
+            bootstrap,
+            status,
+        ]
+    )
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bearer")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token", _mint_sequence(outcomes)
+    )
 
     factory = _make_auth_token_factory()
-
     assert isinstance(factory, _InitialAuthTokenFactory)
-    # Simulate the initial bearer expiring and being invalidated.
-    factory.invalidate()
+    assert factory() == "host-bearer"
+    assert factory.invalidate()
+    if minted_first:
+        assert factory() == "runner-token"
+        assert factory.invalidate()
 
-    # The fallback tries managed mint first (proxy bearer = expired-host-bearer).
-    # That 403s → proxy_auth_failed → re-resolves to SDK/OIDC.
-    token = factory()
-    assert token == "sdk-token"
+    assert factory() is None
+    assert factory() is None
+    assert factory.refused_status == status
+    request = httpx.Request("GET", "https://omnigent.example.com/v1/sessions")
+    refusal = rf"refused this runner's token \(HTTP {status}\)"
+    with pytest.raises(httpx.RequestError, match=refusal):
+        _drive_auth_flow(_RunnerDatabricksAuth(factory), request, httpx.Response(200))
+    assert used == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(400, json={"error": {"code": "invalid_input", "message": "bad request"}}),
+        httpx.Response(400, text="<html><body>400 Bad Request</body></html>"),
+        httpx.Response(400, text='{"error": {"code": "runner_tokens_unsupported"'),
+        httpx.Response(400, json=["runner_tokens_unsupported"]),
+        httpx.Response(400, json={"error": "runner_tokens_unsupported"}),
+        httpx.Response(400),
+    ],
+    ids=["generic-json", "proxy-html", "malformed", "json-list", "flat-error", "empty"],
+)
+@pytest.mark.parametrize("host_bearer", [True, False], ids=["host-launched", "managed"])
+def test_an_unrecognised_400_is_a_refusal_not_a_server_without_runner_tokens(
+    monkeypatch: pytest.MonkeyPatch, response: httpx.Response, host_bearer: bool
+) -> None:
+    """Only the explicit unsupported answer (or 404) keeps the old bootstrap."""
+    used = _personal_credentials_must_stay_untouched(monkeypatch)
+
+    def _answer(mint_url: str, *args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        request = httpx.Request("POST", mint_url)
+        response.request = request
+        raise httpx.HTTPStatusError("mint", request=request, response=response)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    if host_bearer:
+        monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bearer")
+    else:
+        monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _answer)
+
+    with pytest.raises(RunnerTokenRefusedError) as refused:
+        _make_auth_token_factory()
+
+    assert refused.value.status_code == 400
+    assert "without saying that runner tokens are unsupported" in str(refused.value)
+    assert used == []
+
+
+def test_the_explicit_unsupported_answer_is_recognised_exactly() -> None:
+    """The server's ``runner_tokens_unsupported`` code is the only 400 meaning "not offered"."""
+    request = httpx.Request("POST", "https://omnigent.example.com/v1/runners/r/token")
+    assert _is_unsupported_mint_response(_unsupported_response(request))
+    other = httpx.Response(400, request=request, json={"error": {"code": "invalid_input"}})
+    assert not _is_unsupported_mint_response(other)
+    wrong_status = httpx.Response(
+        401, request=request, json={"error": {"code": "runner_tokens_unsupported"}}
+    )
+    assert not _is_unsupported_mint_response(wrong_status)
+
+
+def test_runner_stops_at_boot_with_the_refusal_in_its_log(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The host reports the runner's exit and log tail as the session's error."""
+
+    def _refused() -> None:
+        raise RunnerTokenRefusedError(401)
+
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", _refused)
+
+    with pytest.raises(SystemExit) as stopped:
+        _startup_auth_factory()
+
+    assert stopped.value.code == RUNNER_TOKEN_REFUSED_EXIT_CODE
+    assert "refused this runner's token (HTTP 401)" in capsys.readouterr().err
 
 
 def test_managed_mint_403_after_prior_mint_latches_proxy_auth_failed_at_expiry(
@@ -1365,28 +1566,19 @@ def test_managed_mint_403_after_prior_mint_latches_proxy_auth_failed_at_expiry(
     assert factory.declined is False  # bare requests would be wrong here
 
 
-def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
+def test_refused_remint_mid_session_fails_closed_with_a_clear_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A post-install mint 403 at full expiry re-resolves SDK/OIDC in the same call.
+    """A re-mint refused after the token expired yields no credential and says why.
 
-    Extends the construction-time fallback above to the mid-session case: the
-    managed mint worked (the runner ran on minted JWTs), then the session
-    outlived the JWT and the re-mint 403s. The factory chain must hand the
-    *current* request an SDK/OIDC token rather than returning ``None`` — one
-    ``None`` here means a raised callback, and before the fix it was ``None``
-    forever.
-
-    :param monkeypatch: Pytest environment patch fixture.
-    :returns: None.
+    The runner was replaced or its thread moved: callbacks fail with the
+    refusal instead of switching to the host's sign-in or an SDK login.
     """
+    resolved: list[int] = []
 
-    class _SdkAuth:
-        def current_token(self) -> str:
-            return "sdk-token"
-
-    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
-        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+    def _resolve(*args: Any, **kwargs: Any) -> Any:
+        resolved.append(1)
+        raise AssertionError("no sign-in may stand in for a refused runner token")
 
     calls: list[int] = []
 
@@ -1394,12 +1586,12 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
         calls.append(1)
         if len(calls) == 1:
             return ("minted-jwt", time.time() + 3600)
-        request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+        request = httpx.Request("POST", "https://omnigent.example.com/v1/runners/r/token")
         raise httpx.HTTPStatusError(
             "403", request=request, response=httpx.Response(403, request=request)
         )
 
-    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
     monkeypatch.setenv("OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN", "host-bearer")
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok")
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
@@ -1408,16 +1600,16 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
     monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_ok_then_403)
 
     factory = _make_auth_token_factory()
-    assert isinstance(factory, _InitialAuthTokenFactory)
-    factory.invalidate()
-    assert factory() == "minted-jwt"  # managed mint installed and serving
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory() == "minted-jwt"
+    factory._cached_expires_at = time.time() - 1.0
 
-    mint_factory = factory._fallback_factory
-    assert isinstance(mint_factory, _ManagedMintTokenFactory)
-    # The session outlives the minted JWT, and the edge 403s the re-mint.
-    mint_factory._cached_expires_at = time.time() - 1.0
-
-    assert factory() == "sdk-token"
+    assert factory() is None
+    assert factory.refused_status == 403
+    request = httpx.Request("GET", "https://omnigent.example.com/v1/sessions")
+    with pytest.raises(httpx.RequestError, match=r"refused this runner's token \(HTTP 403\)"):
+        _drive_auth_flow(_RunnerDatabricksAuth(factory), request, httpx.Response(200))
+    assert resolved == []
 
 
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
@@ -1578,6 +1770,20 @@ def test_runner_databricks_auth_noop_without_factory() -> None:
     gen = auth.auth_flow(request)
     sent = next(gen)
     assert "Authorization" not in sent.headers
+
+
+def _unsupported_response(request: httpx.Request) -> httpx.Response:
+    """The server's explicit answer when it does not issue runner tokens."""
+    return httpx.Response(
+        400,
+        request=request,
+        json={
+            "error": {
+                "code": "runner_tokens_unsupported",
+                "message": "runner token minting is unsupported in this auth mode",
+            }
+        },
+    )
 
 
 def _drive_auth_flow(

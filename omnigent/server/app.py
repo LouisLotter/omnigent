@@ -111,6 +111,7 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
+from omnigent.server.principals import MachineBinding, Principal, PrincipalKind
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -2312,6 +2313,18 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
+    # Innermost: every route is classified for people and runners, and a
+    # runner never holds an administrator's override (route_authority.py).
+    # Embedding applications and tests may add rules for routes they mount.
+    from omnigent.server.route_authority import RouteAuthorityMiddleware
+
+    app.state.route_authority_rules = {}
+    app.add_middleware(
+        RouteAuthorityMiddleware,
+        root_app=app,
+        auth_provider=auth_provider,
+        extra_rules=app.state.route_authority_rules,
+    )
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
@@ -3477,6 +3490,11 @@ def create_app(
             )
         if user_id is None:
             return {"user_id": None, "is_admin": False}
+        from omnigent.db.account_authority import machine_principal_active
+
+        if machine_principal_active():
+            # Software holding a person's machine token is never an administrator.
+            return {"user_id": user_id, "is_admin": False}
         listed = admin_list.is_admin(user_id)
         flagged = permission_store is not None and permission_store.is_admin(user_id)
         if listed and not flagged and permission_store is not None:
@@ -4543,11 +4561,58 @@ def create_app(
             for conv, client in roots:
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
 
-    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
-        assert runner_account_store is not None and auth_provider is not None
-        return runner_account_store.with_runner_authority(
-            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
-        )
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> tuple[str, int] | None:
+        """Mint a runner token from the runner's current binding.
+
+        Accounts mode issues under the owner's account lock; other modes read
+        the same strict binding. A runner whose thread is owned by someone
+        other than its host's owner gets nothing.
+
+        :param runner_id: Token-bound runner id, already proven by its binding token.
+        :param ttl_seconds: Token lifetime in seconds.
+        :returns: ``(token, expires_at)``, or ``None`` without a valid binding.
+        """
+        if auth_provider is None:
+            raise OmnigentError(
+                "runner token minting requires an auth provider",
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
+            )
+        if not auth_provider.issues_machine_tokens():
+            # Header/proxy identity is asserted upstream and can't be minted.
+            raise OmnigentError(
+                "runner token minting is unsupported in this auth mode",
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
+            )
+
+        def issue(binding: MachineBinding) -> tuple[str, int]:
+            minted = auth_provider.mint_machine_token(binding, ttl_seconds)
+            if minted is None:
+                # A reserved identity: nothing to issue.
+                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+            return minted
+
+        if runner_account_store is not None:
+            return runner_account_store.with_runner_authority(runner_id, issue)
+        if host_store is None:
+            return None
+        binding = host_store.runner_binding(runner_id)
+        return issue(binding) if binding is not None else None
+
+    def _machine_binding_current(principal: Principal) -> bool:
+        """Whether a machine token still names its runner's live binding.
+
+        Checked on every request: a replaced runner, a rebound thread, a moved
+        or deleted host, or a changed owner or registration ends the token.
+        Host tokens have no HTTP use yet and are refused.
+        """
+        if host_store is None or principal.kind is not PrincipalKind.RUNNER:
+            return False
+        assert principal.runner_id is not None
+        binding = host_store.runner_binding(principal.runner_id, principal.session_id)
+        return binding is not None and binding.matches(principal)
+
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        auth_provider.set_machine_binding_check(_machine_binding_current)
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -4563,7 +4628,9 @@ def create_app(
         """
         if runner_account_store is not None:
             try:
-                return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
+                return runner_account_store.with_runner_authority(
+                    runner_id, lambda binding: binding.user_id
+                )
             except OmnigentError:
                 return None
         return actual_runner_owner(conversation_store, runner_id)
@@ -4578,9 +4645,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
-            mint_managed_runner_token=(
-                _mint_managed_runner_token if runner_account_store is not None else None
-            ),
+            mint_managed_runner_token=_mint_managed_runner_token,
         ),
         prefix="/v1",
         tags=["runners"],
@@ -4955,8 +5020,12 @@ def create_app(
     # mount so FastAPI resolves them before the catch-all fallback.
     all_extra_routers = list(extra_routers or [])
     all_extra_routers.extend(_load_debug_routers(debug_router_modules))
+    from omnigent.server.route_authority import classify_added_routes
+
     for router, prefix, tags in all_extra_routers:
         app.include_router(router, prefix=prefix, tags=[*tags])
+        # Routes an embedding application or debug config adds are for people only.
+        classify_added_routes(app.state.route_authority_rules, router.routes, prefix=prefix)
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()

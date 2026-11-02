@@ -52,7 +52,13 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
-from omnigent.server.principals import Principal, PrincipalKind, record_principal
+from omnigent.server.principals import (
+    MachineBinding,
+    Principal,
+    PrincipalKind,
+    default_scopes,
+    record_principal,
+)
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -373,33 +379,77 @@ def test_accounts_source_login_url_points_at_spa() -> None:
     assert provider.login_url == "/login"
 
 
-def test_mint_runner_token_round_trips_to_owner() -> None:
-    """A managed runner's minted owner token resolves back to the owner.
+def _runner_binding(user_id: str = "alice@example.com") -> MachineBinding:
+    """A runner bound to one thread on its owner's host."""
+    return MachineBinding(
+        kind=PrincipalKind.RUNNER,
+        user_id=user_id,
+        account_generation=None,
+        host_id="host-1",
+        session_id="conv-1",
+        runner_id="runner-1",
+    )
 
-    The sandbox runner has no login of its own, so the server mints an
-    owner JWT it presents as ``Authorization: Bearer`` on its HTTP
-    callbacks — ``get_user_id`` (the same check ``require_user`` applies)
-    must resolve it to the owner, else every callback 401s.
+
+def _bound_provider(source: str = "accounts", *, bound: bool = True) -> UnifiedAuthProvider:
+    """A provider whose binding check accepts (or refuses) every runner token."""
+    if source == "accounts":
+        provider = UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+    else:
+        from tests.server.integration.oidc_fixtures import make_oidc_config
+
+        provider = UnifiedAuthProvider(source="oidc", oidc_config=make_oidc_config())
+    provider.set_machine_binding_check(lambda principal: bound)
+    return provider
+
+
+def _mint(provider: UnifiedAuthProvider, binding: MachineBinding, ttl: int = 1800) -> str:
+    minted = provider.mint_machine_token(binding, ttl)
+    assert minted is not None
+    return minted[0]
+
+
+def test_runner_token_round_trips_to_owner_while_bound() -> None:
+    """A runner token resolves to its owner as a runner principal, only while still bound.
+
+    The runner has no login of its own, so the server mints a token it
+    presents as ``Authorization: Bearer`` on its HTTP callbacks. Every request
+    checks the token against the runner's current binding; without that check
+    wired, no runner token authenticates.
     """
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    from omnigent.server.principals import RUNNER_AUDIENCE, RUNNER_SCOPES
 
-    token = provider.mint_runner_token("alice@example.com", 1800)
-    assert token is not None
-
+    binding = _runner_binding()
+    provider = _bound_provider()
+    token = _mint(provider, binding)
     request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+
     assert provider.get_user_id(request) == "alice@example.com"
+    principal = provider.principal(request)
+    assert principal is not None and binding.matches(principal)
+    assert principal.is_machine and not principal.is_human
+    assert principal.audience == RUNNER_AUDIENCE
+    assert principal.scopes == RUNNER_SCOPES
+    assert principal.token_id
+
+    unbound = _bound_provider(bound=False)
+    assert unbound.get_user_id(_FakeReq(headers={"Authorization": f"Bearer {token}"})) is None
+    unwired = UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+    assert unwired.get_user_id(_FakeReq(headers={"Authorization": f"Bearer {token}"})) is None
 
 
-def test_runner_token_is_delegated_and_a_login_is_not() -> None:
-    """A minted runner token carries the runner delegation; a login cookie does not."""
+def test_runner_token_is_never_a_session_cookie() -> None:
+    """A runner token has its own audience and key; it is delegated, a login is not."""
     from omnigent.server.oidc import mint_session_cookie
 
     cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
-    runner_token = provider.mint_runner_token("alice@example.com", 1800)
-    assert runner_token is not None
-    assert jwt.decode(runner_token, options={"verify_signature": False})["delegated"] == "runner"
+    provider = _bound_provider()
+    runner_token = _mint(provider, _runner_binding())
+    with pytest.raises(jwt.InvalidTokenError):
+        jwt.decode(runner_token, _TEST_COOKIE_SECRET, algorithms=["HS256"])
+    claims = jwt.decode(runner_token, options={"verify_signature": False})
+    assert claims["aud"] == "omnigent:runner"
+    assert "delegated" not in claims
     login = mint_session_cookie(
         user_id="alice@example.com",
         cookie_secret=_TEST_COOKIE_SECRET,
@@ -409,7 +459,9 @@ def test_runner_token_is_delegated_and_a_login_is_not() -> None:
 
     runner = _FakeReq(headers={"Authorization": f"Bearer {runner_token}"})
     browser = _FakeReq(cookies={cfg.session_cookie_name: login})
+    assert provider.get_user_id(runner) == "alice@example.com"
     assert provider.credential_delegation(runner) == "runner"
+    assert provider.get_user_id(browser) == "alice@example.com"
     assert provider.credential_delegation(browser) is None
     assert provider.credential_delegation(_FakeReq()) is None
     # The browser's cookie wins over a runner bearer on the same request.
@@ -417,20 +469,40 @@ def test_runner_token_is_delegated_and_a_login_is_not() -> None:
         cookies={cfg.session_cookie_name: login},
         headers={"Authorization": f"Bearer {runner_token}"},
     )
-    assert provider.credential_delegation(both) is None
-    assert UnifiedAuthProvider(source="header").credential_delegation(runner) is None
+    assert provider.get_user_id(both) == "alice@example.com"
+    assert provider.principal(both) == Principal(PrincipalKind.HUMAN, "alice@example.com")
+    fresh = _FakeReq(headers={"Authorization": f"Bearer {runner_token}"})
+    assert UnifiedAuthProvider(source="header").credential_delegation(fresh) is None
+
+
+def test_legacy_owner_runner_token_is_refused() -> None:
+    """An owner session JWT marked ``delegated=runner`` no longer authenticates anywhere."""
+    import time
+
+    from omnigent.server.oidc import mint_session_token
+
+    provider = _bound_provider()
+    legacy = mint_session_token("alice@example.com", _TEST_COOKIE_SECRET, 1800, "accounts")
+    legacy = jwt.encode(
+        {**jwt.decode(legacy, options={"verify_signature": False}), "delegated": "runner"},
+        _TEST_COOKIE_SECRET,
+        algorithm="HS256",
+    )
+    request = _FakeReq(headers={"Authorization": f"Bearer {legacy}"})
+    assert provider.get_user_id(request) is None
+    assert provider.principal(request) is None
+    assert int(time.time()) < jwt.decode(legacy, options={"verify_signature": False})["exp"]
 
 
 @pytest.mark.parametrize(
     ("claims", "kind"),
     [
         ({}, PrincipalKind.HUMAN),
-        ({"delegated": "runner"}, PrincipalKind.RUNNER),
         ({"grant_id": "login-grant"}, PrincipalKind.HUMAN),
         ({"grant_id": "device-grant", "scope": "sessions"}, PrincipalKind.DELEGATED_CLIENT),
         ({"scope": "sessions"}, PrincipalKind.SERVICE),
     ],
-    ids=["sign-in", "runner", "login-grant", "device-client", "machine-client"],
+    ids=["sign-in", "login-grant", "device-client", "machine-client"],
 )
 def test_authentication_records_who_holds_the_credential(
     claims: dict[str, str], kind: PrincipalKind
@@ -485,7 +557,9 @@ def test_custom_provider_principal_comes_from_its_delegation() -> None:
     provider = _Provider()
     assert provider.principal(_FakeReq()) == Principal(PrincipalKind.HUMAN, "carol")
     runner = _FakeReq(headers={"X-Delegated": "runner"})
-    assert provider.principal(runner) == Principal(PrincipalKind.RUNNER, "carol")
+    assert provider.principal(runner) == Principal(
+        PrincipalKind.RUNNER, "carol", scopes=default_scopes(PrincipalKind.RUNNER)
+    )
     other = _FakeReq(headers={"X-Delegated": "assistant"})
     assert provider.principal(other) == Principal(PrincipalKind.DELEGATED_CLIENT, "carol")
 
@@ -495,26 +569,28 @@ def test_runner_token_stays_delegated_after_it_expires() -> None:
 
     The accounts middleware authenticates once per request; a route reads
     the delegation afterwards, possibly after a slow body has let the token
-    expire. Only a token this server did not sign reads as undelegated.
+    expire. An expired or forged runner token never authenticates.
     """
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
-    expired = provider.mint_runner_token("alice@example.com", -1)
+    import time
+
+    provider = _bound_provider()
+    token = _mint(provider, _runner_binding(), ttl=1)
+    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    assert provider.get_user_id(request) == "alice@example.com"
+    expired = _mint(provider, _runner_binding(), ttl=-1)
     forged = jwt.encode(
-        jwt.decode(expired, options={"verify_signature": False}),
+        jwt.decode(token, options={"verify_signature": False}),
         secrets.token_bytes(32),
         algorithm="HS256",
     )
 
-    assert provider.get_user_id(_FakeReq(headers={"Authorization": f"Bearer {expired}"})) is None
-    assert (
-        provider.credential_delegation(_FakeReq(headers={"Authorization": f"Bearer {expired}"}))
-        == "runner"
-    )
-    assert (
-        provider.credential_delegation(_FakeReq(headers={"Authorization": f"Bearer {forged}"}))
-        is None
-    )
+    time.sleep(1.1)
+    assert provider.credential_delegation(request) == "runner"
+    assert provider.get_user_id(_FakeReq(headers={"Authorization": f"Bearer {token}"})) is None
+    for rejected in (expired, forged):
+        stale = _FakeReq(headers={"Authorization": f"Bearer {rejected}"})
+        assert provider.get_user_id(stale) is None
+        assert provider.credential_delegation(stale) is None
 
 
 @pytest.mark.parametrize(
@@ -542,14 +618,8 @@ def test_runner_token_is_not_a_sign_in_for_account_administration(
     Under an ASGI ``root_path`` the router matches below the mount, and so
     does the refusal.
     """
-    from tests.server.integration.oidc_fixtures import make_oidc_config
-
-    provider = (
-        UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
-        if source == "accounts"
-        else UnifiedAuthProvider(source="oidc", oidc_config=make_oidc_config())
-    )
-    token = provider.mint_runner_token("alice@example.com", 1800)
+    provider = _bound_provider(source)
+    token = _mint(provider, _runner_binding())
     headers = {"Authorization": f"Bearer {token}"}
 
     assert provider.get_user_id(_FakeReq(headers=headers)) == "alice@example.com"
@@ -580,43 +650,38 @@ def test_malformed_delegation_claim_is_rejected() -> None:
     assert provider.credential_delegation(request) == "['runner']"
 
 
-def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
+def test_runner_token_mint_rejects_empty_and_reserved_owner() -> None:
     """No token for an empty or reserved owner — never mint reserved-identity creds."""
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
-    assert provider.mint_runner_token("", 1800) is None
-    assert provider.mint_runner_token("local", 1800) is None
+    provider = _bound_provider()
+    assert provider.mint_machine_token(_runner_binding(""), 1800) is None
+    assert provider.mint_machine_token(_runner_binding("local"), 1800) is None
 
 
-def test_mint_runner_token_returns_none_for_header_source() -> None:
+def test_runner_token_mint_returns_none_for_header_source() -> None:
     """Header/proxy auth can't be minted server-side, so it returns None.
 
     Identity there is asserted by the upstream proxy; a managed runner
     can't synthesize it. The base ``AuthProvider`` default is also None.
     """
     header_provider = UnifiedAuthProvider(source="header")
-    assert header_provider.mint_runner_token("alice@example.com", 1800) is None
+    assert header_provider.mint_machine_token(_runner_binding(), 1800) is None
 
     class _Base(AuthProvider):
         def get_user_id(self, request: object) -> str | None:  # type: ignore[override]
             return None
 
-    assert _Base().mint_runner_token("alice@example.com", 1800) is None
+    assert _Base().mint_machine_token(_runner_binding(), 1800) is None
 
 
-def test_mint_runner_token_expired_resolves_to_none() -> None:
+def test_runner_token_expired_resolves_to_none() -> None:
     """A short TTL genuinely expires: past its exp, get_user_id returns None.
 
-    This is what makes the managed-runner auth refreshable rather than a
-    fixed cap — the token expires and the runner re-mints, so there is no
-    static long-lived credential.
+    This is what makes runner auth refreshable rather than a fixed cap — the
+    token expires and the runner re-mints, so there is no static long-lived
+    credential.
     """
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
-
-    token = provider.mint_runner_token("alice@example.com", -1)
-    assert token is not None
-
+    provider = _bound_provider()
+    token = _mint(provider, _runner_binding(), ttl=-1)
     request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
     assert provider.get_user_id(request) is None
 

@@ -11,6 +11,7 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS
+from omnigent.server.route_authority import HUMAN
 from tests.server.helpers import build_agent_bundle
 from tests.server.test_accounts import _build_accounts_app, _login
 
@@ -485,6 +486,8 @@ async def test_accounts_auth_checks_once_per_request_without_blocking_loop(setup
 
     auth.set_account_check(paused_check)
 
+    admin.app.state.route_authority_rules[("GET", "/_test/auth-context")] = HUMAN
+
     @admin.app.get("/_test/auth-context")
     async def auth_context(request: Request):
         user = auth.get_user_id(request)
@@ -531,6 +534,8 @@ def test_cached_auth_identity_does_not_cross_provider_or_workspace(setup_app):
     auth = stores["auth_provider"]
     other_provider = UnifiedAuthProvider(source="accounts", accounts_config=auth._accounts_config)
     other_provider.set_account_check(lambda *_: False)
+
+    admin.app.state.route_authority_rules[("GET", "/_test/auth-isolation")] = HUMAN
 
     @admin.app.get("/_test/auth-isolation")
     def isolated_identity(request: Request):
@@ -1007,11 +1012,9 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
 
 
 @pytest.mark.parametrize("delete_during_request", [False, True])
-@pytest.mark.parametrize(
-    ("host_owner", "revoked_owner"), [("alice", "alice"), ("admin", "alice"), ("admin", "admin")]
-)
+@pytest.mark.parametrize("revoked_owner", ["alice", "admin"])
 def test_runner_token_uses_saved_account_authority(
-    setup_app, monkeypatch, delete_during_request, host_owner, revoked_owner
+    setup_app, monkeypatch, delete_during_request, revoked_owner
 ):
     import uuid
 
@@ -1024,7 +1027,7 @@ def test_runner_token_uses_saved_account_authority(
     binding = "test-runner-binding"
     runner_id = token_bound_runner_id(binding)
     host_id = uuid.uuid4().hex
-    stores["host_store"].upsert_on_connect(host_id, "runner-host", host_owner)
+    stores["host_store"].upsert_on_connect(host_id, "runner-host", "alice")
     conversations = stores["conversation_store"]
     conversations.set_host_id(session_id, host_id, workspace="/tmp/review-workspace")
     conversations.replace_runner_id(session_id, runner_id)
@@ -1079,9 +1082,12 @@ def test_runner_token_uses_saved_account_authority(
         finally:
             resume.set()
         if pending is not None:
-            assert pending.result(timeout=15).status_code == 401
+            assert pending.result(timeout=15).status_code == (
+                401 if revoked_owner == "alice" else 200
+            )
+    # Only the thread and host owner's removal ends the runner's authority.
     assert runner.get("/v1/sessions").status_code == (401 if revoked_owner == "alice" else 200)
-    assert mint().status_code == 401
+    assert mint().status_code == (401 if revoked_owner == "alice" else 200)
 
 
 def test_oauth_connection_state_cannot_cross_username_reuse(setup_app):

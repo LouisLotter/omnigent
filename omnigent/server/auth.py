@@ -41,9 +41,12 @@ from typing import TYPE_CHECKING
 from starlette.requests import HTTPConnection
 
 from omnigent.server.principals import (
+    MachineBinding,
     Principal,
     PrincipalKind,
     clear_principal,
+    decode_machine_token,
+    default_scopes,
     record_principal,
     recorded_principal,
 )
@@ -107,8 +110,9 @@ def delegated_path_allowed(path: str) -> bool:
 
 
 # JWT claim naming who a credential was handed to on the owner's behalf.
-# ``POST /v1/runners/{id}/token`` sets it to :data:`RUNNER_DELEGATION`: the
-# token acts as the owner, but code holding it is not the owner in person.
+# Runners used to receive an owner session JWT carrying
+# :data:`RUNNER_DELEGATION`; they now hold a machine token (see
+# :mod:`omnigent.server.principals`) and such legacy tokens are refused.
 CREDENTIAL_DELEGATION_CLAIM = "delegated"
 RUNNER_DELEGATION = "runner"
 
@@ -436,23 +440,31 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
+    def issues_machine_tokens(self) -> bool:
+        """Whether this provider can mint runner and host tokens at all.
+
+        Checked before any binding lookup, so a server that cannot mint answers
+        "unsupported" rather than "refused". Default: ``False``.
         """
-        Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
+        return False
 
-        A managed runner runs in a sandbox with no logged-in user
-        credential of its own, so the server mints one for its HTTP
-        callbacks when auth is enabled (see the
-        ``POST /v1/runners/{id}/token`` endpoint). Default: ``None`` — no
-        minting (single-user / no-auth, or a provider whose identity is
-        asserted externally and can't be minted server-side, e.g.
-        header/proxy auth). The runner then authenticates with its tunnel
-        binding token alone.
+    def mint_machine_token(
+        self,
+        binding: MachineBinding,  # noqa: ARG002
+        ttl_seconds: int,  # noqa: ARG002
+    ) -> tuple[str, int] | None:
+        """
+        Mint a short-lived machine token for a runner or host binding.
 
-        :param user_id: The session owner the runner acts as, e.g.
-            ``"alice@example.com"``.
+        A runner has no sign-in of its own, so the server mints one for its
+        HTTP callbacks and tunnel (see ``POST /v1/runners/{id}/token``).
+        Default: ``None`` — no minting (single-user / no-auth, or a provider
+        whose identity is asserted externally, e.g. header/proxy auth). The
+        runner then authenticates with its tunnel binding token alone.
+
+        :param binding: The current server-side binding, never caller-supplied.
         :param ttl_seconds: Token lifetime in seconds.
-        :returns: A bearer token string, or ``None`` when this provider
+        :returns: ``(token, expires_at)``, or ``None`` when this provider
             cannot mint one.
         """
         return None
@@ -492,7 +504,8 @@ class AuthProvider(ABC):
         principal = recorded_principal(request)
         if principal is not None:
             return principal
-        return Principal(_delegated_kind(self.credential_delegation(request)), user_id)
+        kind = _delegated_kind(self.credential_delegation(request))
+        return Principal(kind, user_id, scopes=default_scopes(kind))
 
 
 def _delegated_kind(delegation: object) -> PrincipalKind:
@@ -505,6 +518,8 @@ def _delegated_kind(delegation: object) -> PrincipalKind:
 
 
 _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
+# A machine token verified on this request: (provider, token digest, principal).
+_MACHINE_IDENTITY_KEY = "omnigent.machine_identity"
 
 
 @dataclass(frozen=True)
@@ -584,6 +599,10 @@ class UnifiedAuthProvider(AuthProvider):
         # Accounts JWTs validate generation and revocation on every request.
         # OIDC and machine principals retain their independent lifecycle.
         self._account_check: Callable[[str, str], bool] | None = None
+        # Set by create_app: whether a machine token still matches the
+        # server's current runner/host binding. Unset rejects every machine
+        # token (fail closed).
+        self._machine_binding_check: Callable[[Principal], bool] | None = None
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -596,6 +615,14 @@ class UnifiedAuthProvider(AuthProvider):
     def set_account_check(self, check: Callable[[str, str], bool]) -> None:
         """Wire uncached generation/revocation validation in accounts mode."""
         self._account_check = check
+
+    def set_machine_binding_check(self, check: Callable[[Principal], bool]) -> None:
+        """Wire the per-request check of a machine token against its binding.
+
+        :param check: Callable returning ``True`` while the principal's runner
+            is still bound to its thread on its host for its registration.
+        """
+        self._machine_binding_check = check
 
     def accepts_account_generation(self, user_id: str, generation: str | None) -> bool:
         return self._account_check is None or (
@@ -664,7 +691,11 @@ class UnifiedAuthProvider(AuthProvider):
             handshake (both are ``HTTPConnection``).
         :returns: Authenticated user ID, or ``None`` (→ 401).
         """
-        from omnigent.db.account_authority import bind_account_authority, clear_account_authority
+        from omnigent.db.account_authority import (
+            bind_account_authority,
+            bind_machine_principal,
+            clear_account_authority,
+        )
         from omnigent.db.db_models import current_workspace_id
 
         clear_account_authority()
@@ -676,64 +707,66 @@ class UnifiedAuthProvider(AuthProvider):
         ):
             if identity.user_id is not None and identity.generation is not None:
                 bind_account_authority(identity.user_id, identity.generation)
+            principal = recorded_principal(request)
+            if identity.user_id is not None and principal is not None and principal.is_machine:
+                bind_machine_principal(True)
             return identity.user_id
         clear_principal(request)
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
+    def issues_machine_tokens(self) -> bool:
+        """Accounts and OIDC modes sign machine tokens; header mode can't."""
+        return self._cookie_config() is not None
+
+    def mint_machine_token(
+        self, binding: MachineBinding, ttl_seconds: int
+    ) -> tuple[str, int] | None:
         """
-        Mint a short-lived owner JWT for a managed-sandbox runner.
+        Mint a short-lived machine token for a runner or host binding.
 
-        Accounts / OIDC modes sign a session JWT in the same HS256 format
-        :meth:`_check_cookie` validates, so the runner can present it as
-        ``Authorization: Bearer <jwt>`` on its HTTP callbacks and resolve
-        to *user_id*. The token carries the :data:`RUNNER_DELEGATION` claim
-        (see :meth:`credential_delegation`). Header/proxy mode returns
-        ``None`` — identity there is asserted by the upstream proxy and
-        can't be minted server-side.
+        Accounts / OIDC modes sign it with a key derived from the session
+        secret and a machine audience, so it can never pass as a session
+        cookie. Header/proxy mode returns ``None`` — identity there is
+        asserted by the upstream proxy and can't be minted server-side.
 
-        :param user_id: The session owner the runner acts as, e.g.
-            ``"alice@example.com"``.
+        :param binding: The current server-side binding, never caller-supplied.
         :param ttl_seconds: Token lifetime in seconds.
-        :returns: An HS256-signed JWT, or ``None`` for header mode, an
-            empty/reserved user, or a missing cookie config.
+        :returns: ``(token, expires_at)``, or ``None`` for header mode, a
+            reserved user, or a missing cookie config.
         """
-        if not user_id or user_id in _RESERVED_USERS:
+        if not binding.user_id or binding.user_id in _RESERVED_USERS:
             return None
         cookie_config = self._cookie_config()
         if cookie_config is None:
             return None
-        from omnigent.db.account_authority import account_generation
-        from omnigent.server.oidc import mint_session_token
+        from omnigent.server.principals import mint_machine_token
 
-        return mint_session_token(
-            user_id,
-            cookie_config.cookie_secret,
-            ttl_seconds,
-            self._source,
-            account_generation=account_generation(user_id),
-            delegated=RUNNER_DELEGATION,
-        )
+        return mint_machine_token(binding, cookie_config.cookie_secret, ttl_seconds)
 
     def credential_delegation(self, request: HTTPConnection) -> str | None:
         """
-        Return the ``delegated`` claim of the request's session JWT.
+        Return who the request's credential was handed to, if anyone.
 
-        Reads the same token :meth:`_check_cookie` authenticates (cookie
-        first, then Bearer). A malformed claim still counts as delegated;
-        :meth:`_check_cookie` already refuses such a token. Expiry is not
-        checked: a request authenticated before its token expired is still
-        delegated when a route asks later.
+        A machine principal (runner or host) is always delegated. Otherwise
+        this reads the ``delegated`` claim of the same token
+        :meth:`_check_cookie` authenticates (cookie first, then Bearer). A
+        malformed claim still counts as delegated; :meth:`_check_cookie`
+        already refuses such a token. Expiry is not checked: a request
+        authenticated before its token expired is still delegated when a
+        route asks later.
 
         :param request: The incoming HTTP request or WebSocket handshake.
-        :returns: The delegation, e.g. :data:`RUNNER_DELEGATION`, or
-            ``None`` when the token is undelegated, absent or not signed by
-            this server, or this provider reads identity from a header.
+        :returns: The delegation, e.g. ``"runner"``, or ``None`` when the
+            token is undelegated, absent or not signed by this server, or
+            this provider reads identity from a header.
         """
         import jwt
 
+        principal = recorded_principal(request)
+        if principal is not None and principal.is_machine:
+            return principal.kind.value
         cookie_config = self._cookie_config()
         if cookie_config is None:
             return None
@@ -806,7 +839,8 @@ class UnifiedAuthProvider(AuthProvider):
                 algorithms=["HS256"],
             )
         except jwt.InvalidTokenError:
-            return None
+            secret = cookie_config.cookie_secret
+            return self._check_machine_token(request, token, cache_key, secret)
 
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
@@ -830,9 +864,11 @@ class UnifiedAuthProvider(AuthProvider):
             bind_account_authority(user_id, generation)
 
         # A delegated credential is never cached, so this check runs per request.
+        # A runner's owner session JWT is the pre-machine-token form: refused.
         delegation = payload.get(CREDENTIAL_DELEGATION_CLAIM)
         if delegation is not None and (
             not isinstance(delegation, str)
+            or delegation == RUNNER_DELEGATION
             or _path_under(_route_path(request), _DELEGATION_REFUSED_PREFIXES)
         ):
             return None
@@ -873,6 +909,56 @@ class UnifiedAuthProvider(AuthProvider):
 
         record_principal(request, Principal(_delegated_kind(delegation), user_id))
         return user_id
+
+    def _check_machine_token(
+        self, request: HTTPConnection, token: str, cache_key: str, secret: bytes
+    ) -> str | None:
+        """Authenticate a runner or host token against its current binding.
+
+        The signature, audience and expiry prove only that this server minted
+        the token; the binding check proves it still names the live runner on
+        the thread's host for the owner's registration. The verdict is kept on
+        this request's scope only, so one request checks once.
+
+        :param request: The incoming HTTP request or WebSocket handshake.
+        :param token: The bearer that failed session-cookie validation.
+        :param cache_key: The token's HMAC digest, keying the per-request verdict.
+        :param secret: The server's session secret.
+        :returns: The account the machine principal acts for, or ``None``.
+        """
+        from omnigent.db.account_authority import bind_account_authority, bind_machine_principal
+
+        if _path_under(_route_path(request), _DELEGATION_REFUSED_PREFIXES):
+            return None
+        verified = request.scope.get(_MACHINE_IDENTITY_KEY)
+        if isinstance(verified, tuple) and verified[:2] == (self, cache_key):
+            principal: Principal | None = verified[2]
+        else:
+            principal = decode_machine_token(token, secret)
+            if principal is None or principal.user_id in _RESERVED_USERS:
+                return None
+            user_id, generation = principal.user_id, principal.account_generation
+            if user_id is None:
+                return None
+            if self._account_check is not None and (
+                generation is None or not self._account_check(user_id, generation)
+            ):
+                return None
+            if self._machine_binding_check is None or not self._machine_binding_check(principal):
+                return None
+            request.scope[_MACHINE_IDENTITY_KEY] = (self, cache_key, principal)
+        if (
+            principal is None
+            or principal.user_id is None
+            or principal.expires_at is None
+            or principal.expires_at <= time.time()
+        ):
+            return None
+        if principal.account_generation is not None and self._account_check is not None:
+            bind_account_authority(principal.user_id, principal.account_generation)
+        bind_machine_principal(True)
+        record_principal(request, principal)
+        return principal.user_id
 
     def _check_header(self, request: HTTPConnection) -> str | None:
         """Read the trusted identity header and return the user ID.

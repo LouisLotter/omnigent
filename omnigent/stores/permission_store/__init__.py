@@ -187,6 +187,9 @@ class PermissionStore(ABC):
     def is_admin(self, user_id: str) -> bool:
         """Check whether a user has the admin flag set.
 
+        Always ``False`` while a machine principal (runner or host) acts:
+        software never holds a person's administrator override.
+
         :param user_id: The user to check, e.g. ``"local"``.
         :returns: ``True`` if the user exists and ``is_admin``
             is set, ``False`` otherwise.
@@ -222,7 +225,8 @@ class PermissionStore(ABC):
 
         Checks the user's direct grant and the ``__public__`` sentinel
         grant, subject to the live public ceiling. Does NOT handle admin bypass or sub-agent parent
-        delegation — callers are responsible for those.
+        delegation — callers are responsible for those. While a machine
+        principal acts, only the person's own owner grant counts.
 
         :param user_id: The authenticated user, or ``None`` if unauthenticated.
         :param conversation_id: The session to check.

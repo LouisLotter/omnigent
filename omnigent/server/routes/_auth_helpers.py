@@ -20,16 +20,18 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from collections.abc import Iterable
 
 from fastapi import Request
 
 from omnigent.db.utils import shared_read_scope
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, SessionPermission
 from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
     AuthProvider,
     local_single_user_enabled,
 )
@@ -423,19 +425,29 @@ def get_session_owner_id(
     conversation_id: str,
     permission_store: PermissionStore | None,
 ) -> str | None:
-    """Return the user_id of the session owner, or ``None``.
+    """Return the user_id of the session's single owner, or ``None``.
 
     :param conversation_id: The session to look up.
     :param permission_store: Permission store, or ``None`` to skip.
-    :returns: Owner's user_id, or ``None``.
+    :returns: Owner's user_id, or ``None`` when there is no owner grant or
+        several (ownership is then ambiguous and nobody is shown as owner).
     """
     if permission_store is None:
         return None
     grants, _ = permission_store.list_for_session(conversation_id, limit=1000)
-    for g in grants:
-        if g.level >= LEVEL_OWNER:
-            return g.user_id
-    return None
+    return single_owner(grants)
+
+
+def single_owner(grants: Iterable[SessionPermission]) -> str | None:
+    """The one owner among a session's grants, or ``None`` when absent or ambiguous.
+
+    :param grants: The session's grants.
+    :returns: The owner's user id.
+    """
+    owners = {
+        g.user_id for g in grants if g.level >= LEVEL_OWNER and g.user_id != RESERVED_USER_PUBLIC
+    }
+    return owners.pop() if len(owners) == 1 else None
 
 
 def _can_mutate_agent(

@@ -842,6 +842,27 @@ def register_events_routes(
             return True
         return _has_bound_runner_authority(request, conv)
 
+    async def _record_turn_attribution(
+        request: Request | _RunnerEventContext | StartupInputContext,
+        session_id: str,
+        initiator: str | None,
+    ) -> None:
+        """Record who sent an event apart from whose thread and runner it is.
+
+        A colleague with edit access sends into the owner's thread, and the
+        owner's runner executes it on the owner's computer: the initiator, the
+        thread owner and the acting principal stay distinct in the audit row.
+        """
+        add_audit_attrs(initiator=initiator)
+        if not isinstance(request, Request) or auth_provider is None:
+            return
+        principal = auth_provider.principal(request)
+        if principal is None or principal.is_machine:
+            # A runner acts only on its own person's threads; the guard records it.
+            return
+        owner = await asyncio.to_thread(conversation_store.get_actual_session_owner, session_id)
+        add_audit_attrs(thread_owner=owner.user_id if owner is not None else None)
+
     async def _authorized_conversation(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1272,6 +1293,8 @@ def register_events_routes(
         add_audit_attrs(event_type=body.type)
         if body.type in _TRANSIENT_AUDIT_EVENT_TYPES:
             mark_request_audit_suppressed()
+        elif debug_sink_enabled():
+            await _record_turn_attribution(request, session_id, created_by)
         # Refresh identity within the reporting window, including resumed sessions.
         if debug_sink_enabled() and body.type in _METADATA_OBSERVATION_EVENT_TYPES:
             await asyncio.to_thread(

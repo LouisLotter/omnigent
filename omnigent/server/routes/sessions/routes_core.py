@@ -1927,6 +1927,16 @@ def register_core_routes(
             shared_only_param = False
             include_archived_param = include_archived
             archived_only_param = False
+        from omnigent.db.account_authority import machine_principal_active
+
+        if machine_principal_active() and user_id is not None:
+            # A runner reaches only threads its person owns: no visibility value
+            # can widen that. Others' threads shared with its person are not its
+            # to list or search, so "shared" is empty for a runner.
+            if shared_only_param:
+                return PaginatedList(data=[], first_id=None, last_id=None, has_more=False)
+            owned_by_param = user_id
+            accessible_by_param = user_id
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,

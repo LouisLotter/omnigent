@@ -15,6 +15,12 @@ from omnigent.debug_logging import record_to_row
 async def test_concurrent_api_errors_keep_request_identity(
     app: FastAPI, caplog: pytest.LogCaptureFixture
 ) -> None:
+    from omnigent.server.route_authority import HUMAN
+
+    app.state.route_authority_rules[("GET", "/v1/sessions/{session_id}/_diagnostic_failure")] = (
+        HUMAN
+    )
+
     @app.get("/v1/sessions/{session_id}/_diagnostic_failure")
     async def diagnostic_failure(session_id: str) -> None:
         await asyncio.sleep(0)

@@ -28,10 +28,14 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
-from sqlalchemy.sql.selectable import Subquery
+from sqlalchemy.sql.selectable import ScalarSelect, Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
-from omnigent.db.account_authority import AccountAuthority, require_active_account
+from omnigent.db.account_authority import (
+    AccountAuthority,
+    machine_principal_active,
+    require_active_account,
+)
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
@@ -42,6 +46,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlHost,
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
@@ -357,6 +362,33 @@ def _validate_inference_snapshot(value: str | None) -> None:
             "Reduce the configured model catalog or allowlist.",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+def _runner_host_incarnation(session: Session, host_id: str | None) -> str | None:
+    """The sandbox a host runs now, recorded when a runner is bound to it.
+
+    A runner bound before the host's sandbox was replaced or detached no
+    longer matches, so its binding token can neither mint nor authenticate.
+    """
+    if host_id is None:
+        return None
+    return session.execute(
+        select(SqlHost.sandbox_id).where(
+            SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+        )
+    ).scalar_one_or_none()
+
+
+def _runner_host_incarnation_column() -> ScalarSelect[str | None]:
+    """Correlated subquery: the bound host's current sandbox, for bulk updates."""
+    return (
+        select(SqlHost.sandbox_id)
+        .where(
+            SqlHost.workspace_id == SqlConversationMetadata.workspace_id,
+            SqlHost.host_id == SqlConversationMetadata.host_id,
+        )
+        .scalar_subquery()
+    )
 
 
 def _new_session_metadata_row(
@@ -1188,6 +1220,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     kind=encoded_kind,
                     runner_id=runner_id,
                     host_id=host_id,
+                    runner_host_incarnation=_runner_host_incarnation(meta_sess, host_id),
                     sub_agent_name=sub_agent_name,
                     workspace=workspace,
                     git_branch=git_branch,
@@ -3125,9 +3158,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         # are filtered directly on the AP query below. The only filters that
         # still require Omnigent-side data are the permission scopes.
         # shared_only (accessible − owned) is a permission scope too.
-        needs_meta_filter = (accessible_by is not None) or (owned_by is not None) or shared_only
         if shared_only and accessible_by is None:
             raise ValueError("shared_only=True requires accessible_by to be set")
+        if machine_principal_active() and (accessible_by is not None or owned_by is not None):
+            # A runner or host lists only its person's own threads: a share
+            # never widens it, so "shared with me" is empty for it.
+            if shared_only:
+                return PagedList(data=[], first_id=None, last_id=None, has_more=False)
+            owned_by = owned_by if owned_by is not None else accessible_by
+        needs_meta_filter = (accessible_by is not None) or (owned_by is not None) or shared_only
         if search_scope not in _SEARCH_SCOPES:
             raise ValueError(f"invalid search_scope: {search_scope!r}")
 
@@ -4031,7 +4070,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
-                .values(runner_id=runner_id)
+                .values(
+                    runner_id=runner_id,
+                    runner_host_incarnation=_runner_host_incarnation_column(),
+                )
             )
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
@@ -4234,6 +4276,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if expected_runner_id is None:
                 meta.runner_id = runner_id
+                meta.runner_host_incarnation = _runner_host_incarnation(session, meta.host_id)
             else:
                 session.execute(
                     update(SqlConversationMetadata)
@@ -4242,7 +4285,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.id == conversation_id,
                         SqlConversationMetadata.runner_id == expected_runner_id,
                     )
-                    .values(runner_id=runner_id)
+                    .values(
+                        runner_id=runner_id,
+                        runner_host_incarnation=_runner_host_incarnation_column(),
+                    )
                 )
                 session.refresh(meta)
             return meta
@@ -4275,6 +4321,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.runner_id = None
+            meta.runner_host_incarnation = None
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_runner_id", write)
@@ -4313,6 +4360,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.workspace = None
             meta.git_branch = None
             meta.runner_id = None
+            meta.runner_host_incarnation = None
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)
@@ -4456,6 +4504,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             binding_changed = meta.host_id != host_id or (
                 workspace is not None and meta.workspace != workspace
             )
+            if meta.host_id != host_id:
+                meta.runner_host_incarnation = _runner_host_incarnation(session, host_id)
             meta.host_id = host_id
             if workspace is not None:
                 meta.workspace = workspace
@@ -4743,6 +4793,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 host_id=host_id,
                 inference_snapshot=encoded_inference_snapshot,
             )
+            meta_row.runner_host_incarnation = _runner_host_incarnation(session, host_id)
             session.add(agent_row)
             session.add(meta_row)
             return meta_row, agent_row

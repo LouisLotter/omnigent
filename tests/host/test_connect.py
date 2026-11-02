@@ -1920,6 +1920,20 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "code 3" in error
 
 
+def test_runner_exit_error_carries_a_refused_runner_token(tmp_path: Path) -> None:
+    """A runner the server refused stops, and the session's error says why."""
+    from omnigent.runner._entry import RUNNER_TOKEN_REFUSED_EXIT_CODE, RunnerTokenRefusedError
+
+    log = tmp_path / "runner-refused.log"
+    log.write_text(f"omnigent runner: {RunnerTokenRefusedError(401)}\n", encoding="utf-8")
+
+    error = _runner_exit_error(RUNNER_TOKEN_REFUSED_EXIT_CODE, log)
+
+    assert f"code {RUNNER_TOKEN_REFUSED_EXIT_CODE}" in error
+    assert "refused this runner's token (HTTP 401)" in error
+    assert "does not fall back to the computer's sign-in" in error
+
+
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
