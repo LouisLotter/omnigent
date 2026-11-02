@@ -68,9 +68,12 @@ flowchart LR
   E -->|HTTPS with upstream access token| M
 ```
 
-- **Administrator:** configures approved destinations, auth and nonempty tool
-  allowlists in `OMNIGENT_MCP_REGISTRY`. Optional user allowlists limit visibility
-  and use. Config changes require a server restart.
+- **Administrator:** approves destinations, auth and nonempty tool allowlists in
+  **Settings → MCP** (stored in the database, live without a restart, checked by
+  the destination policy) or in `OMNIGENT_MCP_REGISTRY` (read-only on the page;
+  changes need a restart). Optional user allowlists in the file limit visibility
+  and use. Changing a page-added service's URL or login settings deletes its
+  saved logins.
 - **User:** connects an account through **Settings → MCP** or the launch picker, then
   selects services per session. Selection and account connection are independent.
 - **Runner:** receives service references and tool schemas. A registry entry

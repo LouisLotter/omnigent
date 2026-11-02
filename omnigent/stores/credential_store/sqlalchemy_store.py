@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+from collections.abc import Callable
 from typing import Any, cast
 
 from sqlalchemy import delete, select, update
@@ -135,6 +136,7 @@ class CredentialStore:
         secret: dict[str, Any],
         metadata: dict[str, Any],
         account_id: str = "",
+        precondition: Callable[[Session], None] | None = None,
     ) -> ProviderConnection:
         """Create or replace a user's connection for *provider*.
 
@@ -143,6 +145,9 @@ class CredentialStore:
         Concurrency-safe — two simultaneous connects (a double-clicked
         "Connect") don't 500 on a primary-key violation; the loser retries as an
         update.
+
+        :param precondition: Runs first inside the write transaction and raises to
+            refuse the write, e.g. when the service the secret is for has changed.
         """
         now = now_epoch()
         workspace_id = current_workspace_id()
@@ -171,6 +176,8 @@ class CredentialStore:
             return row
 
         def initial_write(session: Session) -> ProviderConnection:
+            if precondition is not None:
+                precondition(session)
             require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
@@ -184,6 +191,8 @@ class CredentialStore:
             pass
 
         def conflict_write(session: Session) -> ProviderConnection:
+            if precondition is not None:
+                precondition(session)
             require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()

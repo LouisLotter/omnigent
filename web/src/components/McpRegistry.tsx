@@ -8,8 +8,12 @@ import { withBasePath } from "@/lib/basePath";
 import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
 
-export function McpRegistryConnections() {
+export function McpRegistryConnections({ refreshKey = 0 }: { refreshKey?: number } = {}) {
   const { services, error, loading, refresh } = useMcpRegistryCatalog();
+  // An administrator's change to the servers re-reads the catalog.
+  useEffect(() => {
+    if (refreshKey) void refresh();
+  }, [refreshKey, refresh]);
   const callbackFailed = [...new URLSearchParams(window.location.search)].some(
     ([key, value]) => key.startsWith("mcp-") && value === "error",
   );

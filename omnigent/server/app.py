@@ -4707,7 +4707,7 @@ def create_app(
         from omnigent.server.routes.mcp_registry import create_mcp_registry_router
 
         app.include_router(
-            create_mcp_registry_router(mcp_registry, auth_provider),
+            create_mcp_registry_router(mcp_registry, auth_provider, permission_store),
             prefix="/v1",
             tags=["mcp_registry"],
         )

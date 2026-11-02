@@ -134,6 +134,25 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "starting": 6,
 }
 
+# Run-time MCP services (``mcp_registry_services``): the login type, how an
+# OAuth client was obtained, and how it authenticates at the token endpoint.
+MCP_SERVICE_AUTH: dict[str, int] = {
+    "none": 1,
+    "bearer": 2,
+    "oauth": 3,
+}
+
+MCP_OAUTH_CLIENT_REGISTRATION: dict[str, int] = {
+    "manual": 1,
+    "dynamic": 2,
+}
+
+MCP_OAUTH_TOKEN_ENDPOINT_AUTH: dict[str, int] = {
+    "none": 1,
+    "client_secret_post": 2,
+    "client_secret_basic": 3,
+}
+
 
 def _assert_item_type_codes_cover_data_classes() -> None:
     """
@@ -355,3 +374,49 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_mcp_service_auth(name: str) -> int:
+    """Encode a ``mcp_registry_services.auth`` name to its int code."""
+    return _encode(MCP_SERVICE_AUTH, name, field="mcp_registry_services.auth")
+
+
+def decode_mcp_service_auth(code: int) -> str:
+    """Decode a ``mcp_registry_services.auth`` int code to its name."""
+    return _decode(MCP_SERVICE_AUTH, code, field="mcp_registry_services.auth")
+
+
+def encode_mcp_oauth_client_registration(name: str) -> int:
+    """Encode a ``mcp_registry_services.oauth_client_registration`` name."""
+    return _encode(
+        MCP_OAUTH_CLIENT_REGISTRATION,
+        name,
+        field="mcp_registry_services.oauth_client_registration",
+    )
+
+
+def decode_mcp_oauth_client_registration(code: int) -> str:
+    """Decode a ``mcp_registry_services.oauth_client_registration`` code."""
+    return _decode(
+        MCP_OAUTH_CLIENT_REGISTRATION,
+        code,
+        field="mcp_registry_services.oauth_client_registration",
+    )
+
+
+def encode_mcp_oauth_token_endpoint_auth(name: str) -> int:
+    """Encode a ``mcp_registry_services.oauth_token_endpoint_auth`` name."""
+    return _encode(
+        MCP_OAUTH_TOKEN_ENDPOINT_AUTH,
+        name,
+        field="mcp_registry_services.oauth_token_endpoint_auth",
+    )
+
+
+def decode_mcp_oauth_token_endpoint_auth(code: int) -> str:
+    """Decode a ``mcp_registry_services.oauth_token_endpoint_auth`` code."""
+    return _decode(
+        MCP_OAUTH_TOKEN_ENDPOINT_AUTH,
+        code,
+        field="mcp_registry_services.oauth_token_endpoint_auth",
+    )

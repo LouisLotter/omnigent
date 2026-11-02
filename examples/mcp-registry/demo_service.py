@@ -21,6 +21,8 @@ mcp = FastMCP("Demo work tracker", stateless_http=True, json_response=True)
 codes: dict[str, dict] = {}
 refresh_tokens: dict[str, dict] = {}
 access_tokens: dict[str, dict] = {}
+#: Clients registered through dynamic client registration (RFC 7591), by client ID.
+clients: dict[str, dict] = {}
 
 
 @mcp.tool()
@@ -57,6 +59,10 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _origin(request: Request) -> str:
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
 @app.middleware("http")
 async def authenticate_mcp(request: Request, call_next):
     if request.url.path.startswith("/mcp"):
@@ -65,13 +71,70 @@ async def authenticate_mcp(request: Request, call_next):
         if account is None or account["expires_at"] <= time.time():
             from fastapi.responses import JSONResponse
 
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+            metadata = f"{_origin(request)}/.well-known/oauth-protected-resource/mcp"
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{metadata}"'},
+            )
     return await call_next(request)
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/.well-known/oauth-protected-resource/mcp")
+def protected_resource(request: Request):
+    """RFC 9728 metadata, so a client can discover the authorization server."""
+    return {
+        "resource": f"{_origin(request)}/mcp",
+        "authorization_servers": [_origin(request)],
+        "scopes_supported": ["tickets:read", "offline_access"],
+    }
+
+
+@app.get("/.well-known/oauth-authorization-server")
+def authorization_server(request: Request):
+    """RFC 8414 metadata, including the registration endpoint."""
+    origin = _origin(request)
+    return {
+        "issuer": origin,
+        "authorization_endpoint": f"{origin}/authorize",
+        "token_endpoint": f"{origin}/token",
+        "registration_endpoint": f"{origin}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+    }
+
+
+@app.post("/register", status_code=201)
+async def register(request: Request):
+    """Dynamic client registration (RFC 7591): a confidential client per request."""
+    body = await request.json()
+    redirect_uris = body.get("redirect_uris")
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        raise HTTPException(400, "redirect_uris is required")
+    client_id = "dyn-" + secrets.token_urlsafe(12)
+    client_secret = secrets.token_urlsafe(24)
+    clients[client_id] = {"redirect_uris": redirect_uris, "client_secret": client_secret}
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "client_secret_post",
+        "grant_types": ["authorization_code", "refresh_token"],
+    }
+
+
+def _check_client(fields: dict) -> None:
+    """A registered client must present its own secret; the built-in demo client has none."""
+    client = clients.get(str(fields.get("client_id")))
+    if client is not None and fields.get("client_secret") != client["client_secret"]:
+        raise HTTPException(401, "Invalid client")
 
 
 @app.get("/authorize", response_class=HTMLResponse)
@@ -94,20 +157,23 @@ def authorize(request: Request):
 async def approve(request: Request):
     fields = dict(await request.form())
     redirect = str(fields.get("redirect_uri", ""))
-    if redirect != REDIRECT_URI:
+    registered = clients.get(str(fields.get("client_id")))
+    allowed = registered["redirect_uris"] if registered else [REDIRECT_URI]
+    if redirect not in allowed:
         raise HTTPException(400, "Callback does not match the registered demo redirect URI")
     if fields.get("code_challenge_method") != "S256":
         raise HTTPException(400, "PKCE is required")
     code = secrets.token_urlsafe(24)
     codes[code] = {**fields, "expires_at": time.time() + 120}
     return RedirectResponse(
-        REDIRECT_URI + "?" + urlencode({"code": code, "state": fields["state"]}), status_code=303
+        redirect + "?" + urlencode({"code": code, "state": fields["state"]}), status_code=303
     )
 
 
 @app.post("/token")
 async def token(request: Request):
     fields = dict(await request.form())
+    _check_client(fields)
     if fields.get("grant_type") == "authorization_code":
         grant = codes.pop(str(fields.get("code")), None)
         verifier = str(fields.get("code_verifier", ""))

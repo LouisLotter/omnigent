@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 import time
@@ -1038,3 +1039,110 @@ async def test_failed_mark_keeps_the_upstream_diagnosis(registry, monkeypatch, c
         await registry.execute("tracker", "alice", SimpleNamespace(), tool="read_ticket")
     assert "Could not mark MCP service tracker for reconnection" in caplog.text
     assert "private-" not in caplog.text
+
+
+def _managed_registry(db_uri, **config):
+    from omnigent.stores.mcp_service_store import McpServiceStore
+
+    return McpRegistry(
+        McpRegistryConfig(**config),
+        CredentialStore(db_uri, _FakeCipher()),
+        service_store=McpServiceStore(db_uri),
+    )
+
+
+@pytest.mark.asyncio
+async def test_presets_are_offered_to_administrators_but_never_active(db_uri):
+    registry = _managed_registry(
+        db_uri,
+        presets=[
+            {
+                "id": "tracker",
+                "title": "Tracker",
+                "url": "https://<your-host>/mcp",
+                "auth": "oauth",
+                "oauth": {"scopes": ["tickets:read"]},
+                "tools": ["read_ticket"],
+            }
+        ],
+    )
+    assert registry.catalog() == {}
+    app = FastAPI()
+    app.include_router(create_mcp_registry_router(registry, None), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        presets = (await client.get("/v1/mcp-registry/admin/presets")).json()["data"]
+        catalog = (await client.get("/v1/mcp-registry/services")).json()["data"]
+    assert [(p["id"], p["url"]) for p in presets] == [("tracker", "https://<your-host>/mcp")]
+    assert catalog == []
+    with pytest.raises(ValidationError):
+        McpRegistryConfig(presets=[{"id": "x", "title": "x", "client_secret": "no"}])
+
+
+@pytest.mark.asyncio
+async def test_a_draft_is_visible_only_to_its_creator(db_uri):
+    from omnigent.stores.mcp_service_store import McpServiceSettings
+
+    registry = _managed_registry(db_uri)
+    registry.service_store.create(
+        "tracker",
+        McpServiceSettings(title="T", url="https://t.example.com/mcp", auth="none", timeout=5),
+        created_by="alice",
+    )
+    registry.reload()
+    assert registry.service("tracker", "alice").id == "tracker"
+    with pytest.raises(ConnectionError, match="unavailable"):
+        registry.service("tracker", "bob")
+
+
+@pytest.mark.asyncio
+async def test_a_page_added_client_authenticates_with_its_sealed_secret(db_uri, monkeypatch):
+    from omnigent.stores.mcp_service_store import (
+        McpServiceOAuth,
+        McpServiceSettings,
+    )
+
+    registry = _managed_registry(db_uri)
+    registry.service_store.create(
+        "tracker",
+        McpServiceSettings(
+            title="T",
+            url="https://t.example.com/mcp",
+            auth="oauth",
+            timeout=5,
+            tools=("read_ticket",),
+            oauth=McpServiceOAuth(
+                authorize_url="https://auth.example.com/authorize",
+                token_url="https://auth.example.com/token",
+                client_id="client:1",
+                registration="manual",
+                token_endpoint_auth="client_secret_basic",
+            ),
+        ),
+        created_by="admin",
+    )
+    entry = registry.reload()["tracker"]
+    with pytest.raises(ConnectionError, match="client secret"):
+        await registry.exchange(entry, {"grant_type": "refresh_token"})
+    registry.save_client_secret(entry, "s3cret/value")
+    seen = {}
+
+    def token_endpoint(request):
+        seen["authorization"] = request.headers.get("authorization")
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, json={"access_token": "fresh", "token_type": "Bearer"})
+
+    monkeypatch.setattr(
+        registry,
+        "http_client",
+        lambda service, url, **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(token_endpoint), **kwargs
+        ),
+    )
+    tokens = await registry.exchange(entry, {"grant_type": "refresh_token"})
+    assert tokens["access_token"] == "fresh"
+    assert (
+        seen["authorization"] == "Basic " + base64.b64encode(b"client%3A1:s3cret%2Fvalue").decode()
+    )
+    assert "client_secret" not in seen["body"]

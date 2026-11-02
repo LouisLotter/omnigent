@@ -41,6 +41,17 @@ _CODECS = [
         ec.encode_scheduled_task_run_status,
         ec.decode_scheduled_task_run_status,
     ),
+    (ec.MCP_SERVICE_AUTH, ec.encode_mcp_service_auth, ec.decode_mcp_service_auth),
+    (
+        ec.MCP_OAUTH_CLIENT_REGISTRATION,
+        ec.encode_mcp_oauth_client_registration,
+        ec.decode_mcp_oauth_client_registration,
+    ),
+    (
+        ec.MCP_OAUTH_TOKEN_ENDPOINT_AUTH,
+        ec.encode_mcp_oauth_token_endpoint_auth,
+        ec.decode_mcp_oauth_token_endpoint_auth,
+    ),
 ]
 
 
@@ -121,6 +132,13 @@ def test_shipped_codes_are_stable() -> None:
     assert ec.SCHEDULED_TASK_EXECUTION_TARGET == {
         "connected_host": 1,
         "managed_sandbox": 2,
+    }
+    assert ec.MCP_SERVICE_AUTH == {"none": 1, "bearer": 2, "oauth": 3}
+    assert ec.MCP_OAUTH_CLIENT_REGISTRATION == {"manual": 1, "dynamic": 2}
+    assert ec.MCP_OAUTH_TOKEN_ENDPOINT_AUTH == {
+        "none": 1,
+        "client_secret_post": 2,
+        "client_secret_basic": 3,
     }
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,

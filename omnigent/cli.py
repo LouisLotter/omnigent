@@ -4929,18 +4929,38 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
-    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from omnigent.server.mcp_registry import (
+        McpRegistry,
+        McpRegistryConfig,
+        admin_services_enabled,
+    )
 
     mcp_registry = None
     registry_config = McpRegistryConfig.from_env()
-    if registry_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from omnigent.stores.credential_store import build_secret_cipher
 
+    registry_cipher = None
+    if registry_config is not None:
         registry_cipher = build_secret_cipher()
+    elif admin_services_enabled():
+        try:
+            registry_cipher = build_secret_cipher()
+        except ValueError as exc:
+            # Without a registry file this is optional: report it, start without logins.
+            logging.getLogger(__name__).error("MCP services cannot store logins: %s", exc)
+    # Administrators add services in Settings > MCP once logins can be sealed, or
+    # beside a registry file; OMNIGENT_MCP_ADMIN_SERVICES=0 turns that off.
+    manage_services = admin_services_enabled() and (
+        registry_config is not None or registry_cipher is not None
+    )
+    if registry_config is not None or manage_services:
+        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+        from omnigent.stores.mcp_service_store import McpServiceStore
+
         mcp_registry = McpRegistry(
-            registry_config,
+            registry_config or McpRegistryConfig(),
             CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
+            service_store=McpServiceStore(db_uri) if manage_services else None,
         )
 
     # Accounts mode ergonomics: when accounts mode is selected

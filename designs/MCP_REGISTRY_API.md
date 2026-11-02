@@ -26,8 +26,9 @@ Generic grants are keyed by workspace, credential user and service.
 
 Session selections contain a service ID, never its upstream URL or credential.
 The picker stores selections separately from the agent bundle. Direct HTTP/stdio declarations retain their existing behavior.
-An administrator approves destinations and tool allowlists. The catalog API
-does not allow users to register arbitrary destinations.
+An administrator approves destinations and tool allowlists, in the registry file
+or in Settings > MCP ([below](#manage-services-administrators)). Members cannot
+register destinations.
 
 ## Runtime compatibility
 
@@ -124,6 +125,54 @@ return 400; the test endpoint returns 400 for missing/invalid connection state a
 502 for upstream failures. Schema validation normally returns 422. REST errors
 use either FastAPI `{"detail": ...}` or the existing application
 `{"error": {"code": ..., "message": ...}}` envelope.
+
+## Manage services (administrators)
+
+With a service store (the server command enables it wherever the credential
+store has a cipher, or beside a registry file; `OMNIGENT_MCP_ADMIN_SERVICES=0`
+turns it off), administrators add, change and remove services while the server
+runs. Changes are live in the server that made them at once and in other server
+processes within the registry's refresh interval (5 seconds); no restart.
+
+Only a person signed in as an administrator may call these routes. A delegated
+credential, such as the token a runner holds for an administrator, gets 403.
+
+| Method and path | Request | Success response |
+| --- | --- | --- |
+| `GET /v1/mcp-registry/admin/services` | `limit`, `after` as for the catalog | `200 {"data": [admin service, ...], "next_cursor": ...}`: every service, drafts included; registry-file services with `"source": "config"`, `"editable": false`. |
+| `GET /v1/mcp-registry/admin/presets` | None | `200 {"data": [preset, ...]}`: the registry file's `presets`, starting points for the form. |
+| `POST /v1/mcp-registry/admin/services` | `id` plus the settings below | `201` admin service. A new service with no tools is a **draft**: only its creator sees it, to connect and discover tools. |
+| `PUT /v1/mcp-registry/admin/services/{id}` | Settings below | `200` admin service with `"credentials_reset": bool`. |
+| `DELETE /v1/mcp-registry/admin/services/{id}` | None | `200 {"deleted": true}`; removes every saved login for it. |
+| `POST /v1/mcp-registry/admin/services/{id}/discover` | None | `200 {"tools": [{"name", "title", "description"}], "allowed": [...]}`: every tool the server offers, listed with the administrator's own login. |
+
+Settings: `title`, `description`, `url`, `auth` (`none`, `bearer` or `oauth`),
+`timeout` (1-300 s), `tools` (the allowlist, at most 200) and, for `oauth`, an
+optional `oauth` object: `client_id`, write-only `client_secret`,
+`token_endpoint_auth`, `authorize_url` with `token_url`, `scopes`, `resource`.
+Without endpoints the server discovers them (RFC 9728 protected-resource
+metadata, then RFC 8414 or OpenID metadata, else the MCP default paths). Without
+a client ID it registers itself (RFC 7591), preferring a public PKCE client. A
+client secret is sealed in the credential store under the reserved owner
+`__mcp_service__`; responses show only `has_client_secret`.
+
+Changing `url`, `auth` or any OAuth setting replaces the service's credential
+version and deletes every member's login, sign-ins in progress and the OAuth
+client secret, so a service cannot be repointed to collect a key. A client secret
+is kept only while the token URL and client ID stay the same. Logins carry the
+version they were saved for; one saved for other settings is never sent.
+
+**Destination rules.** Page-added services pass a destination policy when saved
+(the URL, and every address its host resolves to) and on every connection,
+which is pinned to the checked address, so a name that later resolves elsewhere
+is refused. Omnigent's default policy: `https` only, no credentials, query or
+fragment, only globally routable addresses (no loopback, private, link-local,
+shared or reserved ranges, also when embedded in IPv6), no `localhost`,
+`.local` or `.internal` names. Redirects are never followed and environment
+proxies are not used. `OMNIGENT_MCP_ALLOW_PRIVATE_DESTINATIONS=1` allows `http`
+and private hosts for a trusted network. A deployment can pass a stricter
+`McpDestinationPolicy` as `McpRegistry(..., destination_policy=...)`.
+Registry-file services are the operator's choice and are not checked.
 
 ## Select services for a session
 

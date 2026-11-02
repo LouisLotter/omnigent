@@ -27,6 +27,10 @@ from omnigent.db.utils import (
 _FORK = "lt1b2c3d4e5f"
 _RELEASE = "b2e4f6a8c013"
 _MERGE = "c0201a2b3c4d"
+# Later migrations build on the merge, so an upgrade ends at the script's head.
+_SCRIPT = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
+(_HEAD,) = _SCRIPT.get_heads()
+assert _MERGE in {revision.revision for revision in _SCRIPT.iterate_revisions(_HEAD, "base")}
 _ID = bytes.fromhex("0123456789abcdef0123456789abcdef")
 
 # Starts the server's migration and SIGKILLs itself right after a matching statement.
@@ -219,7 +223,7 @@ def _interrupt_after_write(engine: sa.Engine, write_number: int) -> list[str]:
 
 
 def _assert_upgraded_with_canaries(uri: str) -> None:
-    assert _heads(uri) == (_MERGE,)
+    assert _heads(uri) == (_HEAD,)
     engine = sa.create_engine(uri)
     try:
         _assert_canaries(engine, _FORK)
@@ -248,7 +252,7 @@ def test_merge_preserves_deployed_data_and_joins_heads(
 
         _migrate(engine, "head")
         config = _build_alembic_config(str(engine.url))
-        assert ScriptDirectory.from_config(config).get_heads() == [_MERGE]
+        assert ScriptDirectory.from_config(config).get_heads() == [_HEAD]
         columns = {column["name"] for column in sa.inspect(engine).get_columns("hosts")}
         assert {"launch_token_only", "lifecycle", "sleep_operation_id", "start_failure"} <= columns
         assert "pull_requests" in {
@@ -258,11 +262,12 @@ def test_merge_preserves_deployed_data_and_joins_heads(
         with engine.connect() as connection:
             assert connection.execute(
                 sa.text("SELECT version_num FROM alembic_version")
-            ).one() == (_MERGE,)
+            ).one() == (_HEAD,)
         if starting_revision != "base":
             _assert_canaries(engine, starting_revision)
 
-        # Undoing only the merge must preserve the schemas and expose both parents.
+        # Undoing the merge (and what follows it) must preserve the schemas and expose
+        # both parents.
         _migrate(engine, _FORK, downgrade=True)
         with engine.connect() as connection:
             assert set(
