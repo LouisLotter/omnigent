@@ -122,7 +122,7 @@ from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
-from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.runner_tunnel import actual_runner_owner, create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -4566,12 +4566,7 @@ def create_app(
                 return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
             except OmnigentError:
                 return None
-        for conv in conversation_store.list_conversations_by_runner_id(runner_id):
-            # The runner acts as the owner, never as someone the thread is shared with.
-            owner = conversation_store.get_session_owner(conv.id, owner_only=True)
-            if owner is not None:
-                return owner
-        return None
+        return actual_runner_owner(conversation_store, runner_id)
 
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(

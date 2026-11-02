@@ -40,7 +40,7 @@ from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server import tunnel_handshake
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.disconnect_evidence import DisconnectEvidence
-from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.runner_tunnel import actual_runner_owner, create_runner_tunnel_router
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
@@ -1421,6 +1421,101 @@ async def test_ws_tunnel_managed_resolver_none_still_rejects() -> None:
         "reason": "unauthenticated",
     }
     assert route_app.registry.online_runner_ids() == []
+
+
+def _owned_thread(conversations, permissions, *grants: tuple[str, int]) -> str:
+    thread = conversations.create_conversation(agent_id=None)
+    for user_id, level in grants:
+        permissions.ensure_user(user_id)
+        permissions.grant(user_id, thread.id, level)
+    return thread.id
+
+
+async def test_actual_runner_owner_is_the_one_root_owner(db_uri: str) -> None:
+    """A runner acts for its threads' single actual owner, or for nobody."""
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    alice, bob = "alice@example.com", "bob@example.com"
+    root = _owned_thread(conversations, permissions, (alice, LEVEL_OWNER), (bob, LEVEL_EDIT))
+    child = conversations.create_conversation(
+        kind="sub_agent", parent_conversation_id=root, sub_agent_name="helper"
+    )
+    contested = _owned_thread(conversations, permissions, (alice, LEVEL_OWNER), (bob, LEVEL_OWNER))
+    shared_only = _owned_thread(conversations, permissions, (bob, LEVEL_EDIT))
+    bobs = _owned_thread(conversations, permissions, (bob, LEVEL_OWNER))
+    for thread_id, runner_id in (
+        (child.id, "child-runner"),
+        (contested, "contested-runner"),
+        (shared_only, "shared-runner"),
+        (root, "split-runner"),
+        (bobs, "split-runner"),
+    ):
+        assert conversations.set_runner_id(thread_id, runner_id)
+
+    assert actual_runner_owner(conversations, "child-runner") == alice
+    assert actual_runner_owner(conversations, "contested-runner") is None
+    assert actual_runner_owner(conversations, "shared-runner") is None
+    assert actual_runner_owner(conversations, "split-runner") is None
+    assert actual_runner_owner(conversations, "unbound-runner") is None
+
+
+@pytest.mark.parametrize("contested", [False, True], ids=["child-binding", "duplicate-owners"])
+async def test_ws_tunnel_managed_runner_registers_only_for_an_actual_owner(
+    db_uri: str, contested: bool
+) -> None:
+    """The handshake uses the strict resolver the app wires outside accounts mode."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    owners = ("alice@example.com", "bob@example.com") if contested else ("alice@example.com",)
+    root = _owned_thread(conversations, permissions, *((user, LEVEL_OWNER) for user in owners))
+    child = conversations.create_conversation(
+        kind="sub_agent", parent_conversation_id=root, sub_agent_name="helper"
+    )
+    token = f"managed-binding-{contested}"
+    runner_id = token_bound_runner_id(token)
+    assert conversations.set_runner_id(child.id, runner_id)
+    route_app = _tunnel_route_app(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        resolve_managed_runner_owner=partial(actual_runner_owner, conversations),
+    )
+    communicator = ApplicationCommunicator(
+        route_app.app,
+        _websocket_scope(
+            f"/v1/runners/{runner_id}/tunnel",
+            headers=[(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii"))],
+            client_host="203.0.113.7",
+        ),
+    )
+    await communicator.send_input({"type": "websocket.connect"})
+    response = await communicator.receive_output(timeout=budget(1.0))
+    try:
+        if contested:
+            assert response == {
+                "type": "websocket.close",
+                "code": 4004,
+                "reason": "unauthenticated",
+            }
+            assert route_app.registry.online_runner_ids() == []
+            return
+        assert response["type"] == "websocket.accept"
+        await _send_hello(communicator, route_app.registry, runner_id=runner_id)
+        assert route_app.registry.runner_owner(runner_id) == "alice@example.com"
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_loopback_unauthenticated_registers_as_local() -> None:
