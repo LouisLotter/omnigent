@@ -369,6 +369,7 @@ def bootstrap_admin(
             admin_username,
             hash_password(init_admin_password),
             is_admin=True,
+            team_owner=True,
         )
     except ValueError:
         logger.info("accounts: %r already created by another worker, skipping", admin_username)

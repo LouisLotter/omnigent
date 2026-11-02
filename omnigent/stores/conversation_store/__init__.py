@@ -1565,6 +1565,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_actual_session_owner(self, conversation_id: str) -> "AccountAuthority | None":
+        """Return the thread's actual owner: the one owner grant on its root.
+
+        A sub-agent thread is owned by its root thread's owner. No shared
+        grant, administrator flag or public grant is ever an owner. Use this
+        wherever ownership decides whose computer, subscription or identity
+        acts.
+
+        :param conversation_id: The thread, e.g. ``"conv_abc123"``.
+        :returns: The owner's username and registration generation (``None``
+            for an identity without an accounts registration), or ``None``
+            when the thread is unknown, has no owner grant, has more than one,
+            or its owner's account was deleted.
+        """
+        ...
+
+    @abstractmethod
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
         """
         Atomically pin ``conversations.runner_id`` only if currently NULL.

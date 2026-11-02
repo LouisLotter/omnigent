@@ -25,11 +25,16 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.account_authority import require_active_account, session_account_owner_query
+from omnigent.db.account_authority import (
+    AccountAuthority,
+    require_active_account,
+    session_account_owner_query,
+)
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
     SqlSessionPermission,
+    SqlUser,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
@@ -1071,6 +1076,44 @@ class HostStore:
             if row is None:
                 return None
             return _row_to_host(row)
+
+    def get_actual_host_owner(self, host_id: str) -> AccountAuthority | None:
+        """
+        Return the registration that owns a live host.
+
+        A host has one recorded owner. It counts only while that account is
+        live and, for an accounts registration, while the host carries the
+        account's current generation, so a reused username never inherits it.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The owner's username and generation (``None`` for an
+            identity without an accounts registration), or ``None`` when the
+            host is unknown, deleted, or held by an earlier registration.
+        """
+        with self._session("select_actual_host_owner") as session:
+            row = session.execute(
+                select(
+                    SqlHost.user_id,
+                    SqlHost.account_generation,
+                    SqlUser.account_generation.label("current_generation"),
+                    SqlUser.deleted_at,
+                )
+                .outerjoin(
+                    SqlUser,
+                    (SqlUser.workspace_id == SqlHost.workspace_id)
+                    & (SqlUser.id == SqlHost.user_id),
+                )
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
+                )
+            ).one_or_none()
+        if row is None or row.deleted_at is not None:
+            return None
+        if row.current_generation is not None and row.account_generation != row.current_generation:
+            return None
+        return AccountAuthority(row.user_id, row.current_generation, current_workspace_id())
 
     def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
         """

@@ -32,6 +32,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.team_store import admin_flag_for_account, lock_team
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -490,14 +491,16 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Set the admin flag on an existing user. See base class for contract."""
 
         def write(session: Session) -> None:
+            lock_team(session)
             require_active_account(session, user_id)
+            flag = admin_flag_for_account(session, user_id, is_admin)
             session.execute(
                 update(SqlUser)
                 .where(
                     SqlUser.workspace_id == current_workspace_id(),
                     SqlUser.id == user_id,
                 )
-                .values(is_admin=is_admin)
+                .values(is_admin=flag)
             )
 
         run_write_transaction(self._session_immediate, "set_user_admin_status", write)

@@ -1040,8 +1040,12 @@ def test_runner_token_uses_saved_account_authority(
     assert issued.status_code == 200, issued.text
     runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
     assert runner.get("/v1/sessions").status_code == 200
-    # A separate administrator can delete either the host or session owner.
-    stores["account_store"].set_admin("alice", True)
+    # A separate team owner can delete either the host or session owner.
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
+
+    SqlAlchemyTeamStore(stores["account_store"].storage_location).add_member(
+        "alice", role="owner", state="active"
+    )
     deleter = alice if revoked_owner == "admin" else admin
     reached, resume = Event(), Event()
     original = stores["account_store"].with_runner_authority

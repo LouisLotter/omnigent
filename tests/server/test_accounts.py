@@ -1615,7 +1615,7 @@ def test_admin_cannot_delete_self(accounts_app: TestClient) -> None:
 
 
 def test_admin_can_delete_former_admin_when_others_exist(
-    accounts_app: TestClient,
+    accounts_app: TestClient, tmp_path: Path
 ) -> None:
     """The previously-locked bootstrap admin IS deletable when another admin exists.
 
@@ -1640,6 +1640,16 @@ def test_admin_can_delete_former_admin_when_others_exist(
         json={"invite": invite_token, "username": "second", "password": "second-pw-1234"},
     )
 
+    # The bootstrap admin is the team's only owner, so another admin alone is not enough.
+    resp = second.delete("/auth/users/admin")
+    assert resp.status_code == 400, resp.text
+    assert "last active owner" in resp.json()["error"]
+
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
+
+    SqlAlchemyTeamStore(f"sqlite:///{tmp_path}/test.db").add_member(
+        "second", role="owner", state="active"
+    )
     resp = second.delete("/auth/users/admin")
     assert resp.status_code == 204, resp.text
 

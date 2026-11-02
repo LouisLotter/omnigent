@@ -570,6 +570,7 @@ def create_accounts_auth_router(
                 username,
                 hash_password(body.password),
                 is_admin=True,
+                team_owner=True,
             )
         except ValueError:
             # Lost a race: another setup request claimed the instance
@@ -754,8 +755,8 @@ def create_accounts_auth_router(
         - **Self-delete** — the calling admin would lock themselves
           out of their own session (cookie still valid but row
           gone; every subsequent /v1/me 401s).
-        - **Last admin** — the deploy must always have at least one
-          admin or there's no recovery path. Previously this was a
+        - **Last admin or owner** — the deploy must always have at least one
+          admin, and its team an active owner, or there's no recovery path. Previously this was a
           hardcoded "can't delete the user named 'admin'", but the
           bootstrap admin's name now defaults to the OS user
           (e.g. ``dhruv.gupta``), so the check generalizes to
@@ -783,8 +784,9 @@ def create_accounts_auth_router(
             return JSONResponse(
                 status_code=400,
                 content={
-                    "error": "cannot delete the last admin — promote another "
-                    "user first or the deploy would have no recovery path"
+                    "error": "cannot delete the last admin or the team's last active "
+                    "owner — promote another user first or the deploy would have no "
+                    "recovery path"
                 },
             )
         # The store already disabled the rows; drop the in-memory timers so

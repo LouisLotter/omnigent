@@ -42,6 +42,14 @@ from omnigent.entities.session_resources import (
     get_resource_by_id,
     resolve_terminal_entry_by_resource_id,
 )
+from omnigent.entities.team import (
+    ExternalIdentityBinding,
+    InventoryAccount,
+    OwnershipFinding,
+    Team,
+    TeamInventory,
+    TeamMember,
+)
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
@@ -59,14 +67,17 @@ __all__ = [
     "DatabricksConnection",
     "DeviceGrant",
     "ErrorData",
+    "ExternalIdentityBinding",
     "FunctionCallData",
     "FunctionCallOutputData",
     "GithubConnection",
+    "InventoryAccount",
     "ItemData",
     "LoadedAgent",
     "MessageData",
     "NativeToolData",
     "NewConversationItem",
+    "OwnershipFinding",
     "PagedList",
     "Policy",
     "Project",
@@ -81,6 +92,9 @@ __all__ = [
     "SessionResourceView",
     "SlashCommandData",
     "StoredFile",
+    "Team",
+    "TeamInventory",
+    "TeamMember",
     "TerminalCommandData",
     "filter_resources_by_type",
     "get_resource_by_id",
