@@ -4567,7 +4567,8 @@ def create_app(
             except OmnigentError:
                 return None
         for conv in conversation_store.list_conversations_by_runner_id(runner_id):
-            owner = conversation_store.get_session_owner(conv.id)
+            # The runner acts as the owner, never as someone the thread is shared with.
+            owner = conversation_store.get_session_owner(conv.id, owner_only=True)
             if owner is not None:
                 return owner
         return None

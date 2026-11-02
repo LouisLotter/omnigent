@@ -1231,7 +1231,7 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
     assert tasks.get(task.id) is None
 
 
-@pytest.mark.parametrize("launch_kind", ["initial", "inline", "transfer", "admin_relaunch"])
+@pytest.mark.parametrize("launch_kind", ["initial", "inline", "transfer"])
 def test_http_launch_rechecks_revocation_before_binding(setup_app, monkeypatch, launch_kind):
     import uuid
 
@@ -1256,14 +1256,10 @@ def test_http_launch_rechecks_revocation_before_binding(setup_app, monkeypatch, 
         )
         assert cleared.status_code == 200, cleared.text
     host_id = uuid.uuid4().hex
-    host_owner = "admin" if launch_kind == "admin_relaunch" else "alice"
+    host_owner = "alice"
     requester = TestClient(admin.app)
-    requester.cookies.update((admin if launch_kind == "admin_relaunch" else alice).cookies)
+    requester.cookies.update(alice.cookies)
     host = stores["host_store"].upsert_on_connect(host_id, "launch-host", host_owner)
-    if launch_kind == "admin_relaunch":
-        stores["conversation_store"].set_host_id(
-            created.json()["session_id"], host_id, workspace="/tmp/workspace"
-        )
     registry = admin.app.state.host_registry
     with account_authority_scope(host_owner, host.account_generation):
         conn = registry.register(
@@ -1329,7 +1325,7 @@ def test_http_launch_rechecks_revocation_before_binding(setup_app, monkeypatch, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("workflow", ["switch_host", "cli_resume", "admin_launch"])
+@pytest.mark.parametrize("workflow", ["switch_host", "cli_resume"])
 async def test_existing_session_transfers_between_hosts(setup_app, workflow):
     """Exercise production auth/admission and host frames through both client flows."""
     import asyncio
@@ -1355,7 +1351,7 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
     source_id, destination_id = uuid.uuid4().hex, uuid.uuid4().hex
     comms = []
     bindings = {}
-    launcher = admin if workflow == "admin_launch" else alice
+    launcher = alice
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://testserver",
@@ -1448,6 +1444,45 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
                 with contextlib.suppress(Exception):
                     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
                     await comm.wait(timeout=10)
+
+
+@pytest.mark.parametrize("relaunch", [False, True])
+def test_admin_cannot_bind_a_members_session_to_their_own_host(setup_app, relaunch):
+    """An administrator's host never runs, or receives credentials for, a member's thread."""
+    import uuid
+
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.host.frames import HostHelloFrame
+
+    admin, alice, stores, _ = setup_app
+    created = create_session(alice)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    host_id = uuid.uuid4().hex
+    host = stores["host_store"].upsert_on_connect(host_id, "admin-host", "admin")
+    if relaunch:
+        stores["conversation_store"].set_host_id(session_id, host_id, workspace="/tmp/workspace")
+    with account_authority_scope("admin", host.account_generation):
+        conn = admin.app.state.host_registry.register(
+            host_id,
+            object(),
+            HostHelloFrame(
+                version="0.15.0",
+                frame_protocol_version=1,
+                name="admin-host",
+                capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
+            ),
+            "admin",
+        )
+
+    response = admin.post(
+        f"/v1/hosts/{host_id}/runners",
+        json={"session_id": session_id, "workspace": "/tmp/workspace"},
+    )
+
+    assert response.status_code == 404, response.text
+    assert conn.outbound_queue.empty()
+    assert stores["conversation_store"].get_conversation(session_id).runner_id is None
 
 
 @pytest.mark.parametrize("operation", ["reset", "share_lookup", "share_ensure", "share_grant"])
