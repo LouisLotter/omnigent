@@ -6,8 +6,10 @@ import logging
 from typing import Any
 
 from fastapi import Request
+from mcp.types import AudioContent, CallToolResult, ImageContent
 
 from omnigent.entities import Conversation
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.server.auth import RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.mcp_gateway import gateway_backend
 from omnigent.server.mcp_registry import McpRegistry, McpUpstreamError
@@ -24,6 +26,34 @@ def registry_user(actor: dict[str, str] | None) -> str:
     if local_single_user_enabled():
         return RESERVED_USER_LOCAL
     raise ConnectionError("An authenticated user is required for registry MCP services")
+
+
+def registry_tool_output(result: CallToolResult) -> tuple[str, bool]:
+    """The gateway's tool output, and whether it carries media for the runner to save.
+
+    Text-only results are joined as before. With image or audio blocks, the output is
+    the tagged envelope: images the harnesses can show are canonicalized, others keep
+    their bytes so the runner can still save them as files.
+    """
+    content: list[dict[str, Any]] = []
+    has_media = False
+    for block in result.content:
+        if isinstance(block, ImageContent | AudioContent) and (
+            block.data and block.mimeType.startswith(f"{block.type}/")
+        ):
+            dumped = block.model_dump(mode="json", exclude_none=True)
+            if isinstance(block, ImageContent):
+                canonical = native_image_payload(block.data, block.mimeType)
+                dumped["data"] = canonical or block.data
+            content.append(dumped)
+            has_media = True
+        else:
+            content.append(
+                {"type": "text", "text": getattr(block, "text", None) or block.model_dump_json()}
+            )
+    if has_media:
+        return encode_mcp_image_result(content, is_error=bool(result.isError)), True
+    return "\n".join(block["text"] for block in content), False
 
 
 async def registry_tools(
@@ -81,9 +111,7 @@ async def execute_registry_tool(
         result = await gateway_backend(registry, request.app.state).call_tool(
             service, user, tool, arguments
         )
-        output = "\n".join(
-            getattr(block, "text", None) or block.model_dump_json() for block in result.content
-        )
+        output, has_media = registry_tool_output(result)
         _logger.info(
             "Registry MCP call service=%s tool=%s session=%s error=%s",
             config.name,
@@ -91,7 +119,10 @@ async def execute_registry_tool(
             conv.id,
             result.isError,
         )
-        return {"result": {"output": output}, "isError": result.isError}
+        executed: dict[str, Any] = {"result": {"output": output}, "isError": result.isError}
+        if has_media:
+            executed["media"] = True
+        return executed
     except McpUpstreamError as exc:
         _logger.warning(
             "Registry MCP call failed service=%s tool=%s session=%s failure=%s http_status=%s",

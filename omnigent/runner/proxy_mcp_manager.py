@@ -25,7 +25,8 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -37,7 +38,9 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.mcp_media_files import save_media_result
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
+from omnigent.runtime.mcp_tool_result import MEDIA_META_KEY
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -157,6 +160,7 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        media_workspace: Callable[[], Awaitable[Path | None]] | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -170,11 +174,14 @@ class ProxyMcpManager:
             is irrelevant.
         :param execution_registry: Runner-owned MCP operations that a new
             server generation can reattach to after a tunnel replacement.
+        :param media_workspace: Resolves the session's workspace, where images and
+            audio from registry services are saved; ``None`` uses the data directory.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._media_workspace = media_workspace
         self._registry_services: set[str] = set()
 
     @property
@@ -538,6 +545,19 @@ class ProxyMcpManager:
                     if isinstance(block_text, str):
                         parts.append(block_text)
                 text = "\n".join(p for p in parts if p)
+                meta = _json_object(result.get("_meta")) or {}
+                if managed and text and meta.get(MEDIA_META_KEY) is True:
+                    # Images and audio from a registry service become files the agent can use.
+                    workspace = await self._media_workspace() if self._media_workspace else None
+                    saved = save_media_result(
+                        text,
+                        session_id=self._session_id,
+                        service=service,
+                        tool=upstream_name,
+                        workspace=workspace,
+                    )
+                    if saved is not None:
+                        return saved
                 if is_error:
                     return json.dumps({"error": text})
                 return text if text else json.dumps(result)
