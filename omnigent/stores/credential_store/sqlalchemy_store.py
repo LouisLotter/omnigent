@@ -16,6 +16,7 @@ import json
 import logging
 import secrets
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from sqlalchemy import delete, select, update
@@ -76,6 +77,26 @@ def _safe_json_obj(raw: str | None) -> dict[str, Any] | None:
     except ValueError:
         return None
     return value if isinstance(value, dict) else None
+
+
+@dataclass(frozen=True)
+class SealedSecret:
+    """A secret encrypted for one row's identity, ready to write in a caller's transaction."""
+
+    workspace_id: int
+    user_id: str
+    provider: str
+    account_id: str
+    secret_enc: str = field(repr=False)
+
+
+def _holds(secret: dict[str, Any], expected: dict[str, str]) -> bool:
+    """Whether *secret* holds every *expected* string value (compared in constant time)."""
+    return all(
+        isinstance(secret.get(name), str)
+        and secrets.compare_digest(secret[name].encode(), value.encode())
+        for name, value in expected.items()
+    )
 
 
 class CredentialStore:
@@ -200,6 +221,74 @@ class CredentialStore:
 
         return run_write_transaction(self._session_immediate, "upsert_retry", conflict_write)
 
+    def seal(
+        self, user_id: str, provider: str, secret: dict[str, Any], *, account_id: str = ""
+    ) -> SealedSecret:
+        """Encrypt *secret* for a row, to write with :meth:`write_sealed` in another
+        store's transaction (e.g. together with the settings it belongs to)."""
+        workspace_id = current_workspace_id()
+        context = _enc_context(workspace_id, user_id, provider, account_id)
+        secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        _check_encrypted_size(secret_enc, self._engine.dialect.name)
+        return SealedSecret(workspace_id, user_id, provider, account_id, secret_enc)
+
+    @staticmethod
+    def write_sealed(session: Session, sealed: SealedSecret, metadata: dict[str, Any]) -> None:
+        """Create or replace *sealed*'s row inside the caller's write transaction.
+
+        The caller serializes writers of the row (for example under a lock on the
+        record the secret belongs to), so no concurrent insert can race this one.
+        """
+        if sealed.workspace_id != current_workspace_id():
+            raise ValueError("a sealed secret is written in the workspace it was sealed for")
+        require_active_account(session, sealed.user_id)
+        key = (sealed.workspace_id, sealed.user_id, sealed.provider, sealed.account_id)
+        now = now_epoch()
+        row = session.get(SqlConnection, key)
+        if row is None:
+            session.add(
+                SqlConnection(
+                    user_id=sealed.user_id,
+                    provider=sealed.provider,
+                    account_id=sealed.account_id,
+                    secret_enc=sealed.secret_enc,
+                    metadata_json=json.dumps(metadata),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            row.secret_enc = sealed.secret_enc
+            row.metadata_json = json.dumps(metadata)
+            row.updated_at = now
+
+    def _ciphertext_holding(
+        self,
+        workspace_id: int,
+        user_id: str,
+        provider: str,
+        account_id: str,
+        expected: dict[str, str],
+    ) -> str | None:
+        """The row's ciphertext if its secret holds the *expected* values, else ``None``."""
+        with self._session("check_secret") as session:
+            checked_enc = session.execute(
+                select(SqlConnection.secret_enc).where(
+                    SqlConnection.workspace_id == workspace_id,
+                    SqlConnection.user_id == user_id,
+                    SqlConnection.provider == provider,
+                    SqlConnection.account_id == account_id,
+                )
+            ).scalar_one_or_none()
+        if checked_enc is None:
+            return None
+        context = _enc_context(workspace_id, user_id, provider, account_id)
+        plaintext = self._cipher.decrypt(checked_enc, context=context)
+        secret = _safe_json_obj(plaintext) if plaintext is not None else None
+        if secret is None or not _holds(secret, expected):
+            return None
+        return checked_enc
+
     def update_secret(
         self,
         user_id: str,
@@ -208,6 +297,8 @@ class CredentialStore:
         secret: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         account_id: str = "",
+        if_secret_matches: dict[str, str] | None = None,
+        precondition: Callable[[Session], None] | None = None,
     ) -> bool:
         """Persist a refreshed secret (and optional metadata) for an existing row.
 
@@ -216,8 +307,26 @@ class CredentialStore:
         ``False`` as success: providers that rotate refresh tokens (GitHub does)
         have already spent the old one, so a silently-dropped refresh wedges the
         user until they reconnect — worth surfacing, not swallowing.
+
+        :param if_secret_matches: Write only while the stored secret still holds
+            these values, e.g. the refresh token the refresh started from, so a
+            reconnect or another refresh that replaced the login meanwhile wins.
+        :param precondition: Runs first inside the write transaction and raises to
+            refuse the write, e.g. when the service the secret is for has changed.
         """
         workspace_id = current_workspace_id()
+        checked_enc = None
+        if if_secret_matches is not None:
+            checked_enc = self._ciphertext_holding(
+                workspace_id, user_id, provider, account_id, if_secret_matches
+            )
+            if checked_enc is None:
+                _logger.warning(
+                    "credential_store: the %s connection changed during a refresh; "
+                    "the refreshed secret was discarded",
+                    provider,
+                )
+                return False
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
         _check_encrypted_size(secret_enc, self._engine.dialect.name)
@@ -225,9 +334,22 @@ class CredentialStore:
         updated_at = now_epoch()
 
         def write(session: Session) -> bool:
+            if precondition is not None:
+                precondition(session)
             require_active_account(session, user_id)
-            row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
-            if row is None:
+            row = session.execute(
+                select(SqlConnection)
+                .where(
+                    SqlConnection.workspace_id == workspace_id,
+                    SqlConnection.user_id == user_id,
+                    SqlConnection.provider == provider,
+                    SqlConnection.account_id == account_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            # Compared in Python: some databases compare TEXT case-insensitively.
+            if row is None or (checked_enc is not None and row.secret_enc != checked_enc):
                 return False
             row.secret_enc = secret_enc
             if metadata_json is not None:
@@ -238,8 +360,8 @@ class CredentialStore:
         updated = run_write_transaction(self._session_immediate, "update_secret", write)
         if not updated:
             _logger.warning(
-                "credential_store: update_secret found no %s connection for the user "
-                "(removed mid-refresh); the refreshed secret was discarded",
+                "credential_store: update_secret found no matching %s connection for the "
+                "user (removed or replaced mid-refresh); the refreshed secret was discarded",
                 provider,
             )
         return updated
@@ -283,11 +405,7 @@ class CredentialStore:
             context = _enc_context(workspace_id, user_id, provider, account_id)
             plaintext = self._cipher.decrypt(checked_enc, context=context)
             secret = _safe_json_obj(plaintext) if plaintext is not None else None
-            if secret is None or not all(
-                isinstance(secret.get(field), str)
-                and secrets.compare_digest(secret[field].encode(), value.encode())
-                for field, value in if_secret_matches.items()
-            ):
+            if secret is None or not _holds(secret, if_secret_matches):
                 return False
         merged = json.dumps({**metadata, **changes})
 

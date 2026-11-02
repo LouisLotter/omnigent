@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -16,6 +17,7 @@ from omnigent.server.mcp_destinations import (
     check_destination,
     destination_refused,
     guarded_client,
+    redirect_refused,
 )
 
 STRICT = DefaultMcpDestinationPolicy()
@@ -158,11 +160,12 @@ async def test_guarded_client_pins_the_checked_address_and_never_redirects(
     fake_dns(monkeypatch, {"mcp.test": ["127.0.0.1"]})
     async with guarded_client(PRIVATE_OK, timeout=5) as client:
         response = await client.get(f"http://mcp.test:{local_server}/")
-        redirected = await client.get(f"http://mcp.test:{local_server}/redirect")
+        with pytest.raises(httpx.TransportError) as refused:
+            await client.get(f"http://mcp.test:{local_server}/redirect")
     assert response.text == "ok"
     # The request still names the host it was addressed to.
     assert _Recorder.hosts[0] == f"mcp.test:{local_server}"
-    assert redirected.status_code == 302
+    assert redirect_refused(refused.value)
     assert len(_Recorder.hosts) == 2
 
 
@@ -173,3 +176,121 @@ async def test_guarded_client_ignores_proxies_from_the_environment(monkeypatch, 
     fake_dns(monkeypatch, {"mcp.test": ["127.0.0.1"]})
     async with guarded_client(PRIVATE_OK, timeout=5) as client:
         assert (await client.get(f"http://mcp.test:{local_server}/")).text == "ok"
+
+
+class _RedirectingMcp(BaseHTTPRequestHandler):
+    """A minimal streamable-HTTP MCP server that redirects as ``mode`` says."""
+
+    mode = "post-307"
+    seen: list[tuple[str, str, str]] = []
+
+    def _record(self) -> None:
+        type(self).seen.append((self.command, self.path, self.headers.get("Authorization", "")))
+
+    def _redirect(self, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Location", "/moved?key=synthetic-query")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        self._record()
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/mcp" and self.mode in ("post-307", "post-308"):
+            self._redirect(int(self.mode[-3:]))
+            return
+        if "id" not in body:
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        result = (
+            {
+                "protocolVersion": body["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "redirecting", "version": "1"},
+            }
+            if body["method"] == "initialize"
+            else {"tools": [{"name": "read_ticket", "inputSchema": {"type": "object"}}]}
+        )
+        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Mcp-Session-Id", "session-1")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self._record()
+        if self.path == "/mcp" and self.mode == "get-307":
+            self._redirect(307)
+            return
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        self._record()
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def redirecting_mcp():
+    _RedirectingMcp.seen = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectingMcp)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["post-307", "post-308", "get-307"])
+async def test_the_mcp_client_never_follows_a_redirect_with_a_members_login(
+    db_uri, monkeypatch, redirecting_mcp, mode
+):
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpUpstreamError
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from omnigent.stores.mcp_service_store import McpServiceSettings, McpServiceStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    monkeypatch.setattr(_RedirectingMcp, "mode", mode)
+    registry = McpRegistry(
+        McpRegistryConfig(),
+        CredentialStore(db_uri, _FakeCipher()),
+        service_store=McpServiceStore(db_uri),
+        destination_policy=PRIVATE_OK,
+    )
+    registry.service_store.create(
+        "tracker",
+        McpServiceSettings(
+            title="T",
+            url=f"http://127.0.0.1:{redirecting_mcp}/mcp",
+            auth="bearer",
+            timeout=10,
+            tools=("read_ticket",),
+        ),
+        created_by="admin",
+    )
+    service = registry.reload()["tracker"]
+    registry.save_login(service, "alice", "mcp:tracker", {"access_token": "canary-login"}, {})
+
+    if mode.startswith("post"):
+        with pytest.raises(McpUpstreamError) as refused:
+            await registry.execute("tracker", "alice", None)
+        assert refused.value.kind == "redirect"
+    else:
+        # The notification stream is refused; ordinary requests still work.
+        tools = await registry.execute("tracker", "alice", None)
+        assert [tool.name for tool in tools] == ["read_ticket"]
+        assert ("GET", "/mcp", "Bearer canary-login") in _RedirectingMcp.seen
+    assert _RedirectingMcp.seen, "the server was never reached"
+    assert all(path == "/mcp" for _method, path, _auth in _RedirectingMcp.seen)

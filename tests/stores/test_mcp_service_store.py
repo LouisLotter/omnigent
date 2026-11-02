@@ -9,6 +9,7 @@ from omnigent.stores import mcp_service_store as service_store_module
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 from omnigent.stores.mcp_service_store import (
     SERVICE_PRINCIPAL,
+    McpClientSecretMissing,
     McpServiceConflict,
     McpServiceNotFound,
     McpServiceOAuth,
@@ -64,9 +65,20 @@ def test_service_principal_is_a_reserved_user():
     assert SERVICE_PRINCIPAL == RESERVED_USER_MCP_SERVICE
 
 
+def client_secret(credentials, value="client-secret", service_id="tracker"):
+    return credentials.seal(
+        SERVICE_PRINCIPAL, client_provider(service_id), {"client_secret": value}
+    )
+
+
 def test_create_get_list_and_conflict(stores):
-    services, _ = stores
-    created = services.create("tracker", settings(auth="oauth", oauth=_OAUTH), created_by="admin")
+    services, credentials = stores
+    created = services.create(
+        "tracker",
+        settings(auth="oauth", oauth=_OAUTH),
+        created_by="admin",
+        client_secret=client_secret(credentials),
+    )
     assert services.get("tracker") == created
     assert created.oauth == _OAUTH
     assert created.created_by == "admin"
@@ -109,12 +121,20 @@ def test_changing_destination_or_login_type_deletes_every_login(stores, change):
     save_login(credentials, record, SERVICE_PRINCIPAL, client_provider("tracker"))
     credentials.upsert("alice", "mcp:other", secret={"access_token": "x"}, metadata={})
 
-    result = services.update("tracker", settings(**change))
+    sealed = client_secret(credentials, "new-secret") if "oauth" in change else None
+    result = services.update("tracker", settings(**change), client_secret=sealed)
 
     assert result.credentials_reset
     assert result.record.credential_version != record.credential_version
-    for provider in ("mcp:tracker", "mcp-pending:tracker", "mcp-client:tracker"):
+    for provider in ("mcp:tracker", "mcp-pending:tracker"):
         assert credentials.list_all(provider=provider) == []
+    client = credentials.get(SERVICE_PRINCIPAL, "mcp-client:tracker", with_secret=True)
+    if sealed is None:
+        assert client is None
+    else:
+        # The new client's secret, saved for the new version in the same transaction.
+        assert client.secret == {"client_secret": "new-secret"}
+        assert client.metadata["service_version"] == result.record.credential_version
     assert credentials.get("alice", "mcp:other") is not None
 
 
@@ -200,3 +220,94 @@ def test_too_many_tools_are_refused(stores):
         services.create(
             "tracker", settings(tools=tuple(f"t{i}" for i in range(201))), created_by=None
         )
+
+
+def _confidential(**changes) -> McpServiceSettings:
+    return settings(auth="oauth", oauth=McpServiceOAuth(**{**_OAUTH.__dict__, **changes}))
+
+
+def _saved_client_secret(credentials) -> tuple[str | None, str | None]:
+    saved = credentials.get(SERVICE_PRINCIPAL, client_provider("tracker"), with_secret=True)
+    if saved is None or saved.secret is None:
+        return None, None
+    return saved.secret.get("client_secret"), saved.metadata.get("service_version")
+
+
+def test_a_kept_client_secret_moves_to_the_new_version_in_the_same_write(stores):
+    services, credentials = stores
+    record = services.create(
+        "tracker", _confidential(), created_by="admin", client_secret=client_secret(credentials)
+    )
+    save_login(credentials, record)
+    # New scopes: logins go, the same client keeps its secret under the new version.
+    changed = services.update(
+        "tracker",
+        _confidential(scopes=("tickets:write",)),
+        expected_version=record.credential_version,
+        keep_client_secret=True,
+    )
+    assert changed.credentials_reset
+    assert credentials.get("alice", member_provider("tracker")) is None
+    assert _saved_client_secret(credentials) == (
+        "client-secret",
+        changed.record.credential_version,
+    )
+    # A metadata-only edit needs no secret and leaves it as it is.
+    renamed = services.update("tracker", _confidential(scopes=("tickets:write",)))
+    assert not renamed.credentials_reset
+    assert _saved_client_secret(credentials)[0] == "client-secret"
+
+
+def test_a_confidential_client_is_never_left_without_its_secret(stores):
+    services, credentials = stores
+    record = services.create(
+        "tracker", _confidential(), created_by="admin", client_secret=client_secret(credentials)
+    )
+    with pytest.raises(McpClientSecretMissing):
+        services.update("tracker", _confidential(token_url="https://other.example.com/token"))
+    # Nothing changed: the refused write left the settings and the secret.
+    assert services.get("tracker").credential_version == record.credential_version
+    assert _saved_client_secret(credentials)[0] == "client-secret"
+    # A secret saved for an older version cannot be kept.
+    credentials.upsert(
+        SERVICE_PRINCIPAL,
+        client_provider("tracker"),
+        secret={"client_secret": "old"},
+        metadata=stamped({}, "0" * 32),
+    )
+    with pytest.raises(McpClientSecretMissing):
+        services.update("tracker", _confidential(scopes=("x",)), keep_client_secret=True)
+
+
+@pytest.mark.parametrize("interleaved", ["update", "delete-and-recreate"])
+def test_a_secret_kept_for_settings_another_admin_replaced_is_refused(stores, interleaved):
+    services, credentials = stores
+    read = services.create(
+        "tracker", _confidential(), created_by="admin", client_secret=client_secret(credentials)
+    )
+    # Another administrator commits between this request's read and its write.
+    other = _confidential(token_url="https://evil.example.com/token", client_id="other")
+    if interleaved == "update":
+        services.update("tracker", other, client_secret=client_secret(credentials, "theirs"))
+    else:
+        services.delete("tracker")
+        services.create(
+            "tracker", other, created_by="b", client_secret=client_secret(credentials, "theirs")
+        )
+    current = services.get("tracker")
+    with pytest.raises(McpServiceVersionChanged):
+        services.update(
+            "tracker",
+            _confidential(scopes=("x",)),
+            expected_version=read.credential_version,
+            keep_client_secret=True,
+        )
+    with pytest.raises(McpServiceVersionChanged):
+        services.update(
+            "tracker",
+            _confidential(),
+            expected_version=read.credential_version,
+            client_secret=client_secret(credentials, "mine"),
+        )
+    assert _saved_client_secret(credentials) == ("theirs", current.credential_version)
+    assert services.get("tracker").oauth.token_url == "https://evil.example.com/token"

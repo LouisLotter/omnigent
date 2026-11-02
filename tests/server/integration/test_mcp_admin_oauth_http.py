@@ -193,3 +193,102 @@ async def test_strict_rules_refuse_a_loopback_service(client, app, demo_mcp):
     )
     assert refused.status_code == 400
     assert "destination rule" in refused.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_manual_confidential_client_keeps_its_secret_through_setup(
+    client, app, demo_mcp, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    registry: McpRegistry = app.state.mcp_registry
+    store = registry.store
+    # The administrator registered Omnigent with the provider themselves.
+    async with httpx.AsyncClient() as provider:
+        registered = (
+            await provider.post(
+                demo_mcp + "/register",
+                json={"redirect_uris": ["http://localhost/v1/connections/mcp-tracker/callback"]},
+            )
+        ).json()
+    responses: list[httpx.Response] = []
+    created = await client.post(
+        ADMIN,
+        json={
+            "id": "tracker",
+            "title": "Demo tracker",
+            "url": demo_mcp + "/mcp",
+            "auth": "oauth",
+            "oauth": {
+                "client_id": registered["client_id"],
+                "client_secret": registered["client_secret"],
+            },
+        },
+    )
+    responses.append(created)
+    assert created.status_code == 201, created.text
+    oauth = created.json()["oauth"]
+    assert (oauth["registration"], oauth["token_endpoint_auth"], oauth["has_client_secret"]) == (
+        "manual",
+        "client_secret_post",
+        True,
+    )
+    await sign_in(client, "tracker", demo_mcp)
+    discovered = await client.post(f"{ADMIN}/tracker/discover")
+    assert discovered.status_code == 200, discovered.text
+
+    # The page's "Save allowed tools" body (settingsFrom), and an older one without the method.
+    as_listed = {
+        "title": "Demo tracker",
+        "description": "",
+        "url": demo_mcp + "/mcp",
+        "auth": "oauth",
+        "timeout": 60,
+        "tools": ["read_ticket", "whoami"],
+        "oauth": {
+            "client_id": oauth["client_id"],
+            "token_endpoint_auth": oauth["token_endpoint_auth"],
+            "authorize_url": oauth["authorize_url"],
+            "token_url": oauth["token_url"],
+            "scopes": oauth["scopes"],
+            "resource": oauth["resource"],
+        },
+    }
+    without_method = {
+        **as_listed,
+        "oauth": {k: v for k, v in as_listed["oauth"].items() if k != "token_endpoint_auth"},
+    }
+    renamed = {**without_method, "title": "Tickets", "description": "Read tickets"}
+    for body in (as_listed, without_method, renamed):
+        saved = await client.put(f"{ADMIN}/tracker", json=body)
+        responses.append(saved)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["credentials_reset"] is False
+        assert saved.json()["oauth"]["token_endpoint_auth"] == "client_secret_post"
+        assert saved.json()["oauth"]["has_client_secret"] is True
+        assert store.get("local", member_provider("tracker")) is not None
+
+    # A refresh still authenticates with the kept secret (the demo checks it).
+    grant = store.get("local", member_provider("tracker"), with_secret=True)
+    store.update_secret(
+        "local",
+        member_provider("tracker"),
+        secret=grant.secret,
+        metadata={**grant.metadata, "expires_at": 0},
+    )
+    result = await registry.execute("tracker", "local", app.state, tool="whoami")
+    assert '"refresh_count":1' in result.content[0].text.replace(" ", "")
+
+    # A changed token URL needs the secret again rather than sending it elsewhere.
+    moved = await client.put(
+        f"{ADMIN}/tracker",
+        json={
+            **without_method,
+            "oauth": {**without_method["oauth"], "token_url": demo_mcp + "/token2"},
+        },
+    )
+    responses.append(moved)
+    assert moved.status_code == 400
+    assert "client secret" in moved.json()["detail"]
+    for response in responses:
+        assert registered["client_secret"] not in response.text
+    assert registered["client_secret"] not in caplog.text

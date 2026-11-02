@@ -267,3 +267,88 @@ describe("MCP server administration", () => {
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("it must be https");
   });
 });
+
+const manualClient: AdminService = {
+  ...tracker,
+  auth: "oauth",
+  oauth: {
+    authorize_url: "https://auth.example.com/authorize",
+    token_url: "https://auth.example.com/token",
+    client_id: "ours",
+    scopes: ["read"],
+    resource: "https://tracker.example.com/mcp",
+    has_client_secret: true,
+    registration: "manual",
+    token_endpoint_auth: "client_secret_post",
+  },
+};
+
+function lastPutBody(requests: ReturnType<typeof presetsAnd>) {
+  const update = requests.mock.calls.filter(([, init]) => init?.method === "PUT").at(-1)!;
+  return JSON.parse(update[1]!.body as string);
+}
+
+describe("manual OAuth clients", () => {
+  it("keep their client ID and authentication method when the allowlist is saved", () => {
+    expect(settingsFrom(manualClient, { tools: ["a"] }).oauth).toEqual({
+      client_id: "ours",
+      token_endpoint_auth: "client_secret_post",
+      authorize_url: "https://auth.example.com/authorize",
+      token_url: "https://auth.example.com/token",
+      scopes: ["read"],
+      resource: "https://tracker.example.com/mcp",
+    });
+  });
+
+  it("keep their method on a metadata-only edit without re-entering the secret", async () => {
+    vi.mocked(listAdminServices).mockResolvedValue([manualClient]);
+    const requests = presetsAnd({ ...manualClient, credentials_reset: false });
+    render(<McpServerAdmin />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByLabelText("Client authentication")).toHaveValue(
+      "client_secret_post",
+    );
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "Tickets" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const body = lastPutBody(requests);
+    expect(body.title).toBe("Tickets");
+    expect(body.oauth).toMatchObject({
+      client_id: "ours",
+      token_endpoint_auth: "client_secret_post",
+    });
+    expect(body.oauth).not.toHaveProperty("client_secret");
+  });
+
+  it("make a client confidential when its secret is entered", async () => {
+    vi.mocked(listAdminServices).mockResolvedValue([]);
+    const requests = presetsAnd({ ...manualClient, draft: true, tools: [] });
+    render(<McpServerAdmin />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add MCP server" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "Tracker" } });
+    fireEvent.change(within(dialog).getByLabelText("Server URL"), {
+      target: { value: "https://tracker.example.com/mcp" },
+    });
+    fireEvent.click(within(dialog).getByRole("radio", { name: "Sign in" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: /OAuth client settings/ }));
+    fireEvent.change(within(dialog).getByLabelText("Client ID"), { target: { value: "ours" } });
+    fireEvent.change(within(dialog).getByLabelText("Client secret"), {
+      target: { value: "typed-secret" },
+    });
+    expect(within(dialog).getByLabelText("Client authentication")).toHaveValue(
+      "client_secret_post",
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save and continue" }));
+    await screen.findByRole("button", { name: "Discover tools" });
+    const created = JSON.parse(
+      requests.mock.calls.find(([path]) => path === "/services")![1]!.body as string,
+    );
+    expect(created.oauth).toMatchObject({
+      client_id: "ours",
+      client_secret: "typed-secret",
+      token_endpoint_auth: "client_secret_post",
+    });
+  });
+});

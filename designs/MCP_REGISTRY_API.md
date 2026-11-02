@@ -159,8 +159,17 @@ client secret is sealed in the credential store under the reserved owner
 Changing `url`, `auth` or any OAuth setting replaces the service's credential
 version and deletes every member's login, sign-ins in progress and the OAuth
 client secret, so a service cannot be repointed to collect a key. A client secret
-is kept only while the token URL and client ID stay the same. Logins carry the
-version they were saved for; one saved for other settings is never sent.
+is kept only while the token URL and client ID stay the same, and the same client
+keeps its `token_endpoint_auth` unless the request names another. The settings and
+the client secret are written in one transaction, and only over the version the
+request read (409 otherwise). Logins carry the version they were saved for; one
+saved for other settings is never sent. A refresh is saved only while the service
+still has the version it started with and the login is still the one refreshed;
+otherwise its response is discarded and the call asks to try again.
+
+These request bodies can carry a client secret or a token, so their 422 errors
+list each problem's `loc`, `type` and `msg` without the submitted input; bodies
+over 64 KB get 413.
 
 **Destination rules.** Page-added services pass a destination policy when saved
 (the URL, and every address its host resolves to) and on every connection,
@@ -168,8 +177,9 @@ which is pinned to the checked address, so a name that later resolves elsewhere
 is refused. Omnigent's default policy: `https` only, no credentials, query or
 fragment, only globally routable addresses (no loopback, private, link-local,
 shared or reserved ranges, also when embedded in IPv6), no `localhost`,
-`.local` or `.internal` names. Redirects are never followed and environment
-proxies are not used. `OMNIGENT_MCP_ALLOW_PRIVATE_DESTINATIONS=1` allows `http`
+`.local` or `.internal` names. Environment proxies are not used. Redirects are
+refused at the transport, below the MCP SDK (which otherwise follows same-origin
+redirects itself), so a redirect fails the call and no login follows it. `OMNIGENT_MCP_ALLOW_PRIVATE_DESTINATIONS=1` allows `http`
 and private hosts for a trusted network. A deployment can pass a stricter
 `McpDestinationPolicy` as `McpRegistry(..., destination_policy=...)`.
 Registry-file services are the operator's choice and are not checked.

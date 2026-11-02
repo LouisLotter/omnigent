@@ -36,6 +36,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore, SealedSecret
 
 McpServiceAuth = Literal["none", "bearer", "oauth"]
 McpClientRegistration = Literal["manual", "dynamic"]
@@ -81,6 +82,10 @@ class McpServiceNotFound(Exception):
 
 class McpServiceVersionChanged(Exception):
     """The service changed or went away since the caller read it."""
+
+
+class McpClientSecretMissing(Exception):
+    """A confidential OAuth client would be left without a client secret for its settings."""
 
 
 @dataclass(frozen=True)
@@ -206,13 +211,22 @@ def _apply_settings(row: SqlMcpRegistryService, settings: McpServiceSettings) ->
     )
 
 
-def _stamp(metadata_json: str | None) -> str | None:
+def _metadata(metadata_json: str | None) -> dict[str, Any]:
     try:
         metadata = json.loads(metadata_json or "")
     except ValueError:
-        return None
-    value = metadata.get(SERVICE_VERSION_KEY) if isinstance(metadata, dict) else None
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _stamp(metadata_json: str | None) -> str | None:
+    value = _metadata(metadata_json).get(SERVICE_VERSION_KEY)
     return value if isinstance(value, str) else None
+
+
+def _confidential(settings: McpServiceSettings) -> bool:
+    """Whether the settings' OAuth client authenticates with a client secret."""
+    return settings.oauth is not None and settings.oauth.token_endpoint_auth != "none"
 
 
 class McpServiceStore:
@@ -332,12 +346,47 @@ class McpServiceStore:
         for tool in sorted(set(tools)):
             session.add(SqlMcpRegistryServiceTool(service_id=service_id, tool_name=tool))
 
+    @staticmethod
+    def _check_sealed(service_id: str, sealed: SealedSecret | None) -> None:
+        if sealed is not None and (sealed.user_id, sealed.provider, sealed.account_id) != (
+            SERVICE_PRINCIPAL,
+            client_provider(service_id),
+            "",
+        ):
+            raise ValueError("the sealed secret is not this service's client secret")
+
+    @staticmethod
+    def _client_row(session: Session, service_id: str) -> SqlConnection | None:
+        return session.execute(
+            select(SqlConnection)
+            .where(
+                SqlConnection.workspace_id == current_workspace_id(),
+                SqlConnection.user_id == SERVICE_PRINCIPAL,
+                SqlConnection.provider == client_provider(service_id),
+                SqlConnection.account_id == "",
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+
     def create(
-        self, service_id: str, settings: McpServiceSettings, *, created_by: str | None
+        self,
+        service_id: str,
+        settings: McpServiceSettings,
+        *,
+        created_by: str | None,
+        client_secret: SealedSecret | None = None,
     ) -> McpServiceRecord:
-        """Add a service. :class:`McpServiceConflict` if the ID is taken."""
+        """Add a service. :class:`McpServiceConflict` if the ID is taken.
+
+        :param client_secret: The OAuth client's secret, sealed with
+            :meth:`CredentialStore.seal`; saved in the same transaction.
+        """
         if len(settings.tools) > MAX_TOOLS:
             raise ValueError(f"A service allows at most {MAX_TOOLS} tools")
+        self._check_sealed(service_id, client_secret)
+        if _confidential(settings) and client_secret is None:
+            raise McpClientSecretMissing(service_id)
         now = now_epoch()
 
         def write(session: Session) -> McpServiceRecord:
@@ -358,6 +407,10 @@ class McpServiceStore:
             # Logins left by an earlier service with this ID carry its version: never valid.
             more, _ = self._delete_logins(session, service_id, keep_version=row.credential_version)
             row.pending_sweep = more
+            if client_secret is not None:
+                CredentialStore.write_sealed(
+                    session, client_secret, stamped({}, row.credential_version)
+                )
             return _record(row, settings.tools)
 
         record = run_write_transaction(self._session_immediate, "create_service", write)
@@ -371,6 +424,8 @@ class McpServiceStore:
         settings: McpServiceSettings,
         *,
         expected_version: str | None = None,
+        client_secret: SealedSecret | None = None,
+        keep_client_secret: bool = False,
     ) -> McpServiceUpdate:
         """Replace a service's settings.
 
@@ -380,9 +435,16 @@ class McpServiceStore:
         :param expected_version: Refuse (:class:`McpServiceVersionChanged`) unless the
             stored version still matches, e.g. after an OAuth client was registered
             for the settings the caller read.
+        :param client_secret: A new OAuth client secret (from :meth:`CredentialStore.seal`),
+            saved in the same transaction for the version this write leaves.
+        :param keep_client_secret: Keep the saved client secret, which must belong to
+            the version the caller read; the caller keeps it only while the token URL
+            and client ID stay the same.
+        :raises McpClientSecretMissing: A confidential client would have no secret.
         """
         if len(settings.tools) > MAX_TOOLS:
             raise ValueError(f"A service allows at most {MAX_TOOLS} tools")
+        self._check_sealed(service_id, client_secret)
         now = now_epoch()
 
         def write(session: Session) -> McpServiceUpdate:
@@ -391,14 +453,39 @@ class McpServiceStore:
                 raise McpServiceNotFound(service_id)
             if expected_version is not None and row.credential_version != expected_version:
                 raise McpServiceVersionChanged(service_id)
+            saved_client = self._client_row(session, service_id)
+            saved_valid = (
+                saved_client is not None
+                and _stamp(saved_client.metadata_json) == row.credential_version
+            )
+            keep = keep_client_secret and client_secret is None
+            if keep and not saved_valid:
+                raise McpClientSecretMissing(service_id)
             reset = not settings.same_credentials(_record(row, ()))
+            if (
+                _confidential(settings)
+                and client_secret is None
+                and not (keep or (saved_valid and not reset))
+            ):
+                raise McpClientSecretMissing(service_id)
             _apply_settings(row, settings)
             row.updated_at = now
             self._replace_tools(session, service_id, settings.tools)
             if reset:
                 row.credential_version = _new_version()
-                more, _ = self._delete_logins(session, service_id, keep_version=None)
+                more, _ = self._delete_logins(
+                    session, service_id, keep_version=None, spare_client=keep
+                )
                 row.pending_sweep = row.pending_sweep or more
+                if keep:
+                    assert saved_client is not None
+                    saved_client.metadata_json = json.dumps(
+                        stamped(_metadata(saved_client.metadata_json), row.credential_version)
+                    )
+            if client_secret is not None:
+                CredentialStore.write_sealed(
+                    session, client_secret, stamped({}, row.credential_version)
+                )
             session.flush()
             return McpServiceUpdate(_record(row, settings.tools), credentials_reset=reset)
 
@@ -439,12 +526,19 @@ class McpServiceStore:
         *,
         keep_version: str | None,
         after: tuple[str, str, str] | None = None,
+        spare_client: bool = False,
     ) -> tuple[bool, tuple[str, str, str] | None]:
         """Delete up to one batch of the service's logins not saved for *keep_version*.
 
+        With *spare_client*, the OAuth client's secret is left for the caller to restamp.
         Returns whether rows may remain past this batch, and the batch's last key.
         """
         workspace_id = current_workspace_id()
+        providers = [
+            provider
+            for provider in credential_providers(service_id)
+            if not (spare_client and provider == client_provider(service_id))
+        ]
         query = (
             select(
                 SqlConnection.provider,
@@ -454,7 +548,7 @@ class McpServiceStore:
             )
             .where(
                 SqlConnection.workspace_id == workspace_id,
-                SqlConnection.provider.in_(credential_providers(service_id)),
+                SqlConnection.provider.in_(providers),
             )
             .order_by(SqlConnection.provider, SqlConnection.user_id, SqlConnection.account_id)
             .limit(BATCH_SIZE)

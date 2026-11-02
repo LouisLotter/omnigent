@@ -50,6 +50,14 @@ class DestinationRefused(httpcore.ConnectError):
     """A connection's resolved address is not allowed; raised before connecting."""
 
 
+class RedirectRefused(httpx.TransportError):
+    """The server answered with a redirect, which run-time services never follow."""
+
+
+#: Statuses httpx, or the MCP SDK on its own, would follow to another URL.
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
 class McpDestinationPolicy(Protocol):
     """Rules for the destinations of run-time MCP services."""
 
@@ -234,6 +242,30 @@ class _GuardedNetworkBackend(httpcore.AsyncNetworkBackend):
         await self._backend.sleep(seconds)
 
 
+class _RedirectRefusingTransport(httpx.AsyncBaseTransport):
+    """Fail every redirect response before any client sees it.
+
+    The MCP SDK follows same-origin redirects itself, whatever the client's
+    ``follow_redirects`` says, so the refusal sits below it.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._inner.handle_async_request(request)
+        if response.status_code in REDIRECT_STATUSES:
+            await response.aclose()
+            raise RedirectRefused(
+                "The MCP server answered with a redirect, which is not followed.",
+                request=request,
+            )
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 class _GuardedTransport(httpx.AsyncHTTPTransport):
     """httpx's transport over :class:`_GuardedNetworkBackend`, without environment proxies."""
 
@@ -251,19 +283,36 @@ class _GuardedTransport(httpx.AsyncHTTPTransport):
 
 
 def guarded_client(policy: McpDestinationPolicy, **kwargs: Any) -> httpx.AsyncClient:
-    """An HTTP client that connects only where *policy* allows and never redirects."""
+    """An HTTP client that connects only where *policy* allows and never redirects.
+
+    A redirect response fails at the transport, and the redirect budget is zero, so
+    neither httpx nor the MCP SDK's own same-origin following can traverse one.
+    """
     return httpx.AsyncClient(
-        transport=_GuardedTransport(policy), trust_env=False, follow_redirects=False, **kwargs
+        transport=_RedirectRefusingTransport(_GuardedTransport(policy)),
+        trust_env=False,
+        follow_redirects=False,
+        max_redirects=0,
+        **kwargs,
     )
 
 
-def destination_refused(exc: BaseException) -> bool:
-    """Whether *exc* (or what caused it) is a refusal by the connection guard."""
+def _caused_by(exc: BaseException, kind: type[BaseException]) -> bool:
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
-        if isinstance(current, DestinationRefused):
+        if isinstance(current, kind):
             return True
         seen.add(id(current))
         current = current.__cause__ or current.__context__
     return False
+
+
+def destination_refused(exc: BaseException) -> bool:
+    """Whether *exc* (or what caused it) is a refusal by the connection guard."""
+    return _caused_by(exc, DestinationRefused)
+
+
+def redirect_refused(exc: BaseException) -> bool:
+    """Whether *exc* (or what caused it) is a refused redirect."""
+    return _caused_by(exc, RedirectRefused)

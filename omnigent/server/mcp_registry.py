@@ -30,6 +30,7 @@ from omnigent.server.mcp_destinations import (
     McpDestinationPolicy,
     destination_refused,
     guarded_client,
+    redirect_refused,
 )
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
 from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
@@ -84,6 +85,12 @@ def _upstream_error(exc: Exception) -> McpUpstreamError:
     for error in errors:
         if isinstance(error, ExceptionGroup):
             errors.extend(error.exceptions)
+    if any(redirect_refused(error) for error in errors):
+        return McpUpstreamError(
+            "MCP service answered with a redirect, which Omnigent does not follow. "
+            "Use the exact URL the service expects (a trailing slash can matter).",
+            kind="redirect",
+        )
     if any(destination_refused(error) for error in errors):
         return McpUpstreamError(
             "MCP service address is refused by the server's destination rules.",
@@ -472,6 +479,13 @@ class McpRegistry:
             return stamped(metadata, service.credential_version)
         return metadata
 
+    @staticmethod
+    def _version_guard(service: McpService) -> Any:
+        """For a run-time service, a write precondition requiring its current version."""
+        if isinstance(service, ManagedMcpService):
+            return version_guard(service.id, service.credential_version)
+        return None
+
     def save_login(
         self,
         service: McpService,
@@ -482,11 +496,7 @@ class McpRegistry:
     ) -> None:
         """Save a login, refused if a run-time service changed since it was read."""
         assert self.store is not None
-        guard = (
-            version_guard(service.id, service.credential_version)
-            if isinstance(service, ManagedMcpService)
-            else None
-        )
+        guard = self._version_guard(service)
         try:
             self.store.upsert(
                 user_id,
@@ -552,16 +562,31 @@ class McpRegistry:
                 if tokens.get("refresh_token") is None:
                     tokens["refresh_token"] = refresh
                 try:
+                    # Saved only while the login is the one refreshed and, for a
+                    # run-time service, its settings are unchanged (under the lock
+                    # edits take); otherwise the response is discarded.
                     updated = await asyncio.to_thread(
                         self.store.update_secret,
                         user_id,
                         f"mcp:{service.id}",
                         secret=tokens,
                         metadata=self.login_metadata(service, self.metadata(tokens)),
+                        if_secret_matches={"refresh_token": refresh},
+                        precondition=self._version_guard(service),
                     )
                 except SecretTooLargeError as exc:
                     raise ConnectionError(str(exc)) from None
+                except McpServiceVersionChanged:
+                    raise ConnectionError(
+                        "The MCP login changed while it was refreshed; try again"
+                    ) from None
                 if not updated:
+                    current = await asyncio.to_thread(self.store.get, user_id, f"mcp:{service.id}")
+                    if current is not None:
+                        # Replaced by a reconnect or another server's refresh: that one stays.
+                        raise ConnectionError(
+                            "The MCP login changed while it was refreshed; try again"
+                        )
                     raise ConnectionError("MCP account disconnected")
                 return str(tokens["access_token"])
             return str(conn.secret["access_token"])

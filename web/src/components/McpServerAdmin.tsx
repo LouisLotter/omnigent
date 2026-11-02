@@ -22,6 +22,7 @@ import {
   type AdminServicePreset,
   type AdminServiceSettings,
   type DiscoveredTool,
+  type TokenEndpointAuth,
 } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
 
@@ -70,7 +71,16 @@ export function settingsFrom(
     oauth:
       auth === "oauth" && oauth
         ? {
-            ...(oauth.registration === "manual" ? { client_id: oauth.client_id } : {}),
+            // A manual client keeps its ID and how it authenticates; a registered one is kept
+            // by the server while the endpoints stay the same.
+            ...(oauth.registration === "manual"
+              ? {
+                  client_id: oauth.client_id,
+                  ...(oauth.token_endpoint_auth
+                    ? { token_endpoint_auth: oauth.token_endpoint_auth }
+                    : {}),
+                }
+              : {}),
             authorize_url: oauth.authorize_url,
             token_url: oauth.token_url,
             scopes: oauth.scopes,
@@ -354,6 +364,9 @@ function DetailsForm({
   const manualClient = service?.oauth?.registration === "manual";
   const [clientId, setClientId] = useState(manualClient ? (service?.oauth?.client_id ?? "") : "");
   const [clientSecret, setClientSecret] = useState("");
+  const [tokenAuth, setTokenAuth] = useState<TokenEndpointAuth | "">(
+    manualClient ? (service?.oauth?.token_endpoint_auth ?? "") : "",
+  );
   const [authorizeUrl, setAuthorizeUrl] = useState(service?.oauth?.authorize_url ?? "");
   const [tokenUrl, setTokenUrl] = useState(service?.oauth?.token_url ?? "");
   const [scopes, setScopes] = useState(service?.oauth?.scopes.join(" ") ?? "");
@@ -399,7 +412,12 @@ function DetailsForm({
       oauth:
         auth === "oauth"
           ? {
-              ...(clientId.trim() ? { client_id: clientId.trim() } : {}),
+              ...(clientId.trim()
+                ? {
+                    client_id: clientId.trim(),
+                    ...(tokenAuth ? { token_endpoint_auth: tokenAuth } : {}),
+                  }
+                : {}),
               ...(clientSecret ? { client_secret: clientSecret } : {}),
               ...(authorizeUrl.trim() && tokenUrl.trim()
                 ? { authorize_url: authorizeUrl.trim(), token_url: tokenUrl.trim() }
@@ -563,8 +581,30 @@ function DetailsForm({
                   type="password"
                   autoComplete="off"
                   value={clientSecret}
-                  onChange={(e) => setClientSecret(e.target.value)}
+                  onChange={(e) => {
+                    setClientSecret(e.target.value);
+                    // A secret means a confidential client.
+                    if (e.target.value && (tokenAuth === "" || tokenAuth === "none")) {
+                      setTokenAuth("client_secret_post");
+                    }
+                  }}
                 />
+              </Field>
+              <Field
+                label="Client authentication"
+                hint="How Omnigent proves the client at the token URL."
+              >
+                <select
+                  aria-label="Client authentication"
+                  className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                  value={tokenAuth}
+                  onChange={(e) => setTokenAuth(e.target.value as TokenEndpointAuth | "")}
+                >
+                  <option value="">Automatic</option>
+                  <option value="client_secret_post">Client secret in the request</option>
+                  <option value="client_secret_basic">Client secret as HTTP Basic</option>
+                  <option value="none">None (public client)</option>
+                </select>
               </Field>
               <Field label="Authorization URL" hint="Leave both URLs empty to discover them.">
                 <Input

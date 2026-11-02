@@ -9,12 +9,13 @@ an administrator. No response ever carries a login or a client secret.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from bisect import bisect_right
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.mcp_destinations import McpDestinationError, check_destination
@@ -30,6 +31,7 @@ from omnigent.server.mcp_registry import (
     McpRegistry,
     McpService,
     McpUpstreamError,
+    TokenEndpointAuth,
     login_matches,
     needs_reconnect,
 )
@@ -39,8 +41,12 @@ from omnigent.server.routes.connections_base import (
     create_connection_router,
     create_resolved_connection_router,
 )
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
+from omnigent.stores.credential_store.sqlalchemy_store import SealedSecret
 from omnigent.stores.mcp_service_store import (
     SERVICE_PRINCIPAL,
+    McpClientRegistration,
+    McpClientSecretMissing,
     McpServiceConflict,
     McpServiceNotFound,
     McpServiceOAuth,
@@ -124,6 +130,45 @@ class AdminServiceCreate(AdminServiceSettings):
         if "__" in value:
             raise ValueError("ids cannot contain '__', the tool namespace separator")
         return value
+
+
+#: Largest request body these routes read (a service's settings, or one login).
+_MAX_BODY_BYTES = 64 * 1024
+_Body = TypeVar("_Body", bound=BaseModel)
+
+
+async def _read_body(request: Request, model: type[_Body]) -> _Body:
+    """Validate a JSON body that can carry a secret.
+
+    FastAPI's own 422 response repeats the submitted input, including a client
+    secret or a token in a field that failed validation, or in the object around
+    it. These errors keep only each problem's location, type and message.
+    """
+    body = await request.body()
+    if len(body) > _MAX_BODY_BYTES:
+        raise HTTPException(413, "The request body is too large")
+
+    def invalid(message: str) -> HTTPException:
+        return HTTPException(422, [{"type": "invalid_body", "loc": ["body"], "msg": message}])
+
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise invalid("The request body must be JSON") from None
+    if not isinstance(data, dict):
+        raise invalid("The request body must be a JSON object")
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(
+            422,
+            [
+                {"type": error["type"], "loc": ["body", *error["loc"]], "msg": error["msg"]}
+                for error in exc.errors(
+                    include_url=False, include_input=False, include_context=False
+                )
+            ],
+        ) from None
 
 
 def _admin_view(service: McpService, *, source: str, has_client_secret: bool) -> dict[str, Any]:
@@ -228,9 +273,8 @@ def create_mcp_registry_router(
         }
 
     @router.put("/mcp-registry/services/{service_id}/connection")
-    async def connect_token(
-        request: Request, service_id: str, body: ConnectMcpToken
-    ) -> dict[str, bool]:
+    async def connect_token(request: Request, service_id: str) -> dict[str, bool]:
+        body = await _read_body(request, ConnectMcpToken)
         entry = await service(request, service_id)
         if entry.auth != "bearer" or registry.store is None:
             raise HTTPException(400, "This service does not accept a personal bearer token")
@@ -388,11 +432,13 @@ def _add_admin_routes(
 
     async def resolve_oauth(
         service_id: str, body: AdminServiceSettings, current: ManagedMcpService | None
-    ) -> tuple[McpServiceOAuth, str | None]:
-        """The OAuth settings for *body*, and the client secret to seal for them.
+    ) -> tuple[McpServiceOAuth, str | None, bool]:
+        """The OAuth settings for *body*, a new client secret to seal for them, and
+        whether to keep the saved one instead.
 
         A secret is sent only to the token URL, so a saved one is kept only while the
-        token URL and client ID stay the same; any other change needs a new one.
+        token URL and client ID stay the same; any other change needs a new one. The
+        same client keeps its authentication method unless the request names one.
         """
         if registry.store is None:
             raise HTTPException(
@@ -412,39 +458,45 @@ def _add_admin_routes(
         previous = current.oauth if current is not None else None
         same_client_endpoint = previous is not None and previous.token_url == token_url
 
-        async def saved_secret() -> str | None:
-            assert current is not None
-            try:
-                return await asyncio.to_thread(registry.client_secret, current)
-            except ConnectionError:
-                return None
+        def oauth(
+            client_id: str, registration: McpClientRegistration, method: TokenEndpointAuth
+        ) -> McpServiceOAuth:
+            return McpServiceOAuth(
+                authorize_url=authorize_url,
+                token_url=token_url,
+                client_id=client_id,
+                scopes=scopes,
+                resource=resource,
+                registration=registration,
+                token_endpoint_auth=method,
+            )
 
         if given.client_id:
-            method = given.token_endpoint_auth or (
-                "client_secret_post" if given.client_secret else "none"
-            )
-            secret = given.client_secret
-            if (
-                secret is None
-                and method != "none"
-                and same_client_endpoint
-                and previous is not None
-                and previous.client_id == given.client_id
-            ):
-                secret = await saved_secret()
-            if method != "none" and secret is None:
-                raise HTTPException(400, "Enter the client secret for this client ID")
-            return (
-                McpServiceOAuth(
-                    authorize_url=authorize_url,
-                    token_url=token_url,
-                    client_id=given.client_id,
-                    scopes=scopes,
-                    resource=resource,
-                    registration="manual",
-                    token_endpoint_auth=method,
+            same_client = previous is not None and previous.client_id == given.client_id
+            method: TokenEndpointAuth
+            if given.token_endpoint_auth is not None:
+                method = given.token_endpoint_auth
+            elif same_client and current is not None:
+                method = current.token_endpoint_auth
+            else:
+                method = "client_secret_post" if given.client_secret else "none"
+            if method == "none" and given.client_secret and given.token_endpoint_auth is None:
+                method = "client_secret_post"
+            if method == "none":
+                return oauth(given.client_id, "manual", method), None, False
+            if given.client_secret:
+                return oauth(given.client_id, "manual", method), given.client_secret, False
+            if same_client and same_client_endpoint and current is not None:
+                if current.token_endpoint_auth != "none":
+                    return oauth(given.client_id, "manual", method), None, True
+            raise HTTPException(
+                400,
+                "Enter the client secret for this client ID"
+                + (
+                    " again: the token URL changed"
+                    if same_client and not same_client_endpoint
+                    else ""
                 ),
-                secret if method != "none" else None,
             )
         if (
             current is not None
@@ -454,22 +506,8 @@ def _add_admin_routes(
             and previous.authorize_url == authorize_url
         ):
             # Same authorization server: keep the client registered earlier.
-            secret = None
-            if current.token_endpoint_auth != "none":
-                secret = await saved_secret()
-            if current.token_endpoint_auth == "none" or secret is not None:
-                return (
-                    McpServiceOAuth(
-                        authorize_url=authorize_url,
-                        token_url=token_url,
-                        client_id=previous.client_id,
-                        scopes=scopes,
-                        resource=resource,
-                        registration="dynamic",
-                        token_endpoint_auth=current.token_endpoint_auth,
-                    ),
-                    secret,
-                )
+            keep = current.token_endpoint_auth != "none"
+            return oauth(previous.client_id, "dynamic", current.token_endpoint_auth), None, keep
         if discovered is None:
             discovered = await discover_oauth(body.url, registry.destination_policy)
         registered = await register_client(
@@ -485,21 +523,16 @@ def _add_admin_routes(
             registry.destination_policy,
         )
         return (
-            McpServiceOAuth(
-                authorize_url=authorize_url,
-                token_url=token_url,
-                client_id=registered.client_id,
-                scopes=scopes,
-                resource=resource,
-                registration="dynamic",
-                token_endpoint_auth=registered.token_endpoint_auth,
-            ),
+            oauth(registered.client_id, "dynamic", registered.token_endpoint_auth),
             registered.client_secret,
+            False,
         )
 
     async def settings_for(
         service_id: str, body: AdminServiceSettings, current: ManagedMcpService | None
-    ) -> tuple[McpServiceSettings, str | None]:
+    ) -> tuple[McpServiceSettings, SealedSecret | None, bool]:
+        """The settings to store, the client secret sealed for them, and whether to
+        keep the saved client secret."""
         if body.auth != "none" and registry.store is None:
             raise HTTPException(
                 400, "Logins need the server's credential store (a credential cipher)"
@@ -509,11 +542,23 @@ def _add_admin_routes(
         unchanged = current is not None and (current.url, current.auth) == (body.url, body.auth)
         if not unchanged:
             await checked_url(body.url, "The server URL")
-        oauth, client_secret = None, None
+        oauth, client_secret, keep = None, None, False
         if body.auth == "oauth":
             try:
-                oauth, client_secret = await resolve_oauth(service_id, body, current)
+                oauth, client_secret, keep = await resolve_oauth(service_id, body, current)
             except McpOAuthDiscoveryError as exc:
+                raise HTTPException(400, str(exc)) from None
+        sealed = None
+        if client_secret is not None:
+            assert registry.store is not None
+            try:
+                sealed = await asyncio.to_thread(
+                    registry.store.seal,
+                    SERVICE_PRINCIPAL,
+                    client_provider(service_id),
+                    {"client_secret": client_secret},
+                )
+            except SecretTooLargeError as exc:
                 raise HTTPException(400, str(exc)) from None
         return (
             McpServiceSettings(
@@ -525,18 +570,9 @@ def _add_admin_routes(
                 tools=tuple(body.tools),
                 oauth=oauth,
             ),
-            client_secret,
+            sealed,
+            keep,
         )
-
-    async def seal_client(service_id: str, client_secret: str | None) -> None:
-        await registry.refresh(force=True)
-        entry = registry.managed_services().get(service_id)
-        if client_secret is None or entry is None:
-            return
-        try:
-            await asyncio.to_thread(registry.save_client_secret, entry, client_secret)
-        except ConnectionError as exc:
-            raise HTTPException(409, str(exc)) from None
 
     async def view(service_id: str) -> dict[str, Any]:
         await registry.refresh(force=True)
@@ -574,33 +610,41 @@ def _add_admin_routes(
         return {"data": [preset.model_dump() for preset in registry.config.presets]}
 
     @router.post("/mcp-registry/admin/services", status_code=201)
-    async def admin_create(request: Request, body: AdminServiceCreate) -> dict[str, Any]:
+    async def admin_create(request: Request) -> dict[str, Any]:
         admin = await require_admin(request)
+        body = await _read_body(request, AdminServiceCreate)
         await registry.refresh(force=True)
         if registry.lookup(body.id) is not None:
             raise HTTPException(409, "An MCP service with this ID already exists")
-        settings, client_secret = await settings_for(body.id, body, None)
+        settings, sealed, _keep = await settings_for(body.id, body, None)
         try:
-            await asyncio.to_thread(store.create, body.id, settings, created_by=admin)
+            # The settings and their client secret are saved in one transaction.
+            await asyncio.to_thread(
+                store.create, body.id, settings, created_by=admin, client_secret=sealed
+            )
         except McpServiceConflict:
             raise HTTPException(409, "An MCP service with this ID already exists") from None
-        await seal_client(body.id, client_secret)
+        except McpClientSecretMissing:
+            raise HTTPException(400, "Enter the client secret for this client ID") from None
         return await view(body.id)
 
     @router.put("/mcp-registry/admin/services/{service_id}")
-    async def admin_update(
-        request: Request, service_id: str, body: AdminServiceSettings
-    ) -> dict[str, Any]:
+    async def admin_update(request: Request, service_id: str) -> dict[str, Any]:
         await require_admin(request)
+        body = await _read_body(request, AdminServiceSettings)
         await registry.refresh(force=True)
         current = managed(service_id)
-        settings, client_secret = await settings_for(service_id, body, current)
+        settings, sealed, keep = await settings_for(service_id, body, current)
         try:
+            # Applies only to the version read above; the client secret is saved, or
+            # the saved one kept, in the same transaction.
             result = await asyncio.to_thread(
                 store.update,
                 service_id,
                 settings,
                 expected_version=current.credential_version,
+                client_secret=sealed,
+                keep_client_secret=keep,
             )
         except McpServiceNotFound:
             raise HTTPException(404, "No MCP service has this ID") from None
@@ -608,7 +652,8 @@ def _add_admin_routes(
             raise HTTPException(
                 409, "The service changed meanwhile; reload and try again"
             ) from None
-        await seal_client(service_id, client_secret)
+        except McpClientSecretMissing:
+            raise HTTPException(400, "Enter the client secret for this client ID") from None
         return {**await view(service_id), "credentials_reset": result.credentials_reset}
 
     @router.delete("/mcp-registry/admin/services/{service_id}")

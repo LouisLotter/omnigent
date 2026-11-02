@@ -22,8 +22,11 @@ from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpServ
 from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 from omnigent.stores.mcp_service_store import (
+    SERVICE_PRINCIPAL,
+    McpServiceOAuth,
     McpServiceSettings,
     McpServiceStore,
+    client_provider,
     member_provider,
     stamped,
 )
@@ -318,3 +321,147 @@ def test_no_login_reaches_a_response_or_a_log(accounts, caplog):
     for response in responses:
         assert CANARY not in response.text
     assert CANARY not in caplog.text
+
+
+# ── Single-user app: the admin routes without accounts ──────────────────────
+
+
+@pytest.fixture
+def local_admin(db_uri, monkeypatch, public_dns):
+    """An app whose only user may manage services, and its registry."""
+    import httpx
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.mcp_registry import create_mcp_registry_router
+
+    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "test-signing-key-32-characters-long")
+    registry = McpRegistry(
+        McpRegistryConfig(public_url="https://omnigent.example.com"),
+        CredentialStore(db_uri, _FakeCipher()),
+        service_store=McpServiceStore(db_uri),
+        destination_policy=DefaultMcpDestinationPolicy(),
+    )
+    app = FastAPI()
+    app.include_router(create_mcp_registry_router(registry, None), prefix="/v1")
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+    return client, registry
+
+
+def manual_oauth(**oauth) -> dict[str, Any]:
+    return bearer_service(
+        auth="oauth",
+        oauth={
+            "client_id": "ours",
+            "client_secret": "our-secret",
+            "authorize_url": "https://auth.example.com/authorize",
+            "token_url": "https://auth.example.com/token",
+            **oauth,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interleaved", ["update", "delete-and-recreate"])
+async def test_an_edit_racing_another_admins_change_never_moves_a_client_secret(
+    local_admin, interleaved
+):
+    client, registry = local_admin
+    store = registry.service_store
+    created = await client.post(ADMIN, json=manual_oauth())
+    assert created.status_code == 201, created.text
+    real_update = store.update
+
+    def theirs_first(service_id, settings, **kwargs):
+        # Another administrator repoints the service after this request read it.
+        current = store.get(service_id)
+        other = McpServiceSettings(
+            title="Theirs",
+            url=current.url,
+            auth="oauth",
+            timeout=60,
+            tools=("read_ticket",),
+            oauth=McpServiceOAuth(
+                authorize_url="https://evil.example.com/authorize",
+                token_url="https://evil.example.com/token",
+                client_id="theirs",
+                token_endpoint_auth="client_secret_post",
+            ),
+        )
+        sealed = registry.store.seal(
+            SERVICE_PRINCIPAL, client_provider(service_id), {"client_secret": "their-secret"}
+        )
+        if interleaved == "update":
+            real_update(service_id, other, client_secret=sealed)
+        else:
+            store.delete(service_id)
+            store.create(service_id, other, created_by="b", client_secret=sealed)
+        return real_update(service_id, settings, **kwargs)
+
+    store.update = theirs_first
+    # Keeps the saved secret (no new one entered) while changing the scopes.
+    edited = await client.put(
+        f"{ADMIN}/tracker",
+        json=settings_of(manual_oauth(client_secret=None, scopes=["read"])),
+    )
+    assert edited.status_code == 409, edited.text
+    store.update = real_update
+    await registry.refresh(force=True)
+    fresh = registry.managed_services()["tracker"]
+    assert fresh.oauth.token_url == "https://evil.example.com/token"
+    # The other administrator's secret, never this request's or the original one.
+    assert registry.client_secret(fresh) == "their-secret"
+
+
+SECRET = "canary-client-secret-5d1e"
+TOKEN = "canary-bearer-token-9b2c"
+
+
+@pytest.mark.asyncio
+async def test_validation_errors_never_repeat_a_submitted_secret(local_admin, caplog):
+    client, _registry = local_admin
+    caplog.set_level(logging.DEBUG)
+    assert (await client.post(ADMIN, json=bearer_service(auth="none"))).status_code == 201
+    secret_bodies = {
+        "oversized secret": manual_oauth(client_secret=SECRET + "x" * 4096),
+        "secret of the wrong type": manual_oauth(client_secret=[SECRET]),
+        "bad sibling field": {**manual_oauth(client_secret=SECRET), "timeout": 999},
+        "missing parent field": {
+            key: value
+            for key, value in manual_oauth(client_secret=SECRET).items()
+            if key != "title"
+        },
+        "unknown field": manual_oauth(client_secret=SECRET, client_secret_extra=SECRET),
+        "oauth not an object": bearer_service(auth="oauth", oauth=SECRET),
+    }
+    responses = []
+    for name, body in secret_bodies.items():
+        created = await client.post(ADMIN, json=body)
+        updated = await client.put(f"{ADMIN}/tracker", json=settings_of(body))
+        for response in (created, updated):
+            assert response.status_code == 422, (name, response.text)
+            assert all({"loc", "msg", "type"} >= set(e) for e in response.json()["detail"])
+            responses.append(response)
+    token_bodies = [
+        {"token": TOKEN + "x" * 16000},
+        {"token": {"value": TOKEN}},
+        {"token": TOKEN, "extra": TOKEN},
+        {"tokn": TOKEN},
+    ]
+    for body in token_bodies:
+        response = await client.put("/v1/mcp-registry/services/tracker/connection", json=body)
+        # Malformed bodies are 422; a valid one fails later (this service takes no token).
+        assert response.status_code in (400, 422), response.text
+        responses.append(response)
+    for raw in (f'"{SECRET}"', f'{{"oauth": "{SECRET}"', f'["{TOKEN}"]'):
+        response = await client.post(
+            ADMIN, content=raw, headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 422, response.text
+        responses.append(response)
+    too_large = await client.post(
+        ADMIN, content=b"{" + b" " * 70_000 + b"}", headers={"Content-Type": "application/json"}
+    )
+    assert too_large.status_code == 413
+    for response in responses:
+        assert SECRET not in response.text and TOKEN not in response.text, response.text
+    assert SECRET not in caplog.text and TOKEN not in caplog.text

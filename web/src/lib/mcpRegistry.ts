@@ -86,8 +86,11 @@ export interface AdminServiceOAuth {
   resource: string | null;
   has_client_secret: boolean;
   registration?: "manual" | "dynamic" | null;
-  token_endpoint_auth?: "none" | "client_secret_post" | "client_secret_basic";
+  token_endpoint_auth?: TokenEndpointAuth;
 }
+
+/** How an OAuth client authenticates at the token endpoint. */
+export type TokenEndpointAuth = "none" | "client_secret_post" | "client_secret_basic";
 
 /** A catalog service in the administrators' list. */
 export interface AdminService {
@@ -118,6 +121,8 @@ export interface AdminServiceSettings {
   oauth?: {
     client_id?: string;
     client_secret?: string;
+    /** Sent with ``client_id``; without it the server keeps the same client's saved method. */
+    token_endpoint_auth?: TokenEndpointAuth;
     authorize_url?: string;
     token_url?: string;
     scopes?: string[];
