@@ -19,11 +19,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import Engine, Select, or_, select, tuple_, update
+from sqlalchemy import (
+    ColumnElement,
+    Engine,
+    Select,
+    SQLColumnExpression,
+    and_,
+    or_,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from omnigent.db.account_authority import (
     AccountAuthority,
@@ -51,6 +61,7 @@ from omnigent.db.utils import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
+from omnigent.server.principals import MachineBinding, PrincipalKind
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -367,6 +378,104 @@ def delete_host_in_session(session: Session, row: SqlHost) -> Host:
     row.status = encode_host_status("offline")
     row.deleted_at = row.deleted_at or now_epoch()
     return _row_to_host(row)
+
+
+def _owner_grants(session_id_column: SQLColumnExpression[str] | str) -> ColumnElement[bool]:
+    """Owner-level grants on a thread, excluding the public sentinel."""
+    from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+
+    return and_(
+        SqlSessionPermission.workspace_id == current_workspace_id(),
+        SqlSessionPermission.conversation_id == session_id_column,
+        SqlSessionPermission.level >= LEVEL_OWNER,
+        SqlSessionPermission.user_id != RESERVED_USER_PUBLIC,
+    )
+
+
+def resolve_runner_binding(
+    session: Session, runner_id: str, session_id: str | None = None
+) -> MachineBinding | None:
+    """
+    Resolve who a runner acts for from the server's own records.
+
+    A runner is bound to threads (``runner_id`` on their metadata). Each bound
+    thread that carries owner grants must have exactly one owner, and that
+    person must own the live host the thread is bound to under their current
+    registration. All bound threads must agree. Sub-agent threads carry no
+    grants of their own and follow their root.
+
+    :param session: Open database session.
+    :param runner_id: Token-bound runner id.
+    :param session_id: Restrict to this thread, as when checking a token.
+    :returns: The binding (its ``session_id`` is the smallest bound thread),
+        or ``None`` when absent, ambiguous or held by someone else.
+    """
+    owner_user = aliased(SqlUser)
+    query = (
+        select(
+            SqlConversationMetadata.id.label("session_id"),
+            SqlConversationMetadata.host_id,
+            SqlSessionPermission.user_id.label("owner"),
+            owner_user.account_generation.label("owner_generation"),
+            owner_user.deleted_at.label("owner_deleted_at"),
+            SqlHost.user_id.label("host_owner"),
+            SqlHost.account_generation.label("host_generation"),
+            SqlHost.deleted_at.label("host_deleted_at"),
+        )
+        .select_from(SqlConversationMetadata)
+        .join(SqlSessionPermission, _owner_grants(SqlConversationMetadata.id))
+        .outerjoin(
+            owner_user,
+            and_(
+                owner_user.workspace_id == SqlSessionPermission.workspace_id,
+                owner_user.id == SqlSessionPermission.user_id,
+            ),
+        )
+        .outerjoin(
+            SqlHost,
+            and_(
+                SqlHost.workspace_id == SqlConversationMetadata.workspace_id,
+                SqlHost.host_id == SqlConversationMetadata.host_id,
+            ),
+        )
+        .where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.runner_id == runner_id,
+        )
+        .order_by(SqlConversationMetadata.id, SqlSessionPermission.user_id)
+    )
+    if session_id is not None:
+        query = query.where(SqlConversationMetadata.id == session_id)
+    rows = session.execute(query).all()
+    owners_by_session: dict[str, set[str]] = {}
+    for row in rows:
+        owners_by_session.setdefault(row.session_id, set()).add(row.owner)
+    if not rows or any(len(owners) != 1 for owners in owners_by_session.values()):
+        return None
+    bindings = set()
+    for row in rows:
+        if (
+            row.owner_deleted_at is not None
+            or row.host_id is None
+            or row.host_owner is None
+            or row.host_deleted_at is not None
+            or row.host_owner != row.owner
+            # The host must belong to the owner's current registration.
+            or (row.owner_generation is not None and row.host_generation != row.owner_generation)
+        ):
+            return None
+        bindings.add((row.owner, row.owner_generation, row.host_id))
+    if len(bindings) != 1:
+        return None
+    owner, generation, host_id = bindings.pop()
+    return MachineBinding(
+        kind=PrincipalKind.RUNNER,
+        user_id=owner,
+        account_generation=generation,
+        host_id=host_id,
+        session_id=min(owners_by_session),
+        runner_id=runner_id,
+    )
 
 
 class HostStore:
@@ -1542,6 +1651,21 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
+    def runner_binding(
+        self, runner_id: str, session_id: str | None = None
+    ) -> MachineBinding | None:
+        """
+        Return who *runner_id* acts for, from the current thread and host records.
+
+        See :func:`resolve_runner_binding`.
+
+        :param runner_id: Token-bound runner id.
+        :param session_id: Restrict to this thread, as when checking a token.
+        :returns: The binding, or ``None`` when absent or ambiguous.
+        """
+        with self._session("select_runner_binding") as session:
+            return resolve_runner_binding(session, runner_id, session_id)
+
     def admit_launch(
         self,
         host_id: str,
@@ -1559,6 +1683,7 @@ class HostStore:
         during resolution. Same-host restarts must not opt into this exception.
         Accounts deployments also require a live session owner able to mint
         runner credentials; other auth modes retain their own owner lifecycle.
+        A host with an owner runs only threads whose single owner is that person.
         """
 
         def write(session: Session) -> None:
@@ -1615,6 +1740,19 @@ class HostStore:
                 raise OmnigentError(
                     "session is no longer bound to this host", code=ErrorCode.UNAUTHORIZED
                 )
+            # A computer runs only its own person's threads, never a colleague's.
+            # Ambiguous ownership is refused; a thread without owner grants
+            # (permissions disabled) has no owner to compare, and accounts mode
+            # requires one above.
+            if owner is not None:
+                thread_owners = session.execute(
+                    select(SqlSessionPermission.user_id).where(_owner_grants(session_id)).limit(2)
+                ).all()
+                if len(thread_owners) > 1 or any(row.user_id != owner for row in thread_owners):
+                    raise OmnigentError(
+                        "This computer belongs to someone other than the thread's owner",
+                        code=ErrorCode.FORBIDDEN,
+                    )
             if meta.inference_snapshot is not None and host.sandbox_provider is None:
                 raise OmnigentError(
                     "This session has a saved sandbox inference profile. "

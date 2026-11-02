@@ -123,11 +123,11 @@ def test_only_a_signed_in_administrator_manages_services(accounts):
     assert created.status_code == 201, created.text
     assert created.json()["source"] == "admin"
 
-    # An administrator's runner holds a token that acts as the administrator.
+    # An administrator's runner acts for the administrator but is never one.
     session = create_session(admin)
     assert session.status_code == 201, session.text
     runner = _delegated_runner(admin, captured, session.json()["session_id"])
-    assert runner.get("/v1/me").json()["is_admin"] is True
+    assert runner.get("/v1/me").json()["is_admin"] is False
 
     attempts = [
         ("get", ADMIN, None),
@@ -147,7 +147,7 @@ def test_only_a_signed_in_administrator_manages_services(accounts):
         assert member.status_code == 403, (path, member.text)
         delegated = getattr(runner, method)(path, **kwargs)
         assert delegated.status_code == 403, (path, delegated.text)
-        assert "runner credential cannot manage MCP services" in delegated.text
+        assert "runner credential cannot use this endpoint" in delegated.text
     # Nothing the refused calls asked for happened.
     listed = admin.get(ADMIN).json()["data"]
     assert [(s["id"], s["url"]) for s in listed] == [

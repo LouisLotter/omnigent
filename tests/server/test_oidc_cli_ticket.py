@@ -415,8 +415,14 @@ async def test_cli_decision_requires_ticket_login_provenance(
     ) as client:
         ticket, verifier = await _create_ticket(client)
         if credential_kind == "runner":
-            token = provider.mint_runner_token("alice@example.com", ttl_seconds=1800)
-            assert token is not None
+            from omnigent.server.principals import MachineBinding, PrincipalKind
+
+            binding = MachineBinding(
+                PrincipalKind.RUNNER, "alice@example.com", None, "host-1", "conv-1", "runner-1"
+            )
+            minted = provider.mint_machine_token(binding, ttl_seconds=1800)
+            assert minted is not None
+            token = minted[0]
         else:
             token = mint_session_cookie("alice@example.com", TEST_SIGNING_KEY, 8, "github")
         client.cookies.set("ap_session", token)

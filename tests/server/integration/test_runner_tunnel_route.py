@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.requests import HTTPConnection
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
@@ -137,6 +137,7 @@ def _tunnel_route_app(
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    mint_managed_runner_token: Callable[[str, int], tuple[str, int] | None] | None = None,
 ) -> TunnelRouteApp:
     """Create a minimal app containing only the runner tunnel route.
 
@@ -148,6 +149,8 @@ def _tunnel_route_app(
     :param resolve_managed_runner_owner: Optional ``runner_id -> owner``
         resolver for server-managed sandbox runners (binding-token auth,
         no user session). ``None`` disables the managed-runner lookup.
+    :param mint_managed_runner_token: Optional ``(runner_id, ttl) -> token``
+        issuer for ``POST /v1/runners/{id}/token``.
     :returns: The FastAPI app and registry owned by its route.
     """
     registry = TunnelRegistry()
@@ -159,6 +162,7 @@ def _tunnel_route_app(
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
+            mint_managed_runner_token=mint_managed_runner_token,
         ),
         prefix="/v1",
     )
@@ -2025,25 +2029,35 @@ async def test_disconnected_batch_waiting_on_lock_cannot_apply_after_reconnect()
 # ── Managed-runner token mint endpoint (POST /v1/runners/{id}/token) ──
 
 
-class _MintingAuthProvider(_CredentialHeaderAuthProvider):
-    """OIDC/accounts-style provider that also mints runner owner tokens.
+def _minter(
+    owners: Callable[[str], str | None],
+) -> Callable[[str, int], tuple[str, int] | None]:
+    """An issuer modelling the server's: a sentinel token for a bound runner.
 
-    Models the deployed contract where ``mint_runner_token`` returns a
-    bearer. The real ``UnifiedAuthProvider`` signs a JWT; here a
-    deterministic sentinel exercises the route without JWT machinery —
-    the token round-trip itself is covered in
-    ``tests/server/test_accounts.py``.
+    The real issuer resolves the strict binding and signs a runner token;
+    that round trip is covered in ``tests/server/test_runner_principal.py``.
     """
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
-        """Return a deterministic sentinel bearer for *user_id*."""
-        return f"minted-owner-token:{user_id}:{ttl_seconds}"
+    def mint(runner_id: str, ttl_seconds: int) -> tuple[str, int] | None:
+        owner = owners(runner_id)
+        if owner is None:
+            return None
+        return f"minted-runner-token:{owner}:{ttl_seconds}", 1_000_000 + ttl_seconds
+
+    return mint
+
+
+def _unsupported_minter(_runner_id: str, _ttl_seconds: int) -> tuple[str, int] | None:
+    """The server's issuer under header/proxy auth: the binding resolves, minting can't."""
+    raise OmnigentError(
+        "runner token minting is unsupported in this auth mode", code=ErrorCode.INVALID_INPUT
+    )
 
 
 def _mint_route_app(
     *,
     auth_provider: AuthProvider | None,
-    resolve_managed_runner_owner: Callable[[str], str | None] | None,
+    mint_managed_runner_token: Callable[[str, int], tuple[str, int] | None] | None,
 ) -> FastAPI:
     """Tunnel-route app with the ``OmnigentError`` -> HTTP handler installed.
 
@@ -2053,12 +2067,12 @@ def _mint_route_app(
     401 / 400 statuses the endpoint intends.
 
     :param auth_provider: Auth provider wired into the route.
-    :param resolve_managed_runner_owner: ``runner_id -> owner`` resolver.
+    :param mint_managed_runner_token: ``(runner_id, ttl) -> token`` issuer.
     :returns: The FastAPI app (error handler installed).
     """
     app = _tunnel_route_app(
         auth_provider=auth_provider,
-        resolve_managed_runner_owner=resolve_managed_runner_owner,
+        mint_managed_runner_token=mint_managed_runner_token,
     ).app
 
     @app.exception_handler(OmnigentError)
@@ -2107,8 +2121,8 @@ async def test_mint_token_endpoint_returns_owner_bearer_for_valid_binding_token(
     token = "managed-runner-binding-token"
     runner_id = token_bound_runner_id(token)
     app = _mint_route_app(
-        auth_provider=_MintingAuthProvider(),
-        resolve_managed_runner_owner=(
+        auth_provider=_CredentialHeaderAuthProvider(),
+        mint_managed_runner_token=_minter(
             lambda rid: "owner@example.com" if rid == runner_id else None
         ),
     )
@@ -2117,9 +2131,8 @@ async def test_mint_token_endpoint_returns_owner_bearer_for_valid_binding_token(
 
     assert response.status_code == 200
     body = response.json()
-    assert body["token"] == "minted-owner-token:owner@example.com:1800"
-    assert isinstance(body["expires_at"], int)
-    assert body["expires_at"] > 0
+    assert body["token"] == "minted-runner-token:owner@example.com:1800"
+    assert body["expires_at"] == 1_001_800
 
 
 async def test_mint_token_endpoint_rejects_unrecognized_token() -> None:
@@ -2135,8 +2148,8 @@ async def test_mint_token_endpoint_rejects_unrecognized_token() -> None:
     attacker_token = "attacker-chosen-token"
     runner_id = token_bound_runner_id(attacker_token)
     app = _mint_route_app(
-        auth_provider=_MintingAuthProvider(),
-        resolve_managed_runner_owner=lambda _rid: None,
+        auth_provider=_CredentialHeaderAuthProvider(),
+        mint_managed_runner_token=_minter(lambda _rid: None),
     )
 
     response = await _post_mint_token(app, runner_id, token=attacker_token)
@@ -2154,8 +2167,8 @@ async def test_mint_token_endpoint_rejects_runner_id_mismatch() -> None:
     :returns: None.
     """
     app = _mint_route_app(
-        auth_provider=_MintingAuthProvider(),
-        resolve_managed_runner_owner=lambda _rid: "owner@example.com",
+        auth_provider=_CredentialHeaderAuthProvider(),
+        mint_managed_runner_token=_minter(lambda _rid: "owner@example.com"),
     )
 
     response = await _post_mint_token(
@@ -2172,8 +2185,8 @@ async def test_mint_token_endpoint_missing_binding_token_rejected() -> None:
     """
     runner_id = token_bound_runner_id("whatever")
     app = _mint_route_app(
-        auth_provider=_MintingAuthProvider(),
-        resolve_managed_runner_owner=lambda _rid: "owner@example.com",
+        auth_provider=_CredentialHeaderAuthProvider(),
+        mint_managed_runner_token=_minter(lambda _rid: "owner@example.com"),
     )
 
     response = await _post_mint_token(app, runner_id, token=None)
@@ -2185,19 +2198,16 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400() -> None
     """When the provider can't mint (header/proxy mode), the endpoint 400s.
 
     The binding token is valid and the owner resolves, but header/proxy
-    identity can't be minted server-side (``mint_runner_token`` returns
-    ``None``) — a clear 400, not a 401.
+    identity can't be minted server-side (the issuer raises
+    ``INVALID_INPUT``) — a clear 400, not a 401.
 
     :returns: None.
     """
     token = "managed-runner-binding-token"
     runner_id = token_bound_runner_id(token)
     app = _mint_route_app(
-        # Base provider: mint_runner_token uses the ABC default (None).
         auth_provider=_CredentialHeaderAuthProvider(),
-        resolve_managed_runner_owner=(
-            lambda rid: "owner@example.com" if rid == runner_id else None
-        ),
+        mint_managed_runner_token=_unsupported_minter,
     )
 
     response = await _post_mint_token(app, runner_id, token=token)

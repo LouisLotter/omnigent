@@ -507,17 +507,29 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
 
 
 class _InitialAuthTokenFactory:
-    """Use a host bearer until rejection, then lazily resolve runner auth."""
+    """Use a host bearer until rejection, then lazily resolve runner auth.
 
-    def __init__(self, token: str, server_url: str) -> None:
+    With a *runner_factory* (the server mints runner tokens), the host bearer
+    never authenticates the runner: it only carries the first mint through a
+    fronting proxy, and the runner starts on its own runner token.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        server_url: str,
+        *,
+        runner_factory: Callable[[], str | None] | None = None,
+    ) -> None:
         """
         :param token: Current bearer obtained from the connected host.
         :param server_url: Omnigent server URL used by the fallback resolver.
+        :param runner_factory: An installed runner-token factory to start on.
         """
-        self._initial_token: str | None = token
+        self._initial_token: str | None = None if runner_factory is not None else token
         self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
-        self._fallback_factory: Callable[[], str | None] | None = None
+        self._fallback_factory: Callable[[], str | None] | None = runner_factory
         self._retry_discovery_at = 0.0
         self._no_credential_logged = False
         self._lock = threading.Lock()
@@ -636,10 +648,13 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host's current bearer, when injected for runner bootstrap. This is
+      1. Host-delegated runner token, when the host launch marker and
+         binding token are present and the server mints runner tokens. The
+         host's injected bearer (if any) only carries the mint request
+         through a fronting proxy; the runner never acts with it.
+      2. Host's current bearer, when injected for runner bootstrap and the
+         server cannot mint (header/proxy mode or an older server). This is
          used until rejection; local refreshable auth resolves lazily.
-      2. Host-delegated runner token, when the host launch marker and
-         binding token are present.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
       4. Databricks OAuth token (refreshed via the SDK) — host-keyed
@@ -717,17 +732,35 @@ def _make_auth_token_factory(
         if _allow_initial_token
         else ""
     )
+    # Prefer the host-launched runner's owner-bound capability so user
+    # credentials stay out of the runner and credential discovery is skipped.
+    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     if initial_token and resolved_server_url:
+        if _allow_delegated_mint and delegated_auth and binding_token:
+            # A runner acts with its own runner token whenever the server mints
+            # one, never with the host's sign-in. A refusal to mint (no-auth or
+            # header mode, an older server, a proxy rejecting the bearer) keeps
+            # the host bearer for bootstrap, as before.
+            from omnigent.runner.identity import token_bound_runner_id
+
+            runner_factory = _ManagedMintTokenFactory(
+                f"{resolved_server_url.rstrip('/')}/v1/runners/"
+                f"{token_bound_runner_id(binding_token)}/token",
+                resolved_server_url,
+                binding_token,
+                proxy_bearer=initial_token,
+            )
+            runner_factory()
+            if not (runner_factory.declined or runner_factory.proxy_auth_failed):
+                return _InitialAuthTokenFactory(
+                    initial_token, resolved_server_url, runner_factory=runner_factory
+                )
         _logger.info(
             "using host-provided bearer for runner bootstrap",
             extra={"session_id": runner_primary_session_id()},
         )
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
-
-    # Prefer the host-launched runner's owner-bound capability so user
-    # credentials stay out of the runner and credential discovery is skipped.
-    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
-    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     # A binding token the server just refused to mint for (bare request), so
     # the managed fallback below doesn't resend the identical probe.
     refused_binding_token: str | None = None

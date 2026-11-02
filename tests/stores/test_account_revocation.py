@@ -13,6 +13,7 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import accounts_store as accounts_module
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
@@ -521,17 +522,15 @@ def test_host_identity_changes_preserve_account_generation(db_uri: str) -> None:
     assert hosts.get_host(rotated_id).account_generation == account.account_generation
 
 
-@pytest.mark.parametrize("revoked_owner", ["alice", "z-host-owner"])
-def test_runner_issuance_serializes_with_deletion(db_uri: str, revoked_owner) -> None:
+def test_runner_issuance_serializes_with_deletion(db_uri: str) -> None:
     from omnigent.db.account_authority import account_generation
     from omnigent.server.auth import LEVEL_OWNER
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     accounts = SqlAlchemyAccountStore(db_uri)
     account = accounts.create_user_with_password("alice", "test-password-hash")
-    accounts.create_user_with_password("z-host-owner", "host-hash")
     host_id = uuid.uuid4().hex
-    HostStore(db_uri).upsert_on_connect(host_id, "laptop", "z-host-owner")
+    HostStore(db_uri).upsert_on_connect(host_id, "laptop", "alice")
     runner_id = uuid.uuid4().hex
     conv = SqlAlchemyConversationStore(db_uri).create_conversation(
         host_id=host_id, workspace="/tmp/workspace", runner_id=runner_id
@@ -539,16 +538,16 @@ def test_runner_issuance_serializes_with_deletion(db_uri: str, revoked_owner) ->
     SqlAlchemyPermissionStore(db_uri).grant("alice", conv.id, LEVEL_OWNER)
     reached, resume, deletion_started = Event(), Event(), Event()
 
-    def issue(owner):
-        assert owner == "alice"
-        assert account_generation(owner) == account.account_generation
+    def issue(binding):
+        assert binding.user_id == "alice"
+        assert account_generation(binding.user_id) == account.account_generation
         reached.set()
         assert resume.wait(10)
         return "issued-under-lock"
 
     def delete():
         deletion_started.set()
-        return accounts.delete_user(revoked_owner)
+        return accounts.delete_user("alice")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         issuance = pool.submit(accounts.with_runner_authority, runner_id, issue)
@@ -598,6 +597,7 @@ def test_launch_admission_requires_binding_unless_initial_bind(db_uri: str) -> N
     hosts.upsert_on_connect(host_id, "laptop", "alice")
     conversations = SqlAlchemyConversationStore(db_uri)
     conv = conversations.create_conversation()
+    SqlAlchemyPermissionStore(db_uri).grant("alice", conv.id, LEVEL_OWNER)
     with pytest.raises(OmnigentError, match="bound"):
         hosts.admit_launch(host_id, conv.id, "alice", account.account_generation)
     hosts.admit_launch(host_id, conv.id, "alice", account.account_generation, allow_unbound=True)
@@ -617,9 +617,8 @@ def test_launch_admission_serializes_with_session_owner_deletion(db_uri, monkeyp
 
     accounts = SqlAlchemyAccountStore(db_uri)
     owner = accounts.create_user_with_password("a-session-owner", "hash")
-    host_owner = accounts.create_user_with_password("z-host-owner", "hash")
     hosts = HostStore(db_uri)
-    host = hosts.upsert_on_connect(uuid.uuid4().hex, "host", host_owner.id)
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "host", owner.id)
     conversation = SqlAlchemyConversationStore(db_uri).create_conversation(
         host_id=host.host_id, workspace="/tmp"
     )
@@ -637,8 +636,8 @@ def test_launch_admission_serializes_with_session_owner_deletion(db_uri, monkeyp
         hosts.admit_launch(
             host.host_id,
             conversation.id,
-            host_owner.id,
-            host_owner.account_generation,
+            owner.id,
+            owner.account_generation,
             require_account_owner=True,
         )
 
@@ -659,7 +658,7 @@ def test_launch_admission_serializes_with_session_owner_deletion(db_uri, monkeyp
             resume.set()
         assert admission.result(timeout=10) is None
         assert deletion.result(timeout=10) is True
-    with pytest.raises(OmnigentError, match="active account owner"):
+    with pytest.raises(OmnigentError, match="revoked"):
         admit()
 
 
@@ -672,9 +671,8 @@ def test_launch_admission_rechecks_session_owner_snapshot(db_uri, monkeypatch, c
 
     accounts = SqlAlchemyAccountStore(db_uri)
     owner = accounts.create_user_with_password("a-session-owner", "hash")
-    host_owner = accounts.create_user_with_password("z-host-owner", "hash")
     hosts = HostStore(db_uri)
-    host = hosts.upsert_on_connect(uuid.uuid4().hex, "host", host_owner.id)
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "host", owner.id)
     conversation = SqlAlchemyConversationStore(db_uri).create_conversation(
         host_id=host.host_id, workspace="/tmp"
     )
@@ -691,14 +689,14 @@ def test_launch_admission_rechecks_session_owner_snapshot(db_uri, monkeypatch, c
         hosts.admit_launch(
             host.host_id,
             conversation.id,
-            host_owner.id,
-            host_owner.account_generation,
+            owner.id,
+            owner.account_generation,
             require_account_owner=True,
         )
 
     monkeypatch.setattr(account_authority, "lock_account", record_lock)
     admit()
-    assert locked == [owner.id, host_owner.id]
+    assert locked == [owner.id]
     if accounts._engine.dialect.name == "sqlite":
         pytest.skip("SQLite already holds its database-wide writer lock at the snapshot")
     snapshot_read, resume = Event(), Event()
@@ -738,6 +736,7 @@ def test_transfer_admission_checks_source_and_saved_generation(db_uri: str) -> N
         hosts.upsert_on_connect(host_id, host_id, "alice")
     conversations = SqlAlchemyConversationStore(db_uri)
     conv = conversations.create_conversation()
+    SqlAlchemyPermissionStore(db_uri).grant("alice", conv.id, LEVEL_OWNER)
     conversations.set_host_id(conv.id, source, workspace="/tmp/source")
     with pytest.raises(OmnigentError, match="bound"):
         hosts.admit_launch(destination, conv.id, "alice", account.account_generation)
@@ -868,8 +867,8 @@ def test_target_without_registration_cannot_acquire_new_account(db_uri, existing
                 permissions.grant("target", uuid.uuid4().hex, 1)
 
 
-@pytest.mark.parametrize("change", ["host_owner", "session_owner", "host", "runner", "permission"])
-def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, change):
+@pytest.mark.parametrize("change", ["owner", "host", "runner", "permission"])
+def test_runner_issuance_rechecks_owner_and_binding(db_uri, monkeypatch, change):
     from omnigent.db import account_authority
     from omnigent.db.account_authority import account_generation
     from omnigent.server.auth import LEVEL_OWNER
@@ -877,11 +876,10 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
 
     accounts = SqlAlchemyAccountStore(db_uri)
     owner = accounts.create_user_with_password("a-session-owner", "hash")
-    host_owner = accounts.create_user_with_password("z-host-owner", "hash")
     hosts = HostStore(db_uri)
     host_id, other_host_id, runner_id = (uuid.uuid4().hex for _ in range(3))
-    hosts.upsert_on_connect(host_id, "first", host_owner.id)
-    hosts.upsert_on_connect(other_host_id, "other", host_owner.id)
+    hosts.upsert_on_connect(host_id, "first", owner.id)
+    hosts.upsert_on_connect(other_host_id, "other", owner.id)
     conversations = SqlAlchemyConversationStore(db_uri)
     conv = conversations.create_conversation(
         host_id=host_id, workspace="/tmp", runner_id=runner_id
@@ -897,13 +895,14 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
 
     monkeypatch.setattr(account_authority, "lock_account", record_lock)
 
-    def issue(user_id):
-        assert user_id == owner.id
-        assert account_generation(user_id) == owner.account_generation
+    def issue(binding):
+        assert binding.user_id == owner.id
+        assert binding.host_id == host_id and binding.session_id == conv.id
+        assert account_generation(binding.user_id) == owner.account_generation
         return "issued"
 
     assert accounts.with_runner_authority(runner_id, issue) == "issued"
-    assert locked == sorted([owner.id, host_owner.id])
+    assert locked == [owner.id]
     if accounts._engine.dialect.name == "sqlite":
         pytest.skip("SQLite already holds its database-wide writer lock at the snapshot")
     reached, resume = Event(), Event()
@@ -922,10 +921,9 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
         try:
             assert reached.wait(10)
             monkeypatch.setattr(accounts_module, "require_active_account", check)
-            if change in ("host_owner", "session_owner"):
-                target = host_owner if change == "host_owner" else owner
-                assert accounts.delete_user(target.id) is True
-                accounts.create_user_with_password(target.id, "replacement-hash")
+            if change == "owner":
+                assert accounts.delete_user(owner.id) is True
+                accounts.create_user_with_password(owner.id, "replacement-hash")
             elif change == "host":
                 conversations.set_host_id(conv.id, other_host_id)
             elif change == "runner":
@@ -934,7 +932,7 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
                 permissions.revoke(owner.id, conv.id)
         finally:
             resume.set()
-        if change in ("host_owner", "session_owner"):
+        if change == "owner":
             with pytest.raises(OmnigentError) as caught:
                 pending.result(timeout=15)
             assert caught.value.code == ErrorCode.UNAUTHORIZED
