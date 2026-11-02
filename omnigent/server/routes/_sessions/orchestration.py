@@ -13299,6 +13299,11 @@ async def _handle_mcp_tools_call(
     result: dict[str, Any] = {"content": [{"type": "text", "text": output}]}
     if "isError" in exec_data:
         result["isError"] = exec_data["isError"]
+    if exec_data.get("media") is True:
+        # Only a registry gateway result sets this: its output carries media to save as files.
+        from omnigent.runtime.mcp_tool_result import MEDIA_META_KEY
+
+        result["_meta"] = {MEDIA_META_KEY: True}
     return _mcp_ok_response(rpc_id, result)
 
 

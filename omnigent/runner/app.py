@@ -4789,6 +4789,7 @@ def create_runner_app(
                 server_client,
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
+                media_workspace=lambda: _session_runtime_cwd(_captured_session_id),
             ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -6095,6 +6096,7 @@ def create_runner_app(
                                             server_client,
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
+                                            media_workspace=lambda: _session_runtime_cwd(conv_id),
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(

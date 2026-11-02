@@ -17,6 +17,9 @@ from omnigent.util.json_types import JsonObject
 
 _ENVELOPE_KEY = "__omnigent_mcp_image_result__"
 _ENVELOPE_VERSION = 1
+#: ``_meta`` key the registry gateway sets on a tool result whose output carries
+#: media blocks for the runner to save as files.
+MEDIA_META_KEY = "omnigent/media"
 
 #: Magic-byte prefixes for the image types Claude accepts, keyed by the media
 #: type the caller declares. A payload must match its own declared type —

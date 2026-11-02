@@ -1,46 +1,87 @@
 """Save images and audio that registry MCP tools return as files the agent can use.
 
-The gateway carries media blocks to the runner in the tagged result envelope. Each
-block is written under ``<data dir>/mcp-files/<session id>/`` and a text block names
-the file. Images stay in the result so vision-capable harnesses still see them;
-audio blocks are replaced by their note, as no harness consumes audio results.
+The gateway marks a result whose output carries media blocks in the tagged envelope.
+Each block is written under the session's workspace, in ``.omnigent/mcp-files/<session>/``
+(ignored by git), or under the data directory when the session has no workspace, and a
+text block names the file. Images a harness can show stay in the result; other images
+and audio are replaced by their note.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
-import mimetypes
 import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 
 from omnigent.process_logging import data_dir
-from omnigent.runtime.mcp_tool_result import decode_mcp_media_result, encode_mcp_image_result
+from omnigent.runtime.mcp_tool_result import (
+    decode_mcp_media_result,
+    encode_mcp_image_result,
+    native_image_payload,
+)
 from omnigent.util.json_types import JsonObject
 
-#: Largest audio file saved; larger blocks are dropped with a note.
-MAX_AUDIO_BYTES = 50 * 1024 * 1024
+#: Largest single media file saved, and the most one result may save.
+MAX_MEDIA_BYTES = 50 * 1024 * 1024
+MAX_RESULT_BYTES = 100 * 1024 * 1024
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
-_EXTENSIONS = {"image/jpeg": ".jpg", "audio/mpeg": ".mp3", "audio/wav": ".wav"}
+#: Extensions by MIME type; anything else is saved as ``.bin``.
+_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "image/avif": ".avif",
+    "image/heic": ".heic",
+    "image/svg+xml": ".svg",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/flac": ".flac",
+    "audio/aac": ".aac",
+    "audio/mp4": ".m4a",
+    "audio/webm": ".webm",
+    "audio/pcm": ".pcm",
+}
 
 
-def media_dir(session_id: str) -> Path:
-    """Where a session's saved media live, e.g. ``~/.omnigent/mcp-files/conv_abc``."""
-    return data_dir() / "mcp-files" / _UNSAFE_NAME.sub("_", session_id)
+def media_dir(session_id: str, workspace: Path | None) -> Path:
+    """Where a session's saved media go, e.g. ``<workspace>/.omnigent/mcp-files/conv_abc``."""
+    name = _UNSAFE_NAME.sub("_", session_id)
+    if name in ("", ".", ".."):
+        name = "_"
+    root = workspace / ".omnigent" / "mcp-files" if workspace is not None else None
+    return (root or data_dir() / "mcp-files") / name
 
 
-def save_media_result(output: str, *, session_id: str, service: str, tool: str) -> str:
-    """Return ``output`` with its media saved as files and named in text blocks.
+def save_media_result(
+    output: str,
+    *,
+    session_id: str,
+    service: str,
+    tool: str,
+    workspace: Path | None,
+) -> str:
+    """Return a gateway media result with its media saved as files and named in text.
 
-    :param output: A registry tool's output, e.g. the tagged envelope or plain text.
+    :param output: The registry tool's output: the tagged envelope the gateway marked.
     :param session_id: The session the call belongs to.
     :param service: The registry service ID, e.g. ``"openrouter"``.
     :param tool: The upstream tool name, e.g. ``"generate-image"``.
-    :returns: The output unchanged when it carries no media; otherwise an envelope
-        with image blocks kept, or plain text when only audio was returned.
+    :param workspace: The session's workspace, or ``None`` to use the data directory.
+    :returns: The output unchanged when it is not an envelope with media; otherwise an
+        envelope keeping the images a harness can show, or plain text (``{"error": …}``
+        for an error result) when none remain.
     """
     try:
         parsed = json.loads(output)
@@ -49,37 +90,58 @@ def save_media_result(output: str, *, session_id: str, service: str, tool: str) 
     result = decode_mcp_media_result(parsed)
     if result is None:
         return output
+    directory = media_dir(session_id, workspace)
     stem = f"{_UNSAFE_NAME.sub('_', service)}-{_UNSAFE_NAME.sub('_', tool)}-"
     stem += datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    budget = MAX_RESULT_BYTES
     blocks: list[JsonObject] = []
     for index, block in enumerate(result.content):
         if block["type"] == "text":
             blocks.append(block)
             continue
-        note = _save_block(block, session_id=session_id, name=f"{stem}-{index}")
+        note, size = _save_block(block, directory=directory, name=f"{stem}-{index}", budget=budget)
+        budget -= size
         blocks.append({"type": "text", "text": note})
         if block["type"] == "image":
-            blocks.append(block)
+            canonical = native_image_payload(str(block["data"]), str(block["mimeType"]))
+            if canonical is not None:
+                blocks.append({**block, "data": canonical})
     if any(block["type"] == "image" for block in blocks):
         return encode_mcp_image_result(blocks, is_error=result.is_error)
     text = "\n".join(str(block["text"]) for block in blocks)
     return json.dumps({"error": text}) if result.is_error else text
 
 
-def _save_block(block: JsonObject, *, session_id: str, name: str) -> str:
+def _save_block(block: JsonObject, *, directory: Path, name: str, budget: int) -> tuple[str, int]:
+    """Write one media block; return the note for the agent and the bytes written."""
     kind = str(block["type"])
     mime_type = str(block["mimeType"])
     try:
         data = base64.b64decode("".join(str(block["data"]).split()), validate=True)
     except (binascii.Error, ValueError):
-        return f"The {kind} ({mime_type}) could not be saved: its data is not valid base64."
-    if kind == "audio" and len(data) > MAX_AUDIO_BYTES:
-        return f"The {kind} ({mime_type}, {len(data)} bytes) was not saved: it is too large."
-    extension = _EXTENSIONS.get(mime_type) or mimetypes.guess_extension(mime_type) or ".bin"
-    directory = media_dir(session_id)
+        return f"The {kind} ({mime_type}) could not be saved: its data is not valid base64.", 0
+    if len(data) > min(MAX_MEDIA_BYTES, budget):
+        return f"The {kind} ({mime_type}, {len(data)} bytes) was not saved: it is too large.", 0
+    path = directory / f"{name}{_EXTENSIONS.get(mime_type.lower(), '.bin')}"
+    try:
+        _ensure_directory(directory)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        return f"The {kind} ({mime_type}) could not be saved: {exc.strerror or exc}.", 0
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return f"The {kind} ({mime_type}) could not be saved: {exc.strerror or exc}.", 0
+    return f"Saved the {kind} to {path} ({mime_type}, {len(data)} bytes).", len(data)
+
+
+def _ensure_directory(directory: Path) -> None:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = directory / f"{name}{extension}"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, "wb") as file:
-        file.write(data)
-    return f"Saved the {kind} to {path} ({mime_type}, {len(data)} bytes)."
+    # Inside a workspace the folder is ignored by git, the ignore file included.
+    ignore = directory.parent / ".gitignore"
+    if directory.parent.name == "mcp-files" and not ignore.exists():
+        with contextlib.suppress(OSError):
+            ignore.write_text("*\n")
