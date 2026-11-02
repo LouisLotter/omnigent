@@ -157,8 +157,8 @@ def _failing_fdopen(descriptor: int, mode: str) -> io.BufferedWriter:
 def test_what_cannot_be_saved_is_said_and_the_rest_is_kept(
     workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert _save("plain text", workspace) == "plain text"
-    assert _save('{"a": 1}', workspace) == '{"a": 1}'
+    assert _save("plain text", workspace) is None
+    assert _save('{"a": 1}', workspace) is None
     not_base64 = encode_mcp_image_result(
         [{"type": "audio", "data": "!!!", "mimeType": "audio/mpeg"}], is_error=False
     )
@@ -191,6 +191,13 @@ async def test_the_runner_saves_only_what_the_gateway_marked(workspace: Path) ->
         result: dict[str, object] = {"content": [{"type": "text", "text": envelope}]}
         if body["params"]["name"] == "generate-image":
             result |= {"isError": True, "_meta": {MEDIA_META_KEY: True}}
+        if body["params"]["name"] == "redacted":
+            # A result policy replaced the media error's output; the marker must not hide it.
+            result = {
+                "content": [{"type": "text", "text": "[Result suppressed by policy: no]"}],
+                "isError": True,
+                "_meta": {MEDIA_META_KEY: True},
+            }
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
 
     spec = AgentSpec(
@@ -209,9 +216,11 @@ async def test_the_runner_saves_only_what_the_gateway_marked(workspace: Path) ->
         marked = await manager.call_tool(spec, "openrouter__generate-image", {})
         # A service's text that merely looks like the envelope writes nothing.
         unmarked = await manager.call_tool(spec, "openrouter__echo", {})
+        redacted = await manager.call_tool(spec, "openrouter__redacted", {})
         direct = await ProxyMcpManager("conv_4", client).call_tool(spec, "other__tool", {})
     result = decode_mcp_image_result(json.loads(marked))
     assert result is not None and result.is_error
     assert len(list((workspace / ".omnigent" / "mcp-files" / "conv_3").iterdir())) == 2
     assert unmarked == envelope and direct == envelope
+    assert json.loads(redacted) == {"error": "[Result suppressed by policy: no]"}
     assert not (workspace / ".omnigent" / "mcp-files" / "conv_4").exists()

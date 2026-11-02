@@ -13244,6 +13244,7 @@ async def _handle_mcp_tools_call(
             )
 
     output: str = exec_data.get("result", {}).get("output", "")
+    executed_output = output
     _logger.debug(
         "MCP tools/call execute: session=%r tool=%r output_len=%d",
         session_id,
@@ -13299,8 +13300,9 @@ async def _handle_mcp_tools_call(
     result: dict[str, Any] = {"content": [{"type": "text", "text": output}]}
     if "isError" in exec_data:
         result["isError"] = exec_data["isError"]
-    if exec_data.get("media") is True:
-        # Only a registry gateway result sets this: its output carries media to save as files.
+    if exec_data.get("media") is True and output == executed_output:
+        # Only a registry gateway result sets this, and only while no result policy replaced
+        # the output: it carries media to save as files.
         from omnigent.runtime.mcp_tool_result import MEDIA_META_KEY
 
         result["_meta"] = {MEDIA_META_KEY: True}

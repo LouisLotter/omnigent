@@ -549,13 +549,15 @@ class ProxyMcpManager:
                 if managed and text and meta.get(MEDIA_META_KEY) is True:
                     # Images and audio from a registry service become files the agent can use.
                     workspace = await self._media_workspace() if self._media_workspace else None
-                    return save_media_result(
+                    saved = save_media_result(
                         text,
                         session_id=self._session_id,
                         service=service,
                         tool=upstream_name,
                         workspace=workspace,
                     )
+                    if saved is not None:
+                        return saved
                 if is_error:
                     return json.dumps({"error": text})
                 return text if text else json.dumps(result)

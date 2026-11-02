@@ -71,7 +71,7 @@ def save_media_result(
     service: str,
     tool: str,
     workspace: Path | None,
-) -> str:
+) -> str | None:
     """Return a gateway media result with its media saved as files and named in text.
 
     :param output: The registry tool's output: the tagged envelope the gateway marked.
@@ -79,17 +79,17 @@ def save_media_result(
     :param service: The registry service ID, e.g. ``"openrouter"``.
     :param tool: The upstream tool name, e.g. ``"generate-image"``.
     :param workspace: The session's workspace, or ``None`` to use the data directory.
-    :returns: The output unchanged when it is not an envelope with media; otherwise an
-        envelope keeping the images a harness can show, or plain text (``{"error": …}``
-        for an error result) when none remain.
+    :returns: ``None`` when the output is not an envelope with media (the caller handles
+        it as any result); otherwise an envelope keeping the images a harness can show, or
+        plain text (``{"error": …}`` for an error result) when none remain.
     """
     try:
         parsed = json.loads(output)
     except ValueError:
-        return output
+        return None
     result = decode_mcp_media_result(parsed)
     if result is None:
-        return output
+        return None
     directory = media_dir(session_id, workspace)
     stem = f"{_UNSAFE_NAME.sub('_', service)}-{_UNSAFE_NAME.sub('_', tool)}-"
     stem += datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
