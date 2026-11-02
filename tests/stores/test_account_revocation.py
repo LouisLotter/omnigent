@@ -18,6 +18,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.stores.team_store import SqlAlchemyTeamStore
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
@@ -242,6 +243,8 @@ def test_failed_session_revocation_rolls_back_password_and_work(db_uri: str) -> 
         uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
     )
     host = hosts.upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+    teams = SqlAlchemyTeamStore(db_uri)
+    member = teams.add_member("alice", role="member", state="active")
 
     updated: list[str] = []
 
@@ -258,8 +261,12 @@ def test_failed_session_revocation_rolls_back_password_and_work(db_uri: str) -> 
             accounts.update_password("alice", "new-hash", revoke_sessions=True)
     finally:
         sa.event.remove(accounts._engine, "before_cursor_execute", fail_host_update)
-    assert updated == ["scheduled_tasks", "hosts"]
+    # The membership's registration moves with the account first, then the work.
+    assert updated == ["team_members", "scheduled_tasks", "hosts"]
     assert accounts.get_password_hash("alice") == "old-hash"
+    # Rolled back with the rest: the membership still matches the account's registration.
+    rolled_back = teams.get_member_for_account("alice")
+    assert rolled_back is not None and rolled_back.id == member.id
     assert accounts.get_user("alice").account_generation == generation
     assert accounts.accepts_generation("alice", generation)
     assert tasks.get(task.id).account_generation == generation
