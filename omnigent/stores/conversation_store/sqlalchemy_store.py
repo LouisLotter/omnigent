@@ -2068,6 +2068,47 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None
             return AccountAuthority(row.user_id, row.account_generation, current_workspace_id())
 
+    def get_actual_session_owner(self, conversation_id: str) -> AccountAuthority | None:
+        """Read the root thread's single owner grant; see the base class."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+
+        with self._conv_session("select_actual_session_owner_root") as session:
+            root_id = session.execute(
+                select(SqlConversation.root_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).scalar_one_or_none()
+        if root_id is None:
+            return None
+        with self._session("select_actual_session_owner") as session:
+            owners = session.execute(
+                select(
+                    SqlSessionPermission.user_id,
+                    SqlUser.account_generation,
+                    SqlUser.deleted_at,
+                )
+                .outerjoin(
+                    SqlUser,
+                    and_(
+                        SqlUser.workspace_id == SqlSessionPermission.workspace_id,
+                        SqlUser.id == SqlSessionPermission.user_id,
+                    ),
+                )
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == root_id,
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                    SqlSessionPermission.user_id != RESERVED_USER_PUBLIC,
+                )
+                .order_by(SqlSessionPermission.user_id)
+                .limit(2)
+            ).all()
+        if len(owners) != 1 or owners[0].deleted_at is not None:
+            return None
+        owner = owners[0]
+        return AccountAuthority(owner.user_id, owner.account_generation, current_workspace_id())
+
     def search(
         self,
         query: str,

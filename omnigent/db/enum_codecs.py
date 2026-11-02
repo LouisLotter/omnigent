@@ -5,7 +5,8 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``hosts.lifecycle``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``) are stored as
+``scheduled_task_runs.status``, ``team_members.role``/``state``,
+``team_identity_bindings.provenance``) are stored as
 integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
 free ``VARCHAR``. The string names remain the
@@ -151,6 +152,29 @@ MCP_OAUTH_TOKEN_ENDPOINT_AUTH: dict[str, int] = {
     "none": 1,
     "client_secret_post": 2,
     "client_secret_basic": 3,
+}
+
+# Team roles; ``owner`` and ``admin`` carry the account admin flag while active.
+TEAM_MEMBER_ROLE: dict[str, int] = {
+    "owner": 1,
+    "admin": 2,
+    "member": 3,
+}
+
+# ``removed`` is terminal: a returning person gets a new membership.
+TEAM_MEMBER_STATE: dict[str, int] = {
+    "invited": 1,
+    "active": 2,
+    "suspended": 3,
+    "removed": 4,
+}
+
+# How a verified external identity was tied to its member: redeeming an
+# invitation, proving the existing account, or the single-owner upgrade.
+TEAM_IDENTITY_PROVENANCE: dict[str, int] = {
+    "invitation": 1,
+    "account_proof": 2,
+    "migration": 3,
 }
 
 
@@ -420,3 +444,33 @@ def decode_mcp_oauth_token_endpoint_auth(code: int) -> str:
         code,
         field="mcp_registry_services.oauth_token_endpoint_auth",
     )
+
+
+def encode_team_member_role(name: str) -> int:
+    """Encode a ``team_members.role`` name to its int code."""
+    return _encode(TEAM_MEMBER_ROLE, name, field="team_members.role")
+
+
+def decode_team_member_role(code: int) -> str:
+    """Decode a ``team_members.role`` int code to its name."""
+    return _decode(TEAM_MEMBER_ROLE, code, field="team_members.role")
+
+
+def encode_team_member_state(name: str) -> int:
+    """Encode a ``team_members.state`` name to its int code."""
+    return _encode(TEAM_MEMBER_STATE, name, field="team_members.state")
+
+
+def decode_team_member_state(code: int) -> str:
+    """Decode a ``team_members.state`` int code to its name."""
+    return _decode(TEAM_MEMBER_STATE, code, field="team_members.state")
+
+
+def encode_team_identity_provenance(name: str) -> int:
+    """Encode a ``team_identity_bindings.provenance`` name to its int code."""
+    return _encode(TEAM_IDENTITY_PROVENANCE, name, field="team_identity_bindings.provenance")
+
+
+def decode_team_identity_provenance(code: int) -> str:
+    """Decode a ``team_identity_bindings.provenance`` int code to its name."""
+    return _decode(TEAM_IDENTITY_PROVENANCE, code, field="team_identity_bindings.provenance")

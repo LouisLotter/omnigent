@@ -237,12 +237,16 @@ def promote_if_listed(admin_list: AdminList, store: AdminFlagStore, user_id: str
     :param user_id: The just-authenticated identity, e.g.
         ``"alice@example.com"``.
     :returns: ``True`` if this call promoted the user, ``False`` if
-        they were not listed or were already admin.
+        they were not listed, were already admin, or the store kept them
+        non-admin (a removed team member stays so until re-admitted).
     """
     if not admin_list.is_admin(user_id):
         return False
     if store.is_admin(user_id):
         return False
     store.set_admin(user_id, True)
+    if not store.is_admin(user_id):
+        logger.info("admin_list: %s stays non-admin after leaving the team", user_id)
+        return False
     logger.info("admin_list: promoted %s to admin", user_id)
     return True

@@ -55,8 +55,10 @@ from omnigent.runner.transports.ws_tunnel.registry import (
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
+from omnigent.server.principals import Principal, PrincipalKind, record_principal
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
+from omnigent.stores import ConversationStore
 
 _logger = logging.getLogger(__name__)
 
@@ -154,6 +156,29 @@ def _resolve_tunnel_owner(
         # checks work uniformly in single-user mode.
         owner = RESERVED_USER_LOCAL
     return owner
+
+
+def actual_runner_owner(conversation_store: ConversationStore, runner_id: str) -> str | None:
+    """Return the one actual owner of the threads bound to *runner_id*.
+
+    A runner bound to a sub-agent thread acts for that thread's root owner.
+    Shares never qualify, and a thread with no owner grant or several, or
+    bindings that disagree, leave the runner without an owner.
+
+    :param conversation_store: Store holding the runner bindings and grants.
+    :param runner_id: Token-bound runner id from the tunnel handshake.
+    :returns: The owner's user id, or ``None`` when it is absent or ambiguous.
+    """
+    owners = {
+        owner.user_id if owner is not None else None
+        for owner in (
+            conversation_store.get_actual_session_owner(conversation.id)
+            for conversation in conversation_store.list_conversations_by_runner_id(runner_id)
+        )
+    }
+    if len(owners) != 1:
+        return None
+    return owners.pop()
 
 
 def _expected_runner_id_from_headers(
@@ -483,6 +508,7 @@ def create_runner_tunnel_router(
                 # instead of registering an owner-less runner.
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
+        record_principal(ws, Principal(PrincipalKind.RUNNER, tunnel_owner, runner_id=runner_id))
 
         await ws.accept()
         session: RunnerSession | None = None

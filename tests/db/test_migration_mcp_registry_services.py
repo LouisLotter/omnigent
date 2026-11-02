@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
+import pytest
 import sqlalchemy as sa
 from alembic import command
 
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
-from omnigent.db.utils import _build_alembic_config, get_or_create_engine
+from omnigent.db.utils import (
+    _build_alembic_config,
+    _initialize_or_verify_schema,
+    get_or_create_engine,
+)
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 from omnigent.stores.mcp_service_store import (
     SERVICE_PRINCIPAL,
@@ -20,6 +27,13 @@ from tests.server.test_credential_store import _FakeCipher
 
 _PREVIOUS = "c0201a2b3c4d"
 _REVISION = "mr1a2b3c4d5e"
+
+
+@pytest.fixture(autouse=True)
+def _restore_head(db_uri: str) -> Iterator[None]:
+    """Leave the shared database at head; later revisions build on this one."""
+    yield
+    _initialize_or_verify_schema(get_or_create_engine(db_uri), db_uri)
 
 
 def _migrate(engine: sa.Engine, revision: str, *, downgrade: bool = False) -> None:

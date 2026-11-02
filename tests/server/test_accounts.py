@@ -52,6 +52,7 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.server.principals import Principal, PrincipalKind, record_principal
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -418,6 +419,75 @@ def test_runner_token_is_delegated_and_a_login_is_not() -> None:
     )
     assert provider.credential_delegation(both) is None
     assert UnifiedAuthProvider(source="header").credential_delegation(runner) is None
+
+
+@pytest.mark.parametrize(
+    ("claims", "kind"),
+    [
+        ({}, PrincipalKind.HUMAN),
+        ({"delegated": "runner"}, PrincipalKind.RUNNER),
+        ({"grant_id": "login-grant"}, PrincipalKind.HUMAN),
+        ({"grant_id": "device-grant", "scope": "sessions"}, PrincipalKind.DELEGATED_CLIENT),
+        ({"scope": "sessions"}, PrincipalKind.SERVICE),
+    ],
+    ids=["sign-in", "runner", "login-grant", "device-client", "machine-client"],
+)
+def test_authentication_records_who_holds_the_credential(
+    claims: dict[str, str], kind: PrincipalKind
+) -> None:
+    """Every credential shape resolves to its account and to the kind of caller holding it."""
+    import time
+
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+    provider.set_grant_revocation_check(lambda grant_id: False)
+    token = jwt.encode(
+        {"sub": "alice", "exp": int(time.time()) + 60, **claims},
+        _TEST_COOKIE_SECRET,
+        algorithm="HS256",
+    )
+
+    # The second request reads the cached identity for an undelegated sign-in.
+    for _ in range(2):
+        request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+        principal = provider.principal(request)
+        assert principal == Principal(kind, "alice")
+        assert principal.is_human is (kind is PrincipalKind.HUMAN)
+
+
+def test_principal_follows_the_connection_and_clears_on_failed_authentication() -> None:
+    """A tunnel's recorded principal wins; re-authenticating without a credential clears it."""
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+    tunnel = _FakeReq()
+    host = Principal(PrincipalKind.HOST, "alice", host_id="host-1")
+    record_principal(tunnel, host)
+    assert provider.principal(tunnel) == host
+
+    assert provider.get_user_id(tunnel) is None
+    assert provider.principal(tunnel) is None
+    header = UnifiedAuthProvider(source="header", local_single_user=True, header_name="X-User")
+    assert header.principal(_FakeReq(headers={"X-User": "bob@example.com"})) == Principal(
+        PrincipalKind.HUMAN, "bob@example.com"
+    )
+    assert header.principal(_FakeReq()) == Principal(PrincipalKind.HUMAN, "local")
+
+
+def test_custom_provider_principal_comes_from_its_delegation() -> None:
+    """An embedding application's provider gets the human/runner split without extra code."""
+    from omnigent.server.auth import AuthProvider
+
+    class _Provider(AuthProvider):
+        def get_user_id(self, request):
+            return "carol"
+
+        def credential_delegation(self, request):
+            return request.headers.get("X-Delegated")
+
+    provider = _Provider()
+    assert provider.principal(_FakeReq()) == Principal(PrincipalKind.HUMAN, "carol")
+    runner = _FakeReq(headers={"X-Delegated": "runner"})
+    assert provider.principal(runner) == Principal(PrincipalKind.RUNNER, "carol")
+    other = _FakeReq(headers={"X-Delegated": "assistant"})
+    assert provider.principal(other) == Principal(PrincipalKind.DELEGATED_CLIENT, "carol")
 
 
 def test_runner_token_stays_delegated_after_it_expires() -> None:
@@ -1615,7 +1685,7 @@ def test_admin_cannot_delete_self(accounts_app: TestClient) -> None:
 
 
 def test_admin_can_delete_former_admin_when_others_exist(
-    accounts_app: TestClient,
+    accounts_app: TestClient, tmp_path: Path
 ) -> None:
     """The previously-locked bootstrap admin IS deletable when another admin exists.
 
@@ -1640,6 +1710,16 @@ def test_admin_can_delete_former_admin_when_others_exist(
         json={"invite": invite_token, "username": "second", "password": "second-pw-1234"},
     )
 
+    # The bootstrap admin is the team's only owner, so another admin alone is not enough.
+    resp = second.delete("/auth/users/admin")
+    assert resp.status_code == 400, resp.text
+    assert "last active owner" in resp.json()["error"]
+
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
+
+    SqlAlchemyTeamStore(f"sqlite:///{tmp_path}/test.db").add_member(
+        "second", role="owner", state="active"
+    )
     resp = second.delete("/auth/users/admin")
     assert resp.status_code == 204, resp.text
 

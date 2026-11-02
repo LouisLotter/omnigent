@@ -52,6 +52,13 @@ _CODECS = [
         ec.encode_mcp_oauth_token_endpoint_auth,
         ec.decode_mcp_oauth_token_endpoint_auth,
     ),
+    (ec.TEAM_MEMBER_ROLE, ec.encode_team_member_role, ec.decode_team_member_role),
+    (ec.TEAM_MEMBER_STATE, ec.encode_team_member_state, ec.decode_team_member_state),
+    (
+        ec.TEAM_IDENTITY_PROVENANCE,
+        ec.encode_team_identity_provenance,
+        ec.decode_team_identity_provenance,
+    ),
 ]
 
 
@@ -148,3 +155,6 @@ def test_shipped_codes_are_stable() -> None:
         "skipped": 5,
         "starting": 6,
     }
+    assert ec.TEAM_MEMBER_ROLE == {"owner": 1, "admin": 2, "member": 3}
+    assert ec.TEAM_MEMBER_STATE == {"invited": 1, "active": 2, "suspended": 3, "removed": 4}
+    assert ec.TEAM_IDENTITY_PROVENANCE == {"invitation": 1, "account_proof": 2, "migration": 3}

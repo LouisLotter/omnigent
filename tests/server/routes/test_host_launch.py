@@ -14,9 +14,9 @@ import pytest
 from fastapi import HTTPException
 
 from omnigent import debug_logging
+from omnigent.db.account_authority import AccountAuthority
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
     configure_host_sharding,
@@ -56,28 +56,20 @@ class _FakeHostRegistry:
 @dataclass
 class _FakeConversationStore:
     convs: dict[str, Conversation] = field(default_factory=dict)
+    owners: dict[str, str] = field(default_factory=dict)
     reads: list[str] = field(default_factory=list)
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         self.reads.append(conversation_id)
         return self.convs.get(conversation_id)
 
+    def get_actual_session_owner(self, conversation_id: str) -> AccountAuthority | None:
+        owner = self.owners.get(conversation_id)
+        return AccountAuthority(owner, None, 0) if owner is not None else None
 
-@dataclass
+
 class _FakePermissionStore:
-    grants: set[tuple[str, str]] = field(default_factory=set)
-
-    def is_admin(self, user_id: str) -> bool:
-        return False
-
-    def check_access(
-        self,
-        user_id: str | None,
-        conversation_id: str,
-        required_level: int,
-    ) -> bool:
-        assert required_level == LEVEL_OWNER
-        return user_id is not None and (user_id, conversation_id) in self.grants
+    """Present when auth is on; ownership itself comes from the conversation store."""
 
 
 # ── resolve_host_owner ───────────────────────────────────────────────
@@ -186,8 +178,8 @@ class TestResolveHostLaunch:
         )
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry(conns={"host_1": conn})
-        conv_store = _FakeConversationStore()
-        permissions = _FakePermissionStore(grants={("alice", "s1")})
+        conv_store = _FakeConversationStore(owners={"s1": "alice"})
+        permissions = _FakePermissionStore()
 
         result = resolve_host_launch(
             user_id="alice",
@@ -203,7 +195,7 @@ class TestResolveHostLaunch:
         assert result.conv is conv
         assert conv_store.reads == []
 
-        permissions.grants.clear()
+        conv_store.owners.clear()
         with pytest.raises(HTTPException) as exc_info:
             resolve_host_launch(
                 user_id="alice",
@@ -228,7 +220,7 @@ class TestResolveHostLaunch:
             root_conversation_id="s1",
             agent_id="ag_1",
         )
-        permissions = _FakePermissionStore(grants={("alice", "s1")})
+        permissions = _FakePermissionStore()
         debug_logging.reset_request_audit_attrs()
 
         resolve_host_launch(
@@ -237,7 +229,7 @@ class TestResolveHostLaunch:
             session_id="s1",
             host_store=_FakeHostStore(hosts={"host_1": host}),
             host_registry=_FakeHostRegistry(conns={"host_1": object()}),
-            conversation_store=_FakeConversationStore(convs={"s1": conv}),
+            conversation_store=_FakeConversationStore(convs={"s1": conv}, owners={"s1": "alice"}),
             permission_store=permissions,  # type: ignore[arg-type]
         )
 
@@ -254,8 +246,8 @@ class TestResolveHostLaunch:
         )
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry(conns={"host_1": object()})
-        conv_store = _FakeConversationStore()
-        permissions = _FakePermissionStore(grants={("alice", "s1"), ("alice", "s2")})
+        conv_store = _FakeConversationStore(owners={"s1": "alice", "s2": "alice"})
+        permissions = _FakePermissionStore()
 
         with pytest.raises(HTTPException) as exc_info:
             resolve_host_launch(

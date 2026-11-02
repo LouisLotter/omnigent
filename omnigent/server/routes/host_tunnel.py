@@ -83,6 +83,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.principals import Principal, PrincipalKind, record_principal
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import (
     LAUNCH_TOKEN_ONLY_REFUSAL,
@@ -284,6 +285,8 @@ def create_host_tunnel_router(
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
             # (consistent with get_user_id returning None on the HTTP side).
             tunnel_owner = RESERVED_USER_LOCAL
+
+        record_principal(ws, Principal(PrincipalKind.HOST, tunnel_owner, host_id=host_id))
 
         # Attribute debug-log records emitted while servicing this host's tunnel
         # to its owner. This WebSocket handler runs in its own task, so the set

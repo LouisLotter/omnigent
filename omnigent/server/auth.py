@@ -40,6 +40,14 @@ from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
+from omnigent.server.principals import (
+    Principal,
+    PrincipalKind,
+    clear_principal,
+    record_principal,
+    recorded_principal,
+)
+
 logger = logging.getLogger(__name__)
 
 # Opt-in multi-user switch.
@@ -464,6 +472,37 @@ class AuthProvider(ABC):
         """
         return None
 
+    def principal(self, request: HTTPConnection) -> Principal | None:
+        """
+        Return who is behind the request's credential.
+
+        A principal recorded while authenticating wins, such as a runner or
+        host tunnel's. Otherwise an undelegated credential is the person's
+        own and a runner-delegated one is a runner.
+
+        :param request: The incoming HTTP request or WebSocket handshake.
+        :returns: The principal, or ``None`` when unauthenticated.
+        """
+        principal = recorded_principal(request)
+        if principal is not None:
+            return principal
+        user_id = self.get_user_id(request)
+        if user_id is None:
+            return None
+        principal = recorded_principal(request)
+        if principal is not None:
+            return principal
+        return Principal(_delegated_kind(self.credential_delegation(request)), user_id)
+
+
+def _delegated_kind(delegation: object) -> PrincipalKind:
+    """Map a credential's ``delegated`` claim to the kind of caller holding it."""
+    if delegation is None:
+        return PrincipalKind.HUMAN
+    if delegation == RUNNER_DELEGATION:
+        return PrincipalKind.RUNNER
+    return PrincipalKind.DELEGATED_CLIENT
+
 
 _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
 
@@ -638,6 +677,7 @@ class UnifiedAuthProvider(AuthProvider):
             if identity.user_id is not None and identity.generation is not None:
                 bind_account_authority(identity.user_id, identity.generation)
             return identity.user_id
+        clear_principal(request)
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
@@ -755,6 +795,8 @@ class UnifiedAuthProvider(AuthProvider):
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
         if self._account_check is None and cached is not None and cached[1] > time.monotonic():
+            # Only a person's own undelegated sign-in is ever cached.
+            record_principal(request, Principal(PrincipalKind.HUMAN, cached[0]))
             return cached[0]
 
         try:
@@ -814,6 +856,14 @@ class UnifiedAuthProvider(AuthProvider):
             # replaced, so it keeps that authority (revocable via ``grant_id``).
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
+            if scope is None:
+                # A first-party login grant renews the person's own session.
+                kind = _delegated_kind(delegation)
+            else:
+                kind = (
+                    PrincipalKind.SERVICE if grant_id is None else PrincipalKind.DELEGATED_CLIENT
+                )
+            record_principal(request, Principal(kind, user_id))
             return user_id
 
         if self._account_check is None and delegation is None:
@@ -821,6 +871,7 @@ class UnifiedAuthProvider(AuthProvider):
             if remaining > 0:
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
 
+        record_principal(request, Principal(_delegated_kind(delegation), user_id))
         return user_id
 
     def _check_header(self, request: HTTPConnection) -> str | None:
@@ -863,8 +914,10 @@ class UnifiedAuthProvider(AuthProvider):
                 email = email.removeprefix(self._header_strip_prefix)
             if not email or email in _RESERVED_USERS:
                 return None
+            record_principal(request, Principal(PrincipalKind.HUMAN, email))
             return email
         if self._local_single_user:
+            record_principal(request, Principal(PrincipalKind.HUMAN, RESERVED_USER_LOCAL))
             return RESERVED_USER_LOCAL
         return None
 

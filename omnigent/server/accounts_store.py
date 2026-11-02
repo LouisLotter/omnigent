@@ -51,6 +51,13 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.stores.team_store import (
+    admin_flag_for_account,
+    carry_membership_registration,
+    claim_founding_owner,
+    lock_team,
+    retire_deleted_account_membership,
+)
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
@@ -159,8 +166,10 @@ def _carry_registration_work(session: Session, user_id: str, *, old: str, new: s
     to the registration, so they keep working; grants and magic links stay revoked.
     Like :func:`_revoke_durable_authority`, this updates every row the user owns in
     one transaction, which only accounts mode does, and only on a password change.
+    Team memberships move too, so a removal keeps applying to the registration.
     """
     workspace_id = current_workspace_id()
+    carry_membership_registration(session, user_id, old=old, new=new)
     session.execute(
         update(SqlScheduledTask)
         .where(
@@ -237,6 +246,7 @@ class SqlAlchemyAccountStore:
         password_hash: str,
         *,
         is_admin: bool = False,
+        team_owner: bool = False,
     ) -> Account:
         """Insert a user row with a password hash.
 
@@ -252,12 +262,16 @@ class SqlAlchemyAccountStore:
             crosses this boundary.
         :param is_admin: Admin flag at creation. Defaults False;
             the first-boot admin bootstrap passes True.
+        :param team_owner: Make the account the team's active owner when the
+            team has no members yet; the first-admin claim passes True.
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
         """
         now = int(time.time())
 
         def write(session: Session) -> Account:
+            if team_owner:
+                lock_team(session)
             existing = lock_account(session, user_id)
             if existing is not None and existing.deleted_at is None:
                 raise ValueError(f"user {user_id!r} already exists")
@@ -277,6 +291,8 @@ class SqlAlchemyAccountStore:
                 # as the same ValueError the SELECT path raises so
                 # callers handle uniqueness violation in one place.
                 raise ValueError(f"user {user_id!r} already exists") from exc
+            if team_owner:
+                claim_founding_owner(session, user_id)
             return _to_account(row)
 
         return run_write_transaction(self._session_immediate, "create_user_with_password", write)
@@ -370,19 +386,24 @@ class SqlAlchemyAccountStore:
         only ever promotes (passes ``True``). No-op if the row is
         missing (the login path ensures it first).
 
+        A team member's role follows the flag; see
+        :func:`omnigent.stores.team_store.admin_flag_for_account`.
+
         :param user_id: The username to update, e.g. ``"alice"``.
         :param is_admin: The flag value to set.
         """
 
         def write(session: Session) -> None:
+            lock_team(session)
             require_active_account(session, user_id)
+            flag = admin_flag_for_account(session, user_id, is_admin)
             session.execute(
                 update(SqlUser)
                 .where(
                     SqlUser.workspace_id == current_workspace_id(),
                     SqlUser.id == user_id,
                 )
-                .values(is_admin=is_admin)
+                .values(is_admin=flag)
             )
 
         run_write_transaction(self._session_immediate, "set_user_admin_status", write)
@@ -478,14 +499,18 @@ class SqlAlchemyAccountStore:
         JWT authentication checks the stored generation and tombstone on every
         request, including requests reaching another server replica.
 
+        The account's team membership is removed in the same transaction, so
+        the username can later register again only as a new member.
+
         :returns: ``True`` if deleted, ``False`` if refused because
-            ``user_id`` is the last remaining admin, ``None`` if no such
-            user exists.
+            ``user_id`` is the last remaining admin or the team's last active
+            owner, ``None`` if no such user exists.
         """
 
         def write(session: Session) -> bool | None:
-            # Acquire the complete lock set in username order, including the
-            # actor and target, before checking the last-admin invariant.
+            # The team lock comes first, then the complete account lock set in
+            # username order, before checking the last-admin and last-owner rules.
+            lock_team(session)
             actor = current_account_user()
             include = (user_id, actor) if actor is not None else (user_id,)
             admin_ids = self._locked_admin_ids(session, include=include)
@@ -497,6 +522,8 @@ class SqlAlchemyAccountStore:
                 other_admins = [uid for uid in admin_ids if uid != user_id]
                 if not other_admins:
                     return False
+            if not retire_deleted_account_membership(session, user_id):
+                return False
             session.execute(
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
@@ -578,6 +605,10 @@ class SqlAlchemyAccountStore:
                 new_generation = uuid.uuid4().hex
                 if generation is not None:
                     _carry_registration_work(session, user_id, old=generation, new=new_generation)
+                else:
+                    # A passwordless identity first receiving credentials stays the same
+                    # registration for its team membership.
+                    carry_membership_registration(session, user_id, old=None, new=new_generation)
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(

@@ -382,3 +382,68 @@ def test_login_unlisted_user_stays_member_end_to_end(
     assert resp.status_code == 200
     assert resp.json()["user"]["is_admin"] is False
     assert account_store.is_admin("erin") is False
+
+
+# ── A removed team member is not restored by the roster ───────────
+
+
+def test_login_roster_does_not_restore_a_removed_members_admin(
+    accounts_router_client: tuple[TestClient, SqlAlchemyAccountStore, Path], db_uri: str
+) -> None:
+    """Removal survives roster logins and password rotation until the team re-admits.
+
+    A deleted and re-registered username is a new registration the roster
+    may promote as before.
+    """
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
+
+    client, account_store, admins_file = accounts_router_client
+    teams = SqlAlchemyTeamStore(db_uri)
+    account_store.create_user_with_password(
+        "owner", hash_password("password123"), is_admin=True, team_owner=True
+    )
+    account_store.create_user_with_password("dave", hash_password("password123"))
+    dave = teams.add_member("dave", role="admin", state="active")
+    teams.change_state(dave.id, "removed")
+    admins_file.write_text("dave\n")
+
+    def login() -> bool:
+        resp = client.post("/auth/login", json={"username": "dave", "password": "password123"})
+        assert resp.status_code == 200, resp.text
+        return resp.json()["user"]["is_admin"]
+
+    assert login() is False
+    assert account_store.is_admin("dave") is False
+    account_store.update_password("dave", hash_password("password123"), revoke_sessions=True)
+    assert login() is False
+
+    teams.add_member("dave", role="member", state="active")
+    assert login() is True
+    assert teams.get_member_for_account("dave").role == "admin"
+
+    teams.change_state(teams.get_member_for_account("dave").id, "removed")
+    assert account_store.delete_user("dave") is True
+    account_store.create_user_with_password("dave", hash_password("password123"))
+    assert login() is True
+
+
+def test_oidc_roster_does_not_restore_a_removed_members_admin(tmp_path: Path, db_uri: str) -> None:
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
+
+    store = SqlAlchemyPermissionStore(db_uri)
+    teams = SqlAlchemyTeamStore(db_uri)
+    SqlAlchemyAccountStore(db_uri).create_user_with_password(
+        "owner", "hash", is_admin=True, team_owner=True
+    )
+    store.ensure_user("alice@example.com")
+    alice = teams.add_member("alice@example.com", role="admin", state="active")
+    teams.change_state(alice.id, "removed")
+    f = tmp_path / "admins"
+    f.write_text("alice@example.com\nnew@example.com\n")
+    admin_list = AdminList(f)
+
+    assert promote_if_listed(admin_list, store, "alice@example.com") is False
+    assert store.is_admin("alice@example.com") is False
+    # An identity that never joined the team keeps roster promotion.
+    store.ensure_user("new@example.com")
+    assert promote_if_listed(admin_list, store, "new@example.com") is True
