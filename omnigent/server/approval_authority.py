@@ -592,7 +592,8 @@ async def gate_approval_answer(
     ordinary checks.
 
     :raises OmnigentError: ``FORBIDDEN`` for a credential that may not
-        answer or an answerer who is not an approver; ``NOT_FOUND`` when they
+        answer, an answerer who is not an approver, or an answer posted
+        through another thread than the one that asked; ``NOT_FOUND`` when they
         cannot see the thread either; ``CONFLICT`` when the approval was
         already decided, expired, or its thread changed owner.
     """
@@ -600,8 +601,15 @@ async def gate_approval_answer(
     if store is None or not isinstance(elicitation_id, str) or not elicitation_id:
         return AnswerGate(False)
     record = await asyncio.to_thread(store.get_verdict, elicitation_id)
-    if record is None or record.session_id != session_id:
+    if record is None:
         return AnswerGate(False)
+    if record.session_id != session_id:
+        # A runner resolves approvals by id alone; an answer posted through
+        # another thread would reach it without these checks.
+        raise OmnigentError(
+            "This approval belongs to another thread; answer it there.",
+            code=ErrorCode.FORBIDDEN,
+        )
     problem = answer_credential_problem(request, auth_provider)
     if problem is not None:
         raise OmnigentError(problem, code=ErrorCode.FORBIDDEN)

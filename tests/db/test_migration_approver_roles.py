@@ -108,14 +108,16 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
     """MySQL and CockroachDB commit each table; a retried upgrade creates the rest."""
     _migrate(engine, _PREVIOUS, downgrade=True)
     _migrate(engine, _REVISION)
-    with engine.begin() as connection:
-        for table in ("approval_verdicts", "protected_policies"):
-            connection.execute(sa.text(f"DROP TABLE {table}"))
-        suffix = " ON approver_grants" if engine.dialect.name == "mysql" else ""
-        connection.execute(sa.text("DROP INDEX ix_approver_grants_approver" + suffix))
-        connection.execute(
-            sa.text("UPDATE alembic_version SET version_num = :rev"), {"rev": _PREVIOUS}
-        )
+    suffix = " ON approver_grants" if engine.dialect.name == "mysql" else ""
+    # One statement per transaction: CockroachDB refuses multi-statement DDL here.
+    for statement, parameters in (
+        ("DROP TABLE approval_verdicts", {}),
+        ("DROP TABLE protected_policies", {}),
+        ("DROP INDEX ix_approver_grants_approver" + suffix, {}),
+        ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
+    ):
+        with engine.begin() as connection:
+            connection.execute(sa.text(statement), parameters)
     engine.dispose()
 
     _migrate(engine, _REVISION)

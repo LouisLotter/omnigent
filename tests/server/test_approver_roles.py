@@ -213,6 +213,30 @@ def test_a_tunnelled_answer_is_refused(team) -> None:
     assert _state(team, elicitation_id) is VerdictState.PENDING
 
 
+def test_an_approval_is_answered_only_on_the_thread_that_asked(team) -> None:
+    """Posting another thread's approval id through one's own thread changes nothing."""
+    from tests.server.test_account_revocation import create_session
+
+    session_id = team["session"]
+    elicitation_id, retry = _ask(team["runner"], session_id)
+    other = create_session(team["alice"]).json()["session_id"]
+
+    for route in ("resolve", "event"):
+        if route == "resolve":
+            answered = _answer(team["alice"], other, elicitation_id)
+        else:
+            answered = team["alice"].post(
+                f"/v1/sessions/{other}/events",
+                json={
+                    "type": "approval",
+                    "data": {"elicitation_id": elicitation_id, "action": "accept"},
+                },
+            )
+        assert answered.status_code == 403, answered.text
+    assert _state(team, elicitation_id) is VerdictState.PENDING
+    assert "error" in _tools_call(team["runner"], session_id, **retry)
+
+
 def test_an_administrator_or_editor_is_not_an_approver_unless_named(team) -> None:
     """D52/D53: thread access is not approval; naming someone makes them an approver."""
     session_id = team["session"]
