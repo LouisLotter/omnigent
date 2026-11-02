@@ -418,6 +418,133 @@ class SqlAccountToken(OmnigentBase):
     )
 
 
+def external_identity_cksum(issuer: str, subject: str) -> bytes:
+    """Return the 32-byte key for an external identity's ``(issuer, subject)``.
+
+    A NUL separates the parts so no other split of the same text collides.
+    Readers still compare the stored issuer and subject.
+    """
+    return hashlib.sha256(f"{issuer}\x00{subject}".encode()).digest()
+
+
+class SqlTeam(OmnigentBase):
+    """
+    SQLAlchemy model for the ``teams`` table.
+
+    One row per workspace: an installation has exactly one team, so the
+    workspace id alone is the key.
+
+    :param id: Stable team id stored as 16 raw bytes (see :class:`Uuid16`).
+    :param name: Display name, or ``NULL`` when unnamed.
+    :param created_at: Unix epoch seconds when the team was created.
+    """
+
+    __tablename__ = "teams"
+
+    # The workspace's own id, never generated: a lone integer key would otherwise
+    # become AUTO_INCREMENT on MySQL and a sequence on PostgreSQL.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        autoincrement=False,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class SqlTeamMember(OmnigentBase):
+    """
+    SQLAlchemy model for the ``team_members`` table.
+
+    Maps one account registration to a membership with a role and a state.
+    A removed membership stays for history; the same username registering
+    again gets a new row and a new member id.
+
+    :param id: Stable member id stored as 16 raw bytes (see :class:`Uuid16`).
+    :param user_id: The account (``users.id``) the membership maps to.
+    :param current_user_id: ``user_id`` until the membership is removed, then
+        ``NULL``; its unique index allows one current membership per account.
+    :param role: Int code (see ``omnigent.db.enum_codecs.TEAM_MEMBER_ROLE``).
+    :param state: Int code (see ``omnigent.db.enum_codecs.TEAM_MEMBER_STATE``).
+    :param created_at: Unix epoch seconds when the membership was created.
+    :param updated_at: Unix epoch seconds of the last role or state change.
+    """
+
+    __tablename__ = "team_members"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    current_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    role: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("role IN (1, 2, 3)", name="ck_team_members_role"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_team_members_state"),
+        CheckConstraint(
+            "(state = 4 AND current_user_id IS NULL) "
+            "OR (state <> 4 AND current_user_id = user_id)",
+            name="ck_team_members_current_user",
+        ),
+        UniqueConstraint("workspace_id", "current_user_id", name="uq_team_members_current_user"),
+        # The last-active-owner check reads one other active owner.
+        Index("ix_team_members_role_state", "workspace_id", "role", "state", "id"),
+    )
+
+
+class SqlTeamIdentityBinding(OmnigentBase):
+    """
+    SQLAlchemy model for the ``team_identity_bindings`` table.
+
+    Ties a verified external identity to one member. The key is a digest of
+    ``(issuer, subject)``, so an identity binds at most once per workspace
+    and concurrent binds of it meet on the primary key.
+
+    :param identity_cksum: :func:`external_identity_cksum` of the identity.
+    :param issuer: The identity provider's issuer.
+    :param subject: The provider's stable subject for the person.
+    :param audience: The audience its assertions must carry.
+    :param member_id: The bound member (relates to ``team_members.id``).
+    :param provenance: Int code (see
+        ``omnigent.db.enum_codecs.TEAM_IDENTITY_PROVENANCE``).
+    :param bound_by_member_id: The member who completed the binding, or
+        ``NULL`` when the system bound it.
+    :param created_at: Unix epoch seconds when the binding was created.
+    """
+
+    __tablename__ = "team_identity_bindings"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    identity_cksum: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    audience: Mapped[str] = mapped_column(String(255), nullable=False)
+    member_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    provenance: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    bound_by_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("provenance IN (1, 2, 3)", name="ck_team_identity_bindings_provenance"),
+        Index(
+            "ix_team_identity_bindings_member",
+            "workspace_id",
+            "member_id",
+            "identity_cksum",
+        ),
+    )
+
+
 class SqlConnection(OmnigentBase):
     """
     SQLAlchemy model for the ``connections`` table.
