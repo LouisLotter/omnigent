@@ -1938,10 +1938,9 @@ class SessionResourceRegistry:
                     terminal_name,
                     session_key,
                 )
-            else:
-                current = self._terminal_registry.get(session_id, terminal_name, session_key)
-                if current is not None and instance is not None and current is not instance:
-                    superseded_by = current
+            current = self._terminal_registry.get(session_id, terminal_name, session_key)
+            if current is not None and instance is not None and current is not instance:
+                superseded_by = current
 
         # A replaced launch must not consume its successor's status memo.
         session_status_before_exit = (
