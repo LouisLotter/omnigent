@@ -260,6 +260,7 @@ import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import {
   compactModelTriggerLabel,
   formatStatusModelLabel,
+  effortSummaryRows,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
   nativeModelTooltip,
@@ -5000,6 +5001,7 @@ function SessionHarnessPicker({
     effectiveModel,
     modelLabel: modelSummary,
     costRoutingEligible,
+    nativeHarness: nativeAgent !== undefined,
   });
   const configurable = hasSessionConfig({
     showModels,
@@ -5399,6 +5401,7 @@ function useSessionConfigSummary({
   effectiveModel,
   modelLabel,
   costRoutingEligible,
+  nativeHarness,
 }: {
   harnessLabel: string | null;
   showModels: boolean;
@@ -5407,8 +5410,10 @@ function useSessionConfigSummary({
   effectiveModel: string | null;
   modelLabel: string | null;
   costRoutingEligible: boolean;
+  nativeHarness: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useSessionEffort();
+  const requestedEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const reportedEffort = useChatStore((s) => s.sessionReportedReasoningEffort);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
@@ -5423,8 +5428,7 @@ function useSessionConfigSummary({
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
-    const effortValue = formatStatusEffortLabel(selectedEffort);
-    if (effortValue) rows.push({ label: "Effort", value: effortValue });
+    rows.push(...effortSummaryRows(reportedEffort, requestedEffort, harnessLabel, nativeHarness));
   }
   if (!routingOn) {
     const source =
@@ -5436,13 +5440,14 @@ function useSessionConfigSummary({
 }
 
 /**
- * The effort this conversation is actually at.
+ * The effort this conversation is actually at: the harness's report when it
+ * sent one, else the requested effort.
  *
- * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
- * different efforts each read their own.
+ * Both are conversation-scoped, so two live conversations at different efforts
+ * each read their own.
  */
 function useSessionEffort(): string | null {
-  return useChatStore((s) => s.sessionReasoningEffort);
+  return useChatStore((s) => s.sessionReportedReasoningEffort ?? s.sessionReasoningEffort);
 }
 
 /**

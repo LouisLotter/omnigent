@@ -231,6 +231,31 @@ def test_normalize_status_payload_keeps_a_short_claude_code_version(
     assert record.get("claude_code_version") == (version if kept else None)
 
 
+@pytest.mark.parametrize(
+    ("effort", "recorded"),
+    [
+        ({"level": "xhigh"}, "xhigh"),
+        ({"level": " High "}, "high"),
+        ({"level": ""}, None),
+        ({"level": 3}, None),
+        ("xhigh", None),
+        (None, None),
+    ],
+)
+def test_normalize_status_payload_records_the_reported_effort(
+    effort: object, recorded: str | None
+) -> None:
+    """Claude Code's ``effort.level`` is recorded; any other shape means not reported."""
+    from omnigent.harnesses.claude_native.status import normalize_status_payload
+
+    payload: dict[str, object] = {"context_window": {"context_window_size": 200_000}}
+    if effort is not None:
+        payload["effort"] = effort
+    record = normalize_status_payload(payload)
+    assert record is not None
+    assert record.get("effort") == recorded
+
+
 def test_sync_raw_status_context_normalizes_and_retries(tmp_path: Path) -> None:
     """The forwarder-side sync normalizes raw captures and tolerates junk.
 

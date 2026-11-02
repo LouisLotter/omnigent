@@ -265,6 +265,7 @@ def _to_conversation(
             else None
         ),
         reported_model=overrides["reported_model"],
+        reported_reasoning_effort=overrides["reported_reasoning_effort"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
@@ -3568,6 +3569,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        reported_reasoning_effort: str | None = None,
+        _unset_reported_reasoning_effort: bool = False,
     ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
@@ -3588,6 +3591,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             session is actually on, verbatim, e.g.
             ``"claude-opus-4-8[1m]"``. ``None`` leaves unchanged.
             No ``_unset`` variant — reports only ever move forward.
+        :param reported_reasoning_effort: The effort the harness last
+            reported, e.g. ``"xhigh"``. ``None`` leaves unchanged.
+        :param _unset_reported_reasoning_effort: When ``True``, clear
+            ``reported_reasoning_effort`` (the harness reported no effort).
         :param cost_control_mode_override: Per-session cost-control
             switch, ``"on"`` or ``"off"``. ``None`` leaves unchanged.
         :param _unset_cost_control_mode_override: When ``True``, clear
@@ -3663,6 +3670,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             if reported_model is not None:
                 overrides["reported_model"] = reported_model
+                overrides_changed = True
+            if _unset_reported_reasoning_effort:
+                overrides["reported_reasoning_effort"] = None
+                overrides_changed = True
+            elif reported_reasoning_effort is not None:
+                overrides["reported_reasoning_effort"] = reported_reasoning_effort
                 overrides_changed = True
             if _unset_cost_control_mode_override:
                 overrides["cost_control_mode_override"] = None
@@ -3781,6 +3794,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        reported_reasoning_effort: str | None = None,
+        _unset_reported_reasoning_effort: bool = False,
     ) -> Conversation | None:
         """Update a conversation, preserving the legacy return contract."""
         result = self.update_conversation_with_changes(
@@ -3800,6 +3815,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             terminal_launch_args=terminal_launch_args,
             archived=archived,
             reported_model=reported_model,
+            reported_reasoning_effort=reported_reasoning_effort,
+            _unset_reported_reasoning_effort=_unset_reported_reasoning_effort,
         )
         return result.conversation if result is not None else None
 

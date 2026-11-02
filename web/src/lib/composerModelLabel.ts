@@ -85,6 +85,36 @@ export function formatStatusEffortLabel(effort: string | null): string | null {
 }
 
 /**
+ * Hover-summary rows for a session's effort. The harness's report wins over the
+ * request; a native harness with neither shows "Unknown" rather than a guess.
+ *
+ * @param reported - Effort the harness reports it runs at, or ``null``.
+ * @param requested - The session's requested effort, or ``null``.
+ * @param harnessLabel - Harness display name for the source row, e.g. ``"Claude Code"``.
+ * @param native - Whether a native CLI owns the effort when none is requested.
+ * @returns Rows such as ``Effort: xHigh`` and ``Effort source: Reported by Claude Code``.
+ */
+export function effortSummaryRows(
+  reported: string | null,
+  requested: string | null,
+  harnessLabel: string | null,
+  native: boolean,
+): { label: string; value: string }[] {
+  if (reported) {
+    const rows = [
+      { label: "Effort", value: normalizeEffortLabel(reported) },
+      { label: "Effort source", value: `Reported by ${harnessLabel ?? "the harness"}` },
+    ];
+    if (requested && requested !== reported) {
+      rows.push({ label: "Requested effort", value: normalizeEffortLabel(requested) });
+    }
+    return rows;
+  }
+  if (requested) return [{ label: "Effort", value: normalizeEffortLabel(requested) }];
+  return native ? [{ label: "Effort", value: "Unknown" }] : [];
+}
+
+/**
  * Compose the current model and effort for the composer status tray.
  *
  * @param model - Model override or bound model id.

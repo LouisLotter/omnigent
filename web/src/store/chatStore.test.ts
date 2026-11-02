@@ -8871,6 +8871,30 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.reported_reasoning_effort", () => {
+    it("records the harness's report without touching the requested effort", () => {
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        sessionReasoningEffort: "high",
+        sessionReportedReasoningEffort: null,
+      });
+      handleSessionEvent({
+        type: "session_reported_reasoning_effort",
+        conversationId: "conv_abc",
+        reportedReasoningEffort: "xhigh",
+      });
+      expect(useChatStore.getState().sessionReportedReasoningEffort).toBe("xhigh");
+      expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+
+      handleSessionEvent({
+        type: "session_reported_reasoning_effort",
+        conversationId: "conv_abc",
+        reportedReasoningEffort: null,
+      });
+      expect(useChatStore.getState().sessionReportedReasoningEffort).toBeNull();
+    });
+  });
+
   describe("session.collaboration_mode", () => {
     it("reflects a collaboration-mode event for the active session", () => {
       useChatStore.setState({ conversationId: "conv_abc", codexPlanMode: false });

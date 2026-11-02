@@ -177,6 +177,8 @@ interface SessionResponseWire {
   // optional so we read it forward-compatibly when added.
   queued_items?: SessionEventInput[];
   reasoning_effort?: string | null;
+  /** Effort the harness reports it runs at; ``null`` when unknown. */
+  reported_reasoning_effort?: string | null;
   llm_model?: string | null;
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
@@ -350,6 +352,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
     reasoningEffort: wire.reasoning_effort,
+    reportedReasoningEffort: wire.reported_reasoning_effort,
     llmModel: wire.llm_model,
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,

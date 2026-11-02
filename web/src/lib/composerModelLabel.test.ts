@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   compactModelTriggerLabel,
   defaultModelLabel,
+  effortSummaryRows,
   formatModelEffortStatusLabel,
   formatStatusEffortLabel,
   formatStatusModelLabel,
@@ -168,5 +169,29 @@ describe("effort labels", () => {
       displayName: "Team model",
     };
     expect(formatModelEffortStatusLabel(row.model, "xhigh", [row])).toBe("Team model xHigh");
+  });
+});
+
+describe("effortSummaryRows", () => {
+  it("shows the reported effort, its source and a differing request", () => {
+    expect(effortSummaryRows("xhigh", "high", "Claude Code", true)).toEqual([
+      { label: "Effort", value: "xHigh" },
+      { label: "Effort source", value: "Reported by Claude Code" },
+      { label: "Requested effort", value: "High" },
+    ]);
+    expect(effortSummaryRows("xhigh", "xhigh", null, true)).toEqual([
+      { label: "Effort", value: "xHigh" },
+      { label: "Effort source", value: "Reported by the harness" },
+    ]);
+  });
+
+  it("falls back to the request, then to Unknown only for native harnesses", () => {
+    expect(effortSummaryRows(null, "medium", "Claude Code", true)).toEqual([
+      { label: "Effort", value: "Medium" },
+    ]);
+    expect(effortSummaryRows(null, null, "Claude Code", true)).toEqual([
+      { label: "Effort", value: "Unknown" },
+    ]);
+    expect(effortSummaryRows(null, null, "Claude SDK", false)).toEqual([]);
   });
 });

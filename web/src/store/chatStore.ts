@@ -790,15 +790,22 @@ export interface ConversationState {
    */
   sessionModelOverride: string | null;
   /**
-   * This session's effective reasoning effort from the server's persisted
+   * This session's requested reasoning effort from the server's persisted
    * ``reasoning_effort``. ``null`` when the harness has no effort control or
-   * none is set.
+   * none is set. Native harnesses that report their own effort fill
+   * ``sessionReportedReasoningEffort``, which the composer displays first.
    *
    * Conversation-scoped for the same reason as ``sessionModelOverride``: two
    * live conversations can sit at different efforts, and a warm switch back
    * re-projects this rather than re-binding.
    */
   sessionReasoningEffort: string | null;
+  /**
+   * The effort the harness reports this session actually runs at, e.g.
+   * ``"xhigh"`` from Claude Code's statusLine. ``null`` when unknown. Display
+   * state only: picks still write ``sessionReasoningEffort``.
+   */
+  sessionReportedReasoningEffort: string | null;
   sessionModelSeeded: boolean;
   /**
    * Selected host id seeded at optimistic create, so the temp composer can run
@@ -2114,6 +2121,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationLoadError: null,
   sessionModelOverride: null,
   sessionReasoningEffort: null,
+  sessionReportedReasoningEffort: null,
   sessionModelSeeded: false,
   sessionHostId: null,
   costControlModeOverride: null,
@@ -5078,6 +5086,7 @@ async function bindStream(
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
+        sessionReportedReasoningEffort: session.reportedReasoningEffort ?? null,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd:
           state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
@@ -8188,6 +8197,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // wrong until a refresh.
       applyToNamedConversation(event.conversationId, {
         sessionReasoningEffort: event.reasoningEffort,
+      });
+      return;
+    case "session_reported_reasoning_effort":
+      // The harness's own report of the effort it runs at; display state only.
+      applyToNamedConversation(event.conversationId, {
+        sessionReportedReasoningEffort: event.reportedReasoningEffort,
       });
       return;
     case "session_permission_mode":

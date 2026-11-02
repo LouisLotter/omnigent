@@ -77,7 +77,7 @@ from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
 )
-from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES, EFFORT_VALUES
 from omnigent.version import VERSION
 
 _FORWARDER_STATE_FILE = "transcript_forwarder.json"
@@ -883,6 +883,10 @@ class _ForwardDedupeState:
     posted_model: str | None = None
     observed_title: str | None = None
     posted_title: str | None = None
+    # Last effort POSTed as ``external_reasoning_effort_report`` (``None`` =
+    # unknown). The first statusLine read always posts, to replace a stale record.
+    posted_reported_effort: str | None = None
+    reported_effort_posted: bool = False
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -6450,7 +6454,10 @@ async def _forward_model_from_status(
     dedupe: _ForwardDedupeState,
 ) -> None:
     """
-    Report the statusLine's active model to ``reported_model`` each poll.
+    Report the statusLine's active model and effort each poll.
+
+    The model goes to ``reported_model`` and the effort to
+    ``reported_reasoning_effort`` (see :func:`_post_reported_effort_if_new`).
 
     Claude Code rewrites the statusLine stdin on every TUI render — including
     right after an in-pane ``/model`` switch, BEFORE the next turn runs. The
@@ -6481,6 +6488,62 @@ async def _forward_model_from_status(
         dedupe=dedupe,
         model=model.strip() if isinstance(model, str) and model.strip() else None,
     )
+    effort = status_state.get("effort")
+    await _post_reported_effort_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        effort=effort if isinstance(effort, str) and effort in EFFORT_VALUES else None,
+    )
+
+
+async def _post_reported_effort_if_new(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    effort: str | None,
+) -> None:
+    """
+    Report the effort the pane runs at to ``reported_reasoning_effort``, deduped.
+
+    The statusLine is rewritten on every render, so this follows ``/effort``,
+    ``/model`` and launch settings alike. A render without a recognised effort
+    reports ``None`` (unknown) rather than keeping a stale level. Best-effort:
+    a failed POST is retried on the next poll.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param effort: The level the statusLine reported, e.g. ``"xhigh"``, or
+        ``None`` when this render carried no recognised level.
+    """
+    if dedupe.reported_effort_posted and effort == dedupe.posted_reported_effort:
+        return
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_reasoning_effort_report",
+                "data": {"reasoning_effort": effort},
+            },
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        _logger.warning(
+            "Failed to report Claude effort to Omnigent session=%s http_status=%s; "
+            "the effort shown may lag until the next poll",
+            session_id,
+            status,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        # An older server rejects the event type: stop re-posting this value.
+        if status is None or status == 429 or status >= 500:
+            return
+    dedupe.posted_reported_effort = effort
+    dedupe.reported_effort_posted = True
 
 
 async def _post_external_compaction_status(

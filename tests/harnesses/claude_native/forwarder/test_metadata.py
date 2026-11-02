@@ -67,6 +67,49 @@ async def test_forward_model_from_status_posts_the_status_model_verbatim(
 
 
 @pytest.mark.asyncio
+async def test_forward_model_from_status_reports_the_effort_the_pane_runs_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The statusLine effort posts as an ``external_reasoning_effort_report``.
+
+    Repeats are deduped, a render without a known level reports ``None``
+    (unknown) instead of keeping the old level, a 5xx is retried and a 4xx
+    from an older server is not re-posted every poll.
+    """
+    status: dict[str, Any] = {"model": "claude-opus-5-5", "effort": "xhigh"}
+    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _bridge_dir: dict(status))
+    responses = iter([202, 202, 503, 202, 400])
+    effort_posts: list[object] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body["type"] != "external_reasoning_effort_report":
+            return httpx.Response(202, json={})
+        effort_posts.append(body["data"]["reasoning_effort"])
+        return httpx.Response(next(responses), json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def _poll(effort: object) -> None:
+            status["effort"] = effort
+            await forwarder._forward_model_from_status(
+                client, session_id="conv_abc", bridge_dir=tmp_path, dedupe=dedupe
+            )
+
+        for effort in ("xhigh", "xhigh", "turbo", "high", "high", "max", "max"):
+            await _poll(effort)
+
+    # xhigh, then unknown for "turbo", then high fails (503) and is retried,
+    # then max is rejected (400) once and not re-posted.
+    assert effort_posts == ["xhigh", None, "high", "high", "max"]
+    assert dedupe.posted_reported_effort == "max"
+
+
+@pytest.mark.asyncio
 async def test_model_reports_keep_generation_and_context_marker(tmp_path: Path) -> None:
     """
     Reports preserve the generation and the ``[1m]`` marker byte-for-byte.

@@ -8522,6 +8522,63 @@ async def test_post_external_model_change_dedupes_when_unchanged(
     assert [event["type"] for _, event in published] == []
 
 
+async def test_post_external_reasoning_effort_report_records_the_observed_effort(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An effort report lands on ``reported_reasoning_effort`` and never on the request.
+
+    The requested ``reasoning_effort`` relaunches the pane with ``--effort``, so
+    an observation must not overwrite it. A repeat is a no-op, ``null`` clears
+    the report back to unknown, and an unsupported level is rejected.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    events_url = f"/v1/sessions/{session['id']}/events"
+
+    async def _report(effort: object) -> httpx.Response:
+        return await client.post(
+            events_url,
+            json={
+                "type": "external_reasoning_effort_report",
+                "data": {"reasoning_effort": effort},
+            },
+        )
+
+    patch = await client.patch(
+        f"/v1/sessions/{session['id']}", json={"reasoning_effort": "high", "silent": True}
+    )
+    assert patch.status_code == 200, patch.text
+
+    first = await _report("xhigh")
+    assert first.status_code == 202, first.text
+    assert first.json() == {"queued": False}
+    assert [
+        (event["type"], event["conversation_id"], event["reported_reasoning_effort"])
+        for _, event in published
+    ] == [("session.reported_reasoning_effort", session["id"], "xhigh")]
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["reported_reasoning_effort"] == "xhigh"
+    assert snapshot["reasoning_effort"] == "high"
+
+    published.clear()
+    assert (await _report("xhigh")).status_code == 202
+    assert published == []
+
+    assert (await _report(None)).status_code == 202
+    assert [event["reported_reasoning_effort"] for _, event in published] == [None]
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["reported_reasoning_effort"] is None
+    assert snapshot["reasoning_effort"] == "high"
+
+    rejected = await _report("turbo")
+    assert rejected.status_code == 400, rejected.text
+    assert "invalid reasoning_effort" in rejected.text
+
+
 async def test_post_external_model_change_rejects_empty_model(
     client: httpx.AsyncClient,
 ) -> None:

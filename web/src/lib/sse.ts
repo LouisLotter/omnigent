@@ -56,6 +56,7 @@ import type {
   SessionPermissionModeEvent,
   SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
+  SessionReportedReasoningEffortEvent,
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
@@ -676,6 +677,18 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       reasoningEffort,
     } satisfies SessionReasoningEffortEvent;
+  }
+  if (eventType === "session.reported_reasoning_effort") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const reportedReasoningEffort = data.reported_reasoning_effort;
+    if (reportedReasoningEffort !== null && typeof reportedReasoningEffort !== "string")
+      return null;
+    return {
+      type: "session_reported_reasoning_effort",
+      conversationId,
+      reportedReasoningEffort,
+    } satisfies SessionReportedReasoningEffortEvent;
   }
   if (eventType === "session.collaboration_mode") {
     const conversationId = data.conversation_id;

@@ -23,6 +23,7 @@ import type {
   SessionPermissionModeEvent,
   SessionPresenceEvent,
   SessionReasoningEffortEvent,
+  SessionReportedReasoningEffortEvent,
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
@@ -1549,6 +1550,32 @@ describe("session.reasoning_effort (FLAT envelope)", () => {
 
   it("rejects missing effort", () => {
     expect(parse("session.reasoning_effort", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+});
+
+describe("session.reported_reasoning_effort (FLAT envelope)", () => {
+  it.each([["xhigh"], [null]])("lifts the reported effort %s", (effort) => {
+    const events = parse("session.reported_reasoning_effort", {
+      conversation_id: "conv_abc",
+      reported_reasoning_effort: effort,
+    });
+    expect(events).toEqual([
+      {
+        type: "session_reported_reasoning_effort",
+        conversationId: "conv_abc",
+        reportedReasoningEffort: effort,
+      } satisfies SessionReportedReasoningEffortEvent,
+    ]);
+  });
+
+  it("rejects a missing or non-string effort", () => {
+    expect(parse("session.reported_reasoning_effort", { conversation_id: "conv_abc" })).toEqual([]);
+    expect(
+      parse("session.reported_reasoning_effort", {
+        conversation_id: "conv_abc",
+        reported_reasoning_effort: 3,
+      }),
+    ).toEqual([]);
   });
 });
 
