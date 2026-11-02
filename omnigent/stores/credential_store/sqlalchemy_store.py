@@ -12,6 +12,7 @@ sit on top of this. See ``designs/CREDENTIAL_STORE.md``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import secrets
@@ -88,6 +89,12 @@ class SealedSecret:
     provider: str
     account_id: str
     secret_enc: str = field(repr=False)
+
+
+def _revision(secret_enc: str) -> str:
+    """Identity of one stored secret: every write encrypts afresh, so a new login,
+    or a refresh saved by anyone, has a different one."""
+    return hashlib.sha256(secret_enc.encode("utf-8")).hexdigest()
 
 
 def _holds(secret: dict[str, Any], expected: dict[str, str]) -> bool:
@@ -167,8 +174,9 @@ class CredentialStore:
         "Connect") don't 500 on a primary-key violation; the loser retries as an
         update.
 
-        :param precondition: Runs first inside the write transaction and raises to
-            refuse the write, e.g. when the service the secret is for has changed.
+        :param precondition: Runs inside the write transaction, after the account
+            locks, and raises to refuse the write, e.g. when the service the
+            secret is for has changed.
         """
         now = now_epoch()
         workspace_id = current_workspace_id()
@@ -197,9 +205,11 @@ class CredentialStore:
             return row
 
         def initial_write(session: Session) -> ProviderConnection:
+            # Account locks first, then what the precondition locks, then the row:
+            # the order account deletion uses.
+            require_active_account(session, user_id)
             if precondition is not None:
                 precondition(session)
-            require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
@@ -212,9 +222,11 @@ class CredentialStore:
             pass
 
         def conflict_write(session: Session) -> ProviderConnection:
+            # Account locks first, then what the precondition locks, then the row:
+            # the order account deletion uses.
+            require_active_account(session, user_id)
             if precondition is not None:
                 precondition(session)
-            require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
@@ -262,33 +274,6 @@ class CredentialStore:
             row.metadata_json = json.dumps(metadata)
             row.updated_at = now
 
-    def _ciphertext_holding(
-        self,
-        workspace_id: int,
-        user_id: str,
-        provider: str,
-        account_id: str,
-        expected: dict[str, str],
-    ) -> str | None:
-        """The row's ciphertext if its secret holds the *expected* values, else ``None``."""
-        with self._session("check_secret") as session:
-            checked_enc = session.execute(
-                select(SqlConnection.secret_enc).where(
-                    SqlConnection.workspace_id == workspace_id,
-                    SqlConnection.user_id == user_id,
-                    SqlConnection.provider == provider,
-                    SqlConnection.account_id == account_id,
-                )
-            ).scalar_one_or_none()
-        if checked_enc is None:
-            return None
-        context = _enc_context(workspace_id, user_id, provider, account_id)
-        plaintext = self._cipher.decrypt(checked_enc, context=context)
-        secret = _safe_json_obj(plaintext) if plaintext is not None else None
-        if secret is None or not _holds(secret, expected):
-            return None
-        return checked_enc
-
     def update_secret(
         self,
         user_id: str,
@@ -297,7 +282,7 @@ class CredentialStore:
         secret: dict[str, Any],
         metadata: dict[str, Any] | None = None,
         account_id: str = "",
-        if_secret_matches: dict[str, str] | None = None,
+        if_revision: str | None = None,
         precondition: Callable[[Session], None] | None = None,
     ) -> bool:
         """Persist a refreshed secret (and optional metadata) for an existing row.
@@ -308,25 +293,14 @@ class CredentialStore:
         have already spent the old one, so a silently-dropped refresh wedges the
         user until they reconnect — worth surfacing, not swallowing.
 
-        :param if_secret_matches: Write only while the stored secret still holds
-            these values, e.g. the refresh token the refresh started from, so a
-            reconnect or another refresh that replaced the login meanwhile wins.
-        :param precondition: Runs first inside the write transaction and raises to
-            refuse the write, e.g. when the service the secret is for has changed.
+        :param if_revision: Write only while the row still holds the secret the
+            caller read (:meth:`get_with_revision`), compared under the row lock,
+            so a reconnect or another refresh saved meanwhile wins.
+        :param precondition: Runs inside the write transaction, after the account
+            locks and before the row lock, and raises to refuse the write, e.g.
+            when the service the secret is for has changed.
         """
         workspace_id = current_workspace_id()
-        checked_enc = None
-        if if_secret_matches is not None:
-            checked_enc = self._ciphertext_holding(
-                workspace_id, user_id, provider, account_id, if_secret_matches
-            )
-            if checked_enc is None:
-                _logger.warning(
-                    "credential_store: the %s connection changed during a refresh; "
-                    "the refreshed secret was discarded",
-                    provider,
-                )
-                return False
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
         _check_encrypted_size(secret_enc, self._engine.dialect.name)
@@ -334,9 +308,9 @@ class CredentialStore:
         updated_at = now_epoch()
 
         def write(session: Session) -> bool:
+            require_active_account(session, user_id)
             if precondition is not None:
                 precondition(session)
-            require_active_account(session, user_id)
             row = session.execute(
                 select(SqlConnection)
                 .where(
@@ -348,8 +322,10 @@ class CredentialStore:
                 .with_for_update()
                 .execution_options(populate_existing=True)
             ).scalar_one_or_none()
-            # Compared in Python: some databases compare TEXT case-insensitively.
-            if row is None or (checked_enc is not None and row.secret_enc != checked_enc):
+            if row is None or (
+                if_revision is not None
+                and not secrets.compare_digest(_revision(row.secret_enc), if_revision)
+            ):
                 return False
             row.secret_enc = secret_enc
             if metadata_json is not None:
@@ -427,6 +403,22 @@ class CredentialStore:
             return True
 
         return run_write_transaction(self._session_immediate, "merge_metadata", write)
+
+    def get_with_revision(
+        self, user_id: str, provider: str, *, account_id: str = ""
+    ) -> tuple[ProviderConnection | None, str | None]:
+        """The connection with its secret, and the revision of the secret read.
+
+        Pass the revision to :meth:`update_secret` as ``if_revision`` so a write
+        based on this read is refused once the row holds anything else.
+        """
+        with self._session("get_with_revision") as session:
+            row = session.get(
+                SqlConnection, (current_workspace_id(), user_id, provider, account_id)
+            )
+            if row is None:
+                return None, None
+            return self._to_entity(row, with_secret=True), _revision(row.secret_enc)
 
     def get(
         self,

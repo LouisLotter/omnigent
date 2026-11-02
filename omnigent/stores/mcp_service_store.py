@@ -24,6 +24,7 @@ from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db import enum_codecs
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     SqlConnection,
     SqlMcpRegistryService,
@@ -224,6 +225,12 @@ def _stamp(metadata_json: str | None) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _lock_accounts(session: Session) -> None:
+    """Lock the acting account (and the service principal) before the service and its
+    connections: account deletion locks accounts first, then deletes connections."""
+    require_active_account(session, SERVICE_PRINCIPAL)
+
+
 def _confidential(settings: McpServiceSettings) -> bool:
     """Whether the settings' OAuth client authenticates with a client secret."""
     return settings.oauth is not None and settings.oauth.token_endpoint_auth != "none"
@@ -390,6 +397,7 @@ class McpServiceStore:
         now = now_epoch()
 
         def write(session: Session) -> McpServiceRecord:
+            _lock_accounts(session)
             if self._lock(session, service_id) is not None:
                 raise McpServiceConflict(service_id)
             row = SqlMcpRegistryService(
@@ -448,6 +456,7 @@ class McpServiceStore:
         now = now_epoch()
 
         def write(session: Session) -> McpServiceUpdate:
+            _lock_accounts(session)
             row = self._lock(session, service_id)
             if row is None or row.deleted_at is not None:
                 raise McpServiceNotFound(service_id)
@@ -499,6 +508,7 @@ class McpServiceStore:
         now = now_epoch()
 
         def write(session: Session) -> tuple[bool, bool]:
+            _lock_accounts(session)
             row = self._lock(session, service_id)
             if row is None or row.deleted_at is not None:
                 return False, False

@@ -533,8 +533,9 @@ class McpRegistry:
         key = (current_workspace_id(), user_id, service.id)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
-            conn = await asyncio.to_thread(
-                self.store.get, user_id, f"mcp:{service.id}", with_secret=True
+            # The revision read with the login: a refresh is saved only over this one.
+            conn, revision = await asyncio.to_thread(
+                self.store.get_with_revision, user_id, f"mcp:{service.id}"
             )
             if (
                 conn is None
@@ -571,7 +572,7 @@ class McpRegistry:
                         f"mcp:{service.id}",
                         secret=tokens,
                         metadata=self.login_metadata(service, self.metadata(tokens)),
-                        if_secret_matches={"refresh_token": refresh},
+                        if_revision=revision,
                         precondition=self._version_guard(service),
                     )
                 except SecretTooLargeError as exc:

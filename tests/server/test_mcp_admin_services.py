@@ -465,3 +465,66 @@ async def test_validation_errors_never_repeat_a_submitted_secret(local_admin, ca
     for response in responses:
         assert SECRET not in response.text and TOKEN not in response.text, response.text
     assert SECRET not in caplog.text and TOKEN not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_only_json_requests_reach_the_secret_bearing_routes(local_admin):
+    """A cross-site simple request (``text/plain``, no preflight) never changes a service."""
+    import json as jsonlib
+
+    client, registry = local_admin
+    body = jsonlib.dumps(bearer_service(auth="none"))
+    cross_site = {
+        "Origin": "https://untrusted.example",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "no-cors",
+    }
+    for headers in (
+        {**cross_site, "Content-Type": "text/plain"},
+        {**cross_site, "Content-Type": "application/x-www-form-urlencoded"},
+        {},  # no content type at all
+    ):
+        created = await client.post(ADMIN, content=body, headers=headers)
+        assert created.status_code == 415, created.text
+    await registry.refresh(force=True)
+    assert registry.managed_services() == {}
+
+    assert (
+        await client.post(ADMIN, content=body, headers={"Content-Type": "application/json"})
+    ).status_code == 201
+    other = jsonlib.dumps(bearer_service(id="other", auth="bearer"))
+    assert (
+        await client.post(
+            ADMIN, content=other, headers={"Content-Type": "application/vnd.api+json"}
+        )
+    ).status_code == 201
+
+    retitled = jsonlib.dumps(settings_of(bearer_service(auth="none", title="Changed")))
+    refused = await client.put(
+        f"{ADMIN}/tracker", content=retitled, headers={**cross_site, "Content-Type": "text/plain"}
+    )
+    assert refused.status_code == 415
+    token = jsonlib.dumps({"token": "canary-bearer-token"})
+    for headers in ({**cross_site, "Content-Type": "text/plain"}, {}):
+        saved = await client.put(
+            "/v1/mcp-registry/services/other/connection", content=token, headers=headers
+        )
+        assert saved.status_code == 415, saved.text
+    assert registry.store.get("local", member_provider("other")) is None
+    await registry.refresh(force=True)
+    assert registry.managed_services()["tracker"].title == "Tracker"
+
+    assert (
+        await client.put(
+            f"{ADMIN}/tracker",
+            content=retitled,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+    ).status_code == 200
+    assert (
+        await client.put(
+            "/v1/mcp-registry/services/other/connection",
+            content=token,
+            headers={"Content-Type": "application/json"},
+        )
+    ).status_code == 200

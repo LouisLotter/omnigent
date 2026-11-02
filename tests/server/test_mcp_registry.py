@@ -1296,3 +1296,59 @@ async def test_two_server_processes_refreshing_one_login_keep_the_first_result(
         await refreshing
     saved = first.store.get("alice", "mcp:tracker", with_secret=True)
     assert (saved.secret["access_token"], saved.secret["refresh_token"]) == ("fast", "fast-r")
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_keeping_the_same_refresh_token_still_wins(db_uri, monkeypatch):
+    """The refresh is bound to the login it read, not to its refresh token's value."""
+    registry = _managed_registry(db_uri)
+    registry.service_store.create("tracker", _public_oauth_settings(), created_by="admin")
+    service = registry.reload()["tracker"]
+    _expiring_login(registry, service, refresh="same-refresh")
+    # The provider answers without a new refresh token, so the old one is kept.
+    endpoint = _PausedTokenEndpoint({"access_token": "stale-response", "expires_in": 3600})
+    endpoint.install(registry, monkeypatch)
+
+    refreshing = asyncio.create_task(registry.token(service, "alice", None))
+    await endpoint.entered.wait()
+    await asyncio.to_thread(
+        registry.save_login,
+        service,
+        "alice",
+        "mcp:tracker",
+        {"access_token": "reconnected", "refresh_token": "same-refresh"},
+        {"expires_at": None},
+    )
+    endpoint.release.set()
+    with pytest.raises(ConnectionError, match="changed"):
+        await refreshing
+    saved = registry.store.get("alice", "mcp:tracker", with_secret=True)
+    assert saved.secret == {"access_token": "reconnected", "refresh_token": "same-refresh"}
+    assert saved.metadata["expires_at"] is None
+    assert await registry.token(service, "alice", None) == "reconnected"
+
+
+@pytest.mark.asyncio
+async def test_two_processes_refreshing_without_rotation_keep_the_first_result(
+    db_uri, monkeypatch
+):
+    first = _managed_registry(db_uri)
+    first.service_store.create("tracker", _public_oauth_settings(), created_by="admin")
+    service = first.reload()["tracker"]
+    _expiring_login(first, service, refresh="kept")
+    second = _managed_registry(db_uri)
+    second_service = second.reload()["tracker"]
+    slow = _PausedTokenEndpoint({"access_token": "slow", "expires_in": 3600})
+    slow.install(first, monkeypatch)
+    fast = _PausedTokenEndpoint({"access_token": "fast", "expires_in": 3600})
+    fast.release.set()
+    fast.install(second, monkeypatch)
+
+    refreshing = asyncio.create_task(first.token(service, "alice", None))
+    await slow.entered.wait()
+    assert await second.token(second_service, "alice", None) == "fast"
+    slow.release.set()
+    with pytest.raises(ConnectionError, match="changed"):
+        await refreshing
+    saved = first.store.get("alice", "mcp:tracker", with_secret=True)
+    assert (saved.secret["access_token"], saved.secret["refresh_token"]) == ("fast", "kept")

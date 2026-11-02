@@ -14,7 +14,7 @@ import re
 from bisect import bisect_right
 from typing import Any, Literal, TypeVar
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -36,6 +36,7 @@ from omnigent.server.mcp_registry import (
     needs_reconnect,
 )
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes.connections_base import (
     ConnectionError,
     create_connection_router,
@@ -142,7 +143,9 @@ async def _read_body(request: Request, model: type[_Body]) -> _Body:
 
     FastAPI's own 422 response repeats the submitted input, including a client
     secret or a token in a field that failed validation, or in the object around
-    it. These errors keep only each problem's location, type and message.
+    it. These errors keep only each problem's location, type and message. Routes
+    using this also require a JSON content type (``require_json_content_type``),
+    so a cross-site ``text/plain`` simple request never reaches it.
     """
     body = await request.body()
     if len(body) > _MAX_BODY_BYTES:
@@ -272,7 +275,10 @@ def create_mcp_registry_router(
             "next_cursor": page[-1] if start + len(page) < len(ids) else None,
         }
 
-    @router.put("/mcp-registry/services/{service_id}/connection")
+    @router.put(
+        "/mcp-registry/services/{service_id}/connection",
+        dependencies=[Depends(require_json_content_type)],
+    )
     async def connect_token(request: Request, service_id: str) -> dict[str, bool]:
         body = await _read_body(request, ConnectMcpToken)
         entry = await service(request, service_id)
@@ -609,7 +615,11 @@ def _add_admin_routes(
         await require_admin(request)
         return {"data": [preset.model_dump() for preset in registry.config.presets]}
 
-    @router.post("/mcp-registry/admin/services", status_code=201)
+    @router.post(
+        "/mcp-registry/admin/services",
+        status_code=201,
+        dependencies=[Depends(require_json_content_type)],
+    )
     async def admin_create(request: Request) -> dict[str, Any]:
         admin = await require_admin(request)
         body = await _read_body(request, AdminServiceCreate)
@@ -628,7 +638,10 @@ def _add_admin_routes(
             raise HTTPException(400, "Enter the client secret for this client ID") from None
         return await view(body.id)
 
-    @router.put("/mcp-registry/admin/services/{service_id}")
+    @router.put(
+        "/mcp-registry/admin/services/{service_id}",
+        dependencies=[Depends(require_json_content_type)],
+    )
     async def admin_update(request: Request, service_id: str) -> dict[str, Any]:
         await require_admin(request)
         body = await _read_body(request, AdminServiceSettings)
