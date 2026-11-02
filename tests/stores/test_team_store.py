@@ -686,3 +686,55 @@ def test_current_membership_follows_password_rotation(stores) -> None:
     assert teams.member_for_owner(owner).id == owner_id
     assert teams.get_member_for_account("owner").id == owner_id
 
+
+# ── Inventory and registrations ────────────────────────────────────
+
+
+def test_inventory_flags_work_recorded_before_the_account_registered(stores, db_uri: str) -> None:
+    """External-identity hosts and schedules do not pass to a later password account."""
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlHost
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    _founder(stores)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    agent_id = uuid.uuid4().hex
+    external_host = uuid.uuid4().hex
+    stores["hosts"].upsert_on_connect(external_host, "alice-laptop", "alice")
+    external_schedule = uuid.uuid4().hex
+    tasks.create(
+        external_schedule, "x", "p", "FREQ=DAILY", "alice", agent_id, "UTC", host_id=external_host
+    )
+    _account(stores, "alice")
+    stores["teams"].add_member("alice", role="member", state="active")
+    assert stores["hosts"].get_actual_host_owner(external_host) is None
+    # Work recorded under the new registration matches it.
+    current_host = uuid.uuid4().hex
+    stores["hosts"].upsert_on_connect(current_host, "alice-desktop", "alice")
+    tasks.create(
+        uuid.uuid4().hex, "y", "p", "FREQ=DAILY", "alice", agent_id, "UTC", host_id=current_host
+    )
+
+    # A host still carrying another generation belongs to an earlier registration.
+    stale_host = uuid.uuid4().hex
+    stores["hosts"].upsert_on_connect(stale_host, "alice-old", "alice")
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            update(SqlHost)
+            .where(SqlHost.host_id == stale_host)
+            .values(account_generation="0" * 32)
+        )
+
+    inventory = stores["teams"].inventory()
+
+    assert inventory.host_owners == {"alice": 1}
+    assert inventory.schedule_owners == {"alice": 1}
+    assert {(f.resource, f.resource_id, f.reason) for f in inventory.findings} == {
+        ("host", external_host, "missing_registration"),
+        ("host", stale_host, "earlier_registration"),
+        ("schedule", external_schedule, "missing_registration"),
+    }

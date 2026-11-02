@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
+from enum import Enum
 from typing import TypeVar, cast
 
 from sqlalchemy import ColumnElement, Insert, delete, func, select, update
@@ -862,6 +863,15 @@ class SqlAlchemyTeamStore:
             return _Inventory(session, page_size).run()
 
 
+class _NoGeneration(Enum):
+    """Marks a resource type that records no account generation."""
+
+    NONE = "none"
+
+
+_NO_GENERATION = _NoGeneration.NONE
+
+
 class _Inventory:
     """One pass over the workspace's accounts and owned resources."""
 
@@ -898,8 +908,16 @@ class _Inventory:
             OwnershipFinding(resource, resource_id, reason, tuple(sorted(owners)))
         )
 
-    def _owner_problem(self, user_id: str | None, generation: str | None = None) -> str | None:
-        """Classify a recorded owner; ``None`` means a live registration."""
+    def _owner_problem(
+        self, user_id: str | None, generation: str | _NoGeneration | None = _NO_GENERATION
+    ) -> str | None:
+        """Classify a recorded owner; ``None`` means a live registration.
+
+        *generation* is the registration a host or schedule recorded, possibly
+        ``None``; other resources record none and pass nothing. Once the
+        account has a generation, a missing or different one belongs to
+        another registration of the same username.
+        """
         if user_id is None:
             return "no_owner"
         if user_id == RESERVED_USER_LOCAL:
@@ -907,9 +925,11 @@ class _Inventory:
         if user_id not in self._generations:
             return "unknown_owner"
         current = self._generations[user_id]
-        if generation is not None and current is not None and generation != current:
-            return "earlier_registration"
-        return None
+        if isinstance(generation, _NoGeneration) or current is None:
+            return None
+        if generation is None:
+            return "missing_registration"
+        return "earlier_registration" if generation != current else None
 
     def _accounts(self) -> list[InventoryAccount]:
         for row in self._pages(SqlTeamMember, SqlTeamMember.id, SqlTeamMember.workspace_id):
