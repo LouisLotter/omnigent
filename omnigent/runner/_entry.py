@@ -424,6 +424,9 @@ class _RunnerDatabricksAuth(ThreadedAuth):
                         request.headers["Authorization"] = f"Bearer {token}"
                         yield request
                     return
+                refused = getattr(self._factory, "refused_status", None)
+                if isinstance(refused, int):
+                    raise httpx.RequestError(runner_token_refusal_message(refused))
                 raise httpx.RequestError("Databricks token refresh returned no token")
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
@@ -506,30 +509,50 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
     return bool(invalidate())
 
 
+# Exit status of a runner whose server refuses its runner token at boot (EX_NOPERM).
+RUNNER_TOKEN_REFUSED_EXIT_CODE = 77
+
+
+def runner_token_refusal_message(status_code: int) -> str:
+    """Explain a refused runner token to the person reading the session's error.
+
+    :param status_code: The mint endpoint's HTTP status, ``401`` or ``403``.
+    """
+    return (
+        f"The Omnigent server refused this runner's token (HTTP {status_code}): its "
+        "thread is no longer bound to this runner on its owner's computer, or the "
+        "thread belongs to someone else. The runner does not fall back to the "
+        "computer's sign-in. Send the message again from Omnigent to start a new runner."
+    )
+
+
+class RunnerTokenRefusedError(RuntimeError):
+    """The server offers runner tokens but refused this runner's binding."""
+
+    def __init__(self, status_code: int) -> None:
+        """
+        :param status_code: The mint endpoint's HTTP status, ``401`` or ``403``.
+        """
+        self.status_code = status_code
+        super().__init__(runner_token_refusal_message(status_code))
+
+
 class _InitialAuthTokenFactory:
     """Use a host bearer until rejection, then lazily resolve runner auth.
 
-    With a *runner_factory* (the server mints runner tokens), the host bearer
-    never authenticates the runner: it only carries the first mint through a
-    fronting proxy, and the runner starts on its own runner token.
+    Only for servers that don't offer runner tokens; a runner whose server
+    mints uses :class:`_ManagedMintTokenFactory` directly.
     """
 
-    def __init__(
-        self,
-        token: str,
-        server_url: str,
-        *,
-        runner_factory: Callable[[], str | None] | None = None,
-    ) -> None:
+    def __init__(self, token: str, server_url: str) -> None:
         """
         :param token: Current bearer obtained from the connected host.
         :param server_url: Omnigent server URL used by the fallback resolver.
-        :param runner_factory: An installed runner-token factory to start on.
         """
-        self._initial_token: str | None = None if runner_factory is not None else token
+        self._initial_token: str | None = token
         self._last_initial_token: str = token  # retained for managed-mint proxy auth
         self._server_url = server_url
-        self._fallback_factory: Callable[[], str | None] | None = runner_factory
+        self._fallback_factory: Callable[[], str | None] | None = None
         self._retry_discovery_at = 0.0
         self._no_credential_logged = False
         self._lock = threading.Lock()
@@ -638,6 +661,24 @@ class _InitialAuthTokenFactory:
             return True
 
 
+def _startup_auth_factory() -> Callable[[], str | None] | None:
+    """Resolve the runner's credential at boot; stop when the server refuses it.
+
+    The message goes to the runner's log, which the host reports as the
+    session's error when the runner exits.
+
+    :returns: The runner's token factory, or ``None`` without a credential.
+    :raises SystemExit: With :data:`RUNNER_TOKEN_REFUSED_EXIT_CODE` when the
+        server refuses this runner's token.
+    """
+    try:
+        return _make_auth_token_factory()
+    except RunnerTokenRefusedError as exc:
+        _logger.error("%s", exc, extra={"session_id": runner_primary_session_id()})
+        print(f"omnigent runner: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(RUNNER_TOKEN_REFUSED_EXIT_CODE) from None
+
+
 def _make_auth_token_factory(
     server_url: str | None = None,
     *,
@@ -651,10 +692,13 @@ def _make_auth_token_factory(
       1. Host-delegated runner token, when the host launch marker and
          binding token are present and the server mints runner tokens. The
          host's injected bearer (if any) only carries the mint request
-         through a fronting proxy; the runner never acts with it.
+         through a fronting proxy; the runner never acts with it. A refused
+         mint (401/403) raises :class:`RunnerTokenRefusedError` instead of
+         falling back to any sign-in.
       2. Host's current bearer, when injected for runner bootstrap and the
-         server cannot mint (header/proxy mode or an older server). This is
-         used until rejection; local refreshable auth resolves lazily.
+         server does not offer runner tokens (404, an explicit "unsupported"
+         400, or a sign-in redirect). This is used until rejection; local
+         refreshable auth resolves lazily.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
       4. Databricks OAuth token (refreshed via the SDK) — host-keyed
@@ -681,6 +725,8 @@ def _make_auth_token_factory(
 
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
+    :raises RunnerTokenRefusedError: When the server offers runner tokens
+        but refuses this runner's binding on its first mint.
     """
     # Return the runner-process singleton when it has been set and no
     # caller-specific overrides are requested. This ensures every harness
@@ -739,9 +785,11 @@ def _make_auth_token_factory(
     if initial_token and resolved_server_url:
         if _allow_delegated_mint and delegated_auth and binding_token:
             # A runner acts with its own runner token whenever the server mints
-            # one, never with the host's sign-in. A refusal to mint (no-auth or
-            # header mode, an older server, a proxy rejecting the bearer) keeps
-            # the host bearer for bootstrap, as before.
+            # one, never with the host's sign-in: the bearer only carries the
+            # first mint through a fronting proxy. A refusal (401/403) stops the
+            # runner. Only a server that doesn't offer runner tokens (404, an
+            # explicit "unsupported" 400, a sign-in redirect) keeps the bearer
+            # for bootstrap, as before.
             from omnigent.runner.identity import token_bound_runner_id
 
             runner_factory = _ManagedMintTokenFactory(
@@ -752,10 +800,10 @@ def _make_auth_token_factory(
                 proxy_bearer=initial_token,
             )
             runner_factory()
-            if not (runner_factory.declined or runner_factory.proxy_auth_failed):
-                return _InitialAuthTokenFactory(
-                    initial_token, resolved_server_url, runner_factory=runner_factory
-                )
+            if runner_factory.refused_status is not None:
+                raise RunnerTokenRefusedError(runner_factory.refused_status)
+            if not runner_factory.declined or runner_factory.declined_by_server_error:
+                return runner_factory
         _logger.info(
             "using host-provided bearer for runner bootstrap",
             extra={"session_id": runner_primary_session_id()},
@@ -766,7 +814,12 @@ def _make_auth_token_factory(
     refused_binding_token: str | None = None
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
         delegated_factory = _make_managed_mint_factory(
-            resolved_server_url, binding_token, proxy_bearer=_proxy_bearer
+            resolved_server_url,
+            binding_token,
+            proxy_bearer=_proxy_bearer,
+            # The runner's own first resolution: a refusal stops it rather than
+            # falling through to any local sign-in.
+            fail_closed=_allow_initial_token,
         )
         if delegated_factory is not None:
             return delegated_factory
@@ -851,6 +904,7 @@ def _make_managed_mint_factory(
     binding_token: str,
     *,
     proxy_bearer: str | None = None,
+    fail_closed: bool = False,
 ) -> Callable[[], str | None] | None:
     """Build a token factory that mints a managed runner's owner JWT.
 
@@ -874,6 +928,9 @@ def _make_managed_mint_factory(
         an Apps proxy lets it through. Used when a host-injected initial
         bearer is available (the minted JWT takes over on subsequent
         refreshes).
+    :param fail_closed: Raise :class:`RunnerTokenRefusedError` when the probe
+        is refused (401/403) instead of returning ``None`` for the caller to
+        try other credentials.
     :returns: A sync callable returning a fresh owner JWT, or ``None`` only
         when the server *definitively* will not mint for this runner (HTTP
         400 no-auth/header mode, 404 older server without the endpoint, or a
@@ -909,6 +966,8 @@ def _make_managed_mint_factory(
         mint_url, server_url, binding_token, proxy_bearer=proxy_bearer
     )
     factory()
+    if fail_closed and factory.refused_status is not None:
+        raise RunnerTokenRefusedError(factory.refused_status)
     if factory.declined and factory.declined_by_server_error:
         # An intermediary 5xx at boot: install the factory anyway, declined
         # latched. Callbacks go out bare, and a rejected bare request clears
@@ -976,6 +1035,9 @@ class _ManagedMintTokenFactory:
         # refusal). Unlike ``declined``, this means the caller should try
         # another credential path (SDK/OIDC) rather than sending bare requests.
         self.proxy_auth_failed = False
+        # The 401/403 that ended the last mint with no cached token left: the
+        # server refused this runner's binding (or a proxy its bearer).
+        self.refused_status: int | None = None
 
     def __call__(self) -> str | None:
         """Return a fresh owner JWT, or ``None``.
@@ -1037,6 +1099,12 @@ class _ManagedMintTokenFactory:
                 cached = self._still_valid_cached_token(now)
                 if cached is None:
                     self.proxy_auth_failed = True
+                    if self.refused_status is None:
+                        _logger.error(
+                            runner_token_refusal_message(response.status_code),
+                            extra={"session_id": runner_primary_session_id()},
+                        )
+                    self.refused_status = response.status_code
                 return cached
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
@@ -1046,6 +1114,7 @@ class _ManagedMintTokenFactory:
             return self._still_valid_cached_token(now)
         self._cached_token = token
         self._cached_expires_at = expires_at
+        self.refused_status = None
         # Promote the minted JWT to proxy bearer so subsequent refreshes
         # through the Apps proxy are authenticated with a valid credential.
         self._proxy_bearer = token
@@ -1827,7 +1896,7 @@ async def _run_tunnel_from_env() -> None:
     )
 
     server_url = _server_url_from_env()
-    auth_token_factory = _make_auth_token_factory()
+    auth_token_factory = _startup_auth_factory()
     # Write the singleton to the canonical module so it is visible to all
     # importers even when this file runs as __main__ (which Python treats as a
     # separate module object from omnigent.runner._entry). Importing the

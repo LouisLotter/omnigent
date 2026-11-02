@@ -45,9 +45,14 @@ def test_rejected_bootstrap_recovers_when_executor_import_fails(
         monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
 
     factory = _entry._make_auth_token_factory()
-    assert isinstance(factory, _entry._InitialAuthTokenFactory)
-    # A host-launched runner whose server mints starts on its own runner token.
-    assert factory() == ("renewed-token" if credential == "delegated" else "bootstrap-token")
+    if credential == "delegated":
+        # A host-launched runner whose server mints starts on its own runner
+        # token; renewal re-mints it without importing the executor.
+        assert isinstance(factory, _entry._ManagedMintTokenFactory)
+        assert factory() == "renewed-token"
+    else:
+        assert isinstance(factory, _entry._InitialAuthTokenFactory)
+        assert factory() == "bootstrap-token"
 
     # A long-lived runner may first import this module during token renewal.
     monkeypatch.setitem(sys.modules, "omnigent.inner.databricks_executor", None)
