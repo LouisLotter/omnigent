@@ -87,6 +87,7 @@ from omnigent.server.principals import Principal, PrincipalKind, record_principa
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import (
     LAUNCH_TOKEN_ONLY_REFUSAL,
+    REGISTRATION_REVOKED_REFUSAL,
     SUPERSEDED_LAUNCH_TOKEN_REFUSAL,
     HostRegistrationRefusedError,
     HostStore,
@@ -108,6 +109,9 @@ _REPLACED_REFUSAL = "A newer connection for this host replaced this one."
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
+
+RunnerOnHost = Callable[[str, str | None, str], bool]
+"""Blocking ``(host_id, host_owner, runner_id)`` check that the runner is the host's to report."""
 
 
 def log_runner_exited(
@@ -159,6 +163,7 @@ def create_host_tunnel_router(
     on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    runner_on_host: RunnerOnHost | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -203,6 +208,11 @@ def create_host_tunnel_router(
     :param runner_exit_reports: Shared store for ``host.runner_exited``
         reports, read by the runner status endpoint. ``None`` (e.g.
         minimal test wiring) drops the reports.
+    :param runner_on_host: Whether a reported runner belongs to the
+        reporting host. A ``host.runner_exited`` report about a runner bound
+        to a thread on another host is dropped: one person's host must not
+        fail or annotate another person's threads. ``None`` accepts every
+        report (minimal test wiring).
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -486,6 +496,7 @@ def create_host_tunnel_router(
                         connection_id=frame.connection_id,
                         by_bearer=managed_token is None,
                         launch_token=managed_token,
+                        owner=tunnel_owner,
                     ),
                     name=f"host-heartbeat:{host_id}",
                 )
@@ -503,6 +514,7 @@ def create_host_tunnel_router(
                         runner_exit_reports,
                         on_runner_exited,
                         on_host_update,
+                        runner_on_host,
                     ),
                     name=f"host-receive:{host_id}",
                 )
@@ -870,6 +882,7 @@ async def _receive_loop(
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
+    runner_on_host: RunnerOnHost | None = None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
@@ -888,6 +901,8 @@ async def _receive_loop(
         logs the session-less ``runner_exited`` event here instead.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
+    :param runner_on_host: Drops a ``host.runner_exited`` report about a
+        runner bound to another host's thread; ``None`` accepts every report.
     """
     # Per-request reassembly of chunked import sessions; buffers die with the
     # connection, so a tunnel drop can never leak a partial session.
@@ -985,6 +1000,29 @@ async def _receive_loop(
             # One-way report: a runner this host spawned died unexpectedly. Stash
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
+            try:
+                reportable = runner_on_host is None or await asyncio.to_thread(
+                    runner_on_host, host_id, conn.owner, frame.runner_id
+                )
+            except Exception:
+                # Unverifiable: keep the crash in the log, change nothing, keep the tunnel.
+                _logger.exception(
+                    "Could not check that runner %s belongs to host %s; dropping its exit report",
+                    frame.runner_id,
+                    host_id,
+                )
+                log_runner_exited(host_id, frame.runner_id, frame.error)
+                continue
+            if not reportable:
+                _logger.warning(
+                    "Host %s reported the exit of runner %s, which runs elsewhere; dropping",
+                    host_id,
+                    frame.runner_id,
+                    extra=debug_event(
+                        "host_runner_exit_refused", host_id=host_id, runner_id=frame.runner_id
+                    ),
+                )
+                continue
             if runner_exit_reports is not None:
                 runner_exit_reports.record(
                     frame.runner_id, frame.error, conn.owner, had_connected=frame.had_connected
@@ -1294,12 +1332,15 @@ async def _heartbeat_loop(
     connection_id: str | None = None,
     by_bearer: bool = False,
     launch_token: str | None = None,
+    owner: str | None = None,
 ) -> None:
     """Serialize host-liveness writes independently of socket pings.
 
     :raises HostRegistrationRefusedError: When the tunnel registered *by_bearer*
-        and the host has since become launch-token-only, or registered with
-        *launch_token* and that token has since been replaced or revoked.
+        and the host has since become launch-token-only, registered with
+        *launch_token* and that token has since been replaced or revoked, or
+        registered for *owner* and the host was removed or no longer belongs
+        to that person's current registration.
     """
     failure_count = 0
     last_failure_log_at = 0.0
@@ -1311,7 +1352,11 @@ async def _heartbeat_loop(
             # Cancellation cannot stop the thread, but heartbeat only updates
             # last-seen; a late write cannot change an offline host's status.
             kept = await asyncio.to_thread(
-                host_store.heartbeat, host_id, by_bearer=by_bearer, launch_token=launch_token
+                host_store.heartbeat,
+                host_id,
+                by_bearer=by_bearer,
+                launch_token=launch_token,
+                owner=owner,
             )
         except asyncio.CancelledError:
             raise
@@ -1362,8 +1407,14 @@ async def _heartbeat_loop(
             last_failure_log_at = 0.0
         if not kept and launch_token is not None:
             raise HostRegistrationRefusedError(SUPERSEDED_LAUNCH_TOKEN_REFUSAL, retryable=True)
-        if not kept:
+        if (
+            not kept
+            and by_bearer
+            and (await asyncio.to_thread(host_store.registers_only_with_launch_token, host_id))
+        ):
             raise HostRegistrationRefusedError(LAUNCH_TOKEN_ONLY_REFUSAL)
+        if not kept:
+            raise HostRegistrationRefusedError(REGISTRATION_REVOKED_REFUSAL, retryable=True)
 
 
 async def _ping_loop(

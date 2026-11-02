@@ -145,7 +145,6 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
-    LEVEL_READ,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -176,9 +175,6 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
-)
-from omnigent.server.routes._auth_helpers import (
-    require_access as _require_access,
 )
 from omnigent.server.routes._errors import agent_removed as _agent_removed
 from omnigent.server.routes._errors import session_not_found as _session_not_found
@@ -259,9 +255,11 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
+    ChildLineage,
     SessionLiveness,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
+    _authorize_child_lineage,
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
@@ -11676,18 +11674,16 @@ async def _create_session_from_existing_agent(
             body, request, user_id, _fixed_native_harness
         )
 
-    # Authorize parent_session_id before inheriting anything.
-    # The caller must own or have READ access to the parent session;
-    # otherwise a forged parent link lets them inherit runner
-    # bindings and establish a parent-child relationship with a
-    # session they don't control.
+    # Authorize parent_session_id before inheriting anything: a forged
+    # parent link must not inherit runner bindings or attach a child to a
+    # session the caller can't edit. The child belongs to the tree's owner.
+    lineage: ChildLineage | None = None
     if body.parent_session_id is not None:
-        await _require_access(
-            user_id,
+        lineage = await _authorize_child_lineage(
             body.parent_session_id,
-            LEVEL_READ,
-            permission_store,
-            conversation_store,
+            user_id=user_id,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         )
 
     # Reject an undeclared sub-agent before persisting the row. Downstream
@@ -11907,7 +11903,7 @@ async def _create_session_from_existing_agent(
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
-    if body.parent_session_id is not None:
+    if body.parent_session_id is not None and lineage is not None and lineage.inherits_runner:
         parent_conv = _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id

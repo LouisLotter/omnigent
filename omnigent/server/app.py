@@ -2079,6 +2079,7 @@ def create_app(
     ) -> None:
         """Authorize the launch and validate its host against the saved agent."""
         if host_store is not None:
+            launched = conversation_store.get_conversation(session_id)
             host_store.admit_launch(
                 host_id,
                 session_id,
@@ -2087,6 +2088,8 @@ def create_app(
                 allow_unbound,
                 transfer_from_host_id,
                 require_account_owner=runner_account_store is not None,
+                # A sub-agent runs as its tree's owner, whatever its own grants say.
+                owner_session_id=launched.root_conversation_id if launched is not None else None,
             )
         from omnigent.host.frames import CAP_MCP_REGISTRY
         from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
@@ -4210,6 +4213,27 @@ def create_app(
             fail_idle_top_level=not runner_ran,
         )
 
+    def _runner_on_host(host_id: str, host_owner: str | None, runner_id: str) -> bool:
+        """Whether a host may report *runner_id*'s exit: no bound thread is elsewhere.
+
+        A thread counts as on the host its runner is routed through (a
+        sub-agent shares an ancestor's). A thread with no host anywhere must
+        belong to the reporting host's owner. A runner bound to no thread yet
+        is accepted: its report stays scoped to the reporting host's owner.
+        """
+        from omnigent.runner.routing import routing_host_id
+
+        for conversation in conversation_store.list_conversations_by_runner_id(runner_id):
+            routed = routing_host_id(conversation, conversation_store)
+            if routed is not None:
+                if routed != host_id:
+                    return False
+                continue
+            owner = conversation_store.get_actual_session_owner(conversation.id)
+            if host_owner is not None and owner is not None and owner.user_id != host_owner:
+                return False
+        return True
+
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
         """Attach bound streams, then recover independent session trees concurrently."""
         from omnigent.entities import Conversation
@@ -4614,6 +4638,24 @@ def create_app(
     if isinstance(auth_provider, UnifiedAuthProvider):
         auth_provider.set_machine_binding_check(_machine_binding_current)
 
+    def _runner_tunnel_authority_current(
+        runner_id: str, owner: str, principal: Principal | None
+    ) -> bool:
+        """Whether an open runner tunnel still has the binding that admitted it.
+
+        A tunnel opened with a runner token must still match that token's
+        binding; one opened with a bare binding token must still resolve to
+        the same owner. Either ends when the runner is replaced, its thread
+        moves, its host's sandbox is replaced or detached, or the owner's
+        registration changes.
+        """
+        if principal is not None:
+            return _machine_binding_current(principal)
+        if host_store is None:
+            return actual_runner_owner(conversation_store, runner_id) == owner
+        binding = host_store.runner_binding(runner_id)
+        return binding is not None and binding.user_id == owner
+
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
 
@@ -4646,6 +4688,7 @@ def create_app(
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
             mint_managed_runner_token=_mint_managed_runner_token,
+            runner_authority_current=_runner_tunnel_authority_current,
         ),
         prefix="/v1",
         tags=["runners"],
@@ -4679,6 +4722,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                runner_on_host=_runner_on_host,
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,

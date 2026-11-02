@@ -55,7 +55,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.persistent_hosts import admit_host_work
 from omnigent.server.routes._auth_helpers import (
@@ -952,6 +952,28 @@ def register_resources_routes(
         except PathUnreachable as exc:
             raise HTTPException(status_code=403, detail=exc.message) from exc
 
+    async def _thread_owners_host(conversation: Conversation) -> HostConnection | None:
+        """The live tunnel of the thread's host, only while it is the thread owner's.
+
+        Workspace reads and writes reach a person's computer: never through a
+        thread whose host belongs to someone other than the thread's owner.
+        """
+        if host_registry is None or not conversation.host_id:
+            return None
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None or permission_store is None:
+            return host_conn
+        owner = await asyncio.to_thread(
+            conversation_store.get_actual_session_owner, conversation.id
+        )
+        if owner is None or host_conn.owner != owner.user_id:
+            _logger.warning(
+                "Refusing host workspace access for session %s: its host is not its owner's",
+                conversation.id,
+            )
+            return None
+        return host_conn
+
     async def _read_workspace_via_host(
         session_id: str,
         conversation: Conversation,
@@ -981,7 +1003,7 @@ def register_resources_routes(
             return None
         if not conversation.host_id or not conversation.workspace:
             return None
-        host_conn = host_registry.get(conversation.host_id)
+        host_conn = await _thread_owners_host(conversation)
         if host_conn is None:
             return None
         try:
@@ -1043,7 +1065,7 @@ def register_resources_routes(
             return None
         if not conversation.host_id or not conversation.workspace:
             return None
-        host_conn = host_registry.get(conversation.host_id)
+        host_conn = await _thread_owners_host(conversation)
         if host_conn is None:
             return None
         try:

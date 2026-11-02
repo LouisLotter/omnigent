@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock
 import pytest
 from starlette.datastructures import Headers
 
+from omnigent.db.account_authority import AccountAuthority
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask
@@ -203,6 +204,8 @@ class FakeConversationStore:
         self._seq = 0
         self.fail_create = fail_create
         self.label_writes: dict[str, dict[str, str]] = {}
+        # Linked by ``_deps`` so the fired session's owner grant is readable here.
+        self.permission_store: FakePermissionStore | None = None
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
@@ -228,6 +231,14 @@ class FakeConversationStore:
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
+
+    def get_actual_session_owner(self, conversation_id: str) -> AccountAuthority | None:
+        """The single owner granted through the linked permission store, as the real store."""
+        grants = self.permission_store.grants if self.permission_store is not None else []
+        owners = {user for user, conv, level in grants if conv == conversation_id and level >= 4}
+        if len(owners) != 1:
+            return None
+        return AccountAuthority(owners.pop(), None, current_workspace_id())
 
 
 class FakePermissionStore:
@@ -297,6 +308,12 @@ class FakeHostStore:
     def get_host(self, host_id: str) -> _FakeHost | None:
         return self.hosts.get(host_id)
 
+    def get_actual_host_owner(self, host_id: str) -> AccountAuthority | None:
+        host = self.hosts.get(host_id)
+        if host is None:
+            return None
+        return AccountAuthority(host.user_id, host.account_generation, current_workspace_id())
+
     def list_hosts(self, owner: str) -> list[_FakeHost]:
         # Mirrors the real store: most-recently-active first. Insertion order in
         # the dict stands in for that ordering here.
@@ -358,11 +375,17 @@ class FakePolicyStore:
 
 
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
+    conversation_store = overrides.get("conversation_store", FakeConversationStore())
+    permission_store = overrides.get("permission_store", FakePermissionStore())
+    if isinstance(conversation_store, FakeConversationStore) and isinstance(
+        permission_store, FakePermissionStore
+    ):
+        conversation_store.permission_store = permission_store
     return FireDeps(
         scheduled_task_store=sched_store,
         agent_store=overrides.get("agent_store", FakeAgentStore()),
-        conversation_store=overrides.get("conversation_store", FakeConversationStore()),
-        permission_store=overrides.get("permission_store", FakePermissionStore()),
+        conversation_store=conversation_store,
+        permission_store=permission_store,
         policy_store=overrides.get("policy_store"),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=overrides.get("host_registry", FakeHostRegistry()),
@@ -878,7 +901,8 @@ async def test_fire_runs_under_task_workspace_scope() -> None:
     await on_fire(42, "task_1")
     await _drain()
 
-    assert store.get_workspace_ids == [42, 42]
+    # Read at the trigger, at the start of the run and again just before dispatch.
+    assert store.get_workspace_ids == [42, 42, 42]
     assert conv_store.create_workspace_ids == [42]
     assert perm.grant_workspace_ids == [42]
     assert store.update_workspace_ids == [42]

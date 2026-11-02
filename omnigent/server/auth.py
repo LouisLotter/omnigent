@@ -484,6 +484,21 @@ class AuthProvider(ABC):
         """
         return None
 
+    def revalidate(self, connection: HTTPConnection, expected: Principal) -> bool:
+        """
+        Whether a long-lived connection's credential still authenticates as before.
+
+        A socket or stream authenticated once is not lasting authority: callers
+        re-check periodically and close the connection when this fails. The
+        default re-runs :meth:`get_user_id`; providers with revocable
+        credentials re-validate them from the original handshake.
+
+        :param connection: The connection whose handshake carries the credential.
+        :param expected: The principal the connection authenticated as.
+        :returns: ``True`` while the same principal still authenticates.
+        """
+        return self.get_user_id(connection) == expected.user_id
+
     def principal(self, request: HTTPConnection) -> Principal | None:
         """
         Return who is behind the request's credential.
@@ -793,7 +808,7 @@ class UnifiedAuthProvider(AuthProvider):
             return self._accounts_config
         return None
 
-    def _check_cookie(self, request: HTTPConnection) -> str | None:
+    def _check_cookie(self, request: HTTPConnection, *, use_cache: bool = True) -> str | None:
         """Validate the session cookie or Bearer token and return the
         user ID.
 
@@ -807,6 +822,7 @@ class UnifiedAuthProvider(AuthProvider):
         request.
 
         :param request: The incoming HTTP request or WebSocket.
+        :param use_cache: Read the TTL cache; ``False`` re-validates the token.
         :returns: User ID from the JWT's ``sub`` claim, or
             ``None`` if no valid token is found.
         """
@@ -826,7 +842,7 @@ class UnifiedAuthProvider(AuthProvider):
             return None
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
-        cached = self._cookie_cache.get(cache_key)
+        cached = self._cookie_cache.get(cache_key) if use_cache else None
         if self._account_check is None and cached is not None and cached[1] > time.monotonic():
             # Only a person's own undelegated sign-in is ever cached.
             record_principal(request, Principal(PrincipalKind.HUMAN, cached[0]))
@@ -909,6 +925,46 @@ class UnifiedAuthProvider(AuthProvider):
 
         record_principal(request, Principal(_delegated_kind(delegation), user_id))
         return user_id
+
+    def revalidate(self, connection: HTTPConnection, expected: Principal) -> bool:
+        """
+        Re-authenticate a long-lived connection from its original credential.
+
+        Bypasses the per-request caches, so an expired token, a revoked or
+        re-registered account, or a runner token whose binding was retired,
+        replaced or removed no longer passes. Runs the database checks
+        authentication runs; call it off the event loop.
+
+        :param connection: The connection whose handshake carries the credential.
+        :param expected: The principal the connection authenticated as.
+        :returns: ``True`` while the same principal still authenticates.
+        """
+        scope = connection.scope
+        cached = {
+            key: scope.pop(key, None) for key in (_CONNECTION_IDENTITY_KEY, _MACHINE_IDENTITY_KEY)
+        }
+        original = recorded_principal(connection)
+        try:
+            clear_principal(connection)
+            if self._source in ("oidc", "accounts"):
+                user_id = self._check_cookie(connection, use_cache=False)
+            else:
+                user_id = self._check_header(connection)
+            current = recorded_principal(connection)
+        finally:
+            for key, value in cached.items():
+                if value is not None:
+                    scope[key] = value
+            if original is not None:
+                record_principal(connection, original)
+        return (
+            user_id is not None
+            and current is not None
+            and current.kind is expected.kind
+            and current.user_id == expected.user_id
+            and current.runner_id == expected.runner_id
+            and current.token_id == expected.token_id
+        )
 
     def _check_machine_token(
         self, request: HTTPConnection, token: str, cache_key: str, secret: bytes

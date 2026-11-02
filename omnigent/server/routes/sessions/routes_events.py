@@ -109,8 +109,12 @@ from omnigent.server.persistent_hosts import (
     is_persistent_host,
     session_progress,
 )
+from omnigent.server.principals import recorded_principal
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
+)
+from omnigent.server.routes._auth_helpers import (
+    connection_still_authorized as _connection_still_authorized,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -1367,7 +1371,7 @@ def register_events_routes(
                 requires_filesystem,
                 uses_filesystem_delivery,
             )
-            from omnigent.runtime.content_resolver import attachment_delivery
+            from omnigent.runtime.content_resolver import attachment_delivery, file_belongs_to
 
             content = body.data.get("content")
             if isinstance(content, list):
@@ -1395,7 +1399,13 @@ def register_events_routes(
                     if not isinstance(file_id, str):
                         continue
                     stored = await asyncio.to_thread(file_store.get, file_id)
-                    if stored is None or stored.session_id not in (None, session_id):
+                    if stored is not None and not file_belongs_to(stored, session_id):
+                        # Never another thread's (or another person's) file by its id.
+                        raise OmnigentError(
+                            f"Attachment {file_id!r} was not uploaded to this session.",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    if stored is None:
                         continue
                     if stored.filename is not None and uses_filesystem_delivery(
                         stored.filename, stored.source_metadata
@@ -3644,6 +3654,20 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        streamed_principal = recorded_principal(request)
+
+        async def _still_authorized() -> bool:
+            return await _connection_still_authorized(
+                request,
+                auth_provider=auth_provider,
+                expected=streamed_principal,
+                user_id=user_id,
+                conversation_id=session_id,
+                required_level=LEVEL_READ,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+
         runner_client = await _get_runner_client(
             session_id,
             runner_router,
@@ -3754,6 +3778,7 @@ def register_events_routes(
                 # the CHILD conversation's stream, and per-conversation
                 # scoping would hide co-viewers on other agents.
                 presence_root_id=conv.root_conversation_id,
+                still_authorized=_still_authorized,
             ),
             media_type="text/event-stream",
             headers={

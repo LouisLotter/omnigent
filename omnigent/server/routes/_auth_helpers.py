@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 from collections.abc import Iterable
 
 from fastapi import Request
+from starlette.requests import HTTPConnection
 
 from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation, SessionPermission
@@ -40,10 +42,16 @@ from omnigent.server.permissions import (
     resolved_allows,
     resolved_level,
 )
+from omnigent.server.principals import Principal
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
+_logger = logging.getLogger(__name__)
+
 _LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
+
+CONNECTION_AUTHORITY_RECHECK_S = 15.0
+"""How often a long-lived session stream or terminal re-checks its caller."""
 
 
 def get_user_id(
@@ -419,6 +427,78 @@ async def require_access_and_level(
         permission_store,
         conversation_store,
     )
+
+
+async def credential_still_valid(
+    connection: HTTPConnection,
+    *,
+    auth_provider: AuthProvider | None,
+    expected: Principal | None,
+    user_id: str | None,
+) -> bool:
+    """Whether a long-lived connection's credential still authenticates its caller.
+
+    :param connection: The request or WebSocket carrying the credential.
+    :param auth_provider: The auth provider, or ``None`` when auth is off.
+    :param expected: The principal the connection authenticated as, or
+        ``None`` when the provider records none.
+    :param user_id: The user the connection was authorized for.
+    :returns: ``True`` while the same caller still authenticates.
+    """
+    if auth_provider is None:
+        return True
+    if expected is not None:
+        return await asyncio.to_thread(auth_provider.revalidate, connection, expected)
+    return await asyncio.to_thread(auth_provider.get_user_id, connection) == user_id
+
+
+async def connection_still_authorized(
+    connection: HTTPConnection,
+    *,
+    auth_provider: AuthProvider | None,
+    expected: Principal | None,
+    user_id: str | None,
+    conversation_id: str,
+    required_level: int,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Whether a long-lived connection's caller may still use the session.
+
+    A stream or socket authorized once is not lasting authority. This re-runs
+    the caller's credential check (a signed-out or re-registered account, an
+    expired token, a retired runner binding fail it) and the session access
+    check at *required_level* (a removed share or a deleted thread fails it).
+    The human administrator override applies as on any request. Any error
+    counts as refused: the client reconnects and is authorized afresh.
+
+    :param connection: The request or WebSocket carrying the credential.
+    :param auth_provider: The auth provider, or ``None`` when auth is off.
+    :param expected: The principal the connection authenticated as, or
+        ``None`` when the provider records none.
+    :param user_id: The user the connection was authorized for.
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param required_level: The level the connection was authorized at.
+    :param permission_store: Permission store, or ``None`` to skip access.
+    :param conversation_store: Conversation store for the access check.
+    :returns: ``True`` while the caller keeps that access.
+    """
+    try:
+        if not await credential_still_valid(
+            connection, auth_provider=auth_provider, expected=expected, user_id=user_id
+        ):
+            return False
+        await require_access_and_level(
+            user_id, conversation_id, required_level, permission_store, conversation_store
+        )
+    except OmnigentError:
+        return False
+    except Exception:
+        _logger.warning(
+            "Re-authorizing a connection to %s failed; ending it", conversation_id, exc_info=True
+        )
+        return False
+    return True
 
 
 def get_session_owner_id(

@@ -545,7 +545,30 @@ async def _run_fire_for_task(
             )
 
         try:
+            # Everything above may have taken minutes (a wake, a slow host):
+            # authority held at the start of the fire does not carry over.
+            await _reauthorize_fire(
+                deps,
+                task,
+                # The host the preflight authorized; managed fires bind a new one.
+                host_id=effective.host_id if preflight is not None else None,
+                conversation_id=conv.id,
+            )
             await dispatch(conv, effective)
+        except _CannotLaunchScheduledFire as exc:
+            _logger.warning(
+                "scheduled fire: task %s lost its authority before dispatch: %s", task.id, exc
+            )
+            await _record_run(
+                deps,
+                task,
+                conv.id,
+                scheduled_at,
+                status="failed",
+                error=str(exc),
+                error_code=exc.error_code,
+            )
+            return
         except Exception:
             # The session + grant are already persisted and owner-visible, so a
             # launch/dispatch failure still records a run — just a failed one.
@@ -598,6 +621,70 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
     return owner is None or owner.account_generation != task.account_generation
+
+
+async def _reauthorize_fire(
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    host_id: str | None,
+    conversation_id: str | None,
+) -> None:
+    """Re-check, where a fire acts, that the task's owner still holds what it uses.
+
+    A fire's earlier checks do not last: a wake or a runner start can take
+    minutes, during which the task can be deleted or move to another owner,
+    the owner can be removed or registered again, and the host can be removed
+    or pass to someone else. The fire never falls back to another host.
+
+    :param task: The task as read at the start of the fire.
+    :param host_id: The connected host the fire runs on, or ``None``.
+    :param conversation_id: The fired session, or ``None`` before it exists.
+    :raises _CannotLaunchScheduledFire: When any of these no longer holds.
+    """
+    current = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+    if (
+        current is None
+        or current.state == "deleted"
+        or current.user_id != task.user_id
+        or current.account_generation != task.account_generation
+    ):
+        raise _CannotLaunchScheduledFire(
+            "the scheduled task was deleted or changed owner during this run",
+            error_code="task_authority_revoked",
+        )
+    if await _owner_is_deleted(deps, task):
+        raise _CannotLaunchScheduledFire(
+            f"owner {task.user_id!r} registration is no longer active",
+            error_code="owner_deleted",
+        )
+    if task.user_id is None:
+        return
+    if host_id is not None:
+        if deps.host_store is None:
+            raise _CannotLaunchScheduledFire(
+                "connected host registry/store is not configured",
+                error_code="host_registry_unavailable",
+            )
+        holder = await asyncio.to_thread(deps.host_store.get_actual_host_owner, host_id)
+        if (
+            holder is None
+            or holder.user_id != task.user_id
+            or holder.generation != task.account_generation
+        ):
+            raise _CannotLaunchScheduledFire(
+                f"connected host {host_id!r} no longer belongs to the scheduled task owner",
+                error_code="host_authority_revoked",
+            )
+    if conversation_id is not None and deps.permission_store is not None:
+        owner = await asyncio.to_thread(
+            deps.conversation_store.get_actual_session_owner, conversation_id
+        )
+        if owner is None or owner.user_id != task.user_id:
+            raise _CannotLaunchScheduledFire(
+                "the scheduled run's session no longer belongs to the task owner",
+                error_code="session_authority_revoked",
+            )
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -1156,6 +1243,8 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
                 else "host_wake_failed"
             ),
         ) from exc
+    # A wake can take minutes; the host must still be the owner's afterwards.
+    await _reauthorize_fire(deps, task, host_id=host_id, conversation_id=None)
 
 
 def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
@@ -1242,6 +1331,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         if runner_client is None:
             raise RuntimeError("runner did not connect before timeout")
 
+        # The runner may have taken minutes to connect: re-check before the prompt runs.
+        await _reauthorize_fire(deps, task, host_id=host_id, conversation_id=conv.id)
         # Re-read the row: the launch wrote runner_id, and the session-init
         # handshake wants the current agent binding.
         fresh = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)

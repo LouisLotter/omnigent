@@ -78,6 +78,11 @@ from omnigent.server.creation_logging import creation_metadata, creation_stage, 
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.interrupted_work import keep_interrupted_outcome, record_runner_incarnation
 from omnigent.server.permissions import check_session_access
+from omnigent.server.principals import recorded_principal
+from omnigent.server.routes._auth_helpers import (
+    CONNECTION_AUTHORITY_RECHECK_S,
+    credential_still_valid,
+)
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
@@ -243,6 +248,27 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+async def _new_session_owner(
+    session_id: str,
+    parent_session_id: str | None,
+    user_id: str,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """Who receives a new session's owner grant.
+
+    A top-level session belongs to its creator. A sub-agent belongs to its
+    thread tree's actual owner, whoever asked for it: sharing the parent never
+    makes someone the owner of a child that runs on the owner's runner.
+
+    :returns: The owner, or ``None`` when the tree has no single owner (the
+        child then has only the access it inherits from its parent).
+    """
+    if parent_session_id is None:
+        return user_id
+    owner = await asyncio.to_thread(conversation_store.get_actual_session_owner, session_id)
+    return owner.user_id if owner is not None else None
 
 
 def _require_attachment_compatible_history(
@@ -1190,13 +1216,19 @@ def register_core_routes(
             with creation_stage("create_identity_ms"):
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
             with creation_stage("create_acl_ms"):
-                grant = await asyncio.to_thread(
-                    permission_store.grant,
-                    user_id,
-                    resp.id,
-                    LEVEL_OWNER,
+                owner_id = await _new_session_owner(
+                    resp.id, body.parent_session_id, user_id, conversation_store
                 )
-            resp.permission_level = grant.level
+                if owner_id is not None:
+                    await asyncio.to_thread(permission_store.grant, owner_id, resp.id, LEVEL_OWNER)
+            # A sub-agent's access is its parent's (see check_session_access).
+            resp.permission_level = (
+                LEVEL_OWNER
+                if owner_id == user_id
+                else await _get_permission_level(
+                    user_id, body.parent_session_id or resp.id, permission_store
+                )
+            )
         await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
@@ -1472,9 +1504,16 @@ def register_core_routes(
             with creation_stage("create_identity_ms"):
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
             with creation_stage("create_acl_ms"):
-                await asyncio.to_thread(
-                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+                owner_id = await _new_session_owner(
+                    result.session_id,
+                    parsed_metadata.parent_session_id,
+                    user_id,
+                    conversation_store,
                 )
+                if owner_id is not None:
+                    await asyncio.to_thread(
+                        permission_store.grant, owner_id, result.session_id, LEVEL_OWNER
+                    )
         await _accept_initial_input(
             request, result.session_id, parsed_metadata.initial_input, user_id
         )
@@ -2278,6 +2317,7 @@ def register_core_routes(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
             )
+        updates_principal = recorded_principal(websocket)
         await websocket.accept()
         _logger.info(
             "session-updates stream connected",
@@ -2498,14 +2538,45 @@ def register_core_routes(
                                 exc_info=True,
                             )
 
+        async def _authority() -> None:
+            """Return once the socket's credential no longer authenticates its caller.
+
+            Per-thread access is re-read on every tick; this ends the socket
+            itself after a sign-out, account change or token expiry.
+            """
+            while True:
+                await asyncio.sleep(CONNECTION_AUTHORITY_RECHECK_S)
+                try:
+                    valid = await credential_still_valid(
+                        websocket,
+                        auth_provider=auth_provider,
+                        expected=updates_principal,
+                        user_id=user_id,
+                    )
+                except Exception:
+                    _logger.warning("session-updates re-authentication failed", exc_info=True)
+                    valid = False
+                if not valid:
+                    return
+
         reader_task = asyncio.create_task(_reader(), name="session-updates-reader")
         ticker_task = asyncio.create_task(_ticker(), name="session-updates-ticker")
         discovery_task = asyncio.create_task(_discovery(), name="session-updates-discovery")
+        authority_task = asyncio.create_task(_authority(), name="session-updates-authority")
         try:
             done, pending = await asyncio.wait(
-                {reader_task, ticker_task, discovery_task},
+                {reader_task, ticker_task, discovery_task, authority_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if authority_task in done and authority_task.exception() is None:
+                _logger.info(
+                    "session-updates stream lost its caller's credential; closing",
+                    extra=debug_event("session_updates", phase="revoked"),
+                )
+                with contextlib.suppress(RuntimeError):
+                    await websocket.close(
+                        code=status.WS_1008_POLICY_VIOLATION, reason="sign-in no longer valid"
+                    )
             for task in pending:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2789,9 +2860,12 @@ def register_core_routes(
             user_id, session_id, required_level, permission_store, conversation_store
         )
         if body.runner_id is not None and permission_store is not None:
-            if not check_session_access(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
-            ):
+            # A runner acts as the thread's owner on the owner's computer, so only
+            # the actual owner binds one: never an editor or the administrator flag.
+            actual_owner = await asyncio.to_thread(
+                conversation_store.get_actual_session_owner, session_id
+            )
+            if actual_owner is None or actual_owner.user_id != user_id:
                 raise OmnigentError(
                     f"Only the session owner can attach a runner to session {session_id!r}. "
                     f"To fork this session instead, run: omnigent run --fork {session_id}",
