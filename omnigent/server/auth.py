@@ -158,9 +158,11 @@ def _session_token_and_source(
 
 def _session_credential(payload: dict[str, object], from_cookie: bool) -> CredentialKind:
     """Classify a person's own session token by where it came from and who it was minted for."""
-    if from_cookie and payload.get(CREDENTIAL_USE_CLAIM) == BROWSER_SESSION_USE:
+    if not from_cookie:
+        return CredentialKind.SESSION_BEARER
+    if payload.get(CREDENTIAL_USE_CLAIM) == BROWSER_SESSION_USE:
         return CredentialKind.BROWSER_SESSION
-    return CredentialKind.SESSION_BEARER
+    return CredentialKind.SESSION_COOKIE
 
 
 # Explicit single-user marker. Set by the managed local-server spawn

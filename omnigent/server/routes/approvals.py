@@ -3,7 +3,10 @@
 - ``GET /v1/approvals``: pending protected approvals the caller may answer.
 - ``GET/POST/DELETE /v1/approvers``: named approvers for a thread, a service
   or the team; ``PUT /v1/approval-settings``: whether the person who started
-  an action may approve it. Human administrators only.
+  an action may approve it. A thread's actual owner manages its approvers
+  (they only add people who may approve that owner's own work); services and
+  the team are managed by human administrators only. Neither the admin flag
+  nor edit access manages another person's thread.
 - ``GET/POST/PATCH/DELETE /v1/protected-policies``: team rules (human
   administrators) and personal rules (their person only).
 
@@ -23,7 +26,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
 from omnigent.server.approval_authority import answer_credential_problem, may_view_approval
-from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, AuthProvider
+from omnigent.server.auth import (
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    AuthProvider,
+)
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.stores import ConversationStore
 from omnigent.stores.approval_store import (
@@ -161,6 +170,45 @@ def create_approvals_router(
             )
         return user_id
 
+    async def _resource_manager(
+        request: Request, resource: ApprovalResource, *, write: bool
+    ) -> str | None:
+        """Who may manage *resource*: its owner for a thread, else an administrator."""
+        if resource.kind is not ResourceKind.SESSION:
+            return await _admin(request, write=write)
+        user_id = _person(request, write=write)
+        if permission_store is None or user_id is None:
+            return user_id
+        thread = await asyncio.to_thread(conversation_store.get_conversation, resource.resource_id)
+        if thread is None:
+            raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        owner = await asyncio.to_thread(
+            conversation_store.get_actual_session_owner, resource.resource_id
+        )
+        if owner is not None and owner.user_id == user_id:
+            if thread.root_conversation_id not in (None, thread.id):
+                raise OmnigentError(
+                    "A sub-agent's approvals belong to its top-level thread; name them there.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            return user_id
+        # Reading a thread's approvers needs only access to the thread.
+        can_see = await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            resource.resource_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        if not can_see:
+            raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        if write:
+            raise OmnigentError(
+                "Only the thread's owner names its approvers.", code=ErrorCode.FORBIDDEN
+            )
+        return user_id
+
     @router.get("/approvals")
     async def list_pending_approvals(request: Request) -> dict[str, Any]:
         """Pending protected approvals the caller may answer, newest first."""
@@ -194,8 +242,8 @@ def create_approvals_router(
         request: Request, kind: ResourceKindName, resource_id: str = ""
     ) -> dict[str, Any]:
         """A resource's named approvers and initiator setting."""
-        await _admin(request, write=False)
         resource = _resource(kind, resource_id)
+        await _resource_manager(request, resource, write=False)
         resources = [resource] if resource == TEAM_RESOURCE else [resource, TEAM_RESOURCE]
         entries = await asyncio.to_thread(store.approvers_for, resources)
         entry = entries[0]
@@ -215,12 +263,12 @@ def create_approvals_router(
     @router.post("/approvers", status_code=201)
     async def add_approver(request: Request, body: ApproverRequest) -> dict[str, Any]:
         """Name an approver for a thread, a service or the team."""
-        admin = await _admin(request, write=True)
         if body.user_id in _RESERVED_APPROVERS:
             raise OmnigentError(f"{body.user_id!r} cannot approve", code=ErrorCode.INVALID_INPUT)
         resource = _resource(body.kind, body.resource_id)
+        manager = await _resource_manager(request, resource, write=True)
         added = await asyncio.to_thread(
-            store.add_approver, resource, body.user_id, granted_by=admin
+            store.add_approver, resource, body.user_id, granted_by=manager
         )
         return {"added": added}
 
@@ -229,8 +277,8 @@ def create_approvals_router(
         request: Request, kind: ResourceKindName, user_id: str, resource_id: str = ""
     ) -> dict[str, Any]:
         """Stop someone approving for a resource; pending approvals bound to it lapse."""
-        await _admin(request, write=True)
         resource = _resource(kind, resource_id)
+        await _resource_manager(request, resource, write=True)
         removed = await asyncio.to_thread(store.remove_approver, resource, user_id)
         return {"removed": removed}
 
@@ -239,10 +287,10 @@ def create_approvals_router(
         request: Request, body: ApprovalSettingsRequest
     ) -> dict[str, Any]:
         """Save whether the person who started an action may approve it."""
-        admin = await _admin(request, write=True)
         resource = _resource(body.kind, body.resource_id)
+        manager = await _resource_manager(request, resource, write=True)
         await asyncio.to_thread(
-            store.set_allow_initiator, resource, body.allow_initiator, updated_by=admin
+            store.set_allow_initiator, resource, body.allow_initiator, updated_by=manager
         )
         (entry,) = await asyncio.to_thread(store.approvers_for, [resource])
         return {"allow_initiator": entry.initiator_may_approve()}

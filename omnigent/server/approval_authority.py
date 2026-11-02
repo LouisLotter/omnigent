@@ -43,7 +43,7 @@ from omnigent.runtime.policies.protected import (
 )
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.permissions import check_session_access
-from omnigent.server.principals import Principal, recorded_principal
+from omnigent.server.principals import CredentialKind, Principal, recorded_principal
 from omnigent.stores.approval_store import (
     TEAM_RESOURCE,
     ApprovalResource,
@@ -444,12 +444,19 @@ def answer_credential_problem(
         return None
     principal = auth_provider.principal(request)
     if principal is None:
-        return f"Sign in to {action}."
+        return f"Sign in to the Omnigent web page to {action}."
     if principal.is_interactive_human:
         return None
+    instead = f"{action[:1].upper()}{action[1:]} in the Omnigent web page instead."
+    if principal.credential is CredentialKind.SESSION_COOKIE:
+        return (
+            f"Sign in again in the browser to {action}. This browser session was not "
+            "started by a sign-in in the browser: it predates approval sign-ins, or it "
+            "came from a link the CLI opened."
+        )
     if principal.is_human:
-        return f"A CLI or host sign-in cannot {action}; sign in through the browser."
-    return f"A {principal.kind.value.replace('_', ' ')} credential cannot {action}."
+        return f"A CLI or host sign-in cannot {action}. {instead}"
+    return f"A {principal.kind.value.replace('_', ' ')} credential cannot {action}. {instead}"
 
 
 @dataclasses.dataclass(frozen=True)

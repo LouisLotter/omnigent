@@ -391,8 +391,8 @@ def test_daily_budget_write_obeys_account_lifecycle(
     request_client = alice if actor == "owner" else admin
     if operation == "approval":
         if actor == "admin":
-            # An administrator approves a member's work only once named its approver.
-            named = admin.post(
+            # An administrator approves a member's work only once its owner names them.
+            named = alice.post(
                 "/v1/approvers",
                 json={"kind": "session", "resource_id": session_id, "user_id": "admin"},
             )

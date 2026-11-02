@@ -52,8 +52,11 @@ class CredentialKind(str, Enum):
 
     - ``BROWSER_SESSION``: a session token minted for a browser, presented in
       the session cookie.
-    - ``SESSION_BEARER``: any other session token, such as a CLI's stored
-      sign-in or a browser token copied into a bearer header.
+    - ``SESSION_COOKIE``: a session token in the session cookie without the
+      browser mark: a browser signed in before the mark existed or through
+      a link from the CLI, or a CLI's token copied into the cookie.
+    - ``SESSION_BEARER``: a session token in a bearer header, such as a
+      CLI's stored sign-in.
     - ``LOGIN_GRANT``: an access token renewed from a first-party login grant
       (the CLI's or a personal host's refresh grant).
     - ``DEVICE_GRANT``: an access token of a device-authorization client.
@@ -64,6 +67,7 @@ class CredentialKind(str, Enum):
     """
 
     BROWSER_SESSION = "browser_session"
+    SESSION_COOKIE = "session_cookie"
     SESSION_BEARER = "session_bearer"
     LOGIN_GRANT = "login_grant"
     DEVICE_GRANT = "device_grant"

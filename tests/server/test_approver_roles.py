@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock
@@ -27,7 +28,7 @@ from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID, mint_delegated_token
-from omnigent.stores.approval_store import VerdictState
+from omnigent.stores.approval_store import ApprovalResource, ResourceKind, VerdictState
 from tests.server.test_account_revocation import setup_app as setup_app
 from tests.server.test_delegated_runner_tokens import (
     _ask,
@@ -79,7 +80,9 @@ def _answer(person: TestClient, session_id: str, elicitation_id: str, action: st
 
 
 def _name_approver(team: dict[str, Any], kind: str, user: str, resource_id: str = "") -> None:
-    named = team["admin"].post(
+    """Name an approver as whoever manages the resource: Alice for her thread, else the admin."""
+    manager = team["alice"] if kind == "session" else team["admin"]
+    named = manager.post(
         "/v1/approvers", json={"kind": kind, "resource_id": resource_id, "user_id": user}
     )
     assert named.status_code == 201, named.text
@@ -108,9 +111,21 @@ def _cli_token(team: dict[str, Any]) -> str:
 
 
 def _grant_token(team: dict[str, Any], *, device: bool) -> str:
-    """An access token from Alice's device grant, or from her CLI's login grant."""
-    config = team["stores"]["auth_provider"]._accounts_config
-    generation = team["stores"]["account_store"].get_user("alice").account_generation
+    """An access token from Alice's stored device grant, or from her CLI's login grant."""
+    from omnigent.server.device_grant_store import DeviceGrantStore
+
+    stores = team["stores"]
+    config = stores["auth_provider"]._accounts_config
+    generation = stores["account_store"].get_user("alice").account_generation
+    grant_id = f"grant-{uuid.uuid4().hex}"
+    client_id = "slack" if device else LOGIN_GRANT_CLIENT_ID
+    DeviceGrantStore(stores["permission_store"].storage_location).create_redeemed_grant(
+        grant_id,
+        user_id="alice",
+        client_id=client_id,
+        refresh_token_hash=uuid.uuid4().hex,
+        created_at=int(time.time()),
+    )
     kwargs: dict[str, Any] = {} if device else {"scope": None}
     return mint_delegated_token(
         "alice",
@@ -118,8 +133,8 @@ def _grant_token(team: dict[str, Any], *, device: bool) -> str:
         600,
         "accounts",
         account_generation=generation,
-        grant_id=f"grant-{uuid.uuid4().hex}",
-        client_id="slack" if device else LOGIN_GRANT_CLIENT_ID,
+        grant_id=grant_id,
+        client_id=client_id,
         jti=uuid.uuid4().hex,
         **kwargs,
     )
@@ -153,16 +168,27 @@ def test_only_a_browser_sign_in_answers_a_protected_approval(team, credential) -
                 "data": {"elicitation_id": elicitation_id, "action": "accept"},
             },
         )
-    elif credential in ("device_grant", "login_grant"):
-        token = _grant_token(team, device=credential == "device_grant")
-        answered = _answer(_bearer(app, token), session_id, elicitation_id)
     else:
-        cookie = _cookie_name(team) if credential == "cli_as_cookie" else None
-        answered = _answer(
-            _bearer(app, _cli_token(team), as_cookie=cookie), session_id, elicitation_id
-        )
+        if credential in ("device_grant", "login_grant"):
+            token = _grant_token(team, device=credential == "device_grant")
+            client = _bearer(app, token)
+        else:
+            cookie = _cookie_name(team) if credential == "cli_as_cookie" else None
+            client = _bearer(app, _cli_token(team), as_cookie=cookie)
+        # The credential is a valid sign-in for Alice: it reads her thread.
+        assert client.get(f"/v1/sessions/{session_id}").status_code == 200
+        answered = _answer(client, session_id, elicitation_id)
 
     assert answered.status_code == 403, answered.text
+    message = answered.json()["error"]["message"]
+    if credential == "runner":
+        # The route is for people only; the guard refuses a runner before the gate.
+        assert answered.json()["error"]["code"] == "machine_principal_forbidden", message
+    elif credential == "cli_as_cookie":
+        # Indistinguishable from a browser session that predates the mark.
+        assert message.startswith("Sign in again in the browser to answer approvals"), message
+    else:
+        assert "Answer approvals in the Omnigent web page instead." in message, message
     assert _state(team, elicitation_id) is VerdictState.PENDING
     assert _tools_call(runner, session_id, **retry)["error"]["message"] == (
         "Tool call has not been approved"
@@ -647,3 +673,68 @@ def test_native_gate_needs_a_browser_answer_still_matching_its_action(team, rule
     assert gate["result"] == ("POLICY_ACTION_DENY" if rule_changes else "POLICY_ACTION_ALLOW"), (
         gate
     )
+
+
+def test_a_thread_owner_names_approvers_for_their_own_thread_only(team) -> None:
+    """Alice names Carol for her thread; an editor, the admin flag or a CLI sign-in cannot."""
+    session_id, runner = team["session"], team["runner"]
+    shared = team["alice"].put(
+        f"/v1/sessions/{session_id}/permissions", json={"user_id": "bob", "level": LEVEL_EDIT}
+    )
+    assert shared.status_code in (200, 201), shared.text
+    body = {"kind": "session", "resource_id": session_id, "user_id": "dave"}
+
+    by_editor = team["bob"].post("/v1/approvers", json=body)
+    by_admin = team["admin"].post("/v1/approvers", json=body)
+    by_stranger = team["carol"].post("/v1/approvers", json=body)
+    by_cli = _bearer(team["alice"].app, _cli_token(team)).post("/v1/approvers", json=body)
+    service = {"kind": "service", "resource_id": "tracker", "user_id": "dave"}
+    owner_on_service = team["alice"].post("/v1/approvers", json=service)
+
+    assert (by_editor.status_code, by_admin.status_code) == (403, 403)
+    assert by_admin.json()["error"]["message"] == "Only the thread's owner names its approvers."
+    assert by_stranger.status_code == 404
+    assert by_cli.status_code == 403
+    assert "Change approvals in the Omnigent web page instead." in by_cli.text
+    assert owner_on_service.status_code == 403
+    thread = ApprovalResource(ResourceKind.SESSION, session_id)
+    service_entry = ApprovalResource(ResourceKind.SERVICE, "tracker")
+    assert [e.approvers for e in team["approvals"].approvers_for([thread, service_entry])] == [
+        (),
+        (),
+    ]
+
+    named = team["alice"].post("/v1/approvers", json={**body, "user_id": "carol"})
+    assert named.status_code == 201, named.text
+    listed = team["bob"].get(
+        "/v1/approvers", params={"kind": "session", "resource_id": session_id}
+    )
+    assert listed.json()["approvers"] == ["carol"], listed.text
+    elicitation_id, retry = _ask(runner, session_id)
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+    team["tracker"].call_tool.assert_awaited_once()
+
+    removed_by_admin = team["admin"].delete(
+        "/v1/approvers", params={"kind": "session", "resource_id": session_id, "user_id": "carol"}
+    )
+    assert removed_by_admin.status_code == 403
+    removed = team["alice"].delete(
+        "/v1/approvers", params={"kind": "session", "resource_id": session_id, "user_id": "carol"}
+    )
+    assert removed.json() == {"removed": True}
+
+
+def test_approvers_are_named_on_the_top_level_thread(team) -> None:
+    """A sub-agent's approvals belong to its root thread, so its own id is refused."""
+    stores = team["stores"]
+    child = stores["conversation_store"].create_conversation(
+        parent_conversation_id=team["session"]
+    )
+    stores["permission_store"].grant("alice", child.id, 4)
+
+    named = team["alice"].post(
+        "/v1/approvers", json={"kind": "session", "resource_id": child.id, "user_id": "carol"}
+    )
+
+    assert named.status_code == 400, named.text

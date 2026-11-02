@@ -541,7 +541,7 @@ def test_authentication_records_who_holds_the_credential(
     [
         (True, True, CredentialKind.BROWSER_SESSION),
         (True, False, CredentialKind.SESSION_BEARER),
-        (False, True, CredentialKind.SESSION_BEARER),
+        (False, True, CredentialKind.SESSION_COOKIE),
     ],
     ids=["browser-cookie", "browser-token-as-bearer", "cli-token-as-cookie"],
 )
