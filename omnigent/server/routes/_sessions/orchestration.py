@@ -129,6 +129,7 @@ from omnigent.runtime.policies.builder import (
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.policies.protected import canonical_tool_call
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import managed_host_checkpoints, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
@@ -147,8 +148,10 @@ from omnigent.server.approval_authority import (
     ApprovalSubject,
     canonical_digest,
     consume_protected_approval,
+    final_check_problem,
     record_operation_outcome,
     record_protected_approval,
+    replay_matches,
     turn_initiator,
 )
 from omnigent.server.auth import (
@@ -181,6 +184,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.mcp_registry import pinned_login
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -452,6 +456,7 @@ from omnigent.util.session_lifecycle import (
 
 if TYPE_CHECKING:
     from omnigent.server.mcp_registry import McpRegistry
+    from omnigent.stores.approval_store import VerdictRecord
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -2790,22 +2795,61 @@ async def _native_gate_subject(
     request: Request,
     session_id: str,
     phase: Phase,
-    data: dict[str, Any],
-    result: PolicyResult,
+    data: object,
+    result: PolicyResult | None,
     conversation_store: ConversationStore,
 ) -> ApprovalSubject:
-    """What a server-held ASK gate's approval is bound to."""
+    """What a server-held ASK gate's approval is bound to.
+
+    :param result: The composed ASK, or ``None`` when checking a re-posted
+        question before evaluating it (its final content is then unknown).
+    """
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     labels = conv.labels if conv is not None else {}
-    tool_name = data.get("name") if phase == Phase.TOOL_CALL else None
-    content: object = result.data if result.data is not None else data
+    tool_name = data.get("name") if phase == Phase.TOOL_CALL and isinstance(data, dict) else None
+    if phase == Phase.TOOL_CALL:
+        content: object = canonical_tool_call(
+            tool_name if isinstance(tool_name, str) else None,
+            data,
+            result.data if result is not None else None,
+        )
+    else:
+        content = result.data if result is not None and result.data is not None else data
     return ApprovalSubject(
         session_id=session_id,
         phase=phase.value,
         tool_name=tool_name if isinstance(tool_name, str) else None,
         content=content,
         initiator=turn_initiator(request, labels.get(_TURN_ACTOR_LABEL)),
+        request=data,
     )
+
+
+async def _replayed_gate_answer_allowed(
+    request: Request,
+    session_id: str,
+    phase: Phase,
+    data: object,
+    conversation_store: ConversationStore,
+    elicitation_id: str,
+) -> bool:
+    """Whether a re-posted, approved question may reuse its answer.
+
+    A recorded approval is reused only while everything it was bound to still
+    holds (principal, initiator, owner, request, protected rules, approvers);
+    a question the ledger never recorded keeps the old behaviour.
+    """
+    from omnigent.runtime import get_approval_store
+
+    if get_approval_store() is None:
+        return True
+    subject = await _native_gate_subject(
+        request, session_id, phase, data, None, conversation_store
+    )
+    matches = await replay_matches(
+        request, conversation_store, subject, elicitation_id=elicitation_id
+    )
+    return matches is not False
 
 
 async def _hold_native_ask_gate_impl(
@@ -2902,6 +2946,11 @@ async def _hold_native_ask_gate_impl(
         if answered.declined_reason is not None:
             raise ElicitationDeclinedError(
                 answered.declined_reason, policy_name=result.deciding_policy
+            )
+        if answered.approved and not approval_owned_by_call:
+            # An approval is reused only for the context it was given in.
+            return await _replayed_gate_answer_allowed(
+                request, session_id, phase, data, conversation_store, elicitation_id
             )
         return answered.approved
     from omnigent.runtime import get_approval_store
@@ -12870,6 +12919,16 @@ def _claim_recorded_mcp_approval(
     return pending
 
 
+def _tool_arguments(
+    namespaced_name: str, arguments: dict[str, Any], data: object
+) -> dict[str, Any]:
+    """The arguments a policy transform leaves, in the one canonical call shape."""
+    call = canonical_tool_call(
+        namespaced_name, {"name": namespaced_name, "arguments": arguments}, data
+    )
+    return cast("dict[str, Any]", call["arguments"])
+
+
 def _mcp_destination(
     request: Request | None,
     spec: AgentSpec,
@@ -12911,12 +12970,20 @@ def _registry_connection_generation(
     version = getattr(service, "credential_version", None) or canonical_digest(
         [service.url, service.auth]
     )
+    marker = _registry_login_marker(registry, service_id, credential_user)
+    return f"{service_id}:{version}:{credential_user}:{marker}"
+
+
+def _registry_login_marker(
+    registry: McpRegistry, service_id: str, credential_user: str | None
+) -> str | None:
+    """The identity of the login a registry call would use, or ``None`` without one."""
     login = (
         registry.store.get(credential_user, f"mcp:{service_id}")
         if registry.store is not None and credential_user
         else None
     )
-    return f"{service_id}:{version}:{credential_user}:{login.created_at if login else None}"
+    return login.login_marker() if login is not None else None
 
 
 async def _recheck_protected_before_effect(
@@ -12927,11 +12994,15 @@ async def _recheck_protected_before_effect(
     actor: dict[str, str] | None,
     facts: dict[str, object],
     *,
-    approved: bool,
+    consumed: VerdictRecord | None,
 ) -> str | None:
     """Evaluate the protected rules once more on exactly what is about to run.
 
-    :param approved: This request consumed an approval bound to these arguments.
+    Every approval they require must be one the consumed approval was given
+    for, under the same rules and approvers; anything else asks again.
+
+    :param consumed: The approval this request consumed for these arguments,
+        or ``None``.
     :returns: Why the call may not run, or ``None``.
     """
     from omnigent.runtime import get_approval_store
@@ -12965,9 +13036,13 @@ async def _recheck_protected_before_effect(
     )
     if verdict.deny is not None:
         return f"Denied by policy: {verdict.deny[1]}"
-    if verdict.asks and not approved:
-        return "A protected rule now requires approval for this call; retry it"
-    return None
+    return await asyncio.to_thread(
+        final_check_problem,
+        store,
+        consumed,
+        [need for _name, _reason, need in verdict.asks],
+        root_session_id=conv.root_conversation_id or conv.id,
+    )
 
 
 def _replayed_mcp_response(rpc_id: int | str | None, body: str) -> Response:
@@ -13001,7 +13076,7 @@ async def _handle_mcp_tools_call(
     the approval so a retry of the same operation gets that result instead
     of running again. A call that raised leaves the outcome unknown.
     """
-    approval_use: dict[str, str] = {}
+    approval_use: dict[str, Any] = {}
     response = await _handle_mcp_tools_call_once(
         rpc_id,
         session_id,
@@ -13038,7 +13113,7 @@ async def _handle_mcp_tools_call_once(
     request: Request | None = None,
     execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     credential_user: str | None = None,
-    approval_use: dict[str, str],
+    approval_use: dict[str, Any],
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -13080,8 +13155,8 @@ async def _handle_mcp_tools_call_once(
         authenticated caller for direct calls, or ``None`` when unknown.
     :param credential_user: Authenticated caller whose registry grant is used;
         independent of the initiating policy actor.
-    :param approval_use: Filled with ``elicitation_id`` when this call
-        consumed a protected approval.
+    :param approval_use: Filled with ``elicitation_id`` and ``record`` when
+        this call consumed a protected approval.
     :returns: A JSON-RPC 2.0 response carrying the tool result as MCP
         ``content`` blocks, an ``InputRequiredResult`` on ASK, or an
         error response when the call is denied, the runner is
@@ -13148,7 +13223,11 @@ async def _handle_mcp_tools_call_once(
         if destination is not None
         else None
     )
-    initiator = (actor or {}).get("run_as")
+    # A runner acts for the owner; the turn's initiator is the server-recorded
+    # turn actor, whatever optional headers the runner sends.
+    initiator = turn_initiator(
+        request, conv.labels.get(_TURN_ACTOR_LABEL), (actor or {}).get("run_as")
+    )
     facts: dict[str, object] = {
         "destination": destination,
         "connection": connection,
@@ -13224,10 +13303,7 @@ async def _handle_mcp_tools_call_once(
         caller_action = approval.get("action") if isinstance(approval, dict) else None
         ledger = None
         # The arguments that would run now, after every current transform.
-        final_arguments = cast(
-            "dict[str, Any]",
-            retry_result.data if retry_result.data is not None else arguments,
-        )
+        final_arguments = _tool_arguments(namespaced_name, arguments, retry_result.data)
         if caller_action == "accept" and retry_result.action == PolicyAction.ASK:
             ledger = await consume_protected_approval(
                 request,
@@ -13243,6 +13319,7 @@ async def _handle_mcp_tools_call_once(
                     rpc_id, -32000, ledger.refusal or "Approval cannot be used"
                 )
             approval_use["elicitation_id"] = elicitation_id_from_state
+            approval_use["record"] = ledger.record
             approved_runner_generation = _session_runner_generation(request, conv)
             arguments = final_arguments
             # The ledger checked every bound fact; the entry holds deferred writes only.
@@ -13290,7 +13367,7 @@ async def _handle_mcp_tools_call_once(
                     )
         elif claimed is not None and retry_result.data is not None:
             # The current policy controls arguments once approval is no longer required.
-            arguments = cast("dict[str, object]", retry_result.data)
+            arguments = _tool_arguments(namespaced_name, arguments, retry_result.data)
         # Fall through to execution.
     else:
         # ── First call: evaluate TOOL_CALL policy ────────────────────
@@ -13335,7 +13412,11 @@ async def _handle_mcp_tools_call_once(
                 set_labels=call_result.set_labels,
                 from_mcp=True,
                 reviewed_arguments=arguments,
-                transformed_arguments=cast("dict[str, object] | None", call_result.data),
+                transformed_arguments=(
+                    _tool_arguments(namespaced_name, arguments, call_result.data)
+                    if call_result.data is not None
+                    else None
+                ),
                 mcp_call_identity=(
                     session_id,
                     namespaced_name,
@@ -13350,7 +13431,7 @@ async def _handle_mcp_tools_call_once(
                     request,
                     conversation_store,
                     _approval_subject(
-                        call_result.data if call_result.data is not None else arguments
+                        _tool_arguments(namespaced_name, arguments, call_result.data)
                     ),
                     elicitation_id=elicitation_id,
                     result=call_result,
@@ -13385,7 +13466,7 @@ async def _handle_mcp_tools_call_once(
         # If the policy returned transformed arguments (e.g.
         # PII-redacted args), use them instead of the originals.
         if call_result.data is not None:
-            arguments = cast("dict[str, object]", call_result.data)
+            arguments = _tool_arguments(namespaced_name, arguments, call_result.data)
 
     # ── Server-side sys_advise_models intercept ──────────────────────────
     # After policy evaluation (DENY/ASK handled above); arguments may have
@@ -13420,10 +13501,29 @@ async def _handle_mcp_tools_call_once(
         arguments,
         actor,
         facts,
-        approved="elicitation_id" in approval_use,
+        consumed=approval_use.get("record"),
     )
     if refusal is not None:
         return _mcp_error_response(rpc_id, -32000, refusal)
+    login_marker: str | None = None
+    if destination is not None:
+        # The login is pinned: the one the call was evaluated (and approved) for.
+        if (
+            await asyncio.to_thread(
+                _registry_connection_generation, request, destination, credential_user
+            )
+            != connection
+        ):
+            return _mcp_error_response(
+                rpc_id,
+                -32000,
+                "The service's login changed after this call was checked; ask again",
+            )
+        registry = cast("McpRegistry", request.app.state.mcp_registry) if request else None
+        if registry is not None:
+            login_marker = await asyncio.to_thread(
+                _registry_login_marker, registry, destination, credential_user
+            )
     # An approved call runs only on its runner connection; the tunnel transport
     # refuses every runner request of this call on any other one.
     pinned: dict[str, Any] = (
@@ -13432,18 +13532,20 @@ async def _handle_mcp_tools_call_once(
         else {}
     )
     if execute_tool is not None:
-        exec_data = await execute_tool(arguments)
+        with pinned_login(destination or "", credential_user, login_marker):
+            exec_data = await execute_tool(arguments)
     elif registry_config is not None:
         from omnigent.server.registry_gateway import execute_registry_tool
 
-        exec_data = await execute_registry_tool(
-            request,
-            conv,
-            registry_config,
-            namespaced_name,
-            arguments,
-            credential_user,
-        )
+        with pinned_login(registry_config.name, credential_user, login_marker):
+            exec_data = await execute_registry_tool(
+                request,
+                conv,
+                registry_config,
+                namespaced_name,
+                arguments,
+                credential_user,
+            )
     else:
         # ── Execute on the runner via WS tunnel ──────────────────────────
         # The runner owns stdio subprocess spawning (correct machine, cwd,

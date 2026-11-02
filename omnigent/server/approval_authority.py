@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
-import json
 import logging
 import time
 from collections.abc import Sequence
@@ -39,7 +37,6 @@ from omnigent.runtime import get_approval_store
 from omnigent.runtime.policies.protected import (
     PERSONAL_NEED,
     TEAM_NEED,
-    protected_fingerprint,
 )
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.permissions import check_session_access
@@ -54,6 +51,8 @@ from omnigent.stores.approval_store import (
     SqlAlchemyApprovalStore,
     VerdictRecord,
     VerdictState,
+    canonical_digest,
+    requirement_resources,
 )
 
 if TYPE_CHECKING:
@@ -94,6 +93,9 @@ class ApprovalSubject:
     :param connection: The service connection's generation, or ``None``.
     :param runner_connection: The runner tunnel's generation, or ``None``.
     :param operation_id: The operation that would consume it, or ``None``.
+    :param request: The request as posted, before any transform, for a gate
+        that a retry re-posts (the native and request gates); ``None``
+        elsewhere.
     """
 
     session_id: str
@@ -105,12 +107,7 @@ class ApprovalSubject:
     connection: str | None = None
     runner_connection: int | None = None
     operation_id: str | None = None
-
-
-def canonical_digest(value: object) -> str:
-    """sha256 of *value* as canonical JSON."""
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(payload.encode()).hexdigest()
+    request: object | None = None
 
 
 def _request_principal(request: object) -> Principal | None:
@@ -170,39 +167,106 @@ def _requirements(
     approvers is a team-shared action, answered by those approvers. A
     personal protected rule's ASK always goes to the person.
     """
-    personal = ApprovalResource(ResourceKind.SESSION, root_session_id)
     found: list[dict[str, Any]] = []
     for need in needs:
-        if need.kind == TEAM_NEED and need.resource is not None:
-            kind, resource_id = need.resource
-            entry = {"kind": TEAM_NEED, "resource": [kind, resource_id]}
-        elif need.kind == PERSONAL_NEED and destination is not None and not need.protected:
-            entry = {"kind": TEAM_NEED, "resource": destination.as_json()}
-        else:
-            entry = {"kind": PERSONAL_NEED, "resource": personal.as_json()}
+        entry = _requirement_for(need, root_session_id, destination)
         if entry not in found:
             found.append(entry)
     return found
 
 
-def _requirement_resources(requirements: Sequence[dict[str, Any]]) -> list[ApprovalResource]:
-    resources = [ApprovalResource.from_json(req["resource"]) for req in requirements]
-    if any(r.kind is ResourceKind.SERVICE for r in resources):
-        # A service without named approvers falls back to the team's.
-        resources.append(TEAM_RESOURCE)
-    return list(dict.fromkeys(resources))
+def _requirement_for(
+    need: ApprovalNeed, root_session_id: str, destination: ApprovalResource | None
+) -> dict[str, Any]:
+    if need.kind == TEAM_NEED and need.resource is not None:
+        kind, resource_id = need.resource
+        return {"kind": TEAM_NEED, "resource": [kind, resource_id]}
+    if need.kind == PERSONAL_NEED and destination is not None and not need.protected:
+        return {"kind": TEAM_NEED, "resource": destination.as_json()}
+    personal = ApprovalResource(ResourceKind.SESSION, root_session_id)
+    return {"kind": PERSONAL_NEED, "resource": personal.as_json()}
 
 
-def _grants_fingerprint(
-    store: SqlAlchemyApprovalStore, requirements: Sequence[dict[str, Any]]
-) -> str:
-    approvers = store.approvers_for(_requirement_resources(requirements))
-    return canonical_digest([entry.fingerprint() for entry in approvers])
+def final_check_problem(
+    store: SqlAlchemyApprovalStore,
+    record: VerdictRecord | None,
+    needs: Sequence[ApprovalNeed],
+    *,
+    root_session_id: str,
+) -> str | None:
+    """Whether a consumed approval covers the protected ASKs found just before an effect.
+
+    Every requirement those ASKs need must be one the approval was given for,
+    under the same protected rules and approvers. Without a consumed approval,
+    any protected ASK refuses the effect.
+
+    :param record: The approval this request consumed, or ``None``.
+    :param needs: The approvals the final protected evaluation requires.
+    :returns: Why the effect may not happen, or ``None``.
+    """
+    if not needs:
+        return None
+    if record is None:
+        return "A protected rule now requires approval for this call; retry it"
+    required = [_requirement_for(need, root_session_id, None) for need in needs]
+    if any(entry not in record.requirements for entry in required):
+        return "A protected rule requires an approval this call was not given; ask again"
+    if store.authority_fingerprints(record.requirements, record.binding.get("owner")) != (
+        record.binding.get("grants"),
+        record.binding.get("policies"),
+    ):
+        return "The approvers or protected rules changed after approval; ask again"
+    return None
 
 
-def _rules_fingerprint(store: SqlAlchemyApprovalStore, owner: str | None) -> str:
-    """Digest of the protected rules governing the owner's threads."""
-    return protected_fingerprint(store.rules_for(owner))
+def _replay_matches_sync(
+    store: SqlAlchemyApprovalStore,
+    conversation_store: ConversationStore,
+    request: HTTPConnection | None,
+    subject: ApprovalSubject,
+    record: VerdictRecord,
+) -> bool:
+    if record.state is not VerdictState.CONSUMED or "request" not in record.binding:
+        return False
+    current = _binding(store, conversation_store, request, subject, record.requirements).fields
+    # The final content needs a fresh evaluation; the posted request stands in for it.
+    ignored = {"content"}
+    keys = (set(current) | set(record.binding)) - ignored
+    changed = sorted(key for key in keys if current.get(key) != record.binding.get(key))
+    if changed:
+        _logger.info(
+            "replayed approval %s refused: %s changed", record.elicitation_id, ", ".join(changed)
+        )
+    return not changed
+
+
+async def replay_matches(
+    request: HTTPConnection | None,
+    conversation_store: ConversationStore,
+    subject: ApprovalSubject,
+    *,
+    elicitation_id: str,
+) -> bool | None:
+    """Whether a re-posted, already approved question may reuse its answer.
+
+    A gate's retry gets its recorded result only while every fact the approval
+    was bound to still holds: principal, initiator, owner, thread, request,
+    protected rules and approvers. A changed context needs a new decision.
+
+    :returns: ``None`` when the question was never recorded in the ledger
+        (no store, or not a protected approval); otherwise whether it matches.
+    """
+    store = get_approval_store()
+    if store is None:
+        return None
+    record = await asyncio.to_thread(store.get_verdict, elicitation_id)
+    if record is None:
+        return None
+    if record.session_id != subject.session_id:
+        return False
+    return await asyncio.to_thread(
+        _replay_matches_sync, store, conversation_store, request, subject, record
+    )
 
 
 def _destination_resource(
@@ -224,6 +288,7 @@ def _binding(
     requirements: Sequence[dict[str, Any]],
 ) -> ApprovalBinding:
     owner = _owner(conversation_store, subject.session_id)
+    grants, policies = store.authority_fingerprints(requirements, owner)
     fields: dict[str, Any] = {
         "v": _BINDING_VERSION,
         "principal": _principal_summary(request),
@@ -237,10 +302,12 @@ def _binding(
         "connection": subject.connection,
         "runner_connection": subject.runner_connection,
         "operation": subject.operation_id,
-        "policies": _rules_fingerprint(store, owner),
-        "grants": _grants_fingerprint(store, requirements),
+        "policies": policies,
+        "grants": grants,
         "requirements": list(requirements),
     }
+    if subject.request is not None:
+        fields["request"] = canonical_digest(subject.request)
     return ApprovalBinding(bytes.fromhex(canonical_digest(fields)), fields)
 
 
@@ -487,10 +554,11 @@ def _eligible(
     resource = ApprovalResource.from_json(requirement["resource"])
     named = approvers[resource]
     if requirement["kind"] == PERSONAL_NEED:
-        if answerer is not None and answerer == owner:
-            return True
-        if answerer not in named.approvers:
+        is_owner = answerer is not None and answerer == owner
+        if not is_owner and answerer not in named.approvers:
             return False
+        # The owner approves their own work by default; a thread that refuses
+        # its initiator refuses its owner's own actions too.
         return answerer != initiator or named.initiator_may_approve()
     if resource.kind is ResourceKind.SERVICE and not named.approvers:
         named = approvers[TEAM_RESOURCE]
@@ -525,9 +593,8 @@ def _gate_sync(
                 "The thread's owner changed; the approval must be asked again.",
                 code=ErrorCode.CONFLICT,
             )
-        resources = _requirement_resources(requirements)
-        current = store.approvers_for(resources)
-        approvers = {entry.resource: entry for entry in current}
+        resources = requirement_resources(requirements)
+        approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
         initiator = record.binding.get("initiator")
         satisfied = {
             index
@@ -546,25 +613,23 @@ def _gate_sync(
                 "You are not an approver for this request.", code=ErrorCode.FORBIDDEN
             )
         # An answer the changed approvers or rules would refuse at use is refused now.
-        if canonical_digest([entry.fingerprint() for entry in current]) != record.binding.get(
-            "grants"
-        ) or _rules_fingerprint(store, owner) != record.binding.get("policies"):
+        if store.authority_fingerprints(requirements, owner) != (
+            record.binding.get("grants"),
+            record.binding.get("policies"),
+        ):
             raise OmnigentError(
                 "The approvers or protected rules changed; the approval must be asked again.",
                 code=ErrorCode.CONFLICT,
             )
     decline = action != "accept"
-    already = {index for answer in record.answers for index in answer.get("satisfies", [])}
-    complete = already | satisfied == set(range(len(requirements)))
     answer = {
         "by": answerer,
         "action": "accept" if not decline else "decline",
         "satisfies": sorted(satisfied),
         "at": now,
     }
-    updated = store.record_answer(
-        record.elicitation_id, answer=answer, decline=decline, complete=complete, now=now
-    )
+    # Completion is decided from the locked row's answers, not this snapshot.
+    updated = store.record_answer(record.elicitation_id, answer=answer, decline=decline, now=now)
     if updated is None:
         raise OmnigentError(
             "This approval was already decided or expired.", code=ErrorCode.CONFLICT
@@ -643,7 +708,7 @@ def may_view_approval(
     if record.state is not VerdictState.PENDING:
         return False
     owner = _owner(conversation_store, record.session_id)
-    resources = _requirement_resources(record.requirements)
+    resources = requirement_resources(record.requirements)
     approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
     return any(
         _eligible(
@@ -667,9 +732,11 @@ __all__ = [
     "canonical_digest",
     "consume_protected_approval",
     "current_binding",
+    "final_check_problem",
     "gate_approval_answer",
     "may_view_approval",
     "record_operation_outcome",
     "record_protected_approval",
+    "replay_matches",
     "turn_initiator",
 ]

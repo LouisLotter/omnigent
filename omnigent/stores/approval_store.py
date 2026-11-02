@@ -9,6 +9,11 @@ The ledger holds one row per protected approval. The row binds what was asked
 by digest, records each answer, and lets exactly one operation consume an
 approval: consumption is a conditional update, so of several concurrent
 attempts only one succeeds, on every backend.
+
+Every change to who approves or what is protected, and every consumption,
+first locks the workspace's team row (the lock membership writes take). A
+consumption rereads the approvers and rules under that lock, so a grant
+removed or a rule changed before it commits always refuses it.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from sqlalchemy import CursorResult, and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import lock_account
 from omnigent.db.db_models import (
     SqlApprovalResource,
     SqlApprovalVerdict,
@@ -39,6 +45,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.team_store import lock_team
 
 # A recorded operation result larger than this is not kept; a retry then
 # learns the operation completed, without its result.
@@ -115,6 +122,24 @@ class ApprovalResource:
 
 
 TEAM_RESOURCE = ApprovalResource(ResourceKind.TEAM)
+
+
+def canonical_digest(value: object) -> str:
+    """sha256 of *value* as canonical JSON."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def requirement_resources(requirements: Sequence[dict[str, Any]]) -> list[ApprovalResource]:
+    """The resources whose approvers decide *requirements*.
+
+    A service without named approvers falls back to the team's, so the team is
+    included whenever a service is.
+    """
+    resources = [ApprovalResource.from_json(req["resource"]) for req in requirements]
+    if any(r.kind is ResourceKind.SERVICE for r in resources):
+        resources.append(TEAM_RESOURCE)
+    return list(dict.fromkeys(resources))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,6 +221,16 @@ class ProtectedRule:
             default=str,
         )
         return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def rules_fingerprint(rules: Sequence[ProtectedRule]) -> str:
+    """Digest of the protected rules in force, for binding a verdict to them."""
+    return canonical_digest(sorted(rule.fingerprint() for rule in rules))
+
+
+def grants_fingerprint(approvers: Sequence[ResourceApprovers]) -> str:
+    """Digest of who may answer for some resources, for binding a verdict to them."""
+    return canonical_digest([entry.fingerprint() for entry in approvers])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,6 +355,95 @@ def _validate_rule_target(
         )
 
 
+def remove_account_approval_authority(session: Session, user_id: str) -> None:
+    """Inside account deletion: drop the account's approver grants and personal rules.
+
+    The deletion transaction already holds the team lock, so a concurrent grant
+    write either commits first (and is removed here) or waits and then finds
+    the account deleted.
+    """
+    workspace = current_workspace_id()
+    session.execute(
+        delete(SqlApproverGrant).where(
+            SqlApproverGrant.workspace_id == workspace,
+            SqlApproverGrant.approver_user_id == user_id,
+        )
+    )
+    session.execute(
+        delete(SqlProtectedPolicy).where(
+            SqlProtectedPolicy.workspace_id == workspace,
+            SqlProtectedPolicy.domain == int(PolicyDomain.PERSONAL),
+            SqlProtectedPolicy.owner_user_id == user_id,
+        )
+    )
+
+
+def _lock_authority(session: Session) -> None:
+    """Serialize approval authority changes and consumptions (the team row lock)."""
+    lock_team(session)
+
+
+def _approvers_in(
+    session: Session, resources: Iterable[ApprovalResource]
+) -> list[ResourceApprovers]:
+    wanted = list(dict.fromkeys(resources))
+    if not wanted:
+        return []
+    keys = [resource.cksum for resource in wanted]
+    workspace = current_workspace_id()
+    grants = session.execute(
+        select(SqlApproverGrant.resource_cksum, SqlApproverGrant.approver_user_id).where(
+            SqlApproverGrant.workspace_id == workspace,
+            SqlApproverGrant.resource_cksum.in_(keys),
+        )
+    ).all()
+    settings = session.execute(
+        select(SqlApprovalResource.resource_cksum, SqlApprovalResource.allow_initiator).where(
+            SqlApprovalResource.workspace_id == workspace,
+            SqlApprovalResource.resource_cksum.in_(keys),
+        )
+    ).all()
+    by_key: dict[bytes, list[str]] = {}
+    for key, user in grants:
+        by_key.setdefault(bytes(key), []).append(user)
+    allow = {bytes(key): value for key, value in settings}
+    return [
+        ResourceApprovers(
+            resource, tuple(sorted(by_key.get(resource.cksum, []))), allow.get(resource.cksum)
+        )
+        for resource in wanted
+    ]
+
+
+def _rules_in(session: Session, owner_user_id: str | None) -> list[ProtectedRule]:
+    scope = SqlProtectedPolicy.domain == int(PolicyDomain.TEAM)
+    if owner_user_id:
+        scope = or_(
+            scope,
+            and_(
+                SqlProtectedPolicy.domain == int(PolicyDomain.PERSONAL),
+                SqlProtectedPolicy.owner_user_id == owner_user_id,
+            ),
+        )
+    rows = session.execute(
+        select(SqlProtectedPolicy)
+        .where(
+            SqlProtectedPolicy.workspace_id == current_workspace_id(),
+            SqlProtectedPolicy.enabled.is_(True),
+            scope,
+        )
+        .order_by(SqlProtectedPolicy.domain, SqlProtectedPolicy.created_at, SqlProtectedPolicy.id)
+    ).scalars()
+    return [_to_rule(row) for row in rows]
+
+
+def _authority_fingerprints(
+    session: Session, requirements: Sequence[dict[str, Any]], owner: str | None
+) -> tuple[str, str]:
+    approvers = _approvers_in(session, requirement_resources(requirements))
+    return grants_fingerprint(approvers), rules_fingerprint(_rules_in(session, owner))
+
+
 class SqlAlchemyApprovalStore:
     """SQLAlchemy persistence for approver grants, protected rules and verdicts.
 
@@ -341,45 +465,33 @@ class SqlAlchemyApprovalStore:
 
     def approvers_for(self, resources: Iterable[ApprovalResource]) -> list[ResourceApprovers]:
         """Each resource's named approvers and initiator setting, in order."""
-        wanted = list(dict.fromkeys(resources))
-        if not wanted:
-            return []
-        keys = [resource.cksum for resource in wanted]
-        workspace = current_workspace_id()
         with self._session("select_resource_approvers") as session:
-            grants = session.execute(
-                select(SqlApproverGrant.resource_cksum, SqlApproverGrant.approver_user_id).where(
-                    SqlApproverGrant.workspace_id == workspace,
-                    SqlApproverGrant.resource_cksum.in_(keys),
-                )
-            ).all()
-            settings = session.execute(
-                select(
-                    SqlApprovalResource.resource_cksum, SqlApprovalResource.allow_initiator
-                ).where(
-                    SqlApprovalResource.workspace_id == workspace,
-                    SqlApprovalResource.resource_cksum.in_(keys),
-                )
-            ).all()
-        by_key: dict[bytes, list[str]] = {}
-        for key, user in grants:
-            by_key.setdefault(bytes(key), []).append(user)
-        allow = {bytes(key): value for key, value in settings}
-        return [
-            ResourceApprovers(
-                resource,
-                tuple(sorted(by_key.get(resource.cksum, []))),
-                allow.get(resource.cksum),
-            )
-            for resource in wanted
-        ]
+            return _approvers_in(session, resources)
+
+    def authority_fingerprints(
+        self, requirements: Sequence[dict[str, Any]], owner: str | None
+    ) -> tuple[str, str]:
+        """``(grants, rules)`` fingerprints for a binding, read in one transaction."""
+        with self._session("select_approval_authority") as session:
+            return _authority_fingerprints(session, requirements, owner)
 
     def add_approver(
         self, resource: ApprovalResource, user_id: str, *, granted_by: str | None
     ) -> bool:
-        """Name *user_id* an approver for *resource*; ``False`` if already named."""
+        """Name *user_id* an approver for *resource*; ``False`` if already named.
+
+        A deleted account cannot be named: the grant would pass to whoever
+        registers the username next. The account and team locks order this
+        write with account deletion, which removes the account's grants.
+
+        :raises OmnigentError: ``INVALID_INPUT`` for a deleted account.
+        """
 
         def write(session: Session) -> bool:
+            _lock_authority(session)
+            account = lock_account(session, user_id)
+            if account is not None and account.deleted_at is not None:
+                raise OmnigentError(f"no account {user_id!r}", code=ErrorCode.INVALID_INPUT)
             existing = session.get(
                 SqlApproverGrant, (current_workspace_id(), resource.cksum, user_id)
             )
@@ -407,6 +519,7 @@ class SqlAlchemyApprovalStore:
         """Stop *user_id* approving for *resource*; ``False`` if they were not named."""
 
         def write(session: Session) -> bool:
+            _lock_authority(session)
             result = cast(
                 "CursorResult[Any]",
                 session.execute(
@@ -421,29 +534,13 @@ class SqlAlchemyApprovalStore:
 
         return run_write_transaction(self._session_immediate, "delete_approver_grant", write)
 
-    def remove_approver_everywhere(self, user_id: str) -> int:
-        """Remove every approver grant held by *user_id*; returns how many."""
-
-        def write(session: Session) -> int:
-            result = cast(
-                "CursorResult[Any]",
-                session.execute(
-                    delete(SqlApproverGrant).where(
-                        SqlApproverGrant.workspace_id == current_workspace_id(),
-                        SqlApproverGrant.approver_user_id == user_id,
-                    )
-                ),
-            )
-            return int(result.rowcount)
-
-        return run_write_transaction(self._session_immediate, "delete_approver_grants", write)
-
     def set_allow_initiator(
         self, resource: ApprovalResource, value: bool | None, *, updated_by: str | None
     ) -> None:
         """Save whether the initiator may approve for *resource*; ``None`` restores the default."""
 
         def write(session: Session) -> None:
+            _lock_authority(session)
             row = session.get(SqlApprovalResource, (current_workspace_id(), resource.cksum))
             if row is None:
                 session.add(
@@ -494,6 +591,7 @@ class SqlAlchemyApprovalStore:
         _validate_rule_target(domain, owner_user_id, approval)
 
         def write(session: Session) -> ProtectedRule:
+            _lock_authority(session)
             now = _now()
             row = SqlProtectedPolicy(
                 id=uuid.uuid4().hex,
@@ -532,6 +630,7 @@ class SqlAlchemyApprovalStore:
         """Change a rule's name, arguments or enabled flag; ``None`` if missing."""
 
         def write(session: Session) -> ProtectedRule | None:
+            _lock_authority(session)
             row = session.get(SqlProtectedPolicy, (current_workspace_id(), rule_id))
             if row is None:
                 return None
@@ -552,6 +651,7 @@ class SqlAlchemyApprovalStore:
         """Delete a rule; ``False`` if it did not exist."""
 
         def write(session: Session) -> bool:
+            _lock_authority(session)
             result = cast(
                 "CursorResult[Any]",
                 session.execute(
@@ -584,30 +684,8 @@ class SqlAlchemyApprovalStore:
 
     def rules_for(self, owner_user_id: str | None) -> list[ProtectedRule]:
         """The enabled rules governing a thread: the team's, then its owner's."""
-        scope = SqlProtectedPolicy.domain == int(PolicyDomain.TEAM)
-        if owner_user_id:
-            scope = or_(
-                scope,
-                and_(
-                    SqlProtectedPolicy.domain == int(PolicyDomain.PERSONAL),
-                    SqlProtectedPolicy.owner_user_id == owner_user_id,
-                ),
-            )
         with self._session("select_governing_protected_policies") as session:
-            rows = session.execute(
-                select(SqlProtectedPolicy)
-                .where(
-                    SqlProtectedPolicy.workspace_id == current_workspace_id(),
-                    SqlProtectedPolicy.enabled.is_(True),
-                    scope,
-                )
-                .order_by(
-                    SqlProtectedPolicy.domain,
-                    SqlProtectedPolicy.created_at,
-                    SqlProtectedPolicy.id,
-                )
-            ).scalars()
-            return [_to_rule(row) for row in rows]
+            return _rules_in(session, owner_user_id)
 
     def has_enabled_rules(self) -> bool:
         """Whether any protected rule is enabled in this workspace."""
@@ -697,16 +775,17 @@ class SqlAlchemyApprovalStore:
         *,
         answer: dict[str, Any],
         decline: bool,
-        complete: bool,
         now: int | None = None,
     ) -> VerdictRecord | None:
         """Record one answer to a pending, unexpired approval.
 
-        The row is locked, so concurrent answers apply one after another.
+        The row is locked, so concurrent answers apply one after another, and
+        completion is decided from the answers the locked row holds: two
+        approvers satisfying different requirements at once approve it.
 
-        :param answer: The answer to append (who, action, which requirements).
+        :param answer: The answer to append: who, the action, and the indexes
+            of the requirements it satisfies (``"satisfies"``).
         :param decline: The answer declines; the approval is then declined.
-        :param complete: With this answer every requirement is satisfied.
         :returns: The updated row, or ``None`` when it is missing, no longer
             pending, or expired.
         """
@@ -720,11 +799,14 @@ class SqlAlchemyApprovalStore:
                     SqlApprovalVerdict.elicitation_id == elicitation_id,
                 )
                 .with_for_update()
+                .execution_options(populate_existing=True)
             ).scalar_one_or_none()
             if row is None or row.state != int(VerdictState.PENDING) or row.expires_at <= at:
                 return None
             answers = [*_json_list(row.answers), answer]
             row.answers = json.dumps(answers, sort_keys=True)
+            satisfied = {index for item in answers for index in item.get("satisfies", [])}
+            complete = satisfied >= set(range(len(_json_list(row.requirements))))
             if decline or complete:
                 row.state = int(VerdictState.DECLINED if decline else VerdictState.APPROVED)
                 row.decided_by = cast("str | None", answer.get("by"))
@@ -744,39 +826,48 @@ class SqlAlchemyApprovalStore:
     ) -> ConsumeResult:
         """Consume an approved, unexpired approval for exactly this binding, once.
 
+        Under the authority lock, the approvers and protected rules the
+        approval was bound to are read again: a grant removed or a rule changed
+        before this commits refuses it.
+
         :returns: Whether this call consumed it; when not, the row and reason.
         """
         at = _now() if now is None else now
 
-        def write(session: Session) -> int:
-            result = cast(
-                "CursorResult[Any]",
-                session.execute(
-                    update(SqlApprovalVerdict)
-                    .where(
-                        SqlApprovalVerdict.workspace_id == current_workspace_id(),
-                        SqlApprovalVerdict.elicitation_id == elicitation_id,
-                        SqlApprovalVerdict.state == int(VerdictState.APPROVED),
-                        SqlApprovalVerdict.binding_digest == binding_digest,
-                        SqlApprovalVerdict.expires_at > at,
-                    )
-                    .values(
-                        state=int(VerdictState.CONSUMED),
-                        consumed_at=at,
-                        operation_id=operation_id,
-                        outcome=int(Outcome.EXECUTING),
-                    )
-                ),
+        def write(session: Session) -> str | None:
+            _lock_authority(session)
+            row = session.execute(
+                select(SqlApprovalVerdict)
+                .where(
+                    SqlApprovalVerdict.workspace_id == current_workspace_id(),
+                    SqlApprovalVerdict.elicitation_id == elicitation_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            if (
+                row is None
+                or row.state != int(VerdictState.APPROVED)
+                or bytes(row.binding_digest) != binding_digest
+                or row.expires_at <= at
+            ):
+                return _refusal(_to_verdict(row) if row is not None else None, binding_digest, at)
+            binding = json.loads(row.binding)
+            bound = (binding.get("grants"), binding.get("policies"))
+            current = _authority_fingerprints(
+                session, _json_list(row.requirements), binding.get("owner")
             )
-            return int(result.rowcount)
+            if current != bound:
+                return "The approvers or protected rules changed after approval; ask again"
+            row.state = int(VerdictState.CONSUMED)
+            row.consumed_at = at
+            row.operation_id = operation_id
+            row.outcome = int(Outcome.EXECUTING)
+            return None
 
-        consumed = run_write_transaction(
-            self._session_immediate, "consume_approval_verdict", write
-        )
+        refusal = run_write_transaction(self._session_immediate, "consume_approval_verdict", write)
         record = self.get_verdict(elicitation_id)
-        if consumed == 1:
-            return ConsumeResult(True, record)
-        return ConsumeResult(False, record, _refusal(record, binding_digest, at))
+        return ConsumeResult(refusal is None, record, refusal)
 
     def record_outcome(self, elicitation_id: str, *, outcome: Outcome, body: str | None) -> None:
         """Record the consuming operation's result, for retries to inspect."""
@@ -843,4 +934,9 @@ __all__ = [
     "SqlAlchemyApprovalStore",
     "VerdictRecord",
     "VerdictState",
+    "canonical_digest",
+    "grants_fingerprint",
+    "remove_account_approval_authority",
+    "requirement_resources",
+    "rules_fingerprint",
 ]

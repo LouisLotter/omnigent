@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import secrets
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -143,6 +144,7 @@ class CredentialStore:
             metadata=_safe_json_obj(row.metadata_json) or {},
             created_at=row.created_at,
             updated_at=row.updated_at,
+            login_id=row.login_id,
         )
 
     def _to_entity(self, row: SqlConnection, *, with_secret: bool) -> ProviderConnection:
@@ -169,7 +171,8 @@ class CredentialStore:
         """Create or replace a user's connection for *provider*.
 
         Idempotent on ``(user_id, provider, account_id)``: reconnecting
-        overwrites the secret and metadata in place, preserving ``created_at``.
+        overwrites the secret and metadata in place, preserving ``created_at``
+        but giving the login a new ``login_id``.
         Concurrency-safe — two simultaneous connects (a double-clicked
         "Connect") don't 500 on a primary-key violation; the loser retries as an
         update.
@@ -196,12 +199,14 @@ class CredentialStore:
                     metadata_json=metadata_json,
                     created_at=now,
                     updated_at=now,
+                    login_id=uuid.uuid4().hex,
                 )
                 session.add(row)
             else:
                 row.secret_enc = secret_enc
                 row.metadata_json = metadata_json
                 row.updated_at = now
+                row.login_id = uuid.uuid4().hex
             return row
 
         def initial_write(session: Session) -> ProviderConnection:
@@ -267,12 +272,14 @@ class CredentialStore:
                     metadata_json=json.dumps(metadata),
                     created_at=now,
                     updated_at=now,
+                    login_id=uuid.uuid4().hex,
                 )
             )
         else:
             row.secret_enc = sealed.secret_enc
             row.metadata_json = json.dumps(metadata)
             row.updated_at = now
+            row.login_id = uuid.uuid4().hex
 
     def update_secret(
         self,

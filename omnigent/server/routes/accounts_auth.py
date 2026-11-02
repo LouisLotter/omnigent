@@ -38,6 +38,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from omnigent.db.account_authority import bind_account_authority, target_account_scope
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
+from omnigent.server.approval_authority import answer_credential_problem
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
@@ -46,6 +47,7 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.server.principals import CredentialKind
 from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
@@ -266,18 +268,30 @@ def create_accounts_auth_router(
     _session_cookie = config.session_cookie_name
     _session_max_age = config.session_ttl_hours * 3600
 
-    def _reissue_session_cookie(response: Response, user_id: str, generation: str) -> None:
-        """Keep the caller signed in after rotating their own account generation."""
+    def _reissue_session_cookie(
+        request: Request, response: Response, user_id: str, generation: str
+    ) -> None:
+        """Keep the caller signed in after rotating their own account generation.
+
+        The new cookie keeps the caller's provenance: only a browser sign-in
+        gets a browser-marked cookie back, so a CLI or host sign-in cannot
+        become one by rotating its own password.
+        """
         bind_account_authority(user_id, generation)
-        _set_browser_session_cookie(response, user_id, generation)
+        principal = auth_provider.principal(request)
+        browser = principal is not None and principal.credential is CredentialKind.BROWSER_SESSION
+        _set_browser_session_cookie(response, user_id, generation, browser=browser)
 
     def _set_browser_session_cookie(
-        response: Response, user_id: str, generation: str | None
+        response: Response, user_id: str, generation: str | None, *, browser: bool = True
     ) -> None:
         """Sign the browser in with a cookie token marked as its own session.
 
         A token returned in a response body goes to whatever client asked
         (a CLI, a script); only this cookie carries the browser mark.
+
+        :param browser: Mark the cookie as a browser sign-in (``False`` keeps
+            a reissued cookie as unmarked as the credential it replaces).
         """
         session_jwt = mint_session_cookie(
             user_id=user_id,
@@ -285,7 +299,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
-            browser=True,
+            browser=browser,
         )
         _set_session_cookie(
             response,
@@ -425,10 +439,17 @@ def create_accounts_auth_router(
 
     @router.post("/invite")
     async def invite(request: Request, body: InviteRequest) -> Response:
-        """Mint a single-use invite URL (admin only)."""
+        """Mint a single-use invite URL (admin only, from a browser sign-in).
+
+        An invitation becomes a new browser sign-in, possibly an
+        administrator's, so a CLI or host credential cannot mint one.
+        """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
             return JSONResponse(status_code=403, content={"error": "admin only"})
+        problem = answer_credential_problem(request, auth_provider, "invite people")
+        if problem is not None:
+            return JSONResponse(status_code=403, content={"error": problem})
 
         token_id = secrets.token_urlsafe(32)
         now = int(time.time())
@@ -806,10 +827,16 @@ def create_accounts_auth_router(
         the plaintext exactly once to the calling admin who
         then DMs it to the user out-of-band. No SMTP needed.
         Also revokes the user's existing sessions and CLI logins.
+
+        Only from a browser sign-in: the new password signs anyone in through
+        the browser, so a CLI or host credential cannot obtain one.
         """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
             return JSONResponse(status_code=403, content={"error": "admin only"})
+        problem = answer_credential_problem(request, auth_provider, "reset passwords")
+        if problem is not None:
+            return JSONResponse(status_code=403, content={"error": problem})
 
         user = account_store.get_user(user_id)
         if user is None:
@@ -833,7 +860,7 @@ def create_accounts_auth_router(
         # An admin resetting their own account keeps this session, so the
         # next request cannot sign them out before they save the password.
         if user_id == admin_id and generation is not None:
-            _reissue_session_cookie(resp, admin_id, generation)
+            _reissue_session_cookie(request, resp, admin_id, generation)
         return resp
 
     @router.post("/users/me/password")
@@ -869,7 +896,7 @@ def create_accounts_auth_router(
         _logger.info("auth/users/me/password: changed for %s", _redact_for_log(user_id))
         resp = Response(status_code=204)
         if generation is not None:
-            _reissue_session_cookie(resp, user_id, generation)
+            _reissue_session_cookie(request, resp, user_id, generation)
         return resp
 
     return router

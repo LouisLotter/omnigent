@@ -15,11 +15,16 @@ Adds four tables:
 - ``approval_verdicts``: one row per protected approval, binding what was
   asked, recording answers, and consuming an approval once.
 
+It also adds the nullable ``connections.login_id``: a login's id, replaced on
+every connect or reconnect and kept by token refreshes, so an approval bound
+to one login is never used through a replacement. Existing logins keep NULL
+until they are next replaced.
+
 Deployment: additive. Older application code ignores the new tables; no
 existing row changes. Each table and index is created only when missing, so an
 upgrade interrupted after MySQL or CockroachDB committed part of it resumes on
 the next start. Downgrading drops the tables, including grants, rules and
-verdicts made since.
+verdicts made since, and the login id column.
 """
 
 from __future__ import annotations
@@ -146,10 +151,16 @@ def _create_tables(bind: sa.Connection) -> None:
             op.create_index(name, table, list(columns))
 
 
+def _has_login_id(bind: sa.Connection) -> bool:
+    return "login_id" in {column["name"] for column in sa.inspect(bind).get_columns("connections")}
+
+
 def upgrade() -> None:
     """Create the four tables and their indexes, skipping what already exists."""
     bind = op.get_bind()
     _create_tables(bind)
+    if not _has_login_id(bind):
+        op.add_column("connections", sa.Column("login_id", sa.String(32), nullable=True))
     if bind.dialect.name == "cockroachdb":
         # CockroachDB publishes new tables only at commit.
         bind.commit()
@@ -162,3 +173,6 @@ def downgrade() -> None:
     for table in reversed(_TABLES):
         if sa.inspect(bind).has_table(table):
             op.drop_table(table)
+    if _has_login_id(bind):
+        with op.batch_alter_table("connections") as batch_op:
+            batch_op.drop_column("login_id")

@@ -771,6 +771,8 @@ class SqlConnection(OmnigentBase):
     :param metadata_json: Non-secret provider metadata as a JSON object.
     :param created_at: Unix epoch seconds the connection was first made.
     :param updated_at: Unix epoch seconds of the last refresh/reconnect.
+    :param login_id: Random id of this login, replaced on every connect or
+        reconnect but kept by token refreshes; approvals bind to it.
     """
 
     __tablename__ = "connections"
@@ -797,6 +799,9 @@ class SqlConnection(OmnigentBase):
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Replaced whenever the login itself is (connect, reconnect), not when its
+    # tokens refresh; NULL for a login saved before the column existed.
+    login_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
         # Every user's login for one provider, e.g. when an administrator changes or

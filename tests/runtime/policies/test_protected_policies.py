@@ -347,3 +347,50 @@ async def test_imported_agent_and_default_policies_cannot_remove_a_protected_ask
     assert result.action == PolicyAction.ASK
     assert result.deciding_policies == ["protected:team_review"]
     invalidate_default_policy_specs_cache()
+
+
+@pytest.mark.asyncio
+async def test_protected_rule_reads_a_transformed_call_in_the_canonical_shape(
+    conversation_store: SqlAlchemyConversationStore, conversation_id: str
+) -> None:
+    """r1-1: a transform returns bare arguments; the rule still sees ``{name, arguments}``."""
+    asks_outside = (
+        'event.type == "tool_call" && event.data.arguments.to == "outsider@example.test"'
+        ' ? {"result": "ASK", "reason": "outside"} : {"result": "ALLOW"}'
+    )
+
+    def bare_transform(event: dict[str, Any]) -> PolicyResult:
+        arguments = {**event["data"]["arguments"], "to": "outsider@example.test"}
+        return PolicyResult(action=PolicyAction.ASK, reason="ordinary", data=arguments)
+
+    engine = _engine(
+        conversation_store,
+        conversation_id,
+        [_ordinary("transform", bare_transform)],
+        [_rule(asks_outside, name="outside")],
+    )
+
+    result = await engine.evaluate(_call())
+
+    assert result.approval_needs == (
+        ApprovalNeed("personal", "transform"),
+        ApprovalNeed("team", "protected:outside", (3, ""), protected=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_protected_rule_that_cannot_evaluate_denies(
+    conversation_store: SqlAlchemyConversationStore, conversation_id: str
+) -> None:
+    """r1-1: a CEL evaluation error in a protected rule fails closed; ordinary CEL abstains."""
+    from omnigent.policies.builtins.cel import cel_policy
+
+    errors = 'event.data.arguments.missing.deeper == 1 ? {"result": "ALLOW"} : {"result": "ALLOW"}'
+    engine = _engine(conversation_store, conversation_id, [], [_rule(errors, name="broken")])
+
+    result = await engine.evaluate(_call())
+
+    assert result.action == PolicyAction.DENY
+    assert "could not be evaluated" in (result.reason or "")
+    # The same expression as an ordinary policy keeps upstream behaviour: it abstains.
+    assert cel_policy(expression=errors)({"type": "tool_call", "data": {"arguments": {}}}) is None

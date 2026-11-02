@@ -59,6 +59,10 @@ def _tables(engine: sa.Engine) -> set[str]:
     return set(sa.inspect(engine).get_table_names())
 
 
+def _has_login_id(engine: sa.Engine) -> bool:
+    return "login_id" in {c["name"] for c in sa.inspect(engine).get_columns("connections")}
+
+
 def _use_every_table(db_uri: str) -> None:
     """The store works against the migrated schema."""
     store = SqlAlchemyApprovalStore(db_uri)
@@ -99,6 +103,7 @@ def test_upgrade_adds_the_tables_and_changes_nothing_else(db_uri, engine) -> Non
 
     assert _get_current_db_heads(engine) == (_REVISION,)
     assert _tables(engine) >= set(_TABLES)
+    assert _has_login_id(engine)
     with engine.connect() as connection:
         assert connection.execute(sa.text("SELECT id FROM users ORDER BY id")).all() == users
     _use_every_table(db_uri)
@@ -114,6 +119,7 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
         ("DROP TABLE approval_verdicts", {}),
         ("DROP TABLE protected_policies", {}),
         ("DROP INDEX ix_approver_grants_approver" + suffix, {}),
+        # The login id column stays: the retry must not add it twice.
         ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
     ):
         with engine.begin() as connection:
@@ -127,6 +133,7 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
     assert "ix_approver_grants_approver" in {
         index["name"] for index in sa.inspect(engine).get_indexes("approver_grants")
     }
+    assert _has_login_id(engine)
     _use_every_table(db_uri)
 
 
@@ -138,6 +145,7 @@ def test_downgrade_drops_only_the_new_tables(db_uri, engine) -> None:
     _migrate(engine, _PREVIOUS, downgrade=True)
 
     assert _tables(engine) == before
+    assert not _has_login_id(engine)
     with engine.connect() as connection:
         assert connection.execute(sa.text("SELECT COUNT(*) FROM users")).scalar_one() >= 1
     _migrate(engine, _REVISION)

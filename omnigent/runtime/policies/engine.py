@@ -25,12 +25,14 @@ from omnigent.policies.types import ApprovalNeed, EvaluationContext, PolicyResul
 from omnigent.runtime.policies.protected import (
     PERSONAL_NEED,
     ProtectedPolicyEntry,
+    canonical_tool_call,
     evaluate_protected,
     protected_context,
 )
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     LabelDef,
+    Phase,
     PolicyAction,
     PolicySpec,
     StateUpdate,
@@ -479,7 +481,11 @@ class PolicyEngine:
 
         if not self.protected_policies:
             return ProtectedVerdict(None, [])
-        final = composed_data if composed_data is not None else ctx.content
+        final = (
+            canonical_tool_call(ctx.tool_name, ctx.content, composed_data)
+            if ctx.phase == Phase.TOOL_CALL
+            else (composed_data if composed_data is not None else ctx.content)
+        )
         facts = protected_facts(ctx, self._protected_owner, self._conversation_id)
         return await evaluate_protected(
             self.protected_policies, protected_context(ctx, final, facts), context

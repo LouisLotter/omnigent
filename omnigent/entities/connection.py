@@ -26,6 +26,8 @@ class ProviderConnection:
     :param metadata: Non-secret provider metadata (login, ids, scopes, expiries).
     :param created_at: Unix epoch seconds the connection was first made.
     :param updated_at: Unix epoch seconds of the last refresh / reconnect.
+    :param login_id: This login's id: a reconnect replaces it, a token refresh
+        keeps it. ``None`` for a login saved before logins had ids.
     """
 
     user_id: str
@@ -38,6 +40,11 @@ class ProviderConnection:
     metadata: dict[str, Any]
     created_at: int
     updated_at: int
+    login_id: str | None = None
+
+    def login_marker(self) -> str:
+        """This login instance's identity, for binding an approval to it."""
+        return self.login_id or f"legacy:{self.created_at}"
 
     def __repr__(self) -> str:
         # ``is not None`` (not truthiness) so a loaded-but-empty secret still

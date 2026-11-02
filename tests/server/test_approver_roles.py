@@ -738,3 +738,410 @@ def test_approvers_are_named_on_the_top_level_thread(team) -> None:
     )
 
     assert named.status_code == 400, named.text
+
+
+# ── Review r1 ────────────────────────────────────────────────────────────
+
+_ASK_OUTSIDE = (
+    'event.type == "tool_call" && has(event.data.arguments.to)'
+    ' && event.data.arguments.to == "outside"'
+    ' ? {"result": "ASK", "reason": "outside recipient"} : {"result": "ALLOW"}'
+)
+
+
+def ask_and_send_outside(event: dict[str, Any]) -> Any:
+    """An agent policy that asks and rewrites the call's arguments (bare, as transforms do)."""
+    from omnigent.policies.types import PolicyResult
+    from omnigent.spec.types import PolicyAction
+
+    if event.get("type") != "tool_call":
+        return None
+    arguments = {**(event["data"].get("arguments") or {}), "to": "outside"}
+    return PolicyResult(action=PolicyAction.ASK, reason="send it?", data=arguments)
+
+
+# Registered the way a server administrator adds a custom handler (``policy_modules``).
+POLICY_REGISTRY = [
+    {
+        "handler": f"{__name__}.ask_and_send_outside",
+        "description": "Test transform: asks, and sends the call to an outside recipient.",
+    }
+]
+
+
+@pytest.fixture
+def custom_handler() -> Any:
+    from omnigent.policies.registry import load_registry
+
+    load_registry([__name__])
+    try:
+        yield
+    finally:
+        load_registry()
+
+
+def _session_rewriting_the_recipient(team: dict[str, Any]) -> tuple[str, TestClient]:
+    from tests.server.test_account_revocation import create_session
+
+    guardrails = {
+        "policies": {
+            "rewrite": {
+                "type": "function",
+                "function": {"path": f"{__name__}.ask_and_send_outside"},
+            }
+        }
+    }
+    created = create_session(team["alice"], guardrails=guardrails)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    attached = team["alice"].post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "tracker", "transport": "registry"},
+    )
+    assert attached.status_code == 200, attached.text
+    return session_id, _delegated_runner(team["alice"], team["stores"], session_id)
+
+
+def _team_rule(team: dict[str, Any], expression: str, name: str = "outside") -> dict[str, Any]:
+    created = team["admin"].post(
+        "/v1/protected-policies",
+        json={
+            "domain": "team",
+            "name": name,
+            "handler": _CEL,
+            "factory_params": {"expression": expression},
+        },
+    )
+    assert created.status_code == 201, created.text
+    return created.json()
+
+
+@pytest.mark.parametrize("rule_changes_before_dispatch", [False, True])
+def test_a_transformed_call_needs_both_approvers_and_a_late_rule_refuses_it(
+    team, monkeypatch, custom_handler, rule_changes_before_dispatch
+) -> None:
+    """r1-1: the team rule sees the transformed call; the person's approval is not enough."""
+    _name_approver(team, "team", "dave")
+    _team_rule(team, _ASK_OUTSIDE)
+    session_id, runner = _session_rewriting_the_recipient(team)
+    elicitation_id, retry = _ask(runner, session_id)
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert [r["kind"] for r in record.requirements] == ["personal", "team"]
+
+    assert _answer(team["alice"], session_id, elicitation_id).json() == {
+        "queued": False,
+        "awaiting": "team",
+    }
+    assert "error" in _tools_call(runner, session_id, **retry)
+    assert _answer(team["dave"], session_id, elicitation_id).status_code == 202
+    if rule_changes_before_dispatch:
+        real = orchestration.consume_protected_approval
+
+        async def consume_then_add_a_rule(*args: Any, **kwargs: Any) -> Any:
+            used = await real(*args, **kwargs)
+            _team_rule(team, '{"result": "ASK", "reason": "late rule"}', name="late")
+            return used
+
+        monkeypatch.setattr(orchestration, "consume_protected_approval", consume_then_add_a_rule)
+
+    response = _tools_call(runner, session_id, **retry)
+
+    if rule_changes_before_dispatch:
+        assert "ask again" in response["error"]["message"], response
+        team["tracker"].call_tool.assert_not_awaited()
+    else:
+        assert "result" in response, response
+        assert team["tracker"].call_tool.await_args.args[3]["to"] == "outside"
+
+
+def _admin_cli(team: dict[str, Any]) -> tuple[str, str]:
+    """The admin's CLI sign-in: its session token and its login-grant access token."""
+    cli = TestClient(team["admin"].app)
+    login = cli.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
+    )
+    assert login.status_code == 200, login.text
+    refreshed = cli.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": login.json()["refresh_token"]},
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    return login.json()["token"], refreshed.json()["access_token"]
+
+
+def test_a_cli_sign_in_cannot_become_a_browser_sign_in_or_obtain_a_password(team) -> None:
+    """r1-2: reset, invitation and password-change chains keep a CLI credential a CLI one."""
+    app = team["admin"].app
+    session_token, grant_token = _admin_cli(team)
+    for token in (session_token, grant_token):
+        cli = _bearer(app, token)
+        assert cli.get("/auth/me").status_code == 200  # a valid admin sign-in
+        reset = cli.post("/auth/users/admin/reset")
+        assert reset.status_code == 403, reset.text
+        assert "Reset passwords in the Omnigent web page instead." in reset.json()["error"]
+        assert cli.post("/auth/users/bob/reset").status_code == 403
+        invite = cli.post("/auth/invite", json={"is_admin": True})
+        assert invite.status_code == 403, invite.text
+    # The old password still signs in: nothing was reset.
+    assert (
+        TestClient(app)
+        .post("/auth/login", json={"username": "admin", "password": "admin-pw-12345"})
+        .status_code
+        == 200
+    )
+
+    # Knowing the old password, a CLI may change it (the restore drill does);
+    # the cookie it gets back stays a non-browser one.
+    cli = _bearer(app, session_token)
+    changed = cli.post(
+        "/auth/users/me/password",
+        json={"old_password": "admin-pw-12345", "new_password": "admin-pw-67890"},
+    )
+    assert changed.status_code == 204, changed.text
+    reissued = TestClient(app)
+    reissued.cookies.set(_cookie_name(team), changed.cookies[_cookie_name(team)])
+    refused = reissued.post(
+        "/v1/approvers", json={"kind": "team", "resource_id": "", "user_id": "carol"}
+    )
+    assert refused.status_code == 403
+    assert "Sign in again in the browser" in refused.json()["error"]["message"]
+
+    # A browser sign-in keeps every power.
+    browser = TestClient(app)
+    signed_in = browser.post(
+        "/auth/login", json={"username": "admin", "password": "admin-pw-67890"}
+    )
+    assert signed_in.status_code == 200
+    assert browser.post("/auth/users/bob/reset").status_code == 200
+    own = browser.post("/auth/users/admin/reset")
+    assert own.status_code == 200
+    assert (
+        browser.post(
+            "/v1/approvers", json={"kind": "team", "resource_id": "", "user_id": "carol"}
+        ).status_code
+        == 201
+    )
+
+
+@pytest.mark.parametrize("tunnel_header", [True, False])
+def test_the_initiator_is_the_server_recorded_turn_actor_with_or_without_the_header(
+    team, tunnel_header
+) -> None:
+    """r1-3: Bob's turn in Alice's thread stays Bob's, however the runner calls."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
+
+    session_id, runner = team["session"], team["runner"]
+    team["alice"].put(
+        f"/v1/sessions/{session_id}/permissions", json={"user_id": "bob", "level": LEVEL_EDIT}
+    )
+    _name_approver(team, "service", "bob", "tracker")
+    # The server records the turn's actor when Bob's message is forwarded.
+    team["stores"]["conversation_store"].set_labels(session_id, {_TURN_ACTOR_LABEL: "bob"})
+    if not tunnel_header:
+        runner = TestClient(team["alice"].app)
+        runner.headers["Authorization"] = team["runner"].headers["Authorization"]
+        assert RUNNER_TUNNEL_TOKEN_HEADER not in runner.headers
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    assert team["approvals"].get_verdict(elicitation_id).binding["initiator"] == "bob"
+    assert _answer(team["bob"], session_id, elicitation_id).status_code == 403
+
+
+def test_an_in_place_reconnect_needs_a_new_decision(team) -> None:
+    """r1-4: a replaced login (same row, same creation time) is a different connection."""
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    app = team["alice"].app
+    db_url = team["stores"]["permission_store"].storage_location
+    service = McpService(
+        id="tracker",
+        title="Tracker",
+        url="https://example.test/mcp",
+        auth="bearer",
+        tools=["post_update"],
+    )
+    registry = McpRegistry(
+        McpRegistryConfig(services=[service]), CredentialStore(db_url, _FakeCipher())
+    )
+    app.state.mcp_registry = registry
+    registry.save_login(service, "alice", "mcp:tracker", {"access_token": "first"}, {})
+    session_id, runner = team["session"], team["runner"]
+    elicitation_id, retry = _ask(runner, session_id)
+    assert _answer(team["alice"], session_id, elicitation_id).status_code == 202
+    before = registry.store.get("alice", "mcp:tracker")
+
+    registry.save_login(service, "alice", "mcp:tracker", {"access_token": "second"}, {})
+    after = registry.store.get("alice", "mcp:tracker")
+
+    assert after.created_at == before.created_at and after.login_id != before.login_id
+    refused = _tools_call(runner, session_id, **retry)
+    assert "ask again" in refused["error"]["message"], refused
+    team["tracker"].call_tool.assert_not_awaited()
+
+
+def test_a_pinned_login_is_refused_after_a_replacement(team) -> None:
+    """r1-4: the token read for an approved call refuses a login other than the approved one."""
+    from omnigent.server.mcp_registry import pinned_login
+    from omnigent.server.routes.connections_base import ConnectionError as McpConnectionError
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    db_url = team["stores"]["permission_store"].storage_location
+    service = McpService(
+        id="tracker",
+        title="Tracker",
+        url="https://example.test/mcp",
+        auth="bearer",
+        tools=["post_update"],
+    )
+    registry = McpRegistry(
+        McpRegistryConfig(services=[service]), CredentialStore(db_url, _FakeCipher())
+    )
+    registry.save_login(service, "alice", "mcp:tracker", {"access_token": "first"}, {})
+    approved = registry.store.get("alice", "mcp:tracker").login_marker()
+
+    async def read() -> str | None:
+        with pinned_login("tracker", "alice", approved):
+            return await registry.token(service, "alice", None)
+
+    assert asyncio.run(read()) == "first"
+    registry.save_login(service, "alice", "mcp:tracker", {"access_token": "second"}, {})
+    with pytest.raises(McpConnectionError):
+        asyncio.run(read())
+
+
+@pytest.mark.parametrize("change", ["none", "rule", "grant", "initiator"])
+def test_a_reposted_native_question_reuses_its_answer_only_unchanged(team, change) -> None:
+    """r1-6: the hook's retry gets its recorded ALLOW only while the approval still matches."""
+    from omnigent.server._elicitation_registry import _harness_parked_elicitations
+    from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
+
+    session_id, runner = team["session"], team["runner"]
+    elicitation_id = f"elicit_evaluate_{uuid.uuid4().hex}"
+    body = {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "context": {},
+        },
+        "_omnigent_elicitation_id": elicitation_id,
+    }
+
+    async def ask_and_approve() -> dict[str, Any]:
+        transport = httpx.ASGITransport(app=team["alice"].app)
+        async with (
+            httpx.AsyncClient(
+                transport=transport, base_url="http://testserver", headers=dict(runner.headers)
+            ) as runner_http,
+            httpx.AsyncClient(
+                transport=transport, base_url="http://testserver", cookies=team["alice"].cookies
+            ) as person_http,
+        ):
+            waiting = asyncio.create_task(
+                runner_http.post(f"/v1/sessions/{session_id}/policies/evaluate", json=body)
+            )
+            async with asyncio.timeout(15):
+                while elicitation_id not in _harness_parked_elicitations:
+                    await asyncio.sleep(0.05)
+            approved = await person_http.post(
+                _resolve_url(session_id, elicitation_id), json={"action": "accept"}
+            )
+            assert approved.status_code == 202, approved.text
+            return (await asyncio.wait_for(waiting, timeout=15)).json()
+
+    assert asyncio.run(ask_and_approve())["result"] == "POLICY_ACTION_ALLOW"
+    if change == "rule":
+        _team_rule(team, '{"result": "ALLOW"}', name="audit")
+    elif change == "grant":
+        _name_approver(team, "session", "carol", session_id)
+    elif change == "initiator":
+        team["stores"]["conversation_store"].set_labels(session_id, {_TURN_ACTOR_LABEL: "bob"})
+
+    reposted = runner.post(f"/v1/sessions/{session_id}/policies/evaluate", json=body).json()
+
+    expected = "POLICY_ACTION_ALLOW" if change == "none" else "POLICY_ACTION_DENY"
+    assert reposted["result"] == expected, reposted
+
+
+def test_a_reregistered_username_inherits_no_approval_authority(team) -> None:
+    """r1-7: deleting Carol removes her grants; a new Carol is not her approver."""
+    session_id, runner = team["session"], team["runner"]
+    _name_approver(team, "service", "carol", "tracker")
+    deleted = team["admin"].delete("/auth/users/carol")
+    assert deleted.status_code == 204, deleted.text
+    gone = team["admin"].post(
+        "/v1/approvers", json={"kind": "service", "resource_id": "tracker", "user_id": "carol"}
+    )
+    assert gone.status_code == 400, gone.text
+    new_carol = _member(team["admin"], "carol")
+    listed = team["admin"].get(
+        "/v1/approvers", params={"kind": "service", "resource_id": "tracker"}
+    )
+    assert listed.json()["approvers"] == []
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    assert _answer(new_carol, session_id, elicitation_id).status_code == 404
+
+
+@pytest.mark.parametrize("initiator", ["alice", "bob"])
+def test_a_thread_refusing_its_initiator_refuses_its_owner_too(team, initiator) -> None:
+    """r1-8: with ``allow_initiator=False`` the owner approves others' actions, not her own."""
+    from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
+
+    session_id, runner = team["session"], team["runner"]
+    saved = team["alice"].put(
+        "/v1/approval-settings",
+        json={"kind": "session", "resource_id": session_id, "allow_initiator": False},
+    )
+    assert saved.json() == {"allow_initiator": False}, saved.text
+    if initiator == "bob":
+        team["alice"].put(
+            f"/v1/sessions/{session_id}/permissions", json={"user_id": "bob", "level": LEVEL_EDIT}
+        )
+        team["stores"]["conversation_store"].set_labels(session_id, {_TURN_ACTOR_LABEL: "bob"})
+    elicitation_id, retry = _ask(runner, session_id)
+
+    answered = _answer(team["alice"], session_id, elicitation_id)
+
+    if initiator == "alice":
+        assert answered.status_code == 403, answered.text
+        assert _state(team, elicitation_id) is VerdictState.PENDING
+    else:
+        assert answered.status_code == 202, answered.text
+        assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_answers_from_one_stale_snapshot_still_complete_the_request(team) -> None:
+    """r1-9: two approvers answering from the same snapshot approve it, resolving it once."""
+    from omnigent.server import approval_authority
+
+    session_id, runner = team["session"], team["runner"]
+    _name_approver(team, "team", "dave")
+    _team_rule(team, '{"result": "ASK", "reason": "team review"}', name="team-review")
+    elicitation_id, _retry = _ask(runner, session_id)
+    snapshot = team["approvals"].get_verdict(elicitation_id)
+    assert [r["kind"] for r in snapshot.requirements] == ["personal", "team"]
+    stores = team["stores"]
+
+    gates = [
+        approval_authority._gate_sync(
+            team["approvals"],
+            stores["conversation_store"],
+            stores["permission_store"],
+            snapshot,
+            person,
+            "accept",
+            True,
+        )
+        for person in ("alice", "dave")
+    ]
+
+    assert [gate.final for gate in gates] == [False, True]
+    assert gates[1].action == "accept"
+    assert _state(team, elicitation_id) is VerdictState.APPROVED

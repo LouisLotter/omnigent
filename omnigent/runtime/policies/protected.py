@@ -66,6 +66,49 @@ class ProtectedPolicyEntry:
         return ApprovalNeed(TEAM_NEED, self.name, resource, protected=True)
 
 
+def canonical_tool_call(tool_name: str | None, content: object, data: object) -> dict[str, Any]:
+    """The one tool-call shape protected rules and every enforcement site use.
+
+    ``{"name": <tool>, "arguments": <arguments>}``. A policy's transform
+    (``data``) for a tool call is its new arguments; a transform that is
+    itself such a call (the tool's own name and an ``arguments`` key) is taken
+    as the whole call.
+
+    :param tool_name: The tool being called.
+    :param content: The call as the enforcement site built it.
+    :param data: The composed transform, or ``None`` when nothing transformed it.
+    """
+    if data is None:
+        if isinstance(content, dict) and "arguments" in content:
+            return {"name": content.get("name", tool_name), "arguments": content["arguments"]}
+        return {"name": tool_name, "arguments": content}
+    if (
+        isinstance(data, dict)
+        and set(data) == {"name", "arguments"}
+        and data.get("name") == tool_name
+    ):
+        return {"name": tool_name, "arguments": data["arguments"]}
+    return {"name": tool_name, "arguments": data}
+
+
+def _fail_closed_arguments(path: str, arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Ask a handler that can report evaluation errors to deny on one.
+
+    A handler factory with a ``fail_closed`` parameter (the CEL handler) would
+    otherwise abstain, and so allow, when its expression cannot evaluate.
+    """
+    import inspect
+
+    from omnigent.policies.function import _resolve_dotted_path
+
+    try:
+        target = _resolve_dotted_path(path)
+        accepts = callable(target) and "fail_closed" in inspect.signature(target).parameters
+    except Exception:
+        return arguments
+    return {**(arguments or {}), "fail_closed": True} if accepts else arguments
+
+
 def build_protected_entries(rules: Sequence[ProtectedRule]) -> list[ProtectedPolicyEntry]:
     """Instantiate protected rules; a rule that fails to load still denies."""
     entries = []
@@ -73,7 +116,10 @@ def build_protected_entries(rules: Sequence[ProtectedRule]) -> list[ProtectedPol
         spec = FunctionPolicySpec(
             name=f"protected:{rule.name}",
             on=None,
-            function=FunctionRef(path=rule.handler, arguments=rule.factory_params),
+            function=FunctionRef(
+                path=rule.handler,
+                arguments=_fail_closed_arguments(rule.handler, rule.factory_params),
+            ),
         )
         try:
             entries.append(ProtectedPolicyEntry(rule, resolve_function_policy(spec)))
@@ -156,6 +202,7 @@ __all__ = [
     "ProtectedPolicyEntry",
     "ProtectedVerdict",
     "build_protected_entries",
+    "canonical_tool_call",
     "evaluate_protected",
     "protected_context",
     "protected_fingerprint",
