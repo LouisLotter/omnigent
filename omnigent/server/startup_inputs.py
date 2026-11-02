@@ -31,6 +31,7 @@ from omnigent.server.scheduled.authority import ScheduledFireRefused, ScheduledO
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     ConversationNotFoundError,
     ConversationStore,
 )
@@ -119,16 +120,30 @@ ScheduledAuthority = Callable[[ScheduledOrigin, str, str | None], Awaitable[None
 """``(origin, session_id, sender)``: raises :class:`ScheduledFireRefused` when refused."""
 
 
-def scheduled_origin(item: ConversationItem) -> ScheduledOrigin | None:
-    """The automation that saved *item*, or ``None`` for a person's own input."""
+def scheduled_origin(
+    item: ConversationItem, conv: Conversation | None = None
+) -> ScheduledOrigin | None:
+    """The automation that saved *item*, or ``None`` for a person's own input.
+
+    An input saved before inputs carried their origin is recognised only as
+    the initial input of a session a fire created (the server-set task-origin
+    label); later messages in such a session stay a person's own.
+
+    :param item: A saved startup input.
+    :param conv: Its session, needed to recognise an older initial input.
+    :returns: The origin, or ``None``.
+    """
     options = (
         item.data.startup_options
         if isinstance(item.data, (MessageData, SlashCommandData))
         else None
     )
-    if options is None or options.scheduled_task_id is None:
-        return None
-    return ScheduledOrigin(options.scheduled_task_id, options.scheduled_task_generation)
+    if options is not None and options.scheduled_task_id is not None:
+        return ScheduledOrigin(options.scheduled_task_id, options.scheduled_task_generation)
+    task_id = conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if conv is not None else None
+    if conv is not None and task_id and item.id == initial_input_id(conv.id):
+        return ScheduledOrigin(task_id, None, registration_known=False)
+    return None
 
 
 _services: weakref.WeakSet[ManagedStartupInputs] = weakref.WeakSet()
@@ -431,7 +446,7 @@ class ManagedStartupInputs:
                 if isinstance(item.data, (MessageData, SlashCommandData))
                 else None
             )
-            origin = scheduled_origin(item)
+            origin = scheduled_origin(item, conv)
             authorize: Callable[[], Awaitable[None]] | None = None
             if origin is not None:
                 scheduled = origin
@@ -535,7 +550,11 @@ class ManagedStartupInputs:
         context: StartupInputContext | None,
         refusal: ScheduledFireRefused,
     ) -> None:
-        """Fail and cancel a scheduled input that lost its authority; nothing was sent."""
+        """Fail a scheduled input that lost its authority; nothing was sent.
+
+        Only this input fails: messages a person queued behind it are still
+        delivered. A retry re-runs the same check, so nothing revives it.
+        """
         _logger.warning("Not delivering the saved message for session %s: %s", session_id, refusal)
         await asyncio.to_thread(
             self.conversations.transition_pending_input,
@@ -544,16 +563,48 @@ class ManagedStartupInputs:
             expected="incomplete" if context is not None and context.submitted else "in_progress",
             status="failed",
         )
-        # Cancelled, so recovery and retries never revive it.
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(
-                self.conversations.set_labels, session_id, {STARTUP_LABEL: "cancelled"}
-            )
-        await self._report_failure(
-            session_id,
-            f"scheduled_{refusal.error_code}",
-            f"The automation's message was not sent: {str(refusal)[:1000]}",
-        )
+        message = f"The automation's message was not sent: {str(refusal)[:1000]}"
+        if getattr(refusal, "unsent_prompt_noted", False):
+            # The forward already followed the persisted prompt with its reason.
+            from omnigent.server.routes.sessions import _publish_sandbox_status, _publish_status
+
+            _publish_sandbox_status(session_id, "failed", message)
+            _publish_status(session_id, "failed", failure_origin="startup_input_failed")
+            return
+        await self._report_failure(session_id, f"scheduled_{refusal.error_code}", message)
+
+    async def discard_scheduled(self, session_id: str, task_id: str) -> None:
+        """Fail the inputs a deleted task's fire saved in *session_id*.
+
+        A person's messages in the same session are left to be delivered.
+
+        :param session_id: The fired session.
+        :param task_id: The deleted task.
+        """
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None:
+            return
+        key = (current_workspace_id(), session_id)
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            origin = scheduled_origin(item, conv)
+            if origin is None or origin.task_id != task_id or item.status != "in_progress":
+                continue
+            delivery = self._deliveries.get(key)
+            if delivery is not None and delivery is not asyncio.current_task():
+                # Delivering it here now: its own checks refuse it.
+                continue
+            if await asyncio.to_thread(
+                self.conversations.transition_pending_input,
+                session_id,
+                item.id,
+                expected="in_progress",
+                status="failed",
+            ):
+                await self._report_failure(
+                    session_id,
+                    "scheduled_task_deleted",
+                    "The automation was deleted, so its message was not sent.",
+                )
 
     async def retry(self, session_id: str) -> bool:
         changed = False

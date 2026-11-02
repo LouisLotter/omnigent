@@ -188,8 +188,8 @@ class FakeStartupInputs:
     async def record_launch_failure(self, session_id: str, reason: str) -> None:
         self.launch_failures.append((session_id, reason))
 
-    async def cancel(self, session_id: str) -> None:
-        self.calls.append("cancel")
+    async def discard_scheduled(self, session_id: str, task_id: str) -> None:
+        self.calls.append("discard")
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):

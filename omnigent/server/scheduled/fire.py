@@ -1433,7 +1433,7 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
             except _CannotLaunchScheduledFire as exc:
                 await _fail_running_run(deps, conv.id, str(exc), exc.error_code)
                 if deps.startup_inputs is not None:
-                    await deps.startup_inputs.cancel(conv.id)
+                    await deps.startup_inputs.discard_scheduled(conv.id, task.id)
                 return
             try:
                 await _run_managed_launch(
@@ -1501,9 +1501,14 @@ def build_startup_authority(
             conv = await asyncio.to_thread(
                 deps.conversation_store.get_conversation, conversation_id
             )
+            # An input saved before inputs carried their registration takes it
+            # from the task row, its owner's registration (a missing row refused above).
+            generation = (
+                origin.generation if origin.registration_known else current.account_generation
+            )
             await _reauthorize_fire(
                 deps,
-                _CapturedTask(origin.task_id, current.user_id, origin.generation),
+                _CapturedTask(origin.task_id, current.user_id, generation),
                 host_id=conv.host_id if conv is not None else None,
                 conversation_id=conversation_id,
             )

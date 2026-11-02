@@ -710,18 +710,21 @@ def create_scheduled_tasks_router(
             if run.conversation_id is not None and run.status in ("starting", "running")
         ]
 
-    async def _cancel_saved_prompts(request: Request, session_ids: list[str]) -> None:
-        """Cancel prompts a deleted task's fires saved but have not delivered.
+    async def _discard_saved_prompts(
+        request: Request, scheduled_task_id: str, session_ids: list[str]
+    ) -> None:
+        """Fail prompts a deleted task's fires saved but have not delivered.
 
         Delivery re-checks the task anyway (on any replica, after a restart);
-        cancelling here also clears them from the sessions' startup state.
+        failing them here also clears them from the sessions' startup state.
+        A person's own messages in those sessions are kept.
         """
         startup_inputs = getattr(request.app.state, "startup_inputs", None)
         if startup_inputs is None:
             return
         for session_id in session_ids:
             try:
-                await startup_inputs.cancel(session_id)
+                await startup_inputs.discard_scheduled(session_id, scheduled_task_id)
             except Exception:
                 _logger.warning(
                     "Could not cancel the saved prompt of session %s", session_id, exc_info=True
@@ -741,7 +744,7 @@ def create_scheduled_tasks_router(
         _require_owned(scheduled_task_id, owner_id)
         unfinished = await asyncio.to_thread(_unfinished_run_sessions, scheduled_task_id)
         await asyncio.to_thread(store.delete, scheduled_task_id)
-        await _cancel_saved_prompts(request, unfinished)
+        await _discard_saved_prompts(request, scheduled_task_id, unfinished)
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False

@@ -24,7 +24,11 @@ class ScheduledOrigin:
     :param task_id: The scheduled task, e.g. ``"3f2c…"``.
     :param generation: The owner registration the fire ran under, or ``None``
         outside accounts mode.
+    :param registration_known: ``False`` for an input saved before inputs
+        carried their registration; the check then takes it from the task row
+        and refuses when that row is gone.
     """
 
     task_id: str
     generation: str | None
+    registration_known: bool = True

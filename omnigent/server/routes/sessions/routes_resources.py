@@ -128,15 +128,20 @@ class DownloadAccessRevoked(Exception):
 
 
 async def _while_authorized(
-    chunks: AsyncIterator[bytes], still_authorized: Callable[[], Awaitable[bool]] | None
+    chunks: AsyncIterator[bytes],
+    still_authorized: Callable[[], Awaitable[bool]] | None,
+    authorized_at: float | None = None,
 ) -> AsyncIterator[bytes]:
     """Forward *chunks*, re-checking the caller before any chunk past the interval.
 
     No byte is forwarded more than :data:`CONNECTION_AUTHORITY_RECHECK_S`
-    after the last successful check. A refused check raises, so the server
-    aborts the response rather than ending it as a complete (truncated) file.
+    after the last successful check, counted from *authorized_at* (the check
+    made once the runner's headers arrived). A refused check raises, so the
+    server aborts the response rather than ending it as a complete
+    (truncated) file.
     """
-    next_check = time.monotonic() + CONNECTION_AUTHORITY_RECHECK_S
+    checked = time.monotonic() if authorized_at is None else authorized_at
+    next_check = checked + CONNECTION_AUTHORITY_RECHECK_S
     async for chunk in chunks:
         if still_authorized is not None and time.monotonic() >= next_check:
             if not await still_authorized():
@@ -158,6 +163,8 @@ class _RunnerStreamResponse(StreamingResponse):
     :param headers: Response headers to forward.
     :param still_authorized: Re-checks the caller during the transfer;
         ``None`` skips it.
+    :param authorized_at: When the caller was last authorized (monotonic);
+        the periodic checks count from it.
     """
 
     def __init__(
@@ -166,9 +173,11 @@ class _RunnerStreamResponse(StreamingResponse):
         *,
         headers: Mapping[str, str],
         still_authorized: Callable[[], Awaitable[bool]] | None = None,
+        authorized_at: float | None = None,
     ) -> None:
         super().__init__(
-            _while_authorized(upstream.aiter_raw(), still_authorized), headers=headers
+            _while_authorized(upstream.aiter_raw(), still_authorized, authorized_at),
+            headers=headers,
         )
         self._upstream = upstream
 
@@ -507,6 +516,15 @@ def register_resources_routes(
                 detail="runner download endpoint unavailable",
             ) from exc
         if resp.status_code == 200 and "content-disposition" in resp.headers:
+            # Resuming the runner and waiting for its headers can take long:
+            # the caller is authorized again before any byte goes out.
+            authorized_at = time.monotonic()
+            if still_authorized is not None and not await still_authorized():
+                await resp.aclose()
+                raise OmnigentError(
+                    f"Access to the files of session {session_id!r} has ended",
+                    code=ErrorCode.FORBIDDEN,
+                )
             skip_gzip(request)
             forwarded = {
                 name: resp.headers[name]
@@ -521,7 +539,10 @@ def register_resources_routes(
                 if name in resp.headers
             }
             return _RunnerStreamResponse(
-                resp, headers=forwarded, still_authorized=still_authorized
+                resp,
+                headers=forwarded,
+                still_authorized=still_authorized,
+                authorized_at=authorized_at,
             )
         try:
             await resp.aread()
@@ -917,30 +938,34 @@ def register_resources_routes(
         """Whether an authorized reader may also read the workspace's files.
 
         Needs edit access, or the owner's ``share_workspace_files``. A child
-        session's access is its thread tree's: the caller's direct grants on
-        the child (usually none) say nothing, so its edit level is resolved
-        through the parent chain and either the child's or the root's sharing
-        flag counts.
+        session's edit access is its thread tree's, resolved by the canonical
+        parent-chain check like every other child decision: a direct grant on
+        the child (an old creator-owned child, or one left behind when the
+        parent grant was lowered) never stands in for it. The human
+        administrator passes that check; the child's own and the root's sharing
+        flags still open the workspace to readers.
 
         :param user_id: The authenticated user.
         :param conv: The conversation already authorized for reading.
-        :param level: The caller's direct level from that authorization.
+        :param level: The caller's direct level on *conv*, used for a
+            top-level session only.
         :returns: ``True`` when the workspace may be read.
         """
-        if permission_store is None or (level is not None and level >= LEVEL_EDIT):
-            return True
-        if conv.share_workspace_files:
+        if permission_store is None:
             return True
         if conv.parent_conversation_id is None:
-            return False
+            return (level is not None and level >= LEVEL_EDIT) or conv.share_workspace_files
         if await asyncio.to_thread(
             check_session_access,
             user_id,
-            conv.parent_conversation_id,
+            conv.id,
             LEVEL_EDIT,
             permission_store,
             conversation_store,
+            conv,
         ):
+            return True
+        if conv.share_workspace_files:
             return True
         root = await asyncio.to_thread(
             conversation_store.get_conversation, conv.root_conversation_id

@@ -23,9 +23,9 @@ import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi.testclient import TestClient
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostRunnerExitedFrame, encode_host_frame
-from omnigent.runner.identity import token_bound_runner_id
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
@@ -59,9 +59,25 @@ _FAST = 0.05
 # ── Runner tunnel ────────────────────────────────────────────────────────────
 
 
-def _runner_tunnel(runner: Any) -> Any:
-    """Open the runner's own tunnel with its runner token and binding token."""
-    return runner.client.websocket_connect(f"/v1/runners/{runner.runner_id}/tunnel")
+async def _runner_tunnel(app: Any, runner: Any, *capabilities: str) -> ApplicationCommunicator:
+    """Open the runner's own tunnel with its runner token and binding token, and say hello.
+
+    Driven as raw ASGI so a test can wait for the server's handler to finish.
+    """
+    scope = _websocket_scope(f"/v1/runners/{runner.runner_id}/tunnel")
+    scope["headers"] = [
+        (b"authorization", f"Bearer {runner.token}".encode()),
+        (
+            RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(),
+            runner.client.headers[RUNNER_TUNNEL_TOKEN_HEADER].encode(),
+        ),
+    ]
+    connection = ApplicationCommunicator(app, scope)
+    await connection.send_input({"type": "websocket.connect"})
+    accepted = await connection.receive_output(timeout=5)
+    assert accepted["type"] == "websocket.accept", accepted
+    await connection.send_input({"type": "websocket.receive", "text": _hello(*capabilities)})
+    return connection
 
 
 def _hello(*capabilities: str) -> str:
@@ -82,65 +98,82 @@ def _close_code(ws: Any) -> int:
             return int(message["code"])
 
 
-def _stays_registered(app: Any, runner_id: str, seconds: float) -> bool:
+async def _server_close_code(connection: ApplicationCommunicator) -> int:
+    """Read until the server closes the tunnel, then wait for its handler to finish."""
+    while True:
+        message = await connection.receive_output(timeout=10)
+        if message["type"] == "websocket.close":
+            await connection.send_input({"type": "websocket.disconnect", "code": message["code"]})
+            await connection.wait(timeout=10)
+            return int(message["code"])
+
+
+async def _stays_registered(app: Any, runner_id: str, seconds: float) -> bool:
     """Wait for the tunnel to register, then check it stays for *seconds*."""
+    registry = app.state.tunnel_registry
     registered_by = time.monotonic() + 5
-    while app.state.tunnel_registry.get(runner_id) is None:
+    while registry.get(runner_id) is None:
         if time.monotonic() > registered_by:
             return False
-        time.sleep(0.01)
+        await asyncio.sleep(0.01)
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        if app.state.tunnel_registry.get(runner_id) is None:
+        if registry.get(runner_id) is None:
             return False
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     return True
 
 
+@pytest.mark.asyncio
 @pytest.mark.timeout(30)
-def test_runner_tunnel_closes_once_its_binding_is_replaced(
+async def test_runner_tunnel_closes_once_its_binding_is_replaced(
     people: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T7: the socket opened by the old incarnation ends; it is not lasting authority."""
     monkeypatch.setattr(runner_tunnel, "RUNNER_AUTHORITY_RECHECK_S", _FAST)
     _admin, alice, _bob, stores = people
-    thread = _session(alice)
-    runner = _runner(stores, alice, thread, "alice")
+    thread = await asyncio.to_thread(_session, alice)
+    runner = await asyncio.to_thread(_runner, stores, alice, thread, "alice")
 
-    with _runner_tunnel(runner) as ws:
-        ws.send_text(_hello())
-        assert _stays_registered(alice.app, runner.runner_id, 0.3)
-        stores["conversation_store"].replace_runner_id(thread, token_bound_runner_id("next"))
-        assert _close_code(ws) == runner_tunnel.RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+    connection = await _runner_tunnel(alice.app, runner)
+    assert await _stays_registered(alice.app, runner.runner_id, 0.3)
+    stores["conversation_store"].replace_runner_id(thread, token_bound_runner_id("next"))
+    assert (
+        await _server_close_code(connection) == runner_tunnel.RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+    )
     assert alice.app.state.tunnel_registry.get(runner.runner_id) is None
 
 
+@pytest.mark.asyncio
 @pytest.mark.timeout(30)
-def test_runner_tunnel_closes_once_its_host_is_removed(
+async def test_runner_tunnel_closes_once_its_host_is_removed(
     people: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T7: removing the computer ends the runner tunnels it carried."""
     monkeypatch.setattr(runner_tunnel, "RUNNER_AUTHORITY_RECHECK_S", _FAST)
     _admin, alice, _bob, stores = people
-    runner = _runner(stores, alice, _session(alice), "alice")
+    thread = await asyncio.to_thread(_session, alice)
+    runner = await asyncio.to_thread(_runner, stores, alice, thread, "alice")
 
-    with _runner_tunnel(runner) as ws:
-        ws.send_text(_hello())
-        assert _stays_registered(alice.app, runner.runner_id, 0.2)
-        stores["host_store"].delete_host(runner.host_id)
-        assert _close_code(ws) == runner_tunnel.RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+    connection = await _runner_tunnel(alice.app, runner)
+    assert await _stays_registered(alice.app, runner.runner_id, 0.2)
+    stores["host_store"].delete_host(runner.host_id)
+    assert (
+        await _server_close_code(connection) == runner_tunnel.RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+    )
 
 
+@pytest.mark.asyncio
 @pytest.mark.timeout(30)
 @pytest.mark.parametrize("rebound", [False, True], ids=["current", "replaced"])
-def test_runner_tunnel_applies_no_event_after_its_binding_is_replaced(
+async def test_runner_tunnel_applies_no_event_after_its_binding_is_replaced(
     people: Any, monkeypatch: pytest.MonkeyPatch, rebound: bool
 ) -> None:
     """Each event batch re-checks the binding before it reaches the thread."""
     monkeypatch.setattr(runner_tunnel, "RUNNER_AUTHORITY_RECHECK_S", 3600.0)
     _admin, alice, _bob, stores = people
-    thread = _session(alice)
-    runner = _runner(stores, alice, thread, "alice")
+    thread = await asyncio.to_thread(_session, alice)
+    runner = await asyncio.to_thread(_runner, stores, alice, thread, "alice")
     ingested: list[str] = []
 
     async def ingest(*, batch: EventBatchFrame, **_kwargs: Any) -> EventAckFrame:
@@ -150,18 +183,20 @@ def test_runner_tunnel_applies_no_event_after_its_binding_is_replaced(
     monkeypatch.setattr(alice.app.state, "runner_event_ingest", ingest, raising=False)
     batch = EventBatchFrame(id="batch-1", session_id=thread, events=[{"type": "noop"}])
 
-    with _runner_tunnel(runner) as ws:
-        ws.send_text(_hello(EVENT_INGEST_CAPABILITY))
-        assert _stays_registered(alice.app, runner.runner_id, 0.1)
-        if rebound:
-            stores["conversation_store"].replace_runner_id(thread, token_bound_runner_id("next"))
-        ws.send_text(encode_frame(batch))
-        if rebound:
-            assert _close_code(ws) == runner_tunnel.RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
-        else:
-            deadline = time.monotonic() + 5
-            while not ingested and time.monotonic() < deadline:
-                time.sleep(0.02)
+    connection = await _runner_tunnel(alice.app, runner, EVENT_INGEST_CAPABILITY)
+    assert await _stays_registered(alice.app, runner.runner_id, 0.1)
+    if rebound:
+        stores["conversation_store"].replace_runner_id(thread, token_bound_runner_id("next"))
+    await connection.send_input({"type": "websocket.receive", "text": encode_frame(batch)})
+    if rebound:
+        code = await _server_close_code(connection)
+        assert code == runner_tunnel.RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+    else:
+        deadline = time.monotonic() + 5
+        while not ingested and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        await connection.send_input({"type": "websocket.disconnect", "code": 1000})
+        await connection.wait(timeout=10)
     assert ingested == ([] if rebound else ["batch-1"])
 
 
@@ -817,33 +852,51 @@ def test_only_the_actual_owner_rebinds_a_threads_runner(people: Any) -> None:
 
 
 class _LiveRunner:
-    """A runner answering resource reads; a download streams in two chunks."""
+    """A runner answering resource reads; a download streams in two chunks.
+
+    Tests can delay the download's headers, shorten its body to one chunk, or
+    start the runner offline so the route resumes it first.
+    """
 
     def __init__(self) -> None:
         self.reads: list[str] = []
         self.between_chunks: Callable[[], None] = lambda: None
+        self.before_headers: Callable[[], None] = lambda: None
+        self.during_resume: Callable[[], None] = lambda: None
+        self.header_delay = 0.0
+        self.short_body = False
+        self.offline_until_resumed = False
+        self.resumed = False
         self.closed = False
 
     def client(self) -> Any:
         import httpx
 
-        async def body() -> AsyncIterator[bytes]:
-            try:
+        runner = self
+
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                if runner.short_body:
+                    yield b"secret"
+                    return
                 yield b"first "
-                self.between_chunks()
+                runner.between_chunks()
                 await asyncio.sleep(0.15)
                 yield b"after the re-check"
-            finally:
-                self.closed = True
 
-        def handle(request: httpx.Request) -> httpx.Response:
+            async def aclose(self) -> None:
+                runner.closed = True
+
+        async def handle(request: httpx.Request) -> httpx.Response:
             self.reads.append(request.url.path)
             if request.url.params.get("download") == "true":
+                self.before_headers()
+                await asyncio.sleep(self.header_delay)
                 headers = {
                     "content-type": "text/plain",
                     "content-disposition": 'attachment; filename="notes.txt"',
                 }
-                return httpx.Response(200, headers=headers, content=body())
+                return httpx.Response(200, headers=headers, stream=Body())
             return httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
 
         return httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://runner")
@@ -857,9 +910,19 @@ def live_runner(monkeypatch: pytest.MonkeyPatch) -> _LiveRunner:
     runner = _LiveRunner()
 
     async def resource_client(*_args: Any, **_kwargs: Any) -> Any:
+        if runner.offline_until_resumed and not runner.resumed:
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
         return runner.client()
 
+    async def resume(**kwargs: Any) -> tuple[None, Any]:
+        # Starting a runner can take long; the test acts during it.
+        runner.during_resume()
+        await asyncio.sleep(0.1)
+        runner.resumed = True
+        return None, kwargs["conv"]
+
     monkeypatch.setattr(sessions, "_get_runner_client_for_resource_access", resource_client)
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", resume)
     monkeypatch.setattr(routes_resources, "CONNECTION_AUTHORITY_RECHECK_S", _FAST)
     return runner
 
@@ -997,15 +1060,15 @@ async def test_a_refused_download_check_forwards_nothing_more() -> None:
     assert 1 < len(forwarded) < 5
 
 
-def test_deleting_a_task_cancels_its_saved_prompts(
+def test_deleting_a_task_fails_its_saved_prompt_and_keeps_human_messages(
     people: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T8: deleting an automation clears the prompt its managed fire saved."""
+    """T8: deleting an automation fails the prompt its fire saved; a person's message stays."""
     from starlette.datastructures import Headers
 
     from omnigent.server.scheduled.authority import ScheduledOrigin
     from omnigent.server.schemas import SessionEventInput
-    from omnigent.server.startup_inputs import STARTUP_LABEL, ManagedStartupInputs
+    from omnigent.server.startup_inputs import ManagedStartupInputs
 
     _admin, alice, _bob, stores = people
     conversations, schedules = stores["conversation_store"], stores["scheduled_task_store"]
@@ -1019,22 +1082,114 @@ def test_deleting_a_task_cancels_its_saved_prompts(
     schedules.create_run(
         uuid.uuid4().hex, task.id, "running", int(time.time()), conversation_id=thread
     )
-    prompt = SessionEventInput(
-        type="message", data={"role": "user", "content": [{"type": "input_text", "text": "go"}]}
-    )
-    asyncio.run(
+
+    def message(text: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        )
+
+    saved = asyncio.run(
         startup.enqueue(
             thread,
-            prompt,
+            message("scheduled"),
             user_id="alice",
             headers=Headers({}),
             scheduled=ScheduledOrigin(task.id, task.account_generation),
         )
     )
-    assert conversations.list_pending_inputs(thread)
+    human = asyncio.run(
+        startup.enqueue(thread, message("mine"), user_id="alice", headers=Headers({}), first=False)
+    )
 
     deleted = alice.delete(f"/v1/scheduled-tasks/{task.id}")
 
     assert deleted.status_code == 200, deleted.text
-    assert conversations.list_pending_inputs(thread) == []
-    assert conversations.get_conversation(thread).labels.get(STARTUP_LABEL) == "cancelled"
+    statuses = {item.id: item.status for item in conversations.list_pending_inputs(thread)}
+    assert statuses == {saved.id: "failed", human.id: "in_progress"}
+
+
+@pytest.mark.parametrize(
+    "child_grant", ["edit-granted", "legacy-creator-owner", "parent-downgraded"]
+)
+def test_a_direct_child_grant_never_outranks_the_trees_read_only(
+    people: Any, live_runner: _LiveRunner, child_grant: str
+) -> None:
+    """r2: only the thread tree's edit access opens a child's unshared workspace."""
+    admin, alice, bob, stores = people
+    conversations, permissions = stores["conversation_store"], stores["permission_store"]
+    parent = _session(alice)
+    if child_grant == "legacy-creator-owner":
+        # Before 8.2b a reader who added a child became its only owner.
+        permissions.grant("bob", parent, LEVEL_READ)
+        agent_id = conversations.get_conversation(parent).agent_id
+        child = conversations.create_conversation(
+            agent_id=agent_id, parent_conversation_id=parent, kind="sub_agent"
+        ).id
+        permissions.grant("bob", child, LEVEL_OWNER)
+    else:
+        child = _child_of(stores, parent)
+        first = LEVEL_EDIT if child_grant == "parent-downgraded" else LEVEL_READ
+
+        def share(thread: str, level: int) -> None:
+            granted = alice.put(
+                f"/v1/sessions/{thread}/permissions", json={"user_id": "bob", "level": level}
+            )
+            assert granted.status_code == 200, granted.text
+
+        share(parent, first)
+        share(child, LEVEL_EDIT)
+        if child_grant == "parent-downgraded":
+            share(parent, LEVEL_READ)
+    url = f"/v1/sessions/{child}/resources/environments/default/filesystem"
+
+    refused = bob.get(url)
+
+    assert refused.status_code == 403, refused.text
+    assert live_runner.reads == []
+    assert admin.get(url).status_code == 200
+    # The owner's sharing opt-in still opens the workspace to readers.
+    conversations.update_conversation(parent, share_workspace_files=True)
+    assert bob.get(url).status_code == 200
+
+
+def _revoke(stores: dict[str, Any], thread: str, revocation: str) -> Callable[[], None]:
+    def revoke() -> None:
+        if revocation == "share_removed":
+            stores["permission_store"].revoke("bob", thread)
+        else:
+            stores["account_store"].update_password("bob", "new-hash", revoke_sessions=True)
+
+    return revoke
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("setup", ["slow-headers", "slow-resume"])
+@pytest.mark.parametrize("revocation", ["share_removed", "sign_in_revoked", None])
+def test_a_download_is_reauthorized_after_a_slow_setup(
+    people: Any, live_runner: _LiveRunner, setup: str, revocation: str | None
+) -> None:
+    """r2: access lost while the runner resumes or answers stops even a one-chunk file."""
+    _admin, alice, bob, stores = people
+    thread = _session(alice)
+    # Resuming a runner needs edit access.
+    stores["permission_store"].grant("bob", thread, LEVEL_EDIT)
+    live_runner.short_body = True
+    revoke = _revoke(stores, thread, revocation) if revocation else (lambda: None)
+    if setup == "slow-headers":
+        live_runner.header_delay = 0.1
+        live_runner.before_headers = revoke
+    else:
+        live_runner.offline_until_resumed = True
+        live_runner.during_resume = revoke
+
+    response = _download(bob, thread)
+
+    if revocation is None:
+        assert response.status_code == 200, response.text
+        assert response.content == b"secret"
+    else:
+        assert response.status_code == 403, response.text
+        assert b"secret" not in response.content
+    assert live_runner.reads, "the runner was asked for the file"
+    assert live_runner.closed

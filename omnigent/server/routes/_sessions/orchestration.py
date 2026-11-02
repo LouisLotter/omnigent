@@ -7203,6 +7203,7 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    authorize_submission: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -7236,35 +7237,52 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :param agent_revision: The agent's effective bundle and selection revision; the
         runner rebuilds the session's spec when it changes.
+    :param authorize_submission: Final authorization for delayed work (a
+        schedule's prompt), which raises to refuse it. Such a prompt is checked
+        first, persisted only after the awaited preparation, and checked again
+        immediately before the runner POST. If it is refused or the POST fails
+        after persisting, a durable "not sent" error follows it in the history,
+        so the runner never recovers it as ordinary work.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
 
+    scheduled = authorize_submission is not None
+    if authorize_submission is not None:
+        # Nothing is persisted for work refused before its preparation.
+        await authorize_submission()
     turn_id = f"turn_{uuid.uuid4().hex}"
     # A web send is persisted under its client stable id (see _web_send_stable_id).
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [item],
-    )
-    if (
-        item.stable_id is not None
-        and persisted_items[0].deduplicated
-        and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
-    ):
-        # A persisted retry may still need forwarding if the first attempt
-        # failed before reaching the runner. A different body under the id
-        # (a pre-adoption web bundle resending an edited restored draft) is a
-        # new message: give it a store-assigned id so it runs under the item
-        # that holds it.
-        item = _build_new_item(body, turn_id, created_by=created_by)
+    persisted_items: list[ConversationItem] = []
+
+    async def persist() -> None:
+        nonlocal item, persisted_items
         persisted_items = await asyncio.to_thread(
             conversation_store.append,
             session_id,
             [item],
         )
+        if (
+            item.stable_id is not None
+            and persisted_items[0].deduplicated
+            and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
+        ):
+            # A persisted retry may still need forwarding if the first attempt
+            # failed before reaching the runner. A different body under the id
+            # (a pre-adoption web bundle resending an edited restored draft) is a
+            # new message: give it a store-assigned id so it runs under the item
+            # that holds it.
+            item = _build_new_item(body, turn_id, created_by=created_by)
+            persisted_items = await asyncio.to_thread(
+                conversation_store.append,
+                session_id,
+                [item],
+            )
+
+    if not scheduled:
+        await persist()
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -7345,11 +7363,6 @@ async def _forward_event_to_runner(
         # registration), so a non-renderer viewer keeps tools advertised
         # — no worse than the pre-hint behavior.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
-        # Id of the item just persisted for this turn. On a cold runner
-        # cache the runner reloads history (which includes this item in
-        # PRE-resolution form) and drops it by id, appending its own
-        # resolved copy — id-based dedup, not a role/content guess.
-        "persisted_item_id": persisted_items[0].id,
     }
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
@@ -7685,6 +7698,21 @@ async def _forward_event_to_runner(
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
+    if authorize_submission is not None:
+        # Persisted only now, then checked again right before it is sent.
+        await persist()
+        try:
+            await authorize_submission()
+        except Exception as refusal:
+            await _note_unsent_prompt(
+                session_id, conversation_store, persisted_items[0].id, refusal
+            )
+            raise
+    # Id of the item just persisted for this turn. On a cold runner
+    # cache the runner reloads history (which includes this item in
+    # PRE-resolution form) and drops it by id, appending its own
+    # resolved copy — id-based dedup, not a role/content guess.
+    runner_body["persisted_item_id"] = persisted_items[0].id
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
@@ -7740,10 +7768,16 @@ async def _forward_event_to_runner(
                 _reject_error,
                 failure_origin="runner_rejected_event",
             )
-            raise OmnigentError(
+            rejected = OmnigentError(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+            if scheduled:
+                # Delayed work is never replayed later without a fresh check.
+                await _note_unsent_prompt(
+                    session_id, conversation_store, persisted_items[0].id, rejected
+                )
+            raise rejected
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -7851,6 +7885,9 @@ async def _forward_event_to_runner(
             extra={"session_id": session_id},
         )
         _publish_status(session_id, "idle")
+        if scheduled:
+            # Delayed work is never replayed later without a fresh check.
+            await _note_unsent_prompt(session_id, conversation_store, persisted_items[0].id, exc)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",
@@ -7858,6 +7895,48 @@ async def _forward_event_to_runner(
         ) from exc
 
     return persisted_items[0].id
+
+
+async def _note_unsent_prompt(
+    session_id: str,
+    conversation_store: ConversationStore,
+    item_id: str,
+    reason: BaseException,
+) -> None:
+    """Follow a persisted but unsent prompt with a durable "not sent" error.
+
+    A trailing user message is what a reconnecting runner replays as a
+    recovery turn; the error after it ends that, so delayed work that lost its
+    authority (or whose submission failed) never runs as ordinary work. The
+    reason is marked as noted so callers don't record it twice.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store the prompt was persisted in.
+    :param item_id: The persisted prompt's id.
+    :param reason: Why it was not sent.
+    """
+    import uuid as _uuid
+
+    await asyncio.to_thread(
+        conversation_store.append,
+        session_id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id=f"unsent_{item_id}",
+                stable_id=_uuid.uuid5(
+                    _uuid.NAMESPACE_URL, f"unsent-prompt:{session_id}:{item_id}"
+                ).hex,
+                data=ErrorData(
+                    source="execution",
+                    code="prompt_not_sent",
+                    message=f"This message was not sent: {str(reason)[:1000]}",
+                ),
+            )
+        ],
+    )
+    with contextlib.suppress(AttributeError):
+        reason.unsent_prompt_noted = True  # type: ignore[attr-defined]
 
 
 async def _stamp_routing_decision_label(
@@ -8192,6 +8271,12 @@ async def _dispatch_session_event_to_runner_impl(
             await authorize_submission()
         if startup_input is not None:
             await startup_input.authorize_submission()
+
+    # Delayed work (a schedule's prompt, connected or saved) is checked again
+    # inside the forward, after its own awaited preparation.
+    delayed = authorize_submission is not None or (
+        startup_input is not None and startup_input.authorize is not None
+    )
 
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
@@ -8581,6 +8666,7 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        authorize_submission=authorize_final if delayed else None,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
