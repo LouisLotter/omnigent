@@ -10,8 +10,11 @@ the bound host's ``sandbox_id`` at the time the thread's runner was bound
 host still runs that sandbox, so replacing or detaching a managed host's
 sandbox retires the runners launched into the old one.
 
-Existing bindings are stamped with their host's current sandbox, so runners
-bound before the upgrade keep working until that sandbox changes.
+Nothing records which sandbox an existing runner was launched into: its host
+may have replaced or detached that sandbox since. So existing runner bindings
+on sandbox-backed hosts are retired (marked so they never match a sandbox);
+their threads bind a new runner on the current sandbox at their next launch.
+Bindings on hosts without a sandbox (personal computers) stay valid.
 
 Deployment: additive; older application code ignores the column. The column
 is added only when missing, so an upgrade interrupted after MySQL or
@@ -32,6 +35,9 @@ depends_on: str | Sequence[str] | None = None
 
 _TABLE = "omnigent_conversation_metadata"
 _COLUMN = "runner_host_incarnation"
+# Equal to omnigent.stores.host_store.RETIRED_RUNNER_INCARNATION; a migration
+# keeps its own copy so later code changes cannot alter what it wrote.
+_RETIRED = "omnigent:retired-runner-binding"
 
 _METADATA = sa.table(
     _TABLE,
@@ -44,7 +50,9 @@ _HOSTS = sa.table(
     "hosts",
     sa.column("workspace_id"),
     sa.column("host_id"),
+    sa.column("sandbox_provider"),
     sa.column("sandbox_id"),
+    sa.column("terminating_sandbox_id"),
 )
 
 
@@ -53,7 +61,7 @@ def _has_column(bind: sa.Connection) -> bool:
 
 
 def upgrade() -> None:
-    """Add the column and stamp existing runner bindings with their host's sandbox."""
+    """Add the column and retire runner bindings on sandbox-backed hosts."""
     bind = op.get_bind()
     if not _has_column(bind):
         op.add_column(_TABLE, sa.Column(_COLUMN, sa.String(256), nullable=True))
@@ -61,18 +69,28 @@ def upgrade() -> None:
         # CockroachDB makes a new column writable only after its schema change commits.
         bind.commit()
         bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
-    current_sandbox = (
-        sa.select(_HOSTS.c.sandbox_id)
+    sandbox_backed = (
+        sa.select(sa.literal(1))
+        .select_from(_HOSTS)
         .where(
             _HOSTS.c.workspace_id == _METADATA.c.workspace_id,
             _HOSTS.c.host_id == _METADATA.c.host_id,
+            sa.or_(
+                _HOSTS.c.sandbox_provider.is_not(None),
+                _HOSTS.c.sandbox_id.is_not(None),
+                _HOSTS.c.terminating_sandbox_id.is_not(None),
+            ),
         )
-        .scalar_subquery()
+        .exists()
     )
     bind.execute(
         _METADATA.update()
-        .where(_METADATA.c.runner_id.is_not(None), _METADATA.c.host_id.is_not(None))
-        .values({_COLUMN: current_sandbox})
+        .where(
+            _METADATA.c.runner_id.is_not(None),
+            _METADATA.c.host_id.is_not(None),
+            sandbox_backed,
+        )
+        .values({_COLUMN: _RETIRED})
     )
 
 

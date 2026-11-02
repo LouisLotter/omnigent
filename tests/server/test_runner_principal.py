@@ -378,6 +378,64 @@ def test_replacing_or_detaching_a_hosts_sandbox_retires_its_runners(people: Any)
     assert _mint(alice.app, new_binding).status_code == 401
 
 
+def _retire_binding(stores: dict[str, Any], thread: str) -> None:
+    """Mark the thread's runner binding retired, as the incarnation migration does."""
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+    from omnigent.stores.host_store import RETIRED_RUNNER_INCARNATION
+
+    with stores["conversation_store"]._engine.begin() as connection:
+        connection.execute(
+            update(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == thread,
+            )
+            .values(runner_host_incarnation=RETIRED_RUNNER_INCARNATION)
+        )
+
+
+@pytest.mark.parametrize("retirement", ["retired-by-migration", "sandbox-replaced"])
+def test_a_retired_binding_is_refused_like_a_replaced_one(people: Any, retirement: str) -> None:
+    """A binding retired at upgrade gets 401 and no mint; a fresh launch works."""
+    _admin, alice, _bob, stores = people
+    hosts, conversations = stores["host_store"], stores["conversation_store"]
+    thread = _session(alice)
+    host_id = uuid.uuid4().hex
+    hosts.upsert_on_connect(host_id, "cloud-computer", "alice")
+    assert hosts.bind_sandbox(host_id, provider="fake", sandbox_id="sandbox-1") is not None
+    conversations.set_host_id(thread, host_id, workspace="/tmp/workspace")
+    old_binding = f"binding-{uuid.uuid4().hex}"
+    conversations.replace_runner_id(thread, token_bound_runner_id(old_binding))
+    minted = _mint(alice.app, old_binding)
+    assert minted.status_code == 200, minted.text
+    old_runner = _bearer(alice.app, minted.json()["token"])
+
+    if retirement == "retired-by-migration":
+        _retire_binding(stores, thread)
+    else:
+        replaced = hosts.replace_managed_host_sandbox(
+            host_id=host_id,
+            user_id="alice",
+            token=uuid.uuid4().hex,
+            provider="fake",
+            sandbox_id="sandbox-2",
+            token_expires_at=int(time.time()) + 3600,
+        )
+        assert replaced is not None
+
+    assert old_runner.get(f"/v1/sessions/{thread}").status_code == 401
+    refused = _mint(alice.app, old_binding)
+    assert refused.status_code == 401
+    assert refused.json()["error"]["code"] == "unauthorized"
+    new_binding = f"binding-{uuid.uuid4().hex}"
+    conversations.replace_runner_id(thread, token_bound_runner_id(new_binding))
+    renewed = _mint(alice.app, new_binding)
+    assert renewed.status_code == 200, renewed.text
+    assert _bearer(alice.app, renewed.json()["token"]).get(f"/v1/sessions/{thread}").is_success
+
+
 def test_runner_token_from_one_thread_names_only_that_binding(people: Any) -> None:
     """A token whose claims are edited (another thread, host or owner) fails its signature."""
     _admin, alice, bob, stores = people

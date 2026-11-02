@@ -380,6 +380,13 @@ def delete_host_in_session(session: Session, row: SqlHost) -> Host:
     return _row_to_host(row)
 
 
+# Marks a runner binding whose launch sandbox is unknown (bound before the
+# incarnation was recorded, on a sandbox-backed host): it never matches a host's
+# sandbox, so the runner must be bound again on the current one. Migration
+# ri1a2b3c4d5e writes the same literal.
+RETIRED_RUNNER_INCARNATION = "omnigent:retired-runner-binding"
+
+
 def _owner_grants(session_id_column: SQLColumnExpression[str] | str) -> ColumnElement[bool]:
     """Owner-level grants on a thread, excluding the public sentinel."""
     from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
@@ -430,6 +437,7 @@ def resolve_runner_binding(
             SqlHost.account_generation.label("host_generation"),
             SqlHost.deleted_at.label("host_deleted_at"),
             SqlHost.sandbox_id.label("host_sandbox_id"),
+            SqlHost.sandbox_provider.label("host_sandbox_provider"),
         )
         .select_from(SqlConversationMetadata)
         .join(SqlSessionPermission, _owner_grants(SqlConversationMetadata.id))
@@ -478,7 +486,10 @@ def resolve_runner_binding(
             or (row.owner_generation is not None and row.host_generation != row.owner_generation)
             # The runner was launched into the sandbox the host runs now; a
             # replaced or detached sandbox's runners are retired.
+            or row.runner_host_incarnation == RETIRED_RUNNER_INCARNATION
             or row.runner_host_incarnation != row.host_sandbox_id
+            # A sandbox-backed host with no sandbox running runs no runner.
+            or (row.host_sandbox_provider is not None and row.host_sandbox_id is None)
         ):
             return None
         bindings.add((row.owner, row.owner_generation, row.host_id))
