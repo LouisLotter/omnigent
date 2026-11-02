@@ -4574,17 +4574,21 @@ def create_app(
         """
         if auth_provider is None:
             raise OmnigentError(
-                "runner token minting requires an auth provider", code=ErrorCode.INVALID_INPUT
+                "runner token minting requires an auth provider",
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
+            )
+        if not auth_provider.issues_machine_tokens():
+            # Header/proxy identity is asserted upstream and can't be minted.
+            raise OmnigentError(
+                "runner token minting is unsupported in this auth mode",
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
             )
 
         def issue(binding: MachineBinding) -> tuple[str, int]:
             minted = auth_provider.mint_machine_token(binding, ttl_seconds)
             if minted is None:
-                # Header/proxy identity is asserted upstream and can't be minted.
-                raise OmnigentError(
-                    "runner token minting is unsupported in this auth mode",
-                    code=ErrorCode.INVALID_INPUT,
-                )
+                # A reserved identity: nothing to issue.
+                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
             return minted
 
         if runner_account_store is not None:

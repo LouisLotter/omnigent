@@ -393,7 +393,11 @@ def _owner_grants(session_id_column: SQLColumnExpression[str] | str) -> ColumnEl
 
 
 def resolve_runner_binding(
-    session: Session, runner_id: str, session_id: str | None = None
+    session: Session,
+    runner_id: str,
+    session_id: str | None = None,
+    *,
+    for_update: bool = False,
 ) -> MachineBinding | None:
     """
     Resolve who a runner acts for from the server's own records.
@@ -401,12 +405,15 @@ def resolve_runner_binding(
     A runner is bound to threads (``runner_id`` on their metadata). Each bound
     thread that carries owner grants must have exactly one owner, and that
     person must own the live host the thread is bound to under their current
-    registration. All bound threads must agree. Sub-agent threads carry no
-    grants of their own and follow their root.
+    registration, still running the sandbox the runner was bound into. All
+    bound threads must agree. Sub-agent threads carry no grants of their own
+    and follow their root.
 
     :param session: Open database session.
     :param runner_id: Token-bound runner id.
     :param session_id: Restrict to this thread, as when checking a token.
+    :param for_update: Lock the binding, grant and host rows and read their
+        latest committed state (a re-read under an account lock).
     :returns: The binding (its ``session_id`` is the smallest bound thread),
         or ``None`` when absent, ambiguous or held by someone else.
     """
@@ -415,12 +422,14 @@ def resolve_runner_binding(
         select(
             SqlConversationMetadata.id.label("session_id"),
             SqlConversationMetadata.host_id,
+            SqlConversationMetadata.runner_host_incarnation,
             SqlSessionPermission.user_id.label("owner"),
             owner_user.account_generation.label("owner_generation"),
             owner_user.deleted_at.label("owner_deleted_at"),
             SqlHost.user_id.label("host_owner"),
             SqlHost.account_generation.label("host_generation"),
             SqlHost.deleted_at.label("host_deleted_at"),
+            SqlHost.sandbox_id.label("host_sandbox_id"),
         )
         .select_from(SqlConversationMetadata)
         .join(SqlSessionPermission, _owner_grants(SqlConversationMetadata.id))
@@ -431,12 +440,15 @@ def resolve_runner_binding(
                 owner_user.id == SqlSessionPermission.user_id,
             ),
         )
-        .outerjoin(
+        .join(
             SqlHost,
             and_(
                 SqlHost.workspace_id == SqlConversationMetadata.workspace_id,
                 SqlHost.host_id == SqlConversationMetadata.host_id,
             ),
+            # A binding needs its host; only a locking read must avoid an outer
+            # join's nullable side, so the plain read keeps hostless rows.
+            isouter=not for_update,
         )
         .where(
             SqlConversationMetadata.workspace_id == current_workspace_id(),
@@ -446,6 +458,8 @@ def resolve_runner_binding(
     )
     if session_id is not None:
         query = query.where(SqlConversationMetadata.id == session_id)
+    if for_update:
+        query = query.with_for_update(of=[SqlConversationMetadata, SqlSessionPermission, SqlHost])
     rows = session.execute(query).all()
     owners_by_session: dict[str, set[str]] = {}
     for row in rows:
@@ -462,6 +476,9 @@ def resolve_runner_binding(
             or row.host_owner != row.owner
             # The host must belong to the owner's current registration.
             or (row.owner_generation is not None and row.host_generation != row.owner_generation)
+            # The runner was launched into the sandbox the host runs now; a
+            # replaced or detached sandbox's runners are retired.
+            or row.runner_host_incarnation != row.host_sandbox_id
         ):
             return None
         bindings.add((row.owner, row.owner_generation, row.host_id))

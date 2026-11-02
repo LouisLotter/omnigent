@@ -2050,7 +2050,8 @@ def _minter(
 def _unsupported_minter(_runner_id: str, _ttl_seconds: int) -> tuple[str, int] | None:
     """The server's issuer under header/proxy auth: the binding resolves, minting can't."""
     raise OmnigentError(
-        "runner token minting is unsupported in this auth mode", code=ErrorCode.INVALID_INPUT
+        "runner token minting is unsupported in this auth mode",
+        code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
     )
 
 
@@ -2199,7 +2200,7 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400() -> None
 
     The binding token is valid and the owner resolves, but header/proxy
     identity can't be minted server-side (the issuer raises
-    ``INVALID_INPUT``) — a clear 400, not a 401.
+    ``RUNNER_TOKENS_UNSUPPORTED``) — a clear, machine-readable 400, not a 401.
 
     :returns: None.
     """
@@ -2213,6 +2214,18 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400() -> None
     response = await _post_mint_token(app, runner_id, token=token)
 
     assert response.status_code == 400
+    assert response.json()["error"]["code"] == "runner_tokens_unsupported"
+
+
+async def test_mint_token_endpoint_without_auth_says_runner_tokens_are_unsupported() -> None:
+    """A no-auth server answers with the explicit code the runner falls back on."""
+    token = "managed-runner-binding-token"
+    app = _mint_route_app(auth_provider=None, mint_managed_runner_token=None)
+
+    response = await _post_mint_token(app, token_bound_runner_id(token), token=token)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "runner_tokens_unsupported"
 
 
 async def test_ping_loop_restamps_runner_liveness(

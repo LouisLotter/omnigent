@@ -440,6 +440,14 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def issues_machine_tokens(self) -> bool:
+        """Whether this provider can mint runner and host tokens at all.
+
+        Checked before any binding lookup, so a server that cannot mint answers
+        "unsupported" rather than "refused". Default: ``False``.
+        """
+        return False
+
     def mint_machine_token(
         self,
         binding: MachineBinding,  # noqa: ARG002
@@ -707,6 +715,10 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    def issues_machine_tokens(self) -> bool:
+        """Accounts and OIDC modes sign machine tokens; header mode can't."""
+        return self._cookie_config() is not None
 
     def mint_machine_token(
         self, binding: MachineBinding, ttl_seconds: int

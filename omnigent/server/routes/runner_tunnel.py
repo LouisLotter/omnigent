@@ -272,8 +272,8 @@ def create_runner_tunnel_router(
     :param mint_managed_runner_token: Issuer that resolves the runner's current
         binding (its thread's single owner, who owns the thread's host) and
         mints a runner token for it. It returns ``None`` when the binding is
-        absent or held by someone else, and raises ``INVALID_INPUT`` when the
-        auth mode cannot mint. ``None`` disables minting.
+        absent or held by someone else, and raises ``RUNNER_TOKENS_UNSUPPORTED``
+        when the auth mode cannot mint. ``None`` disables minting.
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
@@ -381,15 +381,15 @@ def create_runner_tunnel_router(
         :returns: ``{"token": <jwt>, "expires_at": <epoch seconds>}``.
         :raises OmnigentError: 401 when the binding token is absent,
             doesn't match ``runner_id``, or the runner has no valid binding;
-            400 when the active auth mode can't mint server-side
-            (header/proxy, or no auth provider).
+            400 ``runner_tokens_unsupported`` when the active auth mode can't
+            mint server-side (header/proxy, or no auth provider).
         """
         if auth_provider is None:
             # No auth configured: the runner authenticates by binding
             # token alone and needs no bearer — minting is meaningless.
             raise OmnigentError(
                 "runner token minting requires an auth provider",
-                code=ErrorCode.INVALID_INPUT,
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
             )
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token or token_bound_runner_id(token) != runner_id:
@@ -397,10 +397,11 @@ def create_runner_tunnel_router(
         if mint_managed_runner_token is None:
             raise OmnigentError(
                 "runner token minting is unsupported in this auth mode",
-                code=ErrorCode.INVALID_INPUT,
+                code=ErrorCode.RUNNER_TOKENS_UNSUPPORTED,
             )
-        # The issuer raises INVALID_INPUT when the binding is valid but the auth
-        # mode can't mint (header/proxy), so the runner uses its legacy path.
+        # The issuer raises RUNNER_TOKENS_UNSUPPORTED when the binding is valid
+        # but the auth mode can't mint (header/proxy): the runner's cue to use
+        # its older bootstrap. Every other refusal stops the runner.
         minted = await asyncio.to_thread(
             mint_managed_runner_token, runner_id, _MANAGED_RUNNER_TOKEN_TTL_S
         )

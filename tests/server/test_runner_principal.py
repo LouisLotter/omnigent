@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from omnigent.server.route_authority import (
 )
 from tests.server.test_account_revocation import create_session
 from tests.server.test_account_revocation import setup_app as setup_app
+from tests.server.test_accounts import header_mode_app as header_mode_app
 
 
 @dataclasses.dataclass
@@ -161,6 +163,76 @@ def test_runner_does_not_use_its_persons_share_grants(people: Any) -> None:
     assert _usage(alice_runner.client, bob_thread).status_code == 404
 
 
+_SECRET = "zebracrossing"
+
+
+def _threads_mentioning_the_secret(
+    person: TestClient, stores: dict[str, Any], *, archived: bool
+) -> tuple[str, str]:
+    """One thread naming the secret in its title, one only in its body."""
+    from omnigent.entities.conversation import MessageData, NewConversationItem
+
+    by_title, by_body = _session(person), _session(person)
+    assert person.patch(f"/v1/sessions/{by_title}", json={"title": f"{_SECRET} plan"}).is_success
+    assert person.patch(f"/v1/sessions/{by_body}", json={"title": "notes"}).is_success
+    stores["conversation_store"].append(
+        by_body,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{by_body}",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": f"the {_SECRET} notes"}]
+                ),
+            )
+        ],
+    )
+    if archived:
+        for thread in (by_title, by_body):
+            assert person.patch(f"/v1/sessions/{thread}", json={"archived": True}).is_success
+    return by_title, by_body
+
+
+@pytest.mark.parametrize("visibility", ["all", "mine", "shared", "archived"])
+@pytest.mark.parametrize("search_scope", [None, "all", "title", "content"])
+def test_no_visibility_or_search_lists_a_shared_thread_to_a_runner(
+    people: Any, visibility: str, search_scope: str | None
+) -> None:
+    """Every list filter and search stays within the runner's person's own threads."""
+    _admin, alice, bob, stores = people
+    archived = visibility == "archived"
+    bobs = _threads_mentioning_the_secret(bob, stores, archived=archived)
+    for thread in bobs:
+        granted = bob.put(
+            f"/v1/sessions/{thread}/permissions", json={"user_id": "alice", "level": LEVEL_EDIT}
+        )
+        assert granted.status_code == 200, granted.text
+    own = _threads_mentioning_the_secret(alice, stores, archived=archived)
+    runner = _runner(stores, alice, _session(alice), "alice")
+    params: dict[str, object] = {"visibility": visibility, "limit": 100}
+    if search_scope is not None:
+        params |= {"search_query": _SECRET, "search_scope": search_scope}
+
+    human = alice.get("/v1/sessions", params=params)
+    listed = runner.client.get("/v1/sessions", params=params)
+    assert human.status_code == listed.status_code == 200, listed.text
+
+    seen_by_alice = {item["id"] for item in human.json()["data"]}
+    if visibility in ("all", "shared", "archived"):
+        assert set(bobs) & seen_by_alice, "the person herself still sees what was shared"
+    items = listed.json()["data"]
+    assert not set(bobs) & {item["id"] for item in items}
+    assert {item["id"] for item in items} <= set(own) | {
+        thread for thread in seen_by_alice if thread not in bobs
+    }
+    if visibility == "shared":
+        assert items == []
+    elif search_scope == "content":
+        # Content search still finds the person's own thread, with its snippet.
+        by_id = {item["id"]: item for item in items}
+        assert _SECRET in by_id[own[1]]["search_snippet"]
+
+
 def test_runner_works_on_its_own_persons_threads(people: Any) -> None:
     """Same-person positives: the runner reads, writes, lists and creates for its owner."""
     _admin, alice, _bob, stores = people
@@ -249,6 +321,63 @@ def test_runner_token_dies_with_its_binding(people: Any) -> None:
     assert deleted.client.get(f"/v1/sessions/{thread}").status_code == 401
 
 
+def _bearer(app: Any, token: str) -> TestClient:
+    client = TestClient(app)
+    client.headers["Authorization"] = f"Bearer {token}"
+    return client
+
+
+def test_replacing_or_detaching_a_hosts_sandbox_retires_its_runners(people: Any) -> None:
+    """T7: a new computer incarnation under the same host ID and account ends old runners.
+
+    Neither the old runner's token nor a fresh mint with its binding token
+    works after the sandbox is replaced; a runner launched into the new
+    sandbox does. Detaching the sandbox retires that one in turn.
+    """
+    _admin, alice, _bob, stores = people
+    hosts, conversations = stores["host_store"], stores["conversation_store"]
+    thread = _session(alice)
+    host_id = uuid.uuid4().hex
+    hosts.upsert_on_connect(host_id, "cloud-computer", "alice")
+    assert hosts.bind_sandbox(host_id, provider="fake", sandbox_id="sandbox-1") is not None
+    conversations.set_host_id(thread, host_id, workspace="/tmp/workspace")
+    old_binding = f"binding-{uuid.uuid4().hex}"
+    conversations.replace_runner_id(thread, token_bound_runner_id(old_binding))
+    minted = _mint(alice.app, old_binding)
+    assert minted.status_code == 200, minted.text
+    old_runner = _bearer(alice.app, minted.json()["token"])
+    assert old_runner.get(f"/v1/sessions/{thread}").status_code == 200
+    registration = stores["account_store"].get_user("alice").account_generation
+
+    replaced = hosts.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id="alice",
+        token=uuid.uuid4().hex,
+        provider="fake",
+        sandbox_id="sandbox-2",
+        token_expires_at=int(time.time()) + 3600,
+    )
+
+    assert replaced is not None and replaced.host_id == host_id
+    assert stores["account_store"].get_user("alice").account_generation == registration
+    assert old_runner.get(f"/v1/sessions/{thread}").status_code == 401
+    assert _mint(alice.app, old_binding).status_code == 401
+    new_binding = f"binding-{uuid.uuid4().hex}"
+    conversations.replace_runner_id(thread, token_bound_runner_id(new_binding))
+    renewed = _mint(alice.app, new_binding)
+    assert renewed.status_code == 200, renewed.text
+    new_runner = _bearer(alice.app, renewed.json()["token"])
+    assert new_runner.get(f"/v1/sessions/{thread}").status_code == 200
+
+    current = hosts.get_host(host_id)
+    assert current is not None
+    assert hosts.detach_stale_managed_sandbox(
+        host_id, sandbox_id="sandbox-2", expected_updated_at=current.updated_at
+    )
+    assert new_runner.get(f"/v1/sessions/{thread}").status_code == 401
+    assert _mint(alice.app, new_binding).status_code == 401
+
+
 def test_runner_token_from_one_thread_names_only_that_binding(people: Any) -> None:
     """A token whose claims are edited (another thread, host or owner) fails its signature."""
     _admin, alice, bob, stores = people
@@ -290,6 +419,32 @@ def test_expired_and_legacy_runner_tokens_are_refused(
     )
     client.headers["Authorization"] = f"Bearer {legacy_token}"
     assert client.get(f"/v1/sessions/{thread}").status_code == 401
+
+
+def test_header_mode_server_says_runner_tokens_are_unsupported_before_any_binding(
+    header_mode_app: TestClient,
+) -> None:
+    """A server that can't mint answers with the explicit code, never a refusal.
+
+    The runner treats only this answer (or 404) as "use the older bootstrap",
+    so it must not depend on whether the runner's binding resolves.
+    """
+    binding = "header-mode-runner-binding"
+    response = header_mode_app.post(
+        f"/v1/runners/{token_bound_runner_id(binding)}/token",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "runner_tokens_unsupported"
+
+
+def test_accounts_server_refuses_rather_than_reports_unsupported(people: Any) -> None:
+    """An accounts server offers runner tokens: an unbound runner is refused (401)."""
+    _admin, alice, _bob, _stores = people
+    refused = _mint(alice.app, "never-bound-binding")
+    assert refused.status_code == 401
+    assert refused.json()["error"]["code"] != "runner_tokens_unsupported"
 
 
 def test_no_runner_token_for_a_thread_on_someone_elses_computer(people: Any) -> None:

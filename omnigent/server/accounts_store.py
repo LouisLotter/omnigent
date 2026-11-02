@@ -328,8 +328,9 @@ class SqlAlchemyAccountStore:
             if binding is None:
                 return None
             require_active_account(session, binding.user_id, generation=binding.account_generation)
-            # Deletion can remove ownership while the first read waits for the lock.
-            if resolve_runner_binding(session, runner_id) != binding:
+            # Deletion can remove ownership while the first read waits for the lock;
+            # a locking read sees the latest committed binding on every backend.
+            if resolve_runner_binding(session, runner_id, for_update=True) != binding:
                 return None
             with account_authority_scope(binding.user_id, binding.account_generation):
                 return issue(binding)

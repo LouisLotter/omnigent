@@ -516,14 +516,43 @@ RUNNER_TOKEN_REFUSED_EXIT_CODE = 77
 def runner_token_refusal_message(status_code: int) -> str:
     """Explain a refused runner token to the person reading the session's error.
 
-    :param status_code: The mint endpoint's HTTP status, ``401`` or ``403``.
+    :param status_code: The mint endpoint's HTTP status: ``401`` or ``403``, or
+        a ``400`` that did not say runner tokens are unsupported.
     """
+    if status_code in (401, 403):
+        reason = (
+            "its thread is no longer bound to this runner on its owner's computer, "
+            "or the thread belongs to someone else"
+        )
+    else:
+        reason = (
+            "the server, or a proxy in front of it, rejected the request without "
+            "saying that runner tokens are unsupported"
+        )
     return (
-        f"The Omnigent server refused this runner's token (HTTP {status_code}): its "
-        "thread is no longer bound to this runner on its owner's computer, or the "
-        "thread belongs to someone else. The runner does not fall back to the "
-        "computer's sign-in. Send the message again from Omnigent to start a new runner."
+        f"The Omnigent server refused this runner's token (HTTP {status_code}): "
+        f"{reason}. The runner does not fall back to the computer's sign-in. "
+        "Send the message again from Omnigent to start a new runner."
     )
+
+
+def _is_unsupported_mint_response(response: httpx.Response) -> bool:
+    """Whether a mint answer says this server does not offer runner tokens.
+
+    Only the server's explicit ``runner_tokens_unsupported`` error (and a 404
+    from a server without the endpoint, checked by the caller) means "use the
+    older bootstrap". Any other 400 says nothing about runner-token support.
+    """
+    if response.status_code != 400:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    from omnigent.errors import ErrorCode
+
+    return isinstance(error, dict) and error.get("code") == ErrorCode.RUNNER_TOKENS_UNSUPPORTED
 
 
 class RunnerTokenRefusedError(RuntimeError):
@@ -540,8 +569,11 @@ class RunnerTokenRefusedError(RuntimeError):
 class _InitialAuthTokenFactory:
     """Use a host bearer until rejection, then lazily resolve runner auth.
 
-    Only for servers that don't offer runner tokens; a runner whose server
-    mints uses :class:`_ManagedMintTokenFactory` directly.
+    Only for servers that didn't offer runner tokens at boot; a runner whose
+    server mints uses :class:`_ManagedMintTokenFactory` directly. Once the
+    fallback turns out to be a runner token (the server now mints, or refuses
+    this runner), machine authentication is permanent: a refused mint or
+    renewal ends in no credential, never in a stored login or SDK credential.
     """
 
     def __init__(self, token: str, server_url: str) -> None:
@@ -555,6 +587,8 @@ class _InitialAuthTokenFactory:
         self._fallback_factory: Callable[[], str | None] | None = None
         self._retry_discovery_at = 0.0
         self._no_credential_logged = False
+        # Set once the server refused this runner's token: no credential since.
+        self.refused_status: int | None = None
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
@@ -569,26 +603,29 @@ class _InitialAuthTokenFactory:
         """
         if self._initial_token is not None:
             return self._initial_token
+        if self.refused_status is not None and self._fallback_factory is None:
+            return None
         if self._fallback_factory is None:
             if time.monotonic() < self._retry_discovery_at:
                 return None
-            self._fallback_factory = _make_auth_token_factory(
-                self._server_url,
-                _allow_initial_token=False,
-                _proxy_bearer=self._last_initial_token,
-            )
+            try:
+                self._fallback_factory = _make_auth_token_factory(
+                    self._server_url,
+                    _allow_initial_token=False,
+                    _proxy_bearer=self._last_initial_token,
+                    _fail_closed_mint=True,
+                )
+            except RunnerTokenRefusedError as exc:
+                # The server now offers runner tokens and refused this one.
+                self.refused_status = exc.status_code
+                _logger.error("%s", exc, extra={"session_id": runner_primary_session_id()})
+                return None
         token = self._fallback_factory() if self._fallback_factory is not None else None
-        # Managed mint cannot renew itself when its proxy bearer expires —
-        # the injected host bearer before a first mint, or the minted JWT
-        # once a session outlives it. Re-resolve SDK/OIDC in the same call
-        # so the request that hit the failure still gets a credential.
-        if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
-            self._fallback_factory = _make_auth_token_factory(
-                self._server_url,
-                _allow_initial_token=False,
-                _allow_delegated_mint=False,
-            )
-            token = self._fallback_factory() if self._fallback_factory is not None else None
+        if isinstance(self._fallback_factory, _ManagedMintTokenFactory):
+            # Runner tokens are established: a refused renewal propagates as no
+            # credential instead of switching to a person's sign-in.
+            self.refused_status = None if token else self._fallback_factory.refused_status
+            return token
         if self._fallback_factory is None:
             self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
             if not self._no_credential_logged:
@@ -685,6 +722,7 @@ def _make_auth_token_factory(
     _allow_initial_token: bool = True,
     _allow_delegated_mint: bool = True,
     _proxy_bearer: str | None = None,
+    _fail_closed_mint: bool = False,
 ) -> Callable[[], str | None] | None:
     """Build a callable that mints fresh auth tokens.
 
@@ -813,14 +851,17 @@ def _make_auth_token_factory(
     # the managed fallback below doesn't resend the identical probe.
     refused_binding_token: str | None = None
     if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
-        delegated_factory = _make_managed_mint_factory(
-            resolved_server_url,
-            binding_token,
-            proxy_bearer=_proxy_bearer,
-            # The runner's own first resolution: a refusal stops it rather than
-            # falling through to any local sign-in.
-            fail_closed=_allow_initial_token,
-        )
+        try:
+            delegated_factory = _make_managed_mint_factory(
+                resolved_server_url, binding_token, proxy_bearer=_proxy_bearer, fail_closed=True
+            )
+        except RunnerTokenRefusedError:
+            # The server offers runner tokens and refused this runner: no local
+            # sign-in stands in. The runner's own resolution and the bootstrap
+            # wrapper's fallback stop on it; other helpers get no credential.
+            if _allow_initial_token or _fail_closed_mint:
+                raise
+            return None
         if delegated_factory is not None:
             return delegated_factory
         if _proxy_bearer is None:
@@ -1035,9 +1076,11 @@ class _ManagedMintTokenFactory:
         # refusal). Unlike ``declined``, this means the caller should try
         # another credential path (SDK/OIDC) rather than sending bare requests.
         self.proxy_auth_failed = False
-        # The 401/403 that ended the last mint with no cached token left: the
-        # server refused this runner's binding (or a proxy its bearer).
+        # The 401/403 (or unrecognized 400) that ended the last mint with no
+        # cached token left: the server refused this runner's binding.
         self.refused_status: int | None = None
+        # True after any successful mint: the server offers runner tokens.
+        self.minted_once = False
 
     def __call__(self) -> str | None:
         """Return a fresh owner JWT, or ``None``.
@@ -1074,28 +1117,27 @@ class _ManagedMintTokenFactory:
         except httpx.HTTPStatusError as exc:
             response = exc.response
             if (
-                response.status_code in (400, 404)
+                response.status_code == 404
+                or _is_unsupported_mint_response(response)
                 or response.is_server_error
                 or (response.is_redirect and _is_login_redirect_or_unauthorized(response))
             ):
-                # Only treat as a definitive refusal if we have never
-                # successfully minted. A 400/404 mid-session (e.g. during an
-                # IP ACL flip) is transient — the server already proved it
-                # mints for this runner. A 5xx with no cache means an
-                # intermediary (e.g. an Apps relay's Bad Gateway page) is
-                # answering for the mint endpoint; latch declined so
-                # callbacks go out bare instead of failing closed forever.
-                if self._cached_token is None:
+                # The server doesn't offer runner tokens (404, or its explicit
+                # "unsupported" answer), an intermediary 5xx answers for it, or
+                # the Apps sign-in front door redirects before the request
+                # reaches it. Definitive only before the first successful mint:
+                # afterwards the server has proved it mints, so it is transient.
+                # A 5xx latches declined so callbacks go out bare instead of
+                # failing closed forever.
+                if not self.minted_once:
                     self.declined = True
                     self.declined_by_server_error = response.is_server_error
                     return None
                 return self._still_valid_cached_token(now)
-            if response.status_code in (401, 403):
-                # The proxy bearer is expired or invalid — the seeded host
-                # bearer, or the minted JWT once a session outlives it. With
-                # no still-valid cache left the mint loop cannot renew itself:
-                # latch proxy_auth_failed so the caller re-resolves SDK/OIDC
-                # instead of failing closed on every callback.
+            if response.status_code in (400, 401, 403):
+                # The server refused this runner (401/403), or a 400 said
+                # nothing about runner tokens being unsupported. With no
+                # still-valid cache left there is no credential: fail closed.
                 cached = self._still_valid_cached_token(now)
                 if cached is None:
                     self.proxy_auth_failed = True
@@ -1115,6 +1157,7 @@ class _ManagedMintTokenFactory:
         self._cached_token = token
         self._cached_expires_at = expires_at
         self.refused_status = None
+        self.minted_once = True
         # Promote the minted JWT to proxy bearer so subsequent refreshes
         # through the Apps proxy are authenticated with a valid credential.
         self._proxy_bearer = token

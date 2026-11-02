@@ -872,6 +872,12 @@ class SqlConversationMetadata(OmnigentBase):
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # The host's sandbox (``hosts.sandbox_id``) when ``runner_id`` was bound to
+    # it; NULL for a host without one. A runner token is valid only while the
+    # host still runs that sandbox, so replacing it retires older runners.
+    runner_host_incarnation: Mapped[str | None] = mapped_column(
+        String(256), nullable=True, deferred=True
+    )
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

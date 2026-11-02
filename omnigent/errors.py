@@ -242,6 +242,10 @@ class ErrorCode:
     :cvar DURABILITY_UNCONFIRMED: A write was recorded, but the deployment
         could not confirm in time that it is durable (HTTP 503). Sending the
         same idempotent write again is safe and expected.
+    :cvar RUNNER_TOKENS_UNSUPPORTED: This server does not issue runner tokens
+        (no auth, or identity asserted by a proxy), HTTP 400. The only 400 a
+        runner may treat as "use the older bootstrap"; any other refusal of
+        a runner token stops the runner.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -267,6 +271,7 @@ class ErrorCode:
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
     DURABILITY_UNCONFIRMED = "durability_unconfirmed"
+    RUNNER_TOKENS_UNSUPPORTED = "runner_tokens_unsupported"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -312,6 +317,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.REFRESH_UNSUPPORTED: 409,
+    ErrorCode.RUNNER_TOKENS_UNSUPPORTED: 400,
     ErrorCode.WORKSPACE_MISSING: 410,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
@@ -360,6 +366,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorCategory.CONFIG,
+    ErrorCode.RUNNER_TOKENS_UNSUPPORTED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
     # The session's agent was deleted or rebound; the caller must recreate the
@@ -421,6 +428,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
+    ErrorCode.RUNNER_TOKENS_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
 }
 
@@ -455,6 +463,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.RUNNER_TOKENS_UNSUPPORTED: ErrorPhase.REQUEST,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
