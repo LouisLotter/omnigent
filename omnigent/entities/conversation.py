@@ -287,11 +287,19 @@ class Conversation:
 
 
 class StartupInputOptions(BaseModel):
-    """Request options retained only while a startup input awaits delivery."""
+    """Request options retained only while a startup input awaits delivery.
+
+    :param scheduled_task_id: The automation whose fire saved this input,
+        re-checked at delivery; ``None`` for a person's own message.
+    :param scheduled_task_generation: The owner registration the fire ran
+        under, re-checked with the task.
+    """
 
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
+    scheduled_task_id: str | None = None
+    scheduled_task_generation: str | None = None
 
 
 class MessageData(BaseModel):

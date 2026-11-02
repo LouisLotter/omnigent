@@ -172,14 +172,24 @@ class FakeStartupInputs:
         user_id: str | None,
         headers: Headers,
         first: bool = True,
+        scheduled: Any = None,
     ) -> None:
         self.calls.append("enqueue")
         self.enqueued.append(
-            {"session_id": session_id, "event": event, "user_id": user_id, "headers": headers}
+            {
+                "session_id": session_id,
+                "event": event,
+                "user_id": user_id,
+                "headers": headers,
+                "scheduled": scheduled,
+            }
         )
 
     async def record_launch_failure(self, session_id: str, reason: str) -> None:
         self.launch_failures.append((session_id, reason))
+
+    async def cancel(self, session_id: str) -> None:
+        self.calls.append("cancel")
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
@@ -1738,7 +1748,10 @@ async def test_managed_fire_does_not_block_next_fire_while_provisioning(
         for _ in range(2):
             assert await run_now(0, "task_1") is True
             await _drain()
-        assert managed_launch.await_count == 2
+        # Each launch re-checks its task before it provisions.
+        async with asyncio.timeout(5):
+            while managed_launch.await_count < 2:
+                await asyncio.sleep(0.01)
         assert [run["status"] for run in store.runs] == ["running"] * 2
     finally:
         release.set()

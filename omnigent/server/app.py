@@ -1884,6 +1884,13 @@ def create_app(
                 app_state=app_inst.state,
             )
             on_fire = build_on_fire(fire_deps)
+            if app_inst.state.startup_inputs is not None:
+                from omnigent.server.scheduled.fire import build_startup_authority
+
+                # A managed fire's saved prompt is re-checked when it is delivered.
+                app_inst.state.startup_inputs.scheduled_authority = build_startup_authority(
+                    fire_deps
+                )
             # The manual "run now" trigger reuses the same fire path (dispatch /
             # preflight / in-flight guard) as the scheduler; it only differs in
             # allowing a paused task to fire. Exposed on app.state for the

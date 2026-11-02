@@ -811,3 +811,230 @@ def test_only_the_actual_owner_rebinds_a_threads_runner(people: Any) -> None:
         assert "Only the session owner" in refused.text
     passed_owner_gate = alice.patch(f"/v1/sessions/{thread}", json={"runner_id": runner_id})
     assert "Only the session owner" not in passed_owner_gate.text
+
+
+# ── Workspace reads and downloads through a live runner ──────────────────────
+
+
+class _LiveRunner:
+    """A runner answering resource reads; a download streams in two chunks."""
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+        self.between_chunks: Callable[[], None] = lambda: None
+        self.closed = False
+
+    def client(self) -> Any:
+        import httpx
+
+        async def body() -> AsyncIterator[bytes]:
+            try:
+                yield b"first "
+                self.between_chunks()
+                await asyncio.sleep(0.15)
+                yield b"after the re-check"
+            finally:
+                self.closed = True
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            self.reads.append(request.url.path)
+            if request.url.params.get("download") == "true":
+                headers = {
+                    "content-type": "text/plain",
+                    "content-disposition": 'attachment; filename="notes.txt"',
+                }
+                return httpx.Response(200, headers=headers, content=body())
+            return httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://runner")
+
+
+@pytest.fixture
+def live_runner(monkeypatch: pytest.MonkeyPatch) -> _LiveRunner:
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_resources
+
+    runner = _LiveRunner()
+
+    async def resource_client(*_args: Any, **_kwargs: Any) -> Any:
+        return runner.client()
+
+    monkeypatch.setattr(sessions, "_get_runner_client_for_resource_access", resource_client)
+    monkeypatch.setattr(routes_resources, "CONNECTION_AUTHORITY_RECHECK_S", _FAST)
+    return runner
+
+
+def _child_of(stores: dict[str, Any], parent: str) -> str:
+    """A sub-agent of Alice's thread, owned by her as the create route grants it."""
+    conversations = stores["conversation_store"]
+    agent_id = conversations.get_conversation(parent).agent_id
+    child = conversations.create_conversation(
+        agent_id=agent_id, parent_conversation_id=parent, kind="sub_agent"
+    ).id
+    stores["permission_store"].grant("alice", child, LEVEL_OWNER)
+    return child
+
+
+@pytest.mark.parametrize("thread_kind", ["parent", "child"])
+@pytest.mark.parametrize(
+    ("caller", "expected"),
+    [
+        ("bob_read_unshared", 403),
+        ("bob_read_shared", 200),
+        ("bob_edit", 200),
+        ("owner", 200),
+        ("admin", 200),
+    ],
+)
+def test_workspace_reads_follow_the_tree_access_and_sharing(
+    people: Any, live_runner: _LiveRunner, thread_kind: str, caller: str, expected: int
+) -> None:
+    """A read-only share of the tree never opens an unshared workspace, child or not."""
+    admin, alice, bob, stores = people
+    parent = _session(alice)
+    target = parent if thread_kind == "parent" else _child_of(stores, parent)
+    if caller.startswith("bob"):
+        level = LEVEL_EDIT if caller == "bob_edit" else LEVEL_READ
+        stores["permission_store"].grant("bob", parent, level)
+    if caller == "bob_read_shared":
+        stores["conversation_store"].update_conversation(parent, share_workspace_files=True)
+    client = {"owner": alice, "admin": admin}.get(caller, bob)
+
+    response = client.get(f"/v1/sessions/{target}/resources/environments/default/filesystem")
+
+    assert response.status_code == expected, response.text
+    assert bool(live_runner.reads) == (expected == 200)
+
+
+def _download(client: TestClient, thread: str, *, absolute: bool = False) -> Any:
+    query = "download=true&base=host" if absolute else "download=true"
+    path = "home/alice/notes.txt" if absolute else "notes.txt"
+    return client.get(
+        f"/v1/sessions/{thread}/resources/environments/default/filesystem/{path}?{query}"
+    )
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    "revocation", ["share_removed", "sign_in_revoked", "sharing_turned_off", "owner_lost"]
+)
+def test_an_open_download_stops_once_access_is_lost(
+    people: Any, live_runner: _LiveRunner, revocation: str
+) -> None:
+    """T3/T7: bytes stop within the re-check window; the transfer is aborted, not finished."""
+    from omnigent.server.routes.sessions.routes_resources import DownloadAccessRevoked
+
+    _admin, alice, bob, stores = people
+    thread = _session(alice)
+    permissions, conversations = stores["permission_store"], stores["conversation_store"]
+    client = alice if revocation == "owner_lost" else bob
+    if revocation != "owner_lost":
+        stores["permission_store"].grant(
+            "bob", thread, LEVEL_EDIT if revocation == "sign_in_revoked" else LEVEL_READ
+        )
+        conversations.update_conversation(thread, share_workspace_files=True)
+
+    def revoke() -> None:
+        if revocation == "share_removed":
+            permissions.revoke("bob", thread)
+        elif revocation == "sign_in_revoked":
+            stores["account_store"].update_password("bob", "new-hash", revoke_sessions=True)
+        elif revocation == "sharing_turned_off":
+            conversations.update_conversation(thread, share_workspace_files=False)
+        else:
+            # An absolute path is the owner's machine: losing ownership ends it.
+            permissions.revoke("alice", thread)
+
+    live_runner.between_chunks = revoke
+    with pytest.raises(DownloadAccessRevoked):
+        _download(client, thread, absolute=revocation == "owner_lost")
+    assert live_runner.closed
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("caller", ["owner", "bob_edit", "bob_read_shared"])
+def test_a_download_that_keeps_access_completes(
+    people: Any, live_runner: _LiveRunner, caller: str
+) -> None:
+    _admin, alice, bob, stores = people
+    thread = _session(alice)
+    if caller != "owner":
+        level = LEVEL_EDIT if caller == "bob_edit" else LEVEL_READ
+        stores["permission_store"].grant("bob", thread, level)
+        stores["conversation_store"].update_conversation(thread, share_workspace_files=True)
+
+    response = _download(alice if caller == "owner" else bob, thread)
+
+    assert response.status_code == 200, response.text
+    assert response.content == b"first after the re-check"
+    assert live_runner.closed
+
+
+@pytest.mark.asyncio
+async def test_a_refused_download_check_forwards_nothing_more() -> None:
+    """Unit: chunks within the window pass; the first one after a refusal never does."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    async def chunks() -> AsyncIterator[bytes]:
+        for index in range(5):
+            yield f"chunk-{index}".encode()
+            await asyncio.sleep(0.03)
+
+    verdicts = iter([True, False])
+
+    async def still_authorized() -> bool:
+        return next(verdicts)
+
+    forwarded: list[bytes] = []
+    original = routes_resources.CONNECTION_AUTHORITY_RECHECK_S
+    routes_resources.CONNECTION_AUTHORITY_RECHECK_S = 0.05
+    try:
+        with pytest.raises(routes_resources.DownloadAccessRevoked):
+            async for chunk in routes_resources._while_authorized(chunks(), still_authorized):
+                forwarded.append(chunk)
+    finally:
+        routes_resources.CONNECTION_AUTHORITY_RECHECK_S = original
+    assert 1 < len(forwarded) < 5
+
+
+def test_deleting_a_task_cancels_its_saved_prompts(
+    people: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8: deleting an automation clears the prompt its managed fire saved."""
+    from starlette.datastructures import Headers
+
+    from omnigent.server.scheduled.authority import ScheduledOrigin
+    from omnigent.server.schemas import SessionEventInput
+    from omnigent.server.startup_inputs import STARTUP_LABEL, ManagedStartupInputs
+
+    _admin, alice, _bob, stores = people
+    conversations, schedules = stores["conversation_store"], stores["scheduled_task_store"]
+    startup = ManagedStartupInputs(conversations, alice.app.state.host_registry)
+    monkeypatch.setattr(alice.app.state, "startup_inputs", startup, raising=False)
+    thread = _session(alice)
+    agent_id = conversations.get_conversation(thread).agent_id
+    task = schedules.create(
+        uuid.uuid4().hex, "nightly", "check", "FREQ=DAILY", "alice", agent_id, "UTC"
+    )
+    schedules.create_run(
+        uuid.uuid4().hex, task.id, "running", int(time.time()), conversation_id=thread
+    )
+    prompt = SessionEventInput(
+        type="message", data={"role": "user", "content": [{"type": "input_text", "text": "go"}]}
+    )
+    asyncio.run(
+        startup.enqueue(
+            thread,
+            prompt,
+            user_id="alice",
+            headers=Headers({}),
+            scheduled=ScheduledOrigin(task.id, task.account_generation),
+        )
+    )
+    assert conversations.list_pending_inputs(thread)
+
+    deleted = alice.delete(f"/v1/scheduled-tasks/{task.id}")
+
+    assert deleted.status_code == 200, deleted.text
+    assert conversations.list_pending_inputs(thread) == []
+    assert conversations.get_conversation(thread).labels.get(STARTUP_LABEL) == "cancelled"

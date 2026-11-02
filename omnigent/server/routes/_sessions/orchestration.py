@@ -8102,6 +8102,7 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    authorize_submission: Callable[[], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8176,10 +8177,22 @@ async def _dispatch_session_event_to_runner_impl(
         an older host row gets.
     :param agent_revision: The agent's effective bundle and selection revision, stamped on
         both native and non-native forwards to invalidate runner caches.
+    :param authorize_submission: Final authorization for work that was
+        authorized long before it is sent (a schedule's prompt). Awaited
+        before a startup input is claimed and immediately before the event is
+        forwarded; it raises to stop the submission.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+
+    async def authorize_final() -> None:
+        """Re-check delayed authority; raises to stop the submission."""
+        if authorize_submission is not None:
+            await authorize_submission()
+        if startup_input is not None:
+            await startup_input.authorize_submission()
+
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message" and startup_input is None:
@@ -8191,6 +8204,7 @@ async def _dispatch_session_event_to_runner_impl(
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).
+        await authorize_final()
         side_result = await _forward_codex_side_chat_turn(conv, body, runner_client)
         if side_result is not None:
             return side_result
@@ -8303,6 +8317,7 @@ async def _dispatch_session_event_to_runner_impl(
                 return _SessionEventDispatchResult(
                     item_id=None, pending_id=repeated_pending_id, delivery="duplicate"
                 )
+        await authorize_final()
         if startup_input is not None and not await startup_input.claim(
             conversation_store, session_id
         ):
@@ -8452,6 +8467,8 @@ async def _dispatch_session_event_to_runner_impl(
         forwarded = False
         delivery: Literal["accepted", "duplicate", "unknown"] = "accepted"
         try:
+            # Routing above may have waited: check once more, right before sending.
+            await authorize_final()
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
             delivery = await _forward_native_terminal_message(
@@ -8544,6 +8561,7 @@ async def _dispatch_session_event_to_runner_impl(
                     decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id, delivery=delivery)
+    await authorize_final()
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None)
     if startup_input is not None and body.type == "message":

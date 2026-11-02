@@ -73,6 +73,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.authority import ScheduledFireRefused, ScheduledOrigin
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
@@ -125,12 +126,17 @@ class _FireResult(Enum):
     IN_FLIGHT = "in_flight"
 
 
-class _CannotLaunchScheduledFire(RuntimeError):
-    """A fire cannot start because its execution target is not usable."""
+# A fire cannot start, or lost its authority; shared with startup-input delivery.
+_CannotLaunchScheduledFire = ScheduledFireRefused
 
-    def __init__(self, message: str, *, error_code: str) -> None:
-        super().__init__(message)
-        self.error_code = error_code
+
+@dataclass(frozen=True)
+class _CapturedTask:
+    """The task identity a saved prompt carries: id, owner and registration."""
+
+    id: str
+    user_id: str | None
+    account_generation: str | None
 
 
 @dataclass
@@ -610,7 +616,7 @@ async def _run_fire_for_task(
         _logger.exception("scheduled fire: task %s failed", task.id)
 
 
-async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
+async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask | _CapturedTask) -> bool:
     """True when the task's captured owner registration is no longer active.
 
     A NULL owner (single-user / OSS) always resolves to
@@ -625,7 +631,7 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
 
 async def _reauthorize_fire(
     deps: FireDeps,
-    task: ScheduledTask,
+    task: ScheduledTask | _CapturedTask,
     *,
     host_id: str | None,
     conversation_id: str | None,
@@ -1341,6 +1347,14 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         await _ensure_runner_session_initialized(
             conv.id, conv_for_dispatch, runner_client, deps.conversation_store
         )
+        agent_revision = await _agent_revision(deps, conv_for_dispatch)
+
+        async def authorize_submission() -> None:
+            await _reauthorize_fire(deps, task, host_id=host_id, conversation_id=conv.id)
+
+        # Initialization can take minutes; the helper checks again right before
+        # it sends the prompt, after any wait of its own.
+        await authorize_submission()
         await _dispatch_session_event_to_runner(
             conv.id,
             conv_for_dispatch,
@@ -1352,7 +1366,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
-            agent_revision=await _agent_revision(deps, conv_for_dispatch),
+            agent_revision=agent_revision,
+            authorize_submission=authorize_submission,
         )
 
     return _dispatch
@@ -1373,11 +1388,14 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         if deps.startup_inputs is None:
             raise RuntimeError("managed sandboxes are not configured")
         # No browser preference applies to a fire; keep the server default.
+        # The saved prompt keeps the task's identity: delivery, possibly after
+        # a slow sandbox boot or a restart, re-checks it before sending.
         await deps.startup_inputs.enqueue(
             conv.id,
             _prompt_event(task.prompt),
             user_id=task.user_id or RESERVED_USER_LOCAL,
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
+            scheduled=ScheduledOrigin(task.id, task.account_generation),
         )
 
     return _dispatch
@@ -1409,6 +1427,14 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
         )
 
         async def _launch() -> None:
+            try:
+                # Don't provision a sandbox for a task deleted since its fire.
+                await _reauthorize_fire(deps, task, host_id=None, conversation_id=conv.id)
+            except _CannotLaunchScheduledFire as exc:
+                await _fail_running_run(deps, conv.id, str(exc), exc.error_code)
+                if deps.startup_inputs is not None:
+                    await deps.startup_inputs.cancel(conv.id)
+                return
             try:
                 await _run_managed_launch(
                     session_id=conv.id,
@@ -1447,6 +1473,45 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
         )
 
     return _start
+
+
+def build_startup_authority(
+    deps: FireDeps,
+) -> Callable[[ScheduledOrigin, str, str | None], Awaitable[None]]:
+    """Build the delivery-time check for a prompt a managed fire saved.
+
+    Runs when the prompt is about to be delivered, possibly after a slow
+    sandbox boot or a server restart: the task must still exist for the same
+    owner and registration, the owner must be active, and the sandbox host and
+    thread must still be the owner's. A refusal fails the run and raises.
+
+    :param deps: The fire path's dependencies.
+    :returns: ``authorize(origin, conversation_id, sender)``; *sender* is the
+        saved input's ``created_by``.
+    """
+
+    async def authorize(origin: ScheduledOrigin, conversation_id: str, sender: str | None) -> None:
+        try:
+            current = await asyncio.to_thread(deps.scheduled_task_store.get, origin.task_id)
+            if current is None or (current.user_id or RESERVED_USER_LOCAL) != sender:
+                raise _CannotLaunchScheduledFire(
+                    "the scheduled task was deleted or changed owner before its message was sent",
+                    error_code="task_authority_revoked",
+                )
+            conv = await asyncio.to_thread(
+                deps.conversation_store.get_conversation, conversation_id
+            )
+            await _reauthorize_fire(
+                deps,
+                _CapturedTask(origin.task_id, current.user_id, origin.generation),
+                host_id=conv.host_id if conv is not None else None,
+                conversation_id=conversation_id,
+            )
+        except _CannotLaunchScheduledFire as exc:
+            await _fail_running_run(deps, conversation_id, str(exc), exc.error_code)
+            raise
+
+    return authorize
 
 
 async def _fail_running_run(

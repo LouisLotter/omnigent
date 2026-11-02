@@ -289,6 +289,8 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     # A sub-agent of conv_share: nobody holds a direct grant on it, so every
     # caller's access is inherited through the parent.
     conv_store.add("conv_child", parent="conv_share")
+    # A sub-agent of conv_open, whose owner shares workspace files.
+    conv_store.add("conv_open_child", parent="conv_open")
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
@@ -479,7 +481,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
         ("admin@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
         ("manager@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
         ("owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
-        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_open_child"), False),
     ],
     ids=[
         "owner",
@@ -491,7 +493,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
         "child-admin",
         "child-inherited-manager",
         "child-inherited-editor",
-        "child-inherited-viewer",
+        "shared-child-inherited-viewer",
     ],
 )
 async def test_filesystem_marks_reach_scope_for_the_owner_only(
@@ -508,6 +510,21 @@ async def test_filesystem_marks_reach_scope_for_the_owner_only(
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
     assert ("scope=reach" in runner_client.gets[0]) is marked
+
+
+@pytest.mark.asyncio
+async def test_child_of_an_unshared_thread_refuses_a_read_only_viewer(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """A view-only share of the parent never opens the child's unshared workspace."""
+    resp = await client.get(
+        _FS_RELATIVE.replace("conv_share", "conv_child"),
+        headers={"X-Forwarded-Email": "viewer@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
 
 
 @pytest.mark.asyncio

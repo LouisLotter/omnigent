@@ -8,6 +8,7 @@ import contextlib
 import functools
 import mimetypes
 import ntpath
+import time
 import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -58,6 +59,11 @@ from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.persistent_hosts import admit_host_work
+from omnigent.server.principals import recorded_principal
+from omnigent.server.routes._auth_helpers import (
+    CONNECTION_AUTHORITY_RECHECK_S,
+    credential_still_valid,
+)
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -117,20 +123,53 @@ if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 
+class DownloadAccessRevoked(Exception):
+    """A download's caller lost access mid-transfer; the transfer is aborted, not finished."""
+
+
+async def _while_authorized(
+    chunks: AsyncIterator[bytes], still_authorized: Callable[[], Awaitable[bool]] | None
+) -> AsyncIterator[bytes]:
+    """Forward *chunks*, re-checking the caller before any chunk past the interval.
+
+    No byte is forwarded more than :data:`CONNECTION_AUTHORITY_RECHECK_S`
+    after the last successful check. A refused check raises, so the server
+    aborts the response rather than ending it as a complete (truncated) file.
+    """
+    next_check = time.monotonic() + CONNECTION_AUTHORITY_RECHECK_S
+    async for chunk in chunks:
+        if still_authorized is not None and time.monotonic() >= next_check:
+            if not await still_authorized():
+                _logger.info("Download lost its caller's access; aborting it")
+                raise DownloadAccessRevoked("download access revoked")
+            next_check = time.monotonic() + CONNECTION_AUTHORITY_RECHECK_S
+        yield chunk
+
+
 class _RunnerStreamResponse(StreamingResponse):
     """Stream a runner response body and close it however the send ends.
 
     A generator ``finally`` only runs once the body is first pulled, so a
     send that fails before that, or a client that disconnects (where
     Starlette skips background tasks), would leak the tunnel request.
-    Closing in ``__call__`` covers every exit.
+    Closing in ``__call__`` covers every exit, a revoked download included.
 
     :param upstream: The runner's streamed response.
     :param headers: Response headers to forward.
+    :param still_authorized: Re-checks the caller during the transfer;
+        ``None`` skips it.
     """
 
-    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+    def __init__(
+        self,
+        upstream: httpx.Response,
+        *,
+        headers: Mapping[str, str],
+        still_authorized: Callable[[], Awaitable[bool]] | None = None,
+    ) -> None:
+        super().__init__(
+            _while_authorized(upstream.aiter_raw(), still_authorized), headers=headers
+        )
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -408,6 +447,7 @@ def register_resources_routes(
         session_id: str,
         conversation: Conversation,
         runner_path: str,
+        still_authorized: Callable[[], Awaitable[bool]] | None = None,
     ) -> Response:
         """Resume an idle runner if needed and stream a file without buffering it.
 
@@ -420,6 +460,7 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param runner_path: Runner-relative URL carrying ``download=true``.
+        :param still_authorized: Re-checks the caller during the transfer.
         :returns: The attachment, streamed as the runner sends it, or the
             runner's own error body and status for a missing file, a
             directory, or an out-of-grant path.
@@ -479,7 +520,9 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
-            return _RunnerStreamResponse(resp, headers=forwarded)
+            return _RunnerStreamResponse(
+                resp, headers=forwarded, still_authorized=still_authorized
+            )
         try:
             await resp.aread()
         finally:
@@ -855,17 +898,54 @@ def register_resources_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        # ``level is None`` means permissions are disabled (single-user) or, on a
-        # child session, access inherited from the parent chain with no direct
-        # grant. Edit collaborators keep the workspace unconditionally; a
-        # view-only grant reaches it only once the owner shares its files.
-        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+        if permission_store is None:
+            # Permissions disabled (single-user): nothing to gate.
+            return conv, True
+        # Edit collaborators keep the workspace unconditionally; a view-only
+        # grant reaches it only once the owner shares its files.
+        if await _may_browse_workspace(user_id, conv, access.level):
             return conv, await _owns_session(user_id, conv, access.level)
         raise OmnigentError(
             f"{user_id!r} needs edit access to browse the workspace of session "
             f"{session_id!r}, or the owner must enable file sharing",
             code=ErrorCode.FORBIDDEN,
         )
+
+    async def _may_browse_workspace(
+        user_id: str | None, conv: Conversation, level: int | None
+    ) -> bool:
+        """Whether an authorized reader may also read the workspace's files.
+
+        Needs edit access, or the owner's ``share_workspace_files``. A child
+        session's access is its thread tree's: the caller's direct grants on
+        the child (usually none) say nothing, so its edit level is resolved
+        through the parent chain and either the child's or the root's sharing
+        flag counts.
+
+        :param user_id: The authenticated user.
+        :param conv: The conversation already authorized for reading.
+        :param level: The caller's direct level from that authorization.
+        :returns: ``True`` when the workspace may be read.
+        """
+        if permission_store is None or (level is not None and level >= LEVEL_EDIT):
+            return True
+        if conv.share_workspace_files:
+            return True
+        if conv.parent_conversation_id is None:
+            return False
+        if await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            conv.parent_conversation_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        ):
+            return True
+        root = await asyncio.to_thread(
+            conversation_store.get_conversation, conv.root_conversation_id
+        )
+        return root is not None and root.share_workspace_files
 
     async def _owns_session(user_id: str | None, conv: Conversation, level: int | None) -> bool:
         """Whether the caller clears the owner bar :func:`_browse_level` sets.
@@ -3015,6 +3095,36 @@ def register_resources_routes(
         qs = urllib.parse.urlencode({**params, **reach})
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
         if download:
+            downloading_principal = recorded_principal(request)
+            downloading_user = _get_user_id(request, auth_provider)
+            needs_owner = bool(reach)
+
+            async def download_still_authorized() -> bool:
+                # The whole browse decision again: credential, effective level,
+                # the sharing flag and, for an absolute path, the owner rule.
+                try:
+                    if not await credential_still_valid(
+                        request,
+                        auth_provider=auth_provider,
+                        expected=downloading_principal,
+                        user_id=downloading_user,
+                    ):
+                        return False
+                    _conv, still_owner = await _authorize_browse_read_with_owner(
+                        session_id, request, relative_path
+                    )
+                except OmnigentError:
+                    return False
+                except Exception:
+                    _logger.warning(
+                        "Re-authorizing a download from %s failed; aborting it",
+                        session_id,
+                        exc_info=True,
+                    )
+                    return False
+                # Following a workspace symlink outward was granted as the owner.
+                return still_owner or not needs_owner
+
             return await _stream_download_from_runner(
                 request,
                 session_id,
@@ -3022,6 +3132,7 @@ def register_resources_routes(
                 f"/v1/sessions/{session_id}/resources/environments"
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **reach}),
+                still_authorized=download_still_authorized,
             )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"

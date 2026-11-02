@@ -9391,6 +9391,30 @@
             ],
             "title": "Model Override"
           },
+          "scheduled_task_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner registration the fire ran under, re-checked with the task.",
+            "title": "Scheduled Task Generation"
+          },
+          "scheduled_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation whose fire saved this input, re-checked at delivery; `None` for a person's own message.",
+            "title": "Scheduled Task Id"
+          },
           "tools": {
             "anyOf": [
               {
