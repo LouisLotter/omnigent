@@ -120,6 +120,10 @@ class Conversation:
         SDK terminal-response usage); never by user picks. The only
         model value UI surfaces display. ``None`` means no report has
         arrived yet.
+    :param reported_reasoning_effort: The reasoning effort the harness last
+        REPORTED the session runs at, e.g. ``"xhigh"``. Written only by
+        ``external_reasoning_effort_report`` events; never by user picks
+        (those set ``reasoning_effort``). ``None`` means unknown.
     :param model_override: Per-session LLM model override — the user's
         REQUEST, e.g. ``"claude-opus-4-7"``. ``None`` means use the
         agent default from the spec's ``llm.model``. Mutable via
@@ -250,6 +254,7 @@ class Conversation:
     model_override: str | None = None
     inference_snapshot: dict[str, Any] | None = None
     reported_model: str | None = None
+    reported_reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     harness_override: str | None = None

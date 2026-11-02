@@ -1018,6 +1018,8 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        reported_reasoning_effort: str | None = None,
+        _unset_reported_reasoning_effort: bool = False,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -1073,6 +1075,10 @@ class ConversationStore(ABC):
         :param archived: New archived state. ``True`` archives
             (hides from the default listing), ``False`` unarchives,
             ``None`` leaves unchanged.
+        :param reported_reasoning_effort: The effort the harness last
+            reported, e.g. ``"xhigh"``. ``None`` leaves unchanged.
+        :param _unset_reported_reasoning_effort: When ``True``, clear
+            ``reported_reasoning_effort`` (the harness reported no effort).
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
         """
@@ -1097,6 +1103,8 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        reported_reasoning_effort: str | None = None,
+        _unset_reported_reasoning_effort: bool = False,
     ) -> ConversationUpdateResult | None:
         """Update a conversation and report requested model-setting changes.
 

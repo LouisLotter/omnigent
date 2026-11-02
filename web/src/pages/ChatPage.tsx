@@ -260,6 +260,8 @@ import { composerContextFromLabels } from "@/lib/composerContextAdapters";
 import {
   compactModelTriggerLabel,
   formatStatusModelLabel,
+  displayedSessionEffort,
+  effortSummaryRows,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
   nativeModelTooltip,
@@ -4992,6 +4994,9 @@ function SessionHarnessPicker({
     name: nativeAgent?.agentName ?? agentName ?? subAgentName ?? "",
     harness: nativeAgent?.harness ?? sessionHarness,
   };
+  const reportsEffort = nativeAgent?.capabilities?.includes("effortReport") ?? false;
+  const requestedEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const reportedEffort = useChatStore((s) => s.sessionReportedReasoningEffort);
   const summary = useSessionConfigSummary({
     harnessLabel,
     showModels,
@@ -5000,12 +5005,20 @@ function SessionHarnessPicker({
     effectiveModel,
     modelLabel: modelSummary,
     costRoutingEligible,
+    reportsEffort,
   });
   const configurable = hasSessionConfig({
     showModels,
     showEffort,
   });
-  const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+  // A harness that reports its effort shows only the report; an unknown effort
+  // leaves the pill to the model, and the hover summary lists the request.
+  const effortLabel =
+    showEffort && !routingOn
+      ? formatStatusEffortLabel(
+          displayedSessionEffort(reportedEffort, requestedEffort, reportsEffort),
+        )
+      : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
     : modelLabelLoading
@@ -5399,6 +5412,7 @@ function useSessionConfigSummary({
   effectiveModel,
   modelLabel,
   costRoutingEligible,
+  reportsEffort,
 }: {
   harnessLabel: string | null;
   showModels: boolean;
@@ -5407,8 +5421,10 @@ function useSessionConfigSummary({
   effectiveModel: string | null;
   modelLabel: string | null;
   costRoutingEligible: boolean;
+  reportsEffort: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useSessionEffort();
+  const requestedEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const reportedEffort = useChatStore((s) => s.sessionReportedReasoningEffort);
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
@@ -5423,8 +5439,7 @@ function useSessionConfigSummary({
   // Suppress Effort while routing is on: the router picks the model and its
   // effort per turn, so a pinned effort doesn't apply and would mislead.
   if (showEffort && !routingOn) {
-    const effortValue = formatStatusEffortLabel(selectedEffort);
-    if (effortValue) rows.push({ label: "Effort", value: effortValue });
+    rows.push(...effortSummaryRows(reportedEffort, requestedEffort, harnessLabel, reportsEffort));
   }
   if (!routingOn) {
     const source =
@@ -5436,13 +5451,15 @@ function useSessionConfigSummary({
 }
 
 /**
- * The effort this conversation is actually at.
+ * The effort the picker marks as selected: the harness's report when it sent
+ * one, else the requested effort. Display labels use `displayedSessionEffort`,
+ * which never presents a request as the effort a reporting harness runs at.
  *
- * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
- * different efforts each read their own.
+ * Both are conversation-scoped, so two live conversations at different efforts
+ * each read their own.
  */
 function useSessionEffort(): string | null {
-  return useChatStore((s) => s.sessionReasoningEffort);
+  return useChatStore((s) => s.sessionReportedReasoningEffort ?? s.sessionReasoningEffort);
 }
 
 /**

@@ -25,6 +25,7 @@ _CONTEXT_FILE = "context.json"
 # normalizes it into ``context.json`` via :func:`sync_raw_status_context`.
 CONTEXT_RAW_FILE = "context_raw.json"
 _MAX_VERSION_CHARS = 32
+_MAX_EFFORT_CHARS = 32
 
 
 def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | None:
@@ -72,6 +73,12 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | 
         model_id = model.strip()
     if model_id is not None:
         record["model"] = model_id
+    # The effort Claude Code runs at (``effort.level``), whatever set it: a
+    # flag, ``/effort``, settings or the model's default. Absent = not reported.
+    effort = payload.get("effort")
+    level = effort.get("level") if isinstance(effort, dict) else None
+    if isinstance(level, str) and 0 < len(level.strip()) <= _MAX_EFFORT_CHARS:
+        record["effort"] = level.strip().lower()
     # The Claude Code build behind the pane, so delivery diagnostics can tell versions apart.
     version = payload.get("version")
     if isinstance(version, str) and 0 < len(version) <= _MAX_VERSION_CHARS:

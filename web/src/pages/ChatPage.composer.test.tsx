@@ -2147,6 +2147,7 @@ describe("Composer model/effort label", () => {
       skills: [],
       sessionModelOverride: null,
       sessionReasoningEffort: null,
+      sessionReportedReasoningEffort: null,
       llmModel: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
@@ -2200,9 +2201,13 @@ describe("Composer model/effort label", () => {
   });
 
   it("shows the model in the foreground and effort muted", () => {
-    // The chip renders the harness's reported model (`llmModel`), never the
-    // sticky preference or the request.
-    useChatStore.setState({ llmModel: "opus", sessionReasoningEffort: "high" });
+    // The chip renders the harness's reported model (`llmModel`) and effort,
+    // never the sticky preference or the request.
+    useChatStore.setState({
+      llmModel: "opus",
+      sessionReasoningEffort: "high",
+      sessionReportedReasoningEffort: "high",
+    });
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -2242,6 +2247,33 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
     expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+  });
+
+  it("labels a Claude effort it has not reported as unknown, with the request beside it", async () => {
+    useChatStore.setState({
+      llmModel: "opus",
+      sessionReasoningEffort: "high",
+      sessionReportedReasoningEffort: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    // The pill never presents the request as the effort Claude runs at.
+    expect(label()).toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("High");
+    fireEvent.focus(screen.getByTestId("composer-config-gear"));
+    const gearTooltip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(gearTooltip).toHaveTextContent("Effort: Unknown");
+    expect(gearTooltip).toHaveTextContent("Requested effort: High");
+    expect(gearTooltip).not.toHaveTextContent("Effort source:");
   });
 
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {
@@ -2558,6 +2590,7 @@ describe("Composer model/effort label", () => {
     useChatStore.setState({
       sessionModelOverride: null,
       sessionReasoningEffort: "high",
+      sessionReportedReasoningEffort: "high",
       llmModel: null,
       codexModelOptions: [], // cleared by `switchTo`, refilled when the snapshot lands
     });
@@ -5924,6 +5957,8 @@ describe("Composer paste", () => {
 
   afterEach(() => {
     cleanup();
+    // Later suites reset only the requested effort; a report must not leak into them.
+    useChatStore.setState({ sessionReportedReasoningEffort: null });
   });
 
   /** Clipboard items as a real paste carries them: text and/or file entries. */

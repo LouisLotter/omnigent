@@ -618,6 +618,17 @@ export interface SessionReasoningEffortEvent {
 }
 
 /**
+ * `session.reported_reasoning_effort` — the effort a harness reports the
+ * session actually runs at (Claude-native reads Claude Code's statusLine).
+ * `null` means Omnigent no longer knows it. Never changes the requested effort.
+ */
+export interface SessionReportedReasoningEffortEvent {
+  type: "session_reported_reasoning_effort";
+  conversationId: string;
+  reportedReasoningEffort: string | null;
+}
+
+/**
  * `session.collaboration_mode` — active Codex collaboration-mode switch.
  *
  * Emitted when a Codex-native thread enters or exits Plan mode, whether from
@@ -1028,6 +1039,7 @@ export type StreamEvent =
   | SessionModelEvent
   | SessionTitleEvent
   | SessionReasoningEffortEvent
+  | SessionReportedReasoningEffortEvent
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent

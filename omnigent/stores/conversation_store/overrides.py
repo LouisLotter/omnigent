@@ -15,6 +15,7 @@ _SESSION_OVERRIDE_KEYS = (
     "reasoning_effort",
     "model_override",
     "reported_model",
+    "reported_reasoning_effort",
     "cost_control_mode_override",
     "subagent_routing_override",
     "harness_override",

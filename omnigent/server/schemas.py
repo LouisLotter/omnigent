@@ -2214,6 +2214,10 @@ class SessionResponse(BaseModel):
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
         ``"max"``. Provider-specific support is validated when a
         turn executes. ``None`` means use the agent default.
+    :param reported_reasoning_effort: The effort the harness last reported
+        the session runs at, e.g. ``"xhigh"`` from Claude Code's statusLine.
+        ``reasoning_effort`` is the request; this is the observation.
+        ``None`` means Omnigent does not know (no report yet).
     :param items: Committed conversation items in chronological
         order. Empty for a freshly created session.
     :param sub_agent_name: For sub-agent sessions, the sub-agent
@@ -2422,6 +2426,7 @@ class SessionResponse(BaseModel):
     host_online: bool | None = None
     host_resumable: bool = False
     reasoning_effort: str | None = None
+    reported_reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
     sub_agent_name: str | None = None
@@ -3481,6 +3486,29 @@ class SessionReasoningEffortEvent(_SSEEventBase):
     type: Literal["session.reasoning_effort"]
     conversation_id: str
     reasoning_effort: str | None = None
+
+
+class SessionReportedReasoningEffortEvent(_SSEEventBase):
+    """
+    Effort a harness reports the session actually runs at.
+
+    Emitted after an ``external_reasoning_effort_report`` POST, e.g. from the
+    claude-native forwarder reading Claude Code's statusLine. Unlike
+    ``session.reasoning_effort`` it never changes the requested effort.
+
+    :param type: Always ``"session.reported_reasoning_effort"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param reported_reasoning_effort: The reported effort, e.g. ``"xhigh"``,
+        or ``None`` when the harness no longer reports one (unknown).
+
+    Category: **transient** (SSE-only). The server also writes
+    ``reported_reasoning_effort`` on the conversation, so on reconnect clients
+    restore it from the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.reported_reasoning_effort"]
+    conversation_id: str
+    reported_reasoning_effort: str | None = None
 
 
 class SessionCollaborationModeEvent(_SSEEventBase):
@@ -4983,6 +5011,7 @@ ServerStreamEvent = Annotated[
     | SessionModelEvent
     | SessionTitleEvent
     | SessionReasoningEffortEvent
+    | SessionReportedReasoningEffortEvent
     | SessionCollaborationModeEvent
     | SessionPermissionModeEvent
     | SessionCodexApprovalModeEvent

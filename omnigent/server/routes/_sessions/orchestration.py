@@ -1675,6 +1675,7 @@ def _build_session_response(
         host_online=host_online,
         host_resumable=host_resumable,
         reasoning_effort=conv.reasoning_effort,
+        reported_reasoning_effort=conv.reported_reasoning_effort,
         items=items,
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,

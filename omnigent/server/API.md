@@ -1083,6 +1083,13 @@ Request body matches `SessionEventInput`:
                                   `session.reasoning_effort` event. Payload:
                                   `{reasoning_effort: string | null}`; `null`
                                   clears to the model default.
+      - "external_reasoning_effort_report"
+                                — internal effort a native harness reports it
+                                  runs at. Persists `reported_reasoning_effort`
+                                  (never the requested `reasoning_effort`) and
+                                  publishes `session.reported_reasoning_effort`.
+                                  Payload: `{reasoning_effort: string | null}`;
+                                  `null` means the effort is unknown.
       - "external_codex_collaboration_mode_change"
                                 — internal Codex app-server collaboration-mode
                                   update. Persists the mode kind as label
@@ -1376,6 +1383,7 @@ stream and surface queue/interrupt semantics.
 |---|---|---|
 | `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
+| `session.reported_reasoning_effort` | `SessionReportedReasoningEffortEvent` | `{type, conversation_id, reported_reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
 | `session.input.consumed` | `SessionInputConsumedEvent` | `{type, data: {queued_item_id, type, data, position}}` (nested envelope) |

@@ -155,6 +155,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+    _EXTERNAL_REASONING_EFFORT_REPORT_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_STATUS_VALUES,
@@ -213,6 +214,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_external_model_options,
     _persist_external_permission_mode_change,
     _persist_external_reasoning_effort_change,
+    _persist_external_reasoning_effort_report,
     _persist_external_session_title,
     _persist_external_subagent_start,
     _persist_policy_deny_sentinel,
@@ -1138,6 +1140,10 @@ def register_events_routes(
         - ``"external_reasoning_effort_change"`` persists a terminal-observed
           thinking-level switch to ``reasoning_effort`` and publishes a
           ``session.reasoning_effort`` SSE event so the web picker reflects it.
+        - ``"external_reasoning_effort_report"`` records the effort a harness
+          reports it runs at to ``reported_reasoning_effort`` (``null`` =
+          unknown) and publishes ``session.reported_reasoning_effort``. It never
+          changes the requested ``reasoning_effort``.
         - ``"external_codex_collaboration_mode_change"`` persists the
           Codex app-server collaboration mode kind as an internal session label
           (``omnigent.codex_native.collaboration_mode``).
@@ -1310,6 +1316,7 @@ def register_events_routes(
             _EXTERNAL_MODEL_OPTIONS_TYPE,
             _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+            _EXTERNAL_REASONING_EFFORT_REPORT_TYPE,
             _EXTERNAL_SESSION_TITLE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
@@ -2647,6 +2654,14 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE:
             await _persist_external_reasoning_effort_change(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_REASONING_EFFORT_REPORT_TYPE:
+            await _persist_external_reasoning_effort_report(
                 session_id,
                 conv,
                 body,

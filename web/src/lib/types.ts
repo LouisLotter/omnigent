@@ -363,6 +363,8 @@ export interface Session {
   queuedItems?: SessionEventInput[];
   /** Per-session reasoning-effort override, e.g. ``"high"``. */
   reasoningEffort?: string | null;
+  /** Effort the harness reports the session runs at, e.g. ``"xhigh"``; ``null`` when unknown. */
+  reportedReasoningEffort?: string | null;
   /** LLM model identifier from the bound agent's spec. */
   llmModel?: string | null;
   /**

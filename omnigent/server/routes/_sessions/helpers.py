@@ -292,6 +292,7 @@ from omnigent.server.schemas import (
     SessionModelOptionsEvent,
     SessionPermissionModeEvent,
     SessionReasoningEffortEvent,
+    SessionReportedReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourcePaginatedList,
     SessionSandboxStatusEvent,
@@ -2615,7 +2616,7 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
     """
     Validate a terminal-observed reasoning-effort payload.
 
-    :param body: External effort-change event body. ``data.reasoning_effort``
+    :param body: External effort change or report event body. ``data.reasoning_effort``
         must be present and either ``None`` or a supported effort string, e.g.
         ``"medium"``.
     :returns: Normalized effort string, or ``None`` when the terminal cleared
@@ -2624,7 +2625,7 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
     """
     if "reasoning_effort" not in body.data:
         raise OmnigentError(
-            "external_reasoning_effort_change requires data.reasoning_effort",
+            f"{body.type} requires data.reasoning_effort",
             code=ErrorCode.INVALID_INPUT,
         )
     raw_effort = body.data["reasoning_effort"]
@@ -2632,8 +2633,7 @@ def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
         return None
     if not isinstance(raw_effort, str) or not raw_effort.strip():
         raise OmnigentError(
-            "external_reasoning_effort_change requires data.reasoning_effort "
-            "to be a non-empty string or null",
+            f"{body.type} requires data.reasoning_effort to be a non-empty string or null",
             code=ErrorCode.INVALID_INPUT,
         )
     effort = raw_effort.strip()
@@ -2739,6 +2739,43 @@ async def _persist_external_reasoning_effort_change(
         type="session.reasoning_effort",
         conversation_id=session_id,
         reasoning_effort=effort,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+async def _persist_external_reasoning_effort_report(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist and broadcast the effort a harness reports the session runs at.
+
+    Writes ``reported_reasoning_effort`` only: the requested ``reasoning_effort``
+    stays the user's choice and nothing is forwarded to the runner. ``null``
+    clears the report (unknown). No-ops when the value is unchanged.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row for ``session_id`` at the route boundary.
+    :param body: Event body; ``data.reasoning_effort`` is a supported effort,
+        e.g. ``"xhigh"``, or ``None``.
+    :param conversation_store: Store used to update ``reported_reasoning_effort``.
+    :raises OmnigentError: If the payload is missing or unsupported.
+    """
+    effort = _validate_external_reasoning_effort(body)
+    if conv.reported_reasoning_effort == effort:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        reported_reasoning_effort=effort,
+        _unset_reported_reasoning_effort=effort is None,
+    )
+    event = SessionReportedReasoningEffortEvent(
+        type="session.reported_reasoning_effort",
+        conversation_id=session_id,
+        reported_reasoning_effort=effort,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -12327,6 +12364,7 @@ __all__ = [
     "_persist_external_model_options",
     "_persist_external_permission_mode_change",
     "_persist_external_reasoning_effort_change",
+    "_persist_external_reasoning_effort_report",
     "_persist_external_session_title",
     "_persist_external_subagent_start",
     "_persist_native_policy_notice",
