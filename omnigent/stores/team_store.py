@@ -208,6 +208,62 @@ def _lock_current_member(session: Session, user_id: str) -> SqlTeamMember | None
     ).scalar_one_or_none()
 
 
+def _same_registration(
+    column: InstrumentedAttribute[str | None], generation: str | None
+) -> ColumnElement[bool]:
+    """Match a stored generation to *generation*, treating ``NULL`` as a value."""
+    return column.is_(None) if generation is None else column == generation
+
+
+def _live_generation(session: Session, user_id: str) -> tuple[bool, str | None]:
+    """Return whether *user_id* is a live account, and its generation."""
+    row = session.execute(
+        select(SqlUser.deleted_at, SqlUser.account_generation).where(
+            SqlUser.workspace_id == current_workspace_id(), SqlUser.id == user_id
+        )
+    ).one_or_none()
+    if row is None or row.deleted_at is not None:
+        return False, None
+    return True, row.account_generation
+
+
+def _removed_from_registration(session: Session, user_id: str, generation: str | None) -> bool:
+    """Whether this registration of *user_id* has a removed membership; reads one row."""
+    return (
+        session.execute(
+            select(SqlTeamMember.id)
+            .where(
+                SqlTeamMember.workspace_id == current_workspace_id(),
+                SqlTeamMember.user_id == user_id,
+                _same_registration(SqlTeamMember.account_generation, generation),
+                SqlTeamMember.state == _REMOVED,
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
+def carry_membership_registration(
+    session: Session, user_id: str, *, old: str | None, new: str
+) -> None:
+    """Move *user_id*'s memberships from generation *old* to *new*.
+
+    Runs under the account lock when an account's generation rotates or is
+    first provisioned, as hosts and schedules move with it; a removal stays
+    in force for the same registration.
+    """
+    session.execute(
+        update(SqlTeamMember)
+        .where(
+            SqlTeamMember.workspace_id == current_workspace_id(),
+            SqlTeamMember.user_id == user_id,
+            _same_registration(SqlTeamMember.account_generation, old),
+        )
+        .values(account_generation=new)
+    )
+
+
 def _has_other_active_owner(session: Session, member_id: str) -> bool:
     """Whether an active owner other than *member_id* exists; reads at most one row."""
     return (
@@ -293,8 +349,11 @@ def admin_flag_for_account(session: Session, user_id: str, is_admin: bool) -> bo
     """Align a member's role with a direct admin-flag write; return the flag to store.
 
     Promotion makes a member an admin and demotion makes an admin a member; an
-    owner's role changes only through the team. Accounts without a current
-    membership keep the requested flag. Runs after :func:`lock_team`.
+    owner's role changes only through the team. A registration whose
+    membership was removed is not promoted until it is a member again, so a
+    login-time roster cannot restore it. Accounts that never joined, including
+    a later registration of the same username, keep the requested flag. Runs
+    after :func:`lock_team` and the account lock.
 
     :param session: The admin-flag write's session.
     :param user_id: The account being changed, e.g. ``"alice"``.
@@ -304,7 +363,10 @@ def admin_flag_for_account(session: Session, user_id: str, is_admin: bool) -> bo
     """
     row = _lock_current_member(session, user_id)
     if row is None:
-        return is_admin
+        if not is_admin:
+            return False
+        live, generation = _live_generation(session, user_id)
+        return not (live and _removed_from_registration(session, user_id, generation))
     role = cast(MemberRole, decode_team_member_role(row.role))
     if role == "owner" and not is_admin:
         raise OmnigentError(
@@ -344,6 +406,7 @@ def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
     row = SqlTeamMember(
         id=uuid.uuid4().hex,
         user_id=user_id,
+        account_generation=_live_generation(session, user_id)[1],
         current_user_id=user_id,
         role=_OWNER,
         state=_ACTIVE,
@@ -424,6 +487,7 @@ class SqlAlchemyTeamStore:
             row = SqlTeamMember(
                 id=uuid.uuid4().hex,
                 user_id=user_id,
+                account_generation=account.account_generation,
                 current_user_id=user_id,
                 role=encode_team_member_role(role),
                 state=encode_team_member_state(state),
@@ -479,7 +543,9 @@ class SqlAlchemyTeamStore:
             if row is None:
                 return None
             member, generation = row
-            if owner.generation is not None and owner.generation != generation:
+            if member.account_generation != generation or (
+                owner.generation is not None and owner.generation != generation
+            ):
                 return None
             return _to_member(member)
 

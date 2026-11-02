@@ -465,6 +465,9 @@ class SqlTeamMember(OmnigentBase):
 
     :param id: Stable member id stored as 16 raw bytes (see :class:`Uuid16`).
     :param user_id: The account (``users.id``) the membership maps to.
+    :param account_generation: The account registration's generation, carried
+        with the account like a host's; ``NULL`` for an identity without an
+        accounts registration. A removal applies to this registration only.
     :param current_user_id: ``user_id`` until the membership is removed, then
         ``NULL``; its unique index allows one current membership per account.
     :param role: Int code (see ``omnigent.db.enum_codecs.TEAM_MEMBER_ROLE``).
@@ -480,6 +483,7 @@ class SqlTeamMember(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
     current_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     role: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
@@ -497,6 +501,14 @@ class SqlTeamMember(OmnigentBase):
         UniqueConstraint("workspace_id", "current_user_id", name="uq_team_members_current_user"),
         # The last-active-owner check reads one other active owner.
         Index("ix_team_members_role_state", "workspace_id", "role", "state", "id"),
+        # Finds an account registration's memberships, including removed ones.
+        Index(
+            "ix_team_members_registration",
+            "workspace_id",
+            "user_id",
+            "account_generation",
+            "id",
+        ),
     )
 
 

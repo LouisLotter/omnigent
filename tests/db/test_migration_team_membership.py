@@ -166,7 +166,13 @@ def test_upgrade_makes_the_sole_admin_owner_and_changes_nothing_else(db_uri, eng
     # Owner role (1), active state (2), mapped to the existing username.
     assert _members(engine) == [(0, "owner", "owner", 1, 2)]
     assert _snapshot(engine) == before
-    assert SqlAlchemyAccountStore(db_uri).get_user("owner").is_admin
+    owner = SqlAlchemyAccountStore(db_uri).get_user("owner")
+    assert owner.is_admin
+    with engine.connect() as connection:
+        # The owner membership belongs to the account's current registration.
+        assert connection.execute(
+            sa.text("SELECT account_generation FROM team_members")
+        ).scalar_one() == (owner.account_generation)
 
     # Upgrading again is a no-op; downgrading drops only the new tables.
     _migrate(engine, _REVISION)
@@ -353,8 +359,8 @@ def test_sqlite_upgrade_interrupted_anywhere_leaves_the_previous_database(tmp_pa
             upgraded.dispose()
         _assert_upgraded(uri, before)
     _assert_upgraded(uri, before)
-    # Three tables, two indexes, a team and its owner.
-    assert interrupted > 7
+    # Three tables, three indexes, a team and its owner.
+    assert interrupted > 8
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX-only")

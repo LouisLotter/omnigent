@@ -53,6 +53,7 @@ from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.team_store import (
     admin_flag_for_account,
+    carry_membership_registration,
     claim_founding_owner,
     lock_team,
     retire_deleted_account_membership,
@@ -165,8 +166,10 @@ def _carry_registration_work(session: Session, user_id: str, *, old: str, new: s
     to the registration, so they keep working; grants and magic links stay revoked.
     Like :func:`_revoke_durable_authority`, this updates every row the user owns in
     one transaction, which only accounts mode does, and only on a password change.
+    Team memberships move too, so a removal keeps applying to the registration.
     """
     workspace_id = current_workspace_id()
+    carry_membership_registration(session, user_id, old=old, new=new)
     session.execute(
         update(SqlScheduledTask)
         .where(
@@ -602,6 +605,10 @@ class SqlAlchemyAccountStore:
                 new_generation = uuid.uuid4().hex
                 if generation is not None:
                     _carry_registration_work(session, user_id, old=generation, new=new_generation)
+                else:
+                    # A passwordless identity first receiving credentials stays the same
+                    # registration for its team membership.
+                    carry_membership_registration(session, user_id, old=None, new=new_generation)
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(

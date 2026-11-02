@@ -6,7 +6,8 @@ Create Date: 2026-11-02 00:00:00.000000
 
 Every workspace gets its team. Where exactly one live account holds the admin
 flag, that account becomes the team's active owner under its existing
-username; no other account, thread, host or schedule changes. A workspace
+username and registration generation; no other account, thread, host or
+schedule changes. A workspace
 with no admin, or with several, keeps an ownerless team, and the team
 inventory reports it instead of guessing.
 
@@ -45,6 +46,7 @@ _USERS = sa.table(
     sa.column("id", sa.String(128)),
     sa.column("is_admin", sa.Boolean()),
     sa.column("deleted_at", sa.Integer()),
+    sa.column("account_generation", sa.String(32)),
 )
 _TEAMS = sa.table(
     "teams",
@@ -58,6 +60,7 @@ _MEMBERS = sa.table(
     sa.column("workspace_id", sa.BigInteger()),
     sa.column("id", _UUID),
     sa.column("user_id", sa.String(128)),
+    sa.column("account_generation", sa.String(32)),
     sa.column("current_user_id", sa.String(128)),
     sa.column("role", sa.SmallInteger()),
     sa.column("state", sa.SmallInteger()),
@@ -66,6 +69,11 @@ _MEMBERS = sa.table(
 )
 _INDEXES = (
     ("team_members", "ix_team_members_role_state", ("workspace_id", "role", "state", "id")),
+    (
+        "team_members",
+        "ix_team_members_registration",
+        ("workspace_id", "user_id", "account_generation", "id"),
+    ),
     (
         "team_identity_bindings",
         "ix_team_identity_bindings_member",
@@ -97,6 +105,7 @@ def _create_tables(bind: sa.Connection) -> None:
             sa.Column("workspace_id", sa.BigInteger(), nullable=False),
             sa.Column("id", _UUID, nullable=False),
             sa.Column("user_id", sa.String(128), nullable=False),
+            sa.Column("account_generation", sa.String(32), nullable=True),
             sa.Column("current_user_id", sa.String(128), nullable=True),
             sa.Column("role", sa.SmallInteger(), nullable=False),
             sa.Column("state", sa.SmallInteger(), nullable=False),
@@ -160,13 +169,15 @@ def _workspace_ids(bind: sa.Connection) -> list[int]:
         cursor = next_id
 
 
-def _sole_admin(bind: sa.Connection, workspace_id: int) -> str | None:
-    """Return the workspace's only live admin, or ``None`` for none or several."""
-    admins: list[str] = []
+def _sole_admin(bind: sa.Connection, workspace_id: int) -> tuple[str, str | None] | None:
+    """Return the workspace's only live admin and its generation, or ``None``."""
+    admins: list[tuple[str, str | None]] = []
     after = ""
     while len(admins) < 2:
         rows = bind.execute(
-            sa.select(_USERS.c.id, _USERS.c.is_admin, _USERS.c.deleted_at)
+            sa.select(
+                _USERS.c.id, _USERS.c.is_admin, _USERS.c.deleted_at, _USERS.c.account_generation
+            )
             .where(_USERS.c.workspace_id == workspace_id, _USERS.c.id > after)
             .order_by(_USERS.c.id)
             .limit(_PAGE_SIZE)
@@ -174,7 +185,7 @@ def _sole_admin(bind: sa.Connection, workspace_id: int) -> str | None:
         if not rows:
             break
         admins.extend(
-            row.id
+            (row.id, row.account_generation)
             for row in rows
             if row.is_admin and row.deleted_at is None and row.id not in _RESERVED_USERS
         )
@@ -200,14 +211,16 @@ def _backfill_team(bind: sa.Connection, workspace_id: int, now: int) -> None:
     ).first()
     if has_member is not None:
         return
-    owner = _sole_admin(bind, workspace_id)
-    if owner is None:
+    sole_admin = _sole_admin(bind, workspace_id)
+    if sole_admin is None:
         return
+    owner, generation = sole_admin
     bind.execute(
         _MEMBERS.insert().values(
             workspace_id=workspace_id,
             id=uuid.uuid4().bytes,
             user_id=owner,
+            account_generation=generation,
             current_user_id=owner,
             role=_OWNER_ROLE,
             state=_ACTIVE_STATE,

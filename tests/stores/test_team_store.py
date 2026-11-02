@@ -617,3 +617,72 @@ def test_inventory_reports_a_team_without_an_active_owner(stores) -> None:
     inventory = stores["teams"].inventory()
     assert inventory.clean, inventory.findings
     assert inventory.accounts[0].member_id == member.id
+
+
+# ── Removal is registration-specific ───────────────────────────────
+
+
+@pytest.mark.parametrize("store", ["accounts", "permissions"])
+def test_admin_flag_writes_cannot_restore_a_removed_registration(stores, store) -> None:
+    """A removed member stays non-admin through either store until re-admitted."""
+    _founder(stores)
+    _account(stores, "bob")
+    teams, accounts = stores["teams"], stores["accounts"]
+    bob = teams.add_member("bob", role="admin", state="active")
+    teams.change_state(bob.id, "removed")
+
+    stores[store].set_admin("bob", True)
+    assert not accounts.is_admin("bob")
+    # Rotating the password carries the removal to the new generation.
+    accounts.update_password("bob", "hash-2", revoke_sessions=True)
+    stores[store].set_admin("bob", True)
+    assert not accounts.is_admin("bob")
+    assert teams.get_member(bob.id).state == "removed"
+
+    again = teams.add_member("bob", role="member", state="active")
+    stores[store].set_admin("bob", True)
+    assert accounts.is_admin("bob") and teams.get_member(again.id).role == "admin"
+
+
+def test_a_later_registration_of_the_username_is_not_held_by_an_old_removal(stores) -> None:
+    _founder(stores)
+    _account(stores, "bob")
+    teams, accounts = stores["teams"], stores["accounts"]
+    bob = teams.add_member("bob", role="admin", state="active")
+    teams.change_state(bob.id, "removed")
+    assert accounts.delete_user("bob") is True
+    _account(stores, "bob")
+
+    accounts.set_admin("bob", True)
+    assert accounts.is_admin("bob")
+    assert teams.get_member_for_account("bob") is None
+
+
+def test_a_removed_identity_stays_removed_when_it_first_gets_a_password(stores) -> None:
+    """A passwordless identity provisioned with credentials is the same registration."""
+    _founder(stores)
+    teams, accounts, permissions = stores["teams"], stores["accounts"], stores["permissions"]
+    permissions.ensure_user("erin@example.com")
+    erin = teams.add_member("erin@example.com", role="admin", state="active")
+    teams.change_state(erin.id, "removed")
+    permissions.set_admin("erin@example.com", True)
+    assert not accounts.is_admin("erin@example.com")
+
+    generation = accounts.update_password("erin@example.com", "hash")
+    assert generation is not None
+    accounts.set_admin("erin@example.com", True)
+    assert not accounts.is_admin("erin@example.com")
+    # A never-enrolled identity keeps the plain admin-flag behaviour.
+    permissions.ensure_user("frank@example.com")
+    permissions.set_admin("frank@example.com", True)
+    assert accounts.is_admin("frank@example.com")
+
+
+def test_current_membership_follows_password_rotation(stores) -> None:
+    owner_id = _founder(stores)
+    accounts, teams = stores["accounts"], stores["teams"]
+    new_generation = accounts.update_password("owner", "hash-2", revoke_sessions=True)
+    owner = AccountAuthority("owner", new_generation, 0)
+    assert teams.member_for_owner(owner).id == owner_id
+    assert teams.get_member_for_account("owner").id == owner_id
+
