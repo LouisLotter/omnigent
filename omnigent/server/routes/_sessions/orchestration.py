@@ -11925,7 +11925,7 @@ async def _create_session_from_existing_agent(
     registry_labels: dict[str, str] = {}
     if body.mcp_registry_services:
         from omnigent.mcp_selection import registry_selection_labels
-        from omnigent.server.routes.session_mcp_servers import _require_registry_service
+        from omnigent.server.routes.session_mcp_servers import _require_registry_services
 
         if body.sub_agent_name:
             raise OmnigentError(
@@ -11936,8 +11936,7 @@ async def _create_session_from_existing_agent(
             raise OmnigentError(
                 "Cannot load the agent's MCP configuration", code=ErrorCode.INVALID_INPUT
             )
-        for service_id in body.mcp_registry_services:
-            _require_registry_service(request, service_id, user_id)
+        await _require_registry_services(request, list(body.mcp_registry_services), user_id)
         registry_labels = registry_selection_labels(selection_spec, body.mcp_registry_services)
 
     # Validate the host workspace before creating a session or worktree.

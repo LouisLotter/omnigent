@@ -79,6 +79,7 @@ import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { McpRegistryConnections } from "@/components/McpRegistry";
+import { McpServerAdmin } from "@/components/McpServerAdmin";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
@@ -359,7 +360,7 @@ export function SettingsPage() {
       {section === "mcp" && (
         <Section title="MCP">
           {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
-            <McpRegistryConnections />
+            <McpSettings />
           ) : (
             <p className="text-sm text-muted-foreground">
               {info === "loading"
@@ -380,6 +381,17 @@ export function SettingsPage() {
 }
 
 /** Shared section shell: a title + optional description above the body. */
+/** Settings → MCP: administrators manage servers; everyone connects their accounts. */
+function McpSettings() {
+  const [changes, setChanges] = useState(0);
+  return (
+    <div className="space-y-8">
+      <McpServerAdmin onChanged={() => setChanges((count) => count + 1)} />
+      <McpRegistryConnections refreshKey={changes} />
+    </div>
+  );
+}
+
 function Section({
   title,
   description,

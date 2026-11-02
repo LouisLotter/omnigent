@@ -64,6 +64,7 @@ async def registry_tools(
 ) -> list[dict[str, Any]]:
     tools = []
     user = registry_user({"run_as": user_id} if user_id else None)
+    await registry.refresh()
     for config in spec.mcp_servers:
         if config.transport != "registry":
             continue
@@ -105,6 +106,7 @@ async def execute_registry_tool(
         if config.tools is not None and tool not in config.tools:
             raise ConnectionError("Tool is not enabled for this session")
         user = registry_user({"run_as": credential_user} if credential_user else None)
+        await registry.refresh()
         service = registry.service(config.name, user)
         if tool not in service.tools:
             raise ConnectionError("Tool is not allowed by the MCP registry")

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -118,23 +119,52 @@ def create_connection_router(
         endpoints (e.g. GitHub's repo/branch listing) on the same router.
     :returns: A FastAPI router with status / connect / callback / disconnect.
     """
-    provider = hooks.provider
-    store = hooks.store
+
+    async def resolve(_request: Request) -> ConnectionHooks:
+        return hooks
+
+    router = _connection_routes(
+        f"/connections/{hooks.provider}", resolve, auth_provider=auth_provider
+    )
+    if extra_routes is not None:
+        extra_routes(router)
+    return router
+
+
+def create_resolved_connection_router(
+    path: str,
+    resolve_hooks: Callable[[Request], Awaitable[ConnectionHooks]],
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> APIRouter:
+    """The same routes for a family of providers resolved per request.
+
+    For providers that appear while the server runs, e.g. MCP services an
+    administrator adds. *path* carries a path parameter, such as
+    ``"/connections/mcp-{service_id}"``; *resolve_hooks* reads it and raises
+    ``HTTPException(404)`` for an unknown provider.
+    """
+    return _connection_routes(path, resolve_hooks, auth_provider=auth_provider)
+
+
+def _connection_routes(
+    path: str,
+    resolve_hooks: Callable[[Request], Awaitable[ConnectionHooks]],
+    *,
+    auth_provider: AuthProvider | None,
+) -> APIRouter:
     router = APIRouter()
-    key = hooks.signing_key()
 
     def _current_user(request: Request) -> str:
         user_id = require_user(request, auth_provider)
         return user_id if user_id is not None else RESERVED_USER_LOCAL
 
-    def _verify_state(state: str) -> dict:
-        return jwt.decode(state, key, algorithms=[_STATE_ALG])
-
-    @router.get(f"/connections/{provider}/status")
+    @router.get(f"{path}/status")
     async def status(request: Request) -> dict[str, object]:
         """Return the caller's connection status. Never surfaces tokens."""
         user_id = _current_user(request)
-        connection = await asyncio.to_thread(store.get, user_id)
+        hooks = await resolve_hooks(request)
+        connection = await asyncio.to_thread(hooks.store.get, user_id)
         return {
             "enabled": True,
             "connected": connection is not None,
@@ -142,10 +172,13 @@ def create_connection_router(
             **hooks.status_fields(connection),
         }
 
-    @router.get(f"/connections/{provider}/connect")
+    @router.get(f"{path}/connect")
     async def connect(request: Request, return_to: str | None = None) -> RedirectResponse:
         """Redirect the user into the provider's authorization flow."""
         user_id = _current_user(request)
+        hooks = await resolve_hooks(request)
+        provider = hooks.provider
+        key = hooks.signing_key()
         clamped = sanitize_return_to(return_to)
 
         def build_state(extra_claims: dict[str, Any]) -> str:
@@ -167,7 +200,7 @@ def create_connection_router(
             return redirect_with_status(provider, clamped, "error")
         return RedirectResponse(url=start.authorize_url, status_code=302)
 
-    @router.get(f"/connections/{provider}/callback")
+    @router.get(f"{path}/callback")
     async def callback(
         request: Request, code: str | None = None, state: str | None = None
     ) -> RedirectResponse:
@@ -178,6 +211,8 @@ def create_connection_router(
         state's ``return_to`` with a ``?<provider>=connected|error`` marker.
         """
         user_id = _current_user(request)
+        hooks = await resolve_hooks(request)
+        provider = hooks.provider
         # Failure fallbacks have no valid state carrying the client's return_to,
         # so they use the local default; keep it under a subpath mount (the
         # client-set return_to already carries the prefix).
@@ -186,7 +221,7 @@ def create_connection_router(
         if not code or not state:
             return redirect_with_status(provider, default_return_to, "error")
         try:
-            claims = _verify_state(state)
+            claims = jwt.decode(state, hooks.signing_key(), algorithms=[_STATE_ALG])
         except jwt.PyJWTError:
             _logger.warning("%s callback with invalid state", provider)
             return redirect_with_status(provider, default_return_to, "error")
@@ -205,13 +240,12 @@ def create_connection_router(
             return redirect_with_status(provider, return_to, "error")
         return redirect_with_status(provider, return_to, "connected")
 
-    @router.post(f"/connections/{provider}/disconnect")
+    @router.post(f"{path}/disconnect")
     async def disconnect(request: Request) -> dict[str, bool]:
         """Remove the caller's connection."""
         user_id = _current_user(request)
-        removed = await asyncio.to_thread(store.delete, user_id)
+        hooks = await resolve_hooks(request)
+        removed = await asyncio.to_thread(hooks.store.delete, user_id)
         return {"disconnected": removed}
 
-    if extra_routes is not None:
-        extra_routes(router)
     return router

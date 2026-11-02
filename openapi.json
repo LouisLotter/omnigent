@@ -6106,6 +6106,7 @@
             "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
+            "session.reported_reasoning_effort": "#/components/schemas/SessionReportedReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
@@ -6139,6 +6140,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReportedReasoningEffortEvent"
           },
           {
             "$ref": "#/components/schemas/SessionCollaborationModeEvent"
@@ -7666,6 +7670,54 @@
         "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
+      "SessionReportedReasoningEffortEvent": {
+        "description": "Effort a harness reports the session actually runs at.\n\nEmitted after an `external_reasoning_effort_report` POST, e.g. from the\nclaude-native forwarder reading Claude Code's statusLine. Unlike\n`session.reasoning_effort` it never changes the requested effort.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "reported_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The reported effort, e.g. `\"xhigh\"`, or `None` when the harness no longer reports one (unknown). Category: **transient** (SSE-only). The server also writes `reported_reasoning_effort` on the conversation, so on reconnect clients restore it from the session snapshot rather than from a replayed event.",
+            "title": "Reported Reasoning Effort"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.reported_reasoning_effort",
+            "description": "Always `\"session.reported_reasoning_effort\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionReportedReasoningEffortEvent",
+        "type": "object"
+      },
       "SessionResourceCreatedEvent": {
         "description": "A session resource was created.\n\nEmitted when a terminal is launched, a file is uploaded, or\nany other resource is materialized under a session. Wire shape\nis FLAT: `{\"type\": \"session.resource.created\", \"resource\": <SessionResourceObject-like dict>}`.",
         "properties": {
@@ -8215,6 +8267,18 @@
             ],
             "description": "Per-session reasoning-effort hint. Accepted metadata values are `\"none\"`, `\"minimal\"`, `\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, and `\"max\"`. Provider-specific support is validated when a turn executes. `None` means use the agent default.",
             "title": "Reasoning Effort"
+          },
+          "reported_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The effort the harness last reported the session runs at, e.g. `\"xhigh\"` from Claude Code's statusLine. `reasoning_effort` is the request; this is the observation. `None` means Omnigent does not know (no report yet).",
+            "title": "Reported Reasoning Effort"
           },
           "root_conversation_id": {
             "anyOf": [

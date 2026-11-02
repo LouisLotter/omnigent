@@ -1356,10 +1356,11 @@ def register_core_routes(
 
         if parsed_metadata.mcp_registry_services:
             from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
-            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+            from omnigent.server.routes.session_mcp_servers import _require_registry_services
 
-            for service_id in parsed_metadata.mcp_registry_services:
-                _require_registry_service(request, service_id, user_id)
+            await _require_registry_services(
+                request, list(parsed_metadata.mcp_registry_services), user_id
+            )
             labels = {
                 **parsed_metadata.labels,
                 **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),

@@ -280,9 +280,21 @@ is needed for this path; the local host still needs a connection to the server.
 
 ## Administrator configuration
 
-Set `OMNIGENT_MCP_REGISTRY` to a YAML file and restart the server after editing it.
-Invalid configuration fails startup. This prototype uses a file rather than a new
-admin database/UI. Settings shows users only the entries they can access.
+Administrators add, change and remove services in **Settings → MCP → Add MCP
+server**: a name, the URL, the login type (none, an API token, or sign-in with
+OAuth discovery and dynamic client registration), then **Discover tools** with
+their own login and tick the tools agents may use. Changes take effect without a
+restart; the [API reference](../../designs/MCP_REGISTRY_API.md#manage-services-administrators)
+describes the routes and the destination rules. The demo service publishes the
+metadata and registration endpoint that flow needs; run the server with
+`OMNIGENT_MCP_ALLOW_PRIVATE_DESTINATIONS=1` to add it from the page at
+`http://127.0.0.1:18782/mcp`.
+
+Services can also come from a YAML file in `OMNIGENT_MCP_REGISTRY`; restart the
+server after editing it. Invalid configuration fails startup. Its services appear
+read-only on the page, and its optional `presets` list (the same fields as a
+service, without a client secret) offers starting points in the Add form.
+Settings shows users only the entries they can access.
 
 | Field | Purpose |
 | --- | --- |
@@ -379,7 +391,10 @@ sequenceDiagram
 
 ## Embedding and downstream compatibility
 
-The registry and gateway are enabled only when `OMNIGENT_MCP_REGISTRY` is configured.
+The server command enables the registry and gateway when `OMNIGENT_MCP_REGISTRY` is
+configured or the credential store has a cipher (for services added in Settings;
+`OMNIGENT_MCP_ADMIN_SERVICES=0` turns those off). An embedding application passes
+`McpRegistry(config, credential_store, service_store=McpServiceStore(db_uri))`.
 The picker appears only when the server advertises the `mcp` connection capability.
 Existing HTTP/stdio configurations keep their existing routing and behavior.
 Registry calls now use `POST /v1/mcp/{service}` with the required

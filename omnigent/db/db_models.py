@@ -472,6 +472,97 @@ class SqlConnection(OmnigentBase):
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    __table_args__ = (
+        # Every user's login for one provider, e.g. when an administrator changes or
+        # removes an MCP service and its saved logins must go.
+        Index("ix_connections_provider", "workspace_id", "provider", "user_id", "account_id"),
+    )
+
+
+class SqlMcpRegistryService(OmnigentBase):
+    """
+    SQLAlchemy model for the ``mcp_registry_services`` table.
+
+    An MCP service an administrator added at run time, beside the services the
+    server's registry file declares. Holds no secret: members' logins and an
+    OAuth client's secret live in the ``connections`` table, sealed by the
+    credential cipher and stamped with :attr:`credential_version`.
+
+    :param service_id: The catalog ID agents see as the tool prefix, e.g.
+        ``"tracker"``. Immutable.
+    :param auth: Login type code (``enum_codecs.MCP_SERVICE_AUTH``).
+    :param credential_version: Random version of the service's destination and
+        login settings. Changing them replaces it, so a login saved for an older
+        version is never sent to the new destination.
+    :param oauth_scopes: Space-separated OAuth scopes, as OAuth writes them.
+    :param oauth_client_registration: How the OAuth client was obtained
+        (``enum_codecs.MCP_OAUTH_CLIENT_REGISTRATION``).
+    :param oauth_token_endpoint_auth: How the client authenticates at the token
+        endpoint (``enum_codecs.MCP_OAUTH_TOKEN_ENDPOINT_AUTH``).
+    :param pending_sweep: Logins from an older version (or of a removed service)
+        may remain; the next registry load finishes removing them.
+    :param deleted_at: Set when a removal still has logins to remove; such a
+        row is no longer a service and goes once they are gone.
+    """
+
+    __tablename__ = "mcp_registry_services"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    service_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    auth: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    credential_version: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    oauth_authorize_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    oauth_token_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    oauth_client_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    oauth_scopes: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    oauth_resource: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    oauth_client_registration: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    oauth_token_endpoint_auth: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    pending_sweep: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("auth IN (1, 2, 3)", name="ck_mcp_registry_services_auth"),
+        CheckConstraint(
+            "timeout_seconds BETWEEN 1 AND 300", name="ck_mcp_registry_services_timeout"
+        ),
+        CheckConstraint(
+            "oauth_client_registration IS NULL OR oauth_client_registration IN (1, 2)",
+            name="ck_mcp_registry_services_oauth_registration",
+        ),
+        CheckConstraint(
+            "oauth_token_endpoint_auth IS NULL OR oauth_token_endpoint_auth IN (1, 2, 3)",
+            name="ck_mcp_registry_services_oauth_token_auth",
+        ),
+    )
+
+
+class SqlMcpRegistryServiceTool(OmnigentBase):
+    """
+    SQLAlchemy model for the ``mcp_registry_service_tools`` table.
+
+    One row per tool an administrator allowed on a run-time MCP service
+    (relates to ``mcp_registry_services``; no DB foreign key, Rule R032).
+    A service with no rows is a draft only its creator can connect to.
+    """
+
+    __tablename__ = "mcp_registry_service_tools"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    service_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    tool_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+
 
 class SqlDeviceGrant(OmnigentBase):
     """

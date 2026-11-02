@@ -289,7 +289,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         agent = await _bound_agent(request, session_id, LEVEL_OWNER)
         user_id = get_user_id(request, auth_provider)
-        _require_registry_service(request, body.name, user_id)
+        await _require_registry_services(request, [body.name], user_id)
         await _require_registry_runtime(request, session_id, body.name)
         spec = await _selection_spec(session_id, agent)
         existing = {server.name: server for server in spec.mcp_servers}
@@ -523,6 +523,17 @@ def _summary_from_spec(spec: AgentSpec, name: str) -> MCPServerSummary:
         if server.name == name:
             return _summary_from_config(server)
     raise OmnigentError("MCP server was not saved", code=ErrorCode.INTERNAL_ERROR)
+
+
+async def _require_registry_services(
+    request: Request, service_ids: list[str], user_id: str | None
+) -> None:
+    """Check each selected service against an up-to-date catalog."""
+    registry = getattr(request.app.state, "mcp_registry", None)
+    if registry is not None:
+        await registry.refresh()
+    for service_id in service_ids:
+        _require_registry_service(request, service_id, user_id)
 
 
 def _require_registry_service(request: Request, service_id: str, user_id: str | None) -> None:

@@ -76,3 +76,124 @@ export function authorizeRegistryService(
     if (signal.aborted) cancel();
   });
 }
+
+/** OAuth settings of a service, as administrators see them; never a secret. */
+export interface AdminServiceOAuth {
+  authorize_url: string;
+  token_url: string;
+  client_id: string;
+  scopes: string[];
+  resource: string | null;
+  has_client_secret: boolean;
+  registration?: "manual" | "dynamic" | null;
+  token_endpoint_auth?: TokenEndpointAuth;
+}
+
+/** How an OAuth client authenticates at the token endpoint. */
+export type TokenEndpointAuth = "none" | "client_secret_post" | "client_secret_basic";
+
+/** A catalog service in the administrators' list. */
+export interface AdminService {
+  id: string;
+  title: string;
+  description: string;
+  url: string;
+  auth: RegistryService["auth"];
+  timeout: number;
+  tools: string[];
+  /** ``admin``: added in Settings; ``config``: from the server's registry file. */
+  source: "admin" | "config";
+  editable: boolean;
+  oauth: AdminServiceOAuth | null;
+  /** No tools allowed yet: only its creator sees it, to finish setting it up. */
+  draft?: boolean;
+  credentials_reset?: boolean;
+}
+
+/** What the Add/Edit MCP server form sends. ``client_secret`` is write-only. */
+export interface AdminServiceSettings {
+  title: string;
+  description: string;
+  url: string;
+  auth: "none" | "bearer" | "oauth";
+  timeout: number;
+  tools: string[];
+  oauth?: {
+    client_id?: string;
+    client_secret?: string;
+    /** Sent with ``client_id``; without it the server keeps the same client's saved method. */
+    token_endpoint_auth?: TokenEndpointAuth;
+    authorize_url?: string;
+    token_url?: string;
+    scopes?: string[];
+    resource?: string;
+  } | null;
+}
+
+export interface AdminServicePreset {
+  id: string;
+  title: string;
+  description: string;
+  url: string;
+  auth: "none" | "bearer" | "oauth";
+  tools: string[];
+  timeout: number;
+  oauth?: { client_id?: string | null; scopes?: string[] } | null;
+}
+
+export interface DiscoveredTool {
+  name: string;
+  title?: string | null;
+  description: string;
+}
+
+/** Thrown for an admin request; ``status`` 404 means the server has no admin services. */
+export class AdminRequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export async function adminRequest<T>(path = "", init?: RequestInit): Promise<T> {
+  const response = await authenticatedFetch(`/v1/mcp-registry/admin${path}`, init);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const detail =
+      typeof body.detail === "string"
+        ? body.detail
+        : Array.isArray(body.detail)
+          ? "Check the highlighted fields and try again."
+          : "MCP server request failed";
+    throw new AdminRequestError(detail, response.status);
+  }
+  return response.json() as Promise<T>;
+}
+
+export async function listAdminServices(): Promise<AdminService[]> {
+  const services: AdminService[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: { data: AdminService[]; next_cursor?: string | null } =
+      // eslint-disable-next-line no-await-in-loop -- Each page needs the previous cursor.
+      await adminRequest(`/services${cursor ? `?after=${encodeURIComponent(cursor)}` : ""}`);
+    services.push(...page.data);
+    cursor = page.next_cursor ?? null;
+  } while (cursor);
+  return services;
+}
+
+/** A registry entry for a service, so the shared sign-in flow can connect to it. */
+export function asRegistryService(service: AdminService): RegistryService {
+  return {
+    id: service.id,
+    title: service.title,
+    description: service.description,
+    auth: service.auth,
+    connected: false,
+    tools: service.tools,
+    connect_provider: service.oauth ? `mcp-${service.id}` : service.auth,
+  };
+}
