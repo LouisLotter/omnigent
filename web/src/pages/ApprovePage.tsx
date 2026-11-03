@@ -58,6 +58,7 @@ export function ApprovePage() {
   }>();
   const [state, setState] = useState<PageState>({ kind: "loading" });
   const [approval, setApproval] = useState<ApprovalRecord | null>(null);
+  const recordRequested = useRef(false);
   const submission = useRef<{ revision: number; pending: boolean; attempt?: string }>({
     revision: 0,
     pending: false,
@@ -87,9 +88,19 @@ export function ApprovePage() {
         const data: ElicitationData = await res.json();
         if (cancelled) return;
         data.native_delivery = parseNativePermissionDelivery(data.native_delivery);
-        void fetchApprovalRecord(sessionId, elicitationId).then((record) => {
-          if (!cancelled) setApproval(record);
-        });
+        // Only a policy's approve/reject prompt can be a recorded approval; read
+        // its record once, not on every poll.
+        if (
+          !recordRequested.current &&
+          data.status === "pending" &&
+          data.policy_name &&
+          !data.native_delivery
+        ) {
+          recordRequested.current = true;
+          void fetchApprovalRecord(sessionId, elicitationId).then((record) => {
+            if (!cancelled) setApproval(record);
+          });
+        }
         nativeDeliverySeen ||= Boolean(data.native_delivery) || data.resolution === "unanswered";
         polling =
           (nativeDeliverySeen && data.resolution !== "confirmed") ||

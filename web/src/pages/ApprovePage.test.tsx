@@ -15,6 +15,7 @@ import * as identity from "@/lib/identity";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
+  getCurrentAuthorId: () => null,
 }));
 
 /** A Response-like stub: only `ok`, `status`, and `json()` are read. */
@@ -206,6 +207,51 @@ describe("ApprovePage submission", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
     expect(await screen.findByText(/Network error:/)).toBeInTheDocument();
   });
+});
+
+it("shows who asked for a policy approval and on whose computer", async () => {
+  vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) =>
+    String(url).includes("/approvals/")
+      ? jsonResponse({
+          elicitation_id: "eli_1",
+          session_id: "sess_1",
+          state: "pending",
+          initiator: "alice",
+          owner: "alice",
+          asked: {
+            initiator: "alice",
+            contributors: ["bob"],
+            owner: { user: "alice", registration: null },
+            host: { id: "h1", name: "laptop", owner: "alice", kind: "personal", runner_id: null },
+            subscription: {
+              subject: "alice",
+              provider: "anthropic",
+              source: "computer_login",
+              login_state: "unknown",
+              login_state_reported_by: null,
+              account: null,
+              verified: false,
+            },
+            harness: null,
+            model: { requested: null, reported: null },
+            effort: { requested: null, reported: null },
+          },
+          requirements: [],
+          answers: [],
+          decided_by: null,
+          decision_digest: "ab",
+        })
+      : jsonResponse({ status: "pending", policy_name: "approve_posts", message: "Post it?" }),
+  );
+  renderPage();
+  expect(await screen.findByTestId("approval-attribution")).toHaveTextContent(
+    "Asked during alice's turn, on alice's computer (bob also sent input to this turn)",
+  );
+  expect(
+    vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.filter(([url]) => String(url).includes("/approvals/")),
+  ).toHaveLength(1);
 });
 
 it.each(["success", "http error", "network error"])(
