@@ -51,6 +51,7 @@ from omnigent.server.external_identity import (
     external_identity_mode,
     refusal_for_user,
     resolved_external_identity,
+    unbound_refusal,
 )
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
@@ -336,12 +337,16 @@ def create_accounts_auth_router(
             status_code=status_code, content={"error": REFUSAL_MESSAGES[code], "code": code}
         )
 
-    def _login_binding(request: Request, username: str, invite: str | None) -> str | JSONResponse:
+    def _login_binding(
+        request: Request, username: str, invite: str | None, *, cli: bool = False
+    ) -> str | JSONResponse:
         """How a login relates to the proxy's sign-in: refuse it, or what to bind after.
 
         Returns ``"none"``, ``"owner"`` (the proxy asserts the operator: bind the
         owner's own account), ``"link"`` (a link invitation), or a refusal.
-        Decided before the password is checked, from the username alone.
+        Decided before the password is checked, from the username alone. A *cli*
+        login (one asking for refresh material) never binds the founding owner:
+        only a browser's sign-in does.
         """
         mode = external_identity_mode(request)
         resolved = resolved_external_identity(request)
@@ -353,9 +358,10 @@ def create_accounts_auth_router(
             return "none" if resolved.member.user_id == username else _refused(MISMATCH_CODE)
         if invite is not None:
             return "link"
-        if resolved.identity.installation_owner:
+        if resolved.identity.installation_owner and not cli:
             return "owner"
-        return _refused(UNBOUND_CODE)
+        refusal = unbound_refusal(mode)
+        return "none" if refusal is None else _refused(refusal)
 
     def _member_suspended(user_id: str) -> bool:
         if team_store is None:
@@ -482,7 +488,7 @@ def create_accounts_auth_router(
         OWASP authentication cheat-sheet guidance.
         """
         username = body.username.strip().lower()
-        binding = _login_binding(request, username, body.invite)
+        binding = _login_binding(request, username, body.invite, cli=body.issue_refresh is True)
         if isinstance(binding, JSONResponse):
             _logger.info("auth/login: refused by the front proxy's sign-in")
             return binding

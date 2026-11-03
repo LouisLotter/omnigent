@@ -205,6 +205,13 @@ _BIND = ExternalIdentityMode.BIND
         # Sign-in routes check the person themselves.
         (_REQUIRED, _member("alice"), _person("bob"), "/auth/login", None),
         (_REQUIRED, _member("alice"), _person("bob"), "/auth/logout", None),
+        # Bind, the move to the proxy: an unbound sign-in (a device's) proceeds; a bound one
+        # with someone else's credential, or a suspended member's, is refused as in required.
+        (_BIND, None, _person("alice"), "/v1/me", None),
+        (_BIND, None, _person("alice", PrincipalKind.HOST), "/v1/me", None),
+        (_BIND, _member("alice"), _person("bob"), "/v1/me", MISMATCH_CODE),
+        (_BIND, _member("bob", "suspended"), _person("bob"), "/v1/me", SUSPENDED_CODE),
+        (_BIND, _member("alice"), _person("alice"), "/v1/me", None),
     ],
 )
 def test_the_same_person_rule_with_an_envelope(mode, member, principal, path, expected) -> None:
@@ -227,6 +234,27 @@ def test_the_same_person_rule_with_an_envelope(mode, member, principal, path, ex
 )
 def test_the_same_person_rule_without_an_envelope(mode, principal, expected) -> None:
     assert decide(mode, None, principal, "/v1/me") == expected
+
+
+def test_an_unbound_sign_in_is_refused_only_in_required() -> None:
+    from omnigent.server.external_identity import unbound_refusal
+
+    assert unbound_refusal(ExternalIdentityMode.BIND) is None
+    assert unbound_refusal(ExternalIdentityMode.REQUIRED) == UNBOUND_CODE
+
+
+def test_the_founding_binding_needs_a_browsers_sign_in() -> None:
+    from omnigent.server.external_identity import _FOUNDING_CREDENTIALS
+
+    assert CredentialKind.BROWSER_SESSION in _FOUNDING_CREDENTIALS
+    for credential in (
+        CredentialKind.SESSION_BEARER,
+        CredentialKind.LOGIN_GRANT,
+        CredentialKind.DEVICE_GRANT,
+        CredentialKind.CLIENT_CREDENTIALS,
+        CredentialKind.MACHINE,
+    ):
+        assert credential not in _FOUNDING_CREDENTIALS
 
 
 def test_the_invalid_code_has_a_message() -> None:

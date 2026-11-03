@@ -78,7 +78,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.authority_changes import authority_change_count, sleep_until_authority_change
-from omnigent.server.external_identity import machine_refusal_for_user
+from omnigent.server.external_identity import (
+    machine_refusal_for_user,
+    resolved_external_identity,
+)
 from omnigent.server.host_registry import (
     ConcurrentRegistrationError,
     HostConnection,
@@ -445,6 +448,9 @@ def create_host_tunnel_router(
                     launch_token=managed_token,
                     epoch=registration_epoch,
                 )
+            # The proxy's sign-in this handshake carried, for the team's status.
+            resolved = resolved_external_identity(ws)
+            conn.external_identity = resolved.identity if resolved is not None else None
             # The server may arm, re-arm, revoke or delete the host while this
             # registration is in flight. A tunnel it no longer authorizes ends
             # here, before it carries any frame, or at its next heartbeat.
