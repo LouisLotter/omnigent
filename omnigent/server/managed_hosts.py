@@ -4178,11 +4178,7 @@ async def _start_sandbox_host(
         # Only a launcher with start claims takes the claimed attempt (see
         # SandboxLifecycle.claim_start); like the classifier below it is current.
         start_claimed = cast(Callable[..., str], launcher.start_host)
-        owned = (
-            {"owner": owner}
-            if owner is not None and takes_owner(launcher)
-            else {}
-        )
+        owned = {"owner": owner} if owner is not None and takes_owner(launcher) else {}
         return await asyncio.to_thread(
             start_claimed,
             sandbox_id,
