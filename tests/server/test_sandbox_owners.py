@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -19,9 +20,11 @@ import pytest
 
 from omnigent.db.utils import now_epoch
 from omnigent.errors import OmnigentError
+from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 from omnigent.onboarding.sandboxes.types import (
     AdmissionReport,
     RepoWorkspace,
+    SandboxCapabilities,
     SandboxOwner,
     StartClaim,
     SuspendResult,
@@ -40,7 +43,12 @@ from omnigent.server.sandbox_owners import launcher_call, owner_for, sandbox_own
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.team_store import SqlAlchemyTeamStore
 from tests.server import persistent_host_fakes
-from tests.server.persistent_host_fakes import FakeComputer, FakeHost, call_soon
+from tests.server.persistent_host_fakes import (
+    FakeComputer,
+    FakeHost,
+    FakeUntypedComputer,
+    call_soon,
+)
 
 pytestmark = [pytest.mark.timeout(60)]
 
@@ -359,3 +367,226 @@ async def test_the_reaper_names_the_owner_of_a_removed_hosts_sandbox(
             ),
         )
     ]
+
+
+# ── Starts without start claims (Codex WP8.4 r1-3) ─────────────────────
+
+
+class _NoClaimsOwned(SandboxHostLauncher):
+    """``owner_context`` without start claims: its start requires the owner keyword.
+
+    :ivar starts: Each start's keyword arguments, as received.
+    """
+
+    provider: ClassVar[str] = "fakeowned"
+    supports_owner_context: ClassVar[bool] = True
+    classifies: ClassVar[bool] = False
+
+    def __init__(self) -> None:
+        self.starts: list[dict[str, object]] = []
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return dataclasses.replace(
+            super().capabilities, classifies_runner_by_agent=type(self).classifies
+        )
+
+    def prepare(self) -> None:
+        return None
+
+    def provision(self, name: str, *, owner: SandboxOwner | None = None) -> str:
+        del name, owner
+        return "sb-owned"
+
+    def start_host(  # type: ignore[override]
+        self, sandbox_id: str, *, owner: SandboxOwner, **kwargs: object
+    ) -> str:
+        del sandbox_id
+        self.starts.append({"owner": owner, **kwargs})
+        return "/root/workspace"
+
+
+class _NoClaimsClassifying(_NoClaimsOwned):
+    classifies: ClassVar[bool] = True
+
+
+class _NoClaimsPlain(SandboxHostLauncher):
+    """No ``owner_context``: a start that names an owner fails here."""
+
+    provider: ClassVar[str] = "fakeplain"
+
+    def __init__(self) -> None:
+        self.starts: list[dict[str, object]] = []
+
+    def prepare(self) -> None:
+        return None
+
+    def provision(self, name: str) -> str:
+        del name
+        return "sb-plain"
+
+    def start_host(self, sandbox_id: str, **kwargs: object) -> str:  # type: ignore[override]
+        del sandbox_id
+        assert "owner" not in kwargs
+        self.starts.append(dict(kwargs))
+        return "/root/workspace"
+
+
+_ALICE = SandboxOwner(user_id="alice", host_id="h" * 32, member_id="m" * 32, team_id="t" * 32)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("launcher_type", "host_config", "on_stage", "agent_name", "start_attempt", "expected"),
+    [
+        pytest.param(_NoClaimsOwned, None, None, None, None, set(), id="bare"),
+        pytest.param(_NoClaimsOwned, None, print, None, None, {"on_stage"}, id="stage"),
+        pytest.param(_NoClaimsOwned, {"a": 1}, None, None, None, {"host_config"}, id="config"),
+        pytest.param(
+            _NoClaimsOwned, {"a": 1}, print, None, None, {"host_config", "on_stage"}, id="both"
+        ),
+        # A claimed attempt reaches only a launcher with start claims: here it is dropped, and
+        # the owner still goes through.
+        pytest.param(_NoClaimsOwned, None, None, None, 3, set(), id="attempt-without-claims"),
+        pytest.param(
+            _NoClaimsClassifying,
+            None,
+            None,
+            "coder",
+            None,
+            {"host_config", "on_stage", "agent_name"},
+            id="classified",
+        ),
+    ],
+)
+async def test_every_start_names_the_owner_to_a_provider_without_start_claims(
+    launcher_type: type[_NoClaimsOwned],
+    host_config: dict[str, object] | None,
+    on_stage: Any,
+    agent_name: str | None,
+    start_attempt: int | None,
+    expected: set[str],
+) -> None:
+    from omnigent.server.managed_hosts import _start_sandbox_host
+
+    launcher = launcher_type()
+    assert launcher.capabilities.owner_context and not launcher.capabilities.start_claims
+    await _start_sandbox_host(
+        launcher,
+        "sb-owned",
+        token="tok",
+        host_id="h" * 32,
+        host_name="Alice's",
+        server_url="http://omnigent.test",
+        repos=(),
+        host_config=host_config,
+        agent_name=agent_name,
+        on_stage=on_stage,
+        start_attempt=start_attempt,
+        owner=_ALICE,
+    )
+    (start,) = launcher.starts
+    assert start["owner"] == _ALICE
+    optional = {"host_config", "on_stage", "agent_name", "start_attempt"}
+    assert {key for key in start if key in optional} == expected
+
+
+@pytest.mark.asyncio
+async def test_a_provider_without_owner_context_never_receives_the_keyword() -> None:
+    from omnigent.server.managed_hosts import _start_sandbox_host
+
+    launcher = _NoClaimsPlain()
+    await _start_sandbox_host(
+        launcher,
+        "sb-plain",
+        token="tok",
+        host_id="h" * 32,
+        host_name="Plain",
+        server_url="http://omnigent.test",
+        repos=(),
+        host_config={"a": 1},
+        owner=_ALICE,
+    )
+    assert launcher.starts and "owner" not in launcher.starts[0]
+
+
+@dataclass
+class _OwnedUntypedComputer(FakeUntypedComputer):
+    """An untyped persistent provider (no admission, no start claims) that takes owners."""
+
+    supports_owner_context: ClassVar[bool] = True
+    owners: list[tuple[str, SandboxOwner | None]] = field(default_factory=list)
+
+    def provision(self, name: str, *, owner: SandboxOwner | None = None) -> str:
+        self.owners.append(("provision", owner))
+        return super().provision(name)
+
+    def is_running(self, sandbox_id: str, *, owner: SandboxOwner | None = None) -> bool | None:
+        self.owners.append(("is_running", owner))
+        return super().is_running(sandbox_id)
+
+    def resume(self, sandbox_id: str, *, owner: SandboxOwner | None = None) -> None:
+        self.owners.append(("resume", owner))
+        super().resume(sandbox_id)
+
+    def start_host(  # type: ignore[override]
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repos: Sequence[RepoWorkspace] = (),
+        host_config: dict[str, object] | None = None,
+        on_stage: Any = None,
+        owner: SandboxOwner,
+    ) -> str:
+        self.owners.append(("start_host", owner))
+        return super().start_host(
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repos=repos,
+            host_config=host_config,
+            on_stage=on_stage,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_start_without_start_claims_names_the_owner(
+    owned: tuple[FakeHost, OwnedComputer, dict[str, str]],
+) -> None:
+    """The untyped wake: no admission, no claim, a start for no attempt; Alice named throughout."""
+    fake, _computer, ids = owned
+    untyped = _OwnedUntypedComputer()
+    loop = asyncio.get_running_loop()
+    untyped.on_host_start = lambda token: call_soon(loop, fake.connect, token)
+    assert not untyped.capabilities.start_claims and untyped.capabilities.owner_context
+    persistent_hosts.configure(
+        fake.store,
+        fake.registry,
+        ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="http://omnigent.test",
+                launcher_factory=lambda: untyped,
+                token_ttl_s=3600,
+                provider=untyped.provider,
+                persistent=PersistentHostPolicy(),
+                online_timeout_s=10,
+            )
+        ),
+    )
+    created = await persistent_hosts.create_host(owner="alice", name="Untyped", provider=None)
+    fake.host_id = created.host_id
+    task = persistent_hosts._states[created.host_id].wake_task
+    assert task is not None
+    await asyncio.wait_for(task, 10)
+    assert untyped.events == ["provision", "start_host"]
+    alice = SandboxOwner(
+        user_id="alice", host_id=created.host_id, member_id=ids["member"], team_id=ids["team"]
+    )
+    assert ("start_host", alice) in untyped.owners
+    assert {owner for _, owner in untyped.owners} == {alice}
