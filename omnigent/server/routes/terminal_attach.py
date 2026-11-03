@@ -85,6 +85,7 @@ from omnigent.runtime import (
 )
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
+from omnigent.server.authority_changes import sleep_until_authority_change
 from omnigent.server.principals import recorded_principal
 from omnigent.server.routes._auth_helpers import (
     CONNECTION_AUTHORITY_RECHECK_S,
@@ -320,7 +321,7 @@ async def _serve_while_authorized(
 
     async def _watch() -> None:
         while True:
-            await asyncio.sleep(interval)
+            await sleep_until_authority_change(interval)
             if not await still_authorized():
                 return
 

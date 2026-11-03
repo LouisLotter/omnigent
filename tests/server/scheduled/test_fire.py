@@ -626,6 +626,44 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert "alice" in store.runs[0]["error"]
 
 
+class _FakeTeamStore:
+    """Memberships by account: only what the fire reads."""
+
+    def __init__(self, states: dict[str, str]) -> None:
+        self._states = states
+
+    def get_member_for_account(self, user_id: str) -> Any:
+        state = self._states.get(user_id)
+        return None if state is None else SimpleNamespace(state=state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("state", "fires"), [("suspended", False), ("active", True)])
+async def test_a_suspended_owner_skips_fires_and_keeps_the_task(state: str, fires: bool) -> None:
+    """A suspended owner's task skips without being disabled; an active owner's fires."""
+    perm = FakePermissionStore(users={"alice"})
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(store, permission_store=perm, conversation_store=conv_store)
+    deps.team_store = _FakeTeamStore({"alice": state})
+    on_fire = build_on_fire(deps, launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert bool(conv_store.created) is fires
+    assert {"id": "task_1", "state": "deleted"} not in store.updates
+    if not fires:
+        assert launched == []
+        assert [(run["status"], run["error_code"]) for run in store.runs] == [
+            ("skipped", "owner_suspended")
+        ]
+
+
 def _claude_agent_deps(
     store: FakeScheduledTaskStore, conv_store: FakeConversationStore, *, harness: str
 ) -> FireDeps:

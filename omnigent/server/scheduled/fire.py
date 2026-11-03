@@ -171,6 +171,8 @@ class FireDeps:
     # ``app.state``, read per fire for the default-public-sessions policy.
     # ``None`` (tests, embedders) leaves every fired session private.
     app_state: Any | None = None
+    # The team's memberships: a suspended owner's tasks skip their fires.
+    team_store: Any | None = None
 
 
 @dataclass
@@ -410,6 +412,18 @@ async def _run_fire_for_task(
                 error_code="owner_deleted",
             )
             return
+        if await _owner_is_suspended(deps, task):
+            # Kept enabled: reinstating the owner resumes the schedule.
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="skipped",
+                error="the task owner's team membership is suspended",
+                error_code="owner_suspended",
+            )
+            return
         managed = task.execution_target == "managed_sandbox"
         if not managed and task.execution_target != "connected_host":
             _logger.info(
@@ -629,6 +643,14 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask | _CapturedTask)
     return owner is None or owner.account_generation != task.account_generation
 
 
+async def _owner_is_suspended(deps: FireDeps, task: ScheduledTask | _CapturedTask) -> bool:
+    """True when the task's owner is a suspended team member."""
+    if task.user_id is None or deps.team_store is None:
+        return False
+    member = await asyncio.to_thread(deps.team_store.get_member_for_account, task.user_id)
+    return member is not None and member.state == "suspended"
+
+
 async def _reauthorize_fire(
     deps: FireDeps,
     task: ScheduledTask | _CapturedTask,
@@ -663,6 +685,11 @@ async def _reauthorize_fire(
         raise _CannotLaunchScheduledFire(
             f"owner {task.user_id!r} registration is no longer active",
             error_code="owner_deleted",
+        )
+    if await _owner_is_suspended(deps, task):
+        raise _CannotLaunchScheduledFire(
+            "the task owner's team membership is suspended",
+            error_code="owner_suspended",
         )
     if task.user_id is None:
         return

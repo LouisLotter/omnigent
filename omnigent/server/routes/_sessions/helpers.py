@@ -122,6 +122,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
+from omnigent.server.authority_changes import authority_change_count
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
@@ -9827,6 +9828,7 @@ async def _stream_live_events(
     if authority_recheck_s is None:
         authority_recheck_s = CONNECTION_AUTHORITY_RECHECK_S
     next_recheck_at = time.monotonic() + authority_recheck_s
+    checked_changes = authority_change_count()
     try:
         # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
         # a bare ``async for`` would leave the subscriber slot until GC.
@@ -9847,7 +9849,11 @@ async def _stream_live_events(
             async for event in live_events:
                 if await request.is_disconnected():
                     break
-                if still_authorized is not None and time.monotonic() >= next_recheck_at:
+                if still_authorized is not None and (
+                    time.monotonic() >= next_recheck_at
+                    or authority_change_count() != checked_changes
+                ):
+                    checked_changes = authority_change_count()
                     if not await still_authorized():
                         revoked = True
                         break

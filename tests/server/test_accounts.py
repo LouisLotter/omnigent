@@ -1268,6 +1268,7 @@ def _build_accounts_app(
     *,
     init_admin_password: str | None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    **create_app_kwargs: object,
 ) -> Iterator[TestClient]:
     """Build a production-shaped accounts-mode app + TestClient.
 
@@ -1282,6 +1283,8 @@ def _build_accounts_app(
         with it (admin exists, no setup pending). When ``None``, no
         admin is created and ``/v1/info`` reports ``needs_setup``.
     :param sandbox_config: Managed sandbox providers, or ``None`` for none.
+    :param create_app_kwargs: Further ``create_app`` arguments, e.g. a team
+        admission adapter.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
@@ -1360,6 +1363,7 @@ def _build_accounts_app(
         auth_provider=auth_provider,
         account_store=account_store,
         sandbox_config=sandbox_config,
+        **create_app_kwargs,  # type: ignore[arg-type]
     )
     with TestClient(app) as client:
         yield client

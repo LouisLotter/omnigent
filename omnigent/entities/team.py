@@ -14,6 +14,9 @@ from typing import Literal
 MemberRole = Literal["owner", "admin", "member"]
 MemberState = Literal["invited", "active", "suspended", "removed"]
 IdentityProvenance = Literal["invitation", "account_proof", "migration"]
+InvitationState = Literal["pending", "redeemed", "revoked", "expired"]
+# Roles an invitation may offer; an owner is appointed by changing a member's role.
+InvitationRole = Literal["admin", "member"]
 
 # Roles whose active members hold the account admin flag.
 ADMIN_ROLES: frozenset[MemberRole] = frozenset({"owner", "admin"})
@@ -88,6 +91,8 @@ class ExternalIdentityBinding:
     :param bound_by_member_id: The member who completed the binding, or
         ``None`` when the system bound it (for example the upgrade).
     :param created_at: Unix epoch seconds when the binding was created.
+    :param email: The address the identity was verified with, if any; for the
+        front proxy's admission list, never an authorization key.
     """
 
     issuer: str
@@ -97,6 +102,49 @@ class ExternalIdentityBinding:
     provenance: IdentityProvenance
     bound_by_member_id: str | None
     created_at: int
+    email: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class TeamInvitation:
+    """A single-use invitation to join the team, or to link an existing account.
+
+    :param id: Stable invitation id, a bare 32-char hex UUID.
+    :param email: The invited address, lowercase. A proxy-verified sign-in
+        must carry it to redeem the invitation.
+    :param role: The role the member gets, ``"admin"`` or ``"member"``.
+    :param target_user_id: For a link invitation, the existing account the
+        invitee proves with its password; ``None`` creates a new account.
+    :param created_by_member_id: The member who issued it.
+    :param created_at: Unix epoch seconds when it was issued.
+    :param expires_at: Unix epoch seconds after which it cannot be redeemed.
+    :param state: ``"pending"``, ``"redeemed"``, ``"revoked"`` or ``"expired"``.
+    :param redeemed_member_id: The membership it created or linked, once redeemed.
+    """
+
+    id: str
+    email: str
+    role: InvitationRole
+    target_user_id: str | None
+    created_by_member_id: str | None
+    created_at: int
+    expires_at: int
+    state: InvitationState
+    redeemed_member_id: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionSnapshot:
+    """Who a front proxy should admit, for one membership revision.
+
+    :param revision: Increases with every change that alters the list; a
+        proxy ignores a snapshot older than the last one it applied.
+    :param emails: Sorted lowercase addresses: active members' verified
+        sign-ins and pending, unexpired invitations.
+    """
+
+    revision: int
+    emails: tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)

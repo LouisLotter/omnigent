@@ -55,6 +55,16 @@ function rememberUsername(value: string): void {
   }
 }
 
+/** Why the app signed this browser out, from an identity refusal (``?reason=``). */
+const IDENTITY_REFUSALS: Record<string, string> = {
+  external_identity_mismatch:
+    "You were signed in to Omnigent as someone else than the person signed in to this installation. Sign in with your own account.",
+  external_identity_unbound:
+    "Your sign-in to this installation is not linked to a member of this team. Ask a team administrator for an invitation.",
+  member_suspended: "Your membership of this team is suspended. Ask a team administrator.",
+  external_identity_required: "Open Omnigent through this installation's own web address.",
+};
+
 export function LoginPage() {
   const appName = useAppName();
   const loginV2 = useLoginV2();
@@ -76,12 +86,13 @@ export function LoginPage() {
   const [username, setUsername] = useState(readLastUsername);
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const refusal = params.get("reason");
   const [error, setError] = useState<string | null>(
     magicError === "expired"
       ? "That sign-in link has expired. Enter your password to sign in."
       : magicError === "missing"
         ? "That sign-in link is no longer valid. Enter your password to sign in."
-        : null,
+        : (IDENTITY_REFUSALS[refusal ?? ""] ?? null),
   );
 
   // Already signed in? Don't show a login form to an authenticated

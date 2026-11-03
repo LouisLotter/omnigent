@@ -32,6 +32,8 @@ from omnigent.stores.approval_store import (
 _PREVIOUS = "ri1a2b3c4d5e"
 _REVISION = "ap1a2b3c4d5e"
 _TABLES = ("approval_resources", "approver_grants", "protected_policies", "approval_verdicts")
+# Tables later revisions add; a downgrade below this revision drops them too.
+_LATER_TABLES = ("team_invitations",)
 
 
 def _migrate(engine: sa.Engine, revision: str, *, downgrade: bool = False) -> None:
@@ -64,7 +66,13 @@ def _has_login_id(engine: sa.Engine) -> bool:
 
 
 def _use_every_table(db_uri: str) -> None:
-    """The store works against the migrated schema."""
+    """The store works against the migrated schema.
+
+    The stores read the current schema, which later revisions extend, so the
+    database is upgraded to head first.
+    """
+    engine = get_or_create_engine(db_uri)
+    _migrate(engine, "head")
     store = SqlAlchemyApprovalStore(db_uri)
     service = ApprovalResource(ResourceKind.SERVICE, "tracker")
     assert store.add_approver(service, "carol", granted_by="admin")
@@ -140,7 +148,7 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
 def test_downgrade_drops_only_the_new_tables(db_uri, engine) -> None:
     SqlAlchemyAccountStore(db_uri).create_user_with_password("alice", "password-hash")
     _use_every_table(db_uri)
-    before = _tables(engine) - set(_TABLES)
+    before = _tables(engine) - set(_TABLES) - set(_LATER_TABLES)
 
     _migrate(engine, _PREVIOUS, downgrade=True)
 

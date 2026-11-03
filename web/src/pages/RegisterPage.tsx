@@ -26,6 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { register as registerRequest } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
+import { type InvitationPreview, previewInvitation } from "@/lib/teamApi";
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -40,6 +41,8 @@ export function RegisterPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [accepted, setAccepted] = useState(false); // v2: invite landing accepted
+  // A team invitation names the role and the email address it is for.
+  const [preview, setPreview] = useState<InvitationPreview | null>(null);
 
   // Server rejects invites that are missing / expired / redeemed
   // with a generic 400. Surface the same generic UI in the
@@ -50,6 +53,17 @@ export function RegisterPage() {
     const el = document.getElementById("register-username");
     if (el instanceof HTMLInputElement) el.focus();
   }, []);
+
+  useEffect(() => {
+    if (invite === "") return;
+    let cancelled = false;
+    void previewInvitation(invite).then((found) => {
+      if (!cancelled) setPreview(found);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [invite]);
 
   async function onSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -80,7 +94,9 @@ export function RegisterPage() {
       <div className="space-y-1 text-center">
         <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
         <p className="text-ui text-muted-foreground">
-          You were invited to join this Omnigent server.
+          {preview === null
+            ? "You were invited to join this Omnigent server."
+            : `You were invited to join ${preview.team_name ?? "this team"} as ${preview.role === "admin" ? "an admin" : "a member"}, with ${preview.email}.`}
         </p>
       </div>
 

@@ -69,6 +69,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.authority_changes import sleep_until_authority_change
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
@@ -2545,7 +2546,7 @@ def register_core_routes(
             itself after a sign-out, account change or token expiry.
             """
             while True:
-                await asyncio.sleep(CONNECTION_AUTHORITY_RECHECK_S)
+                await sleep_until_authority_change(CONNECTION_AUTHORITY_RECHECK_S)
                 try:
                     valid = await credential_still_valid(
                         websocket,

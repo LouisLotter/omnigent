@@ -54,6 +54,7 @@ from omnigent.runner.transports.ws_tunnel.registry import (
 )
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.authority_changes import sleep_until_authority_change
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.principals import (
     Principal,
@@ -1068,7 +1069,7 @@ async def _authority_loop(
     tunnel; event batches are refused meanwhile by their own check.
     """
     while True:
-        await asyncio.sleep(RUNNER_AUTHORITY_RECHECK_S)
+        await sleep_until_authority_change(RUNNER_AUTHORITY_RECHECK_S)
         if registry.get(runner_id) is not session:
             return
         try:

@@ -36,10 +36,22 @@ from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from omnigent.db.account_authority import bind_account_authority, target_account_scope
+from omnigent.errors import OmnigentError
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.approval_authority import answer_credential_problem
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.external_identity import (
+    MISMATCH_CODE,
+    REFUSAL_MESSAGES,
+    REQUIRED_CODE,
+    SUSPENDED_CODE,
+    UNBOUND_CODE,
+    ExternalIdentityMode,
+    external_identity_mode,
+    refusal_for_user,
+    resolved_external_identity,
+)
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
     InvalidPasswordError,
@@ -52,7 +64,9 @@ from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
     from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.team_admission import AdmissionSync
     from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
 
 _logger = logging.getLogger(__name__)
 
@@ -90,6 +104,8 @@ class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
     issue_refresh: bool = False
+    # A team invitation that links this existing account to a membership.
+    invite: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class RegisterRequest(BaseModel):
@@ -224,6 +240,8 @@ def create_accounts_auth_router(
     permission_store: PermissionStore | None = None,
     device_grant_store: DeviceGrantStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    team_store: SqlAlchemyTeamStore | None = None,
+    admission_sync: AdmissionSync | None = None,
 ) -> APIRouter:
     """Build the ``/auth/*`` router for the accounts provider.
 
@@ -255,6 +273,10 @@ def create_accounts_auth_router(
     :param scheduled_task_store: When set, ``DELETE /auth/users/{id}``
         disarms the scheduler timers of the deleted user's tasks (the
         rows themselves are disabled by ``AccountStore.delete_user``).
+    :param team_store: The team's memberships and invitations. Registration
+        redeems team invitations, and a suspended member cannot sign in.
+    :param admission_sync: Told when a redemption changes who a front proxy
+        should admit.
     :returns: APIRouter to mount at ``/auth``.
     """
     if auth_provider._source != "accounts":
@@ -309,10 +331,146 @@ def create_accounts_auth_router(
             max_age_seconds=_session_max_age,
         )
 
+    def _refused(code: str, status_code: int = 403) -> JSONResponse:
+        return JSONResponse(
+            status_code=status_code, content={"error": REFUSAL_MESSAGES[code], "code": code}
+        )
+
+    def _login_binding(request: Request, username: str, invite: str | None) -> str | JSONResponse:
+        """How a login relates to the proxy's sign-in: refuse it, or what to bind after.
+
+        Returns ``"none"``, ``"owner"`` (the proxy asserts the operator: bind the
+        owner's own account), ``"link"`` (a link invitation), or a refusal.
+        Decided before the password is checked, from the username alone.
+        """
+        mode = external_identity_mode(request)
+        resolved = resolved_external_identity(request)
+        if resolved is None:
+            if mode is ExternalIdentityMode.REQUIRED:
+                return _refused(REQUIRED_CODE)
+            return "link" if invite is not None else "none"
+        if resolved.member is not None:
+            return "none" if resolved.member.user_id == username else _refused(MISMATCH_CODE)
+        if invite is not None:
+            return "link"
+        if resolved.identity.installation_owner:
+            return "owner"
+        return _refused(UNBOUND_CODE)
+
+    def _member_suspended(user_id: str) -> bool:
+        if team_store is None:
+            return False
+        member = team_store.get_member_for_account(user_id)
+        return member is not None and member.state == "suspended"
+
+    def _admission_changed() -> None:
+        if admission_sync is not None:
+            admission_sync.request()
+
+    def _complete_login_binding(
+        request: Request, binding: str, username: str, invite: str | None
+    ) -> JSONResponse | None:
+        """After a verified password: bind the owner or redeem a link invitation."""
+        from omnigent.stores.team_store import (
+            IdentityBindingConflictError,
+            InvitationEmailMismatchError,
+            InvitationUnavailableError,
+        )
+
+        resolved = resolved_external_identity(request)
+        identity = resolved.identity if resolved is not None else None
+        if binding == "owner" and identity is not None:
+            if (
+                team_store is None
+                or team_store.bind_installation_owner(username, identity) is None
+            ):
+                return _refused(UNBOUND_CODE)
+            _admission_changed()
+        elif binding == "link" and invite is not None:
+            try:
+                account_store.link_team_invitation(invite, user_id=username, identity=identity)
+            except InvitationUnavailableError:
+                return JSONResponse(
+                    status_code=400, content={"error": "invite invalid or expired"}
+                )
+            except InvitationEmailMismatchError as exc:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": str(exc), "code": "invitation_email_mismatch"},
+                )
+            except IdentityBindingConflictError:
+                return _refused(MISMATCH_CODE)
+            except OmnigentError as exc:
+                return JSONResponse(status_code=409, content={"error": str(exc)})
+            _admission_changed()
+        return None
+
+    def _register_member(request: Request, body: RegisterRequest, username: str) -> Response:
+        """Redeem a team invitation: the account, its membership and binding at once."""
+        from omnigent.stores.team_store import (
+            IdentityBindingConflictError,
+            InvitationEmailMismatchError,
+            InvitationUnavailableError,
+        )
+
+        mode = external_identity_mode(request)
+        resolved = resolved_external_identity(request)
+        if resolved is None and mode is ExternalIdentityMode.REQUIRED:
+            return _refused(REQUIRED_CODE)
+        if resolved is not None and resolved.member is not None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "You are already a member of this team. Sign in instead.",
+                    "code": "external_identity_bound",
+                },
+            )
+        identity = resolved.identity if resolved is not None else None
+        try:
+            user, _member = account_store.redeem_team_invitation(
+                body.invite,
+                username=username,
+                password_hash=hash_password(body.password),
+                identity=identity,
+            )
+        except InvitationUnavailableError:
+            return JSONResponse(status_code=400, content={"error": "invite invalid or expired"})
+        except InvitationEmailMismatchError as exc:
+            return JSONResponse(
+                status_code=403,
+                content={"error": str(exc), "code": "invitation_email_mismatch"},
+            )
+        except IdentityBindingConflictError:
+            return _refused(MISMATCH_CODE)
+        except ValueError:
+            return JSONResponse(status_code=409, content={"error": "username already taken"})
+        _admission_changed()
+        if user.account_generation is not None:
+            bind_account_authority(username, user.account_generation)
+        account_store.mark_logged_in(username, int(time.time()))
+        session_jwt = mint_session_cookie(
+            user_id=username,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider="accounts",
+            account_generation=user.account_generation,
+        )
+        resp = JSONResponse(
+            status_code=200,
+            content={
+                "token": session_jwt,
+                "expires_in": _session_max_age,
+                "user": {"id": user.id, "is_admin": user.is_admin},
+            },
+        )
+        _set_browser_session_cookie(resp, username, user.account_generation)
+        _logger.info("auth/register: %s joined the team by invitation", _redact_for_log(username))
+        return resp
+
     # ── Login / logout / me ───────────────────────────────────────
 
     @router.post("/login")
-    async def login(body: LoginRequest) -> Response:
+    async def login(request: Request, body: LoginRequest) -> Response:
         """Verify password and mint a session cookie.
 
         Returns 401 on any failure (unknown user, wrong password,
@@ -324,6 +482,10 @@ def create_accounts_auth_router(
         OWASP authentication cheat-sheet guidance.
         """
         username = body.username.strip().lower()
+        binding = _login_binding(request, username, body.invite)
+        if isinstance(binding, JSONResponse):
+            _logger.info("auth/login: refused by the front proxy's sign-in")
+            return binding
         password_hash, generation = account_store.login_snapshot(username)
         if generation is not None:
             bind_account_authority(username, generation)
@@ -343,6 +505,12 @@ def create_accounts_auth_router(
         except InvalidPasswordError:
             _logger.info("auth/login: bad password for %s", _redact_for_log(username))
             return JSONResponse(status_code=401, content={"error": "invalid username or password"})
+
+        if _member_suspended(username):
+            return _refused(SUSPENDED_CODE)
+        linked = _complete_login_binding(request, binding, username, body.invite)
+        if linked is not None:
+            return linked
 
         # Opportunistic rehash if argon2 parameters were upgraded.
         # Cheap and self-healing; failure is non-fatal (the user
@@ -450,6 +618,15 @@ def create_accounts_auth_router(
         problem = answer_credential_problem(request, auth_provider, "invite people")
         if problem is not None:
             return JSONResponse(status_code=403, content={"error": problem})
+        if external_identity_mode(request) is not ExternalIdentityMode.OFF:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Invite people from Settings → Members: an invitation here "
+                    "names the person's email address.",
+                    "code": "team_invitations_required",
+                },
+            )
 
         token_id = secrets.token_urlsafe(32)
         now = int(time.time())
@@ -483,7 +660,7 @@ def create_accounts_auth_router(
         )
 
     @router.post("/register")
-    async def register(body: RegisterRequest) -> Response:
+    async def register(request: Request, body: RegisterRequest) -> Response:
         """Consume an invite, create the user, sign them in.
 
         Ordering: validate format → check name availability → THEN
@@ -508,6 +685,15 @@ def create_accounts_auth_router(
             # Don't burn the invite — the user can retry with a
             # different name on the same URL.
             return JSONResponse(status_code=409, content={"error": "username already taken"})
+
+        if team_store is not None and team_store.invitation_for_token(body.invite) is not None:
+            return _register_member(request, body, username)
+        if (
+            external_identity_mode(request) is ExternalIdentityMode.REQUIRED
+            or resolved_external_identity(request) is not None
+        ):
+            # Behind a proxy, a new account always comes from a team invitation.
+            return JSONResponse(status_code=400, content={"error": "invite invalid or expired"})
 
         now = int(time.time())
         token = account_store.redeem_token(body.invite, kind="invite", now_epoch_seconds=now)
@@ -559,7 +745,7 @@ def create_accounts_auth_router(
         return resp
 
     @router.post("/setup")
-    async def setup(body: SetupRequest) -> Response:
+    async def setup(request: Request, body: SetupRequest) -> Response:
         """Create the FIRST admin account from the web UI (first-run claim).
 
         Unauthenticated by necessity — there's no one to authenticate
@@ -582,6 +768,12 @@ def create_accounts_auth_router(
         # bootstrap uses, so the two agree on what "set up" means.
         if any(u.has_password for u in account_store.list_users()):
             return JSONResponse(status_code=409, content={"error": "setup already completed"})
+        resolved = resolved_external_identity(request)
+        if (
+            resolved is None and external_identity_mode(request) is ExternalIdentityMode.REQUIRED
+        ) or (resolved is not None and not resolved.identity.installation_owner):
+            # Behind a proxy only the installation's operator may claim it.
+            return _refused(REQUIRED_CODE if resolved is None else UNBOUND_CODE)
 
         username = body.username.strip().lower()
         now = int(time.time())
@@ -600,6 +792,9 @@ def create_accounts_auth_router(
 
         if user.account_generation is not None:
             bind_account_authority(username, user.account_generation)
+        if resolved is not None and team_store is not None:
+            team_store.bind_installation_owner(username, resolved.identity)
+            _admission_changed()
         account_store.mark_logged_in(username, now)
         # Admin list applies (additive); the setup admin is already admin.
         if promote_if_listed(admin_list, account_store, username):
@@ -709,6 +904,11 @@ def create_accounts_auth_router(
         # deleted them after the token was minted).
         user = account_store.get_user(token.user_id)
         if user is None or user.account_generation != token.account_generation:
+            return RedirectResponse(url=f"{config.base_url}/login?magic=expired", status_code=302)
+        if refusal_for_user(request, token.user_id) is not None or _member_suspended(
+            token.user_id
+        ):
+            # A link signs in only the person the proxy admitted; it is spent either way.
             return RedirectResponse(url=f"{config.base_url}/login?magic=expired", status_code=302)
         if token.account_generation is not None:
             bind_account_authority(token.user_id, token.account_generation)

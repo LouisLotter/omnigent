@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable
-from typing import TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
@@ -33,15 +33,18 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlScheduledTask,
     SqlSessionPermission,
+    SqlTeamMember,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
     decode_account_token_kind,
+    decode_team_member_role,
     encode_account_token_kind,
     encode_device_grant_status,
     encode_scheduled_task_state,
+    encode_team_member_state,
 )
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -49,19 +52,32 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Account, AccountToken
+from omnigent.entities.team import InvitationRole, MemberState, TeamMember
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.principals import MachineBinding
 from omnigent.stores.approval_store import remove_account_approval_authority
 from omnigent.stores.host_store import resolve_runner_binding
 from omnigent.stores.team_store import (
+    InvitationEmailMismatchError,
     admin_flag_for_account,
+    apply_member_state,
+    bind_identity_in_session,
     carry_membership_registration,
     claim_founding_owner,
+    close_redeemed_invitation,
+    insert_active_membership,
+    lock_pending_invitation,
     lock_team,
+    member_state_row,
     retire_deleted_account_membership,
+    to_member,
 )
 
+if TYPE_CHECKING:
+    from omnigent.server.external_identity import ExternalIdentity
+
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
+_SUSPENDED = encode_team_member_state("suspended")
 
 
 def _to_account(row: SqlUser) -> Account:
@@ -537,12 +553,190 @@ class SqlAlchemyAccountStore:
             return row.password_hash, row.account_generation
 
     def accepts_generation(self, user_id: str, generation: str) -> bool:
-        """Read revocation state on every accounts authentication attempt."""
+        """Read revocation state on every accounts authentication attempt.
+
+        A suspended team member's credentials are refused too, whatever their
+        kind: sessions, grants, runner and host tokens.
+        """
         with self._session("validate_account_authority") as session:
-            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            row = session.execute(
+                select(SqlUser.deleted_at, SqlUser.account_generation, SqlTeamMember.state)
+                .outerjoin(
+                    SqlTeamMember,
+                    (SqlTeamMember.workspace_id == SqlUser.workspace_id)
+                    & (SqlTeamMember.current_user_id == SqlUser.id),
+                )
+                .where(SqlUser.workspace_id == current_workspace_id(), SqlUser.id == user_id)
+            ).one_or_none()
             return (
-                row is not None and row.deleted_at is None and row.account_generation == generation
+                row is not None
+                and row.deleted_at is None
+                and row.account_generation == generation
+                and row.state != _SUSPENDED
             )
+
+    # ── Team membership through accounts ──────────────────────────
+
+    def redeem_team_invitation(
+        self,
+        token: str,
+        *,
+        username: str,
+        password_hash: str,
+        identity: ExternalIdentity | None,
+    ) -> tuple[Account, TeamMember]:
+        """Create the invited account, its membership and its identity binding at once.
+
+        The invitation is consumed in the same transaction, so a concurrent
+        second redemption fails. With a proxy-verified *identity*, its address
+        must be the invited one and the identity is bound (provenance
+        ``invitation``); without one (no proxy in front) no binding is made.
+
+        :raises InvitationUnavailableError: Unknown, used, revoked or expired.
+        :raises InvitationEmailMismatchError: The identity carries another address.
+        :raises IdentityBindingConflictError: The identity is already bound.
+        :raises ValueError: The username is taken.
+        """
+        now = int(time.time())
+
+        def write(session: Session) -> tuple[Account, TeamMember]:
+            lock_team(session)
+            invitation = lock_pending_invitation(session, token, now)
+            if invitation.target_user_id is not None:
+                # A link invitation is redeemed by proving the existing account.
+                raise InvitationEmailMismatchError()
+            if identity is not None and identity.email != invitation.email:
+                raise InvitationEmailMismatchError()
+            existing = lock_account(session, username)
+            if existing is not None and existing.deleted_at is None:
+                raise ValueError(f"user {username!r} already exists")
+            row = existing or SqlUser(id=username)
+            row.is_admin = False
+            row.password_hash = password_hash
+            row.created_at = now
+            row.last_login_at = None
+            row.deleted_at = None
+            row.account_generation = uuid.uuid4().hex
+            session.add(row)
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                raise ValueError(f"user {username!r} already exists") from exc
+            member = insert_active_membership(
+                session,
+                username,
+                cast(InvitationRole, decode_team_member_role(invitation.role)),
+                row.account_generation,
+            )
+            if identity is not None:
+                bind_identity_in_session(
+                    session,
+                    member.id,
+                    issuer=identity.issuer,
+                    subject=identity.subject,
+                    audience=identity.audience,
+                    provenance="invitation",
+                    bound_by_member_id=invitation.created_by_member_id,
+                    email=identity.email,
+                )
+            close_redeemed_invitation(session, invitation, member.id, now)
+            session.refresh(row)
+            return _to_account(row), to_member(member)
+
+        return run_write_transaction(self._session_immediate, "redeem_team_invitation", write)
+
+    def link_team_invitation(
+        self, token: str, *, user_id: str, identity: ExternalIdentity | None
+    ) -> TeamMember:
+        """Give an existing account the membership a link invitation offers.
+
+        The caller has verified the account's password. With a proxy-verified
+        *identity*, its address must be the invited one and it is bound
+        (provenance ``account_proof``).
+
+        :raises InvitationUnavailableError: Unknown, used, revoked, expired, or
+            for another account.
+        :raises InvitationEmailMismatchError: The identity carries another address.
+        """
+        now = int(time.time())
+
+        def write(session: Session) -> TeamMember:
+            from omnigent.stores.team_store import InvitationUnavailableError
+
+            lock_team(session)
+            invitation = lock_pending_invitation(session, token, now)
+            if invitation.target_user_id != user_id:
+                raise InvitationUnavailableError()
+            if identity is not None and identity.email != invitation.email:
+                raise InvitationEmailMismatchError()
+            require_active_account(session, user_id)
+            account = lock_account(session, user_id)
+            if account is None or account.deleted_at is not None:
+                raise InvitationUnavailableError()
+            member = insert_active_membership(
+                session,
+                user_id,
+                cast(InvitationRole, decode_team_member_role(invitation.role)),
+                account.account_generation,
+            )
+            if identity is not None:
+                bind_identity_in_session(
+                    session,
+                    member.id,
+                    issuer=identity.issuer,
+                    subject=identity.subject,
+                    audience=identity.audience,
+                    provenance="account_proof",
+                    bound_by_member_id=invitation.created_by_member_id,
+                    email=identity.email,
+                )
+            close_redeemed_invitation(session, invitation, member.id, now)
+            return to_member(member)
+
+        return run_write_transaction(self._session_immediate, "link_team_invitation", write)
+
+    def change_member_state(self, member_id: str, state: MemberState) -> TeamMember:
+        """Suspend or reinstate a member, or move them on in the team lifecycle.
+
+        Suspending also rotates the account's registration through the path a
+        password reset uses: every session, refresh and device grant, magic
+        link and runner or host token issued before dies, while hosts,
+        schedules and the membership move to the new registration. A
+        reinstated member therefore signs in again everywhere.
+
+        :raises OmnigentError: ``NOT_FOUND``, ``CONFLICT`` for a transition the
+            lifecycle does not allow, or :class:`LastActiveOwnerError`.
+        """
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        def write(session: Session) -> TeamMember:
+            lock_team(session)
+            user_id = session.execute(
+                select(SqlTeamMember.current_user_id).where(
+                    SqlTeamMember.workspace_id == current_workspace_id(),
+                    SqlTeamMember.id == member_id,
+                )
+            ).scalar_one_or_none()
+            if user_id is None:
+                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            require_active_account(session, user_id)
+            account = lock_account(session, user_id)
+            row = member_state_row(session, user_id)
+            if row is None or row.id != member_id:
+                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            changed = apply_member_state(session, row, state)
+            generation = account.account_generation if account is not None else None
+            if changed and state == "suspended" and generation is not None:
+                new_generation = uuid.uuid4().hex
+                _carry_registration_work(session, user_id, old=generation, new=new_generation)
+                session.execute(
+                    update(SqlUser)
+                    .where(SqlUser.workspace_id == current_workspace_id(), SqlUser.id == user_id)
+                    .values(account_generation=new_generation)
+                )
+            return to_member(row)
+
+        return run_write_transaction(self._session_immediate, "change_team_member_state", write)
 
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.

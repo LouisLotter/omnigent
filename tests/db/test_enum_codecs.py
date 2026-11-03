@@ -59,6 +59,11 @@ _CODECS = [
         ec.encode_team_identity_provenance,
         ec.decode_team_identity_provenance,
     ),
+    (
+        ec.TEAM_INVITATION_STATE,
+        ec.encode_team_invitation_state,
+        ec.decode_team_invitation_state,
+    ),
 ]
 
 
@@ -158,3 +163,4 @@ def test_shipped_codes_are_stable() -> None:
     assert ec.TEAM_MEMBER_ROLE == {"owner": 1, "admin": 2, "member": 3}
     assert ec.TEAM_MEMBER_STATE == {"invited": 1, "active": 2, "suspended": 3, "removed": 4}
     assert ec.TEAM_IDENTITY_PROVENANCE == {"invitation": 1, "account_proof": 2, "migration": 3}
+    assert ec.TEAM_INVITATION_STATE == {"pending": 1, "redeemed": 2, "revoked": 3}

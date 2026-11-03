@@ -64,6 +64,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.external_identity import refusal_for_user
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
     RATE_LIMITER_MAX_KEYS,
@@ -481,7 +482,7 @@ def create_oauth_token_router(
                 return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
             try:
-                return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+                return _handle_refresh_grant(request, str(form.get("refresh_token") or ""))
             except OmnigentError:
                 return _oauth_error("invalid_grant")
         if grant_type == "client_credentials":
@@ -493,7 +494,7 @@ def create_oauth_token_router(
             return handle_client_credentials(request, form)
         return _oauth_error("unsupported_grant_type")
 
-    def _handle_refresh_grant(refresh_token: str) -> Response:
+    def _handle_refresh_grant(request: Request, refresh_token: str) -> Response:
         if not refresh_token:
             return _oauth_error("invalid_request")
         # Opportunistic housekeeping so login-grant rows (one per login)
@@ -524,6 +525,9 @@ def create_oauth_token_router(
         ):
             return _oauth_error("expired_token")
         if grant.user_id is None:
+            return _oauth_error("invalid_grant")
+        if refusal_for_user(request, grant.user_id) is not None:
+            # Behind a proxy, a grant renews only for the person the proxy admitted.
             return _oauth_error("invalid_grant")
 
         if _is_login_grant(grant.client_id):
