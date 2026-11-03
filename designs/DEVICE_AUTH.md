@@ -378,7 +378,8 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   form — a browser must not receive refresh material). The raw refresh
   token rides back once (`/auth/cli-poll` / the login response) as an
   optional `refresh_token` key — old CLIs ignore it, new CLIs against old
-  servers see it absent. `client_id` is `"omnigent-cli"`.
+  servers see it absent. That login response sets no session cookie: the CLI
+  keeps the body's token. `client_id` is `"omnigent-cli"`.
 - **Authority** — a refreshed login-grant token carries `grant_id` (so
   revocation still kills it) but **no `scope` claim**, so the delegated
   path allowlist does not apply: it renews the session JWT and keeps that

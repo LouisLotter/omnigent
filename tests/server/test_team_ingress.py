@@ -157,6 +157,17 @@ def world(
         yield world
 
 
+@pytest.fixture
+def moving_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    """A team of one moving behind the proxy: ``bind`` mode, the owner not bound yet."""
+    monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_MODE", "bind")
+    monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_KEY", _KEY)
+    for base in _build_accounts_app(
+        tmp_path, monkeypatch, init_admin_password=_OWNER_PASSWORD, team_admission=None
+    ):
+        yield World(base.app, RecordingAdmission(), {}, {})
+
+
 def _code(response) -> str | None:
     body = response.json()
     error = body.get("error")
@@ -721,6 +732,185 @@ def test_a_client_credentials_subject_that_is_a_member_gets_no_token(world: Worl
     assert world.people["owner"].post(f"/v1/team/members/{bob_id}/suspend").status_code == 200
     assert refused(TestClient(world.app))  # type: ignore[arg-type]
     assert refused(world.as_("bob-sub", "bob@example.test"))
+
+
+# ── 8.11: moving a team of one behind the proxy (bind, then required) ──
+
+
+def _team_status(world: World):
+    from omnigent.server.team_status import team_status
+
+    state = world.app.state  # type: ignore[attr-defined]
+    return team_status(state.team_store, state.host_registry)
+
+
+def _laptop_tunnel(client: TestClient, bearer: str, host_id: str):
+    """Open *host_id*'s tunnel with a CLI sign-in and say hello; the caller closes it."""
+    tunnel = client.websocket_connect(
+        f"/v1/hosts/{host_id}/tunnel", headers={"Authorization": f"Bearer {bearer}"}
+    )
+    socket = tunnel.__enter__()
+    socket.send_text(_make_hello("owner-laptop"))
+    return tunnel
+
+
+def test_bind_keeps_a_device_whose_sign_in_differs_working_and_reports_it(
+    moving_world: World,
+) -> None:
+    """The owner's laptop connects first, under a device sign-in unlike the browser's."""
+    world = moving_world
+    registry = world.app.state.host_registry  # type: ignore[attr-defined]
+    device = world.as_("device-sub", "owner@example.test", owner=True)
+    # The laptop's CLI sign-in (refresh material asked): it works, and binds nothing.
+    cli = device.post(
+        "/auth/login",
+        json={"username": "admin", "password": _OWNER_PASSWORD, "issue_refresh": True},
+    )
+    assert cli.status_code == 200, cli.text
+    device.cookies.clear()  # a CLI keeps the token it was given, not the browser's cookie
+    assert _team_status(world).owners_bound == 0
+    host_id = uuid.uuid4().hex
+    tunnel = _laptop_tunnel(device, cli.json()["token"], host_id)
+    try:
+        assert _wait_for(lambda: registry.get(host_id) is not None)
+        [host] = _team_status(world).hosts
+        assert (host.host_id, host.identity) == (host_id, "unbound")
+
+        # The owner's browser signs in: the founding binding is the browser's identity.
+        browser = world.as_("browser-sub", "owner@example.test", owner=True)
+        signed_in = browser.post(
+            "/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD}
+        )
+        assert signed_in.status_code == 200, signed_in.text
+        status = _team_status(world)
+        assert (status.owners, status.owners_bound) == (1, 1)
+        # The laptop keeps working, and is reported as unbound: the move stops at bind.
+        assert registry.get(host_id) is not None
+        assert [h.identity for h in status.hosts] == ["unbound"]
+        assert (
+            device.get(
+                "/v1/me", headers={"Authorization": f"Bearer {cli.json()['token']}"}
+            ).status_code
+            == 200
+        )
+    finally:
+        tunnel.__exit__(None, None, None)
+
+
+def test_bind_reports_a_laptop_under_the_owners_own_sign_in_as_the_owners(
+    moving_world: World,
+) -> None:
+    world = moving_world
+    registry = world.app.state.host_registry  # type: ignore[attr-defined]
+    browser = world.as_("owner-sub", "owner@example.test", owner=True)
+    login = browser.post("/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD})
+    assert login.status_code == 200, login.text
+    host_id = uuid.uuid4().hex
+    tunnel = _laptop_tunnel(browser, login.json()["token"], host_id)
+    try:
+        assert _wait_for(lambda: registry.get(host_id) is not None)
+        assert [(h.host_id, h.identity) for h in _team_status(world).hosts] == [(host_id, "owner")]
+    finally:
+        tunnel.__exit__(None, None, None)
+    # A cloud computer's private route carries no sign-in at all.
+    managed_id, token = _managed_host(world, "admin")
+    with TestClient(world.app).websocket_connect(  # type: ignore[arg-type]
+        f"/v1/hosts/{managed_id}/tunnel", headers={MANAGED_HOST_TOKEN_HEADER: token}
+    ) as cloud:
+        cloud.send_text(_make_hello("cloud"))
+        assert _wait_for(lambda: registry.get(managed_id) is not None)
+        assert [h.identity for h in _team_status(world).hosts if h.host_id == managed_id] == [
+            "none"
+        ]
+
+
+def test_bind_never_founds_from_a_cli_and_still_refuses_another_members_sign_in(
+    moving_world: World,
+) -> None:
+    world = moving_world
+    device = world.as_("device-sub", "owner@example.test", owner=True)
+    for _ in range(2):
+        cli = device.post(
+            "/auth/login",
+            json={"username": "admin", "password": _OWNER_PASSWORD, "issue_refresh": True},
+        )
+        assert cli.status_code == 200
+        device.cookies.clear()  # a CLI keeps the token it was given, not the browser's cookie
+    bearer = {"Authorization": f"Bearer {cli.json()['token']}"}
+    assert device.get("/v1/me", headers=bearer).status_code == 200
+    assert _team_status(world).owners_bound == 0
+    browser = world.as_("owner-sub", "owner@example.test", owner=True)
+    assert (
+        browser.post(
+            "/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD}
+        ).status_code
+        == 200
+    )
+    # A sign-in bound to the owner carrying another account's credential is still refused.
+    _stores(world)["accounts"].create_user_with_password("mallory", "unused")
+    from omnigent.server.passwords import hash_password
+
+    _stores(world)["accounts"].update_password("mallory", hash_password("mallory-pw-1234"))
+    mallory = TestClient(world.app).post(  # type: ignore[arg-type]
+        "/auth/login", json={"username": "mallory", "password": "mallory-pw-1234"}
+    )
+    assert mallory.status_code == 200
+    borrowed = world.as_("owner-sub", "owner@example.test")
+    refused = borrowed.get(
+        "/v1/me", headers={"Authorization": f"Bearer {mallory.json()['token']}"}
+    )
+    assert refused.status_code == 403 and _code(refused) == "external_identity_mismatch"
+
+
+def test_a_cli_session_token_never_founds_as_a_bearer_or_as_a_cookie(
+    moving_world: World,
+) -> None:
+    """A CLI sign-in's credentials, every way a client could keep them, never found.
+
+    Under the owner's own proxy sign-in: whatever the CLI login's response sets, kept and sent
+    back as a client with a cookie jar would; its session token as a bearer; and that token
+    copied into the session cookie. A browser's own sign-in then founds its own subject.
+    """
+    world = moving_world
+    device = world.as_("device-sub", "owner@example.test", owner=True)
+    cli = device.post(
+        "/auth/login",
+        json={"username": "admin", "password": _OWNER_PASSWORD, "issue_refresh": True},
+    )
+    assert cli.status_code == 200, cli.text
+    token = cli.json()["token"]
+    assert cli.json()["refresh_token"]
+    # The response's own cookies, kept by the client: the CLI login sets none.
+    kept = device.get("/v1/me")
+    assert _team_status(world).owners_bound == 0
+    assert _COOKIE not in cli.cookies
+    assert kept.status_code == 401, kept.text
+    as_bearer = device.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+    assert as_bearer.status_code == 200, as_bearer.text
+    assert _team_status(world).owners_bound == 0
+    # Copied into the session cookie: an unmarked session, not a browser's.
+    device.cookies.set(_COOKIE, token)
+    as_cookie = device.get("/v1/me")
+    assert as_cookie.status_code == 200, as_cookie.text
+    assert _team_status(world).owners_bound == 0
+    device.cookies.clear()
+    # A browser's own sign-in, its cookie marked as a browser's, founds at its first request.
+    browser = TestClient(world.app)  # type: ignore[arg-type]
+    login = browser.post("/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD})
+    assert login.status_code == 200, login.text
+    assert _COOKIE in login.cookies
+    assert _team_status(world).owners_bound == 0  # no proxy sign-in on that request
+    browser.headers[ENVELOPE_HEADER] = _envelope("browser-sub", "owner@example.test", owner=True)
+    assert browser.get("/v1/me").status_code == 200
+    assert _team_status(world).owners_bound == 1
+    assert _bound_subjects(world, "admin") == ["browser-sub"]
+
+
+def _bound_subjects(world: World, user_id: str) -> list[str]:
+    """The proxy subjects bound to *user_id*'s membership."""
+    store = world.app.state.team_store  # type: ignore[attr-defined]
+    member = store.get_member_for_account(user_id)
+    return sorted(binding.subject for binding in store.list_external_identities(member.id))
 
 
 # ── R1: the founding binding is one-time (F-3) ──

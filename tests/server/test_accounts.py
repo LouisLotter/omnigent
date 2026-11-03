@@ -26,6 +26,7 @@ from __future__ import annotations
 import secrets
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import copy_context
 from pathlib import Path
 
 import jwt
@@ -668,14 +669,23 @@ def test_runner_token_is_not_a_sign_in_for_account_administration(
     Under an ASGI ``root_path`` the router matches below the mount, and so
     does the refusal.
     """
+    from omnigent.db.account_authority import machine_principal_active
+
     provider = _bound_provider(source)
     token = _mint(provider, _runner_binding())
     headers = {"Authorization": f"Bearer {token}"}
 
-    assert provider.get_user_id(_FakeReq(headers=headers)) == "alice@example.com"
+    # Each check in its own context, as each request has one: an accepted runner token marks
+    # the machine principal there, which must not reach the next test (an admin's check
+    # there would answer False).
+    def user_of(request: _FakeReq) -> str | None:
+        return copy_context().run(provider.get_user_id, request)
+
+    assert user_of(_FakeReq(headers=headers)) == "alice@example.com"
     expected = "alice@example.com" if allowed else None
     request = _FakeReq(headers=headers, path=path, root_path=root_path)
-    assert provider.get_user_id(request) == expected
+    assert user_of(request) == expected
+    assert not machine_principal_active()
 
 
 def test_malformed_delegation_claim_is_rejected() -> None:

@@ -40,7 +40,12 @@ from typing import TYPE_CHECKING
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from omnigent.server.principals import Principal, PrincipalKind, recorded_principal
+from omnigent.server.principals import (
+    CredentialKind,
+    Principal,
+    PrincipalKind,
+    recorded_principal,
+)
 
 if TYPE_CHECKING:
     from omnigent.entities.team import TeamMember
@@ -333,7 +338,7 @@ def refusal_for_user(connection: HTTPConnection, user_id: str) -> str | None:
     if resolved is None:
         return REQUIRED_CODE if mode is ExternalIdentityMode.REQUIRED else None
     if resolved.member is None:
-        return UNBOUND_CODE
+        return unbound_refusal(mode)
     if resolved.member.user_id != user_id:
         return MISMATCH_CODE
     if resolved.member.state != "active":
@@ -358,12 +363,23 @@ def machine_refusal_for_user(connection: HTTPConnection, user_id: str) -> str | 
     if resolved is None:
         return None
     if resolved.member is None:
-        return UNBOUND_CODE
+        return unbound_refusal(external_identity_mode(connection))
     if resolved.member.user_id != user_id:
         return MISMATCH_CODE
     if resolved.member.state != "active":
         return SUSPENDED_CODE
     return None
+
+
+def unbound_refusal(mode: ExternalIdentityMode) -> str | None:
+    """The refusal for a credential under a sign-in bound to nobody: none while binding.
+
+    ``bind`` is the move to the proxy: an identity no member is bound to yet,
+    such as a device's sign-in, proceeds as a request without an envelope
+    would, so nothing the operator uses breaks while they check who is bound.
+    A sign-in bound to someone else is still refused. ``required`` refuses it.
+    """
+    return None if mode is ExternalIdentityMode.BIND else UNBOUND_CODE
 
 
 def decide(
@@ -394,7 +410,7 @@ def decide(
         return None
     member = resolved.member
     if member is None:
-        return UNBOUND_CODE
+        return unbound_refusal(mode)
     if principal.user_id != member.user_id:
         return MISMATCH_CODE
     if member.state != "active":
@@ -408,6 +424,14 @@ def _route_path(scope: Scope) -> str:
     if root_path and path.startswith(root_path + "/"):
         return path[len(root_path) :]
     return path
+
+
+# The founding owner binds from a browser's sign-in only: a session marked as a browser's when it
+# was minted. A CLI's, a host's or a grant's credential under the owner's proxy sign-in never
+# becomes the founding binding, nor does an unmarked session token in the cookie (an older
+# browser session, or a CLI's token copied there): that one needs a fresh password sign-in, so a
+# device whose sign-in differs from the browser's cannot take it first.
+_FOUNDING_CREDENTIALS = frozenset({CredentialKind.BROWSER_SESSION})
 
 
 class ExternalIdentityMiddleware:
@@ -451,6 +475,7 @@ class ExternalIdentityMiddleware:
             and identity.installation_owner
             and principal is not None
             and principal.kind is PrincipalKind.HUMAN
+            and principal.credential in _FOUNDING_CREDENTIALS
             and principal.user_id
         ):
             member = await asyncio.to_thread(

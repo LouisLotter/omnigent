@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from cachetools import TTLCache
 
@@ -55,6 +55,9 @@ from omnigent.host.frames import (
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.stores.host_store import LAUNCH_TOKEN_ONLY_REFUSAL, HostRegistrationRefusedError
+
+if TYPE_CHECKING:
+    from omnigent.server.external_identity import ExternalIdentity
 
 _logger = logging.getLogger(__name__)
 
@@ -537,6 +540,9 @@ class HostConnection:
     close_requested_code: int | None = None
     close_requested_reason: str | None = None
     account_generation: str | None = None
+    # The identity-aware proxy's verified sign-in the tunnel's handshake carried, if any;
+    # resolved against the team's bindings when asked (team_status.py), not stored as a member.
+    external_identity: ExternalIdentity | None = None
     # True when this tunnel authenticated with a valid managed-sandbox launch
     # token, i.e. a server-provisioned sandbox proving itself on connect — not a
     # user machine reusing a managed host's id under ordinary login. Read by the

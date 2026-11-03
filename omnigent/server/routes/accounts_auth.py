@@ -51,6 +51,7 @@ from omnigent.server.external_identity import (
     external_identity_mode,
     refusal_for_user,
     resolved_external_identity,
+    unbound_refusal,
 )
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
@@ -94,9 +95,10 @@ class LoginRequest(BaseModel):
         :data:`_MIN_PASSWORD_LENGTH` but otherwise opaque.
     :param issue_refresh: When ``True`` and a grant store is wired, also
         issue a login-scoped refresh grant and include ``refresh_token``
-        in the response. Intended for CLI / unattended-host callers only
-        (``omnigent login``); the web form never sends this field, so
-        browser sessions never receive long-lived refresh material. Pydantic
+        in the response, and set no session cookie. Intended for CLI /
+        unattended-host callers only (``omnigent login``); the web form never
+        sends this field, so browser sessions never receive long-lived refresh
+        material. Pydantic
         coerces non-bool values to bool, so only the literal JSON booleans
         ``true``/``false`` are accepted.
     """
@@ -336,12 +338,16 @@ def create_accounts_auth_router(
             status_code=status_code, content={"error": REFUSAL_MESSAGES[code], "code": code}
         )
 
-    def _login_binding(request: Request, username: str, invite: str | None) -> str | JSONResponse:
+    def _login_binding(
+        request: Request, username: str, invite: str | None, *, cli: bool = False
+    ) -> str | JSONResponse:
         """How a login relates to the proxy's sign-in: refuse it, or what to bind after.
 
         Returns ``"none"``, ``"owner"`` (the proxy asserts the operator: bind the
         owner's own account), ``"link"`` (a link invitation), or a refusal.
-        Decided before the password is checked, from the username alone.
+        Decided before the password is checked, from the username alone. A *cli*
+        login (one asking for refresh material) never binds the founding owner:
+        only a browser's sign-in does.
         """
         mode = external_identity_mode(request)
         resolved = resolved_external_identity(request)
@@ -353,9 +359,10 @@ def create_accounts_auth_router(
             return "none" if resolved.member.user_id == username else _refused(MISMATCH_CODE)
         if invite is not None:
             return "link"
-        if resolved.identity.installation_owner:
+        if resolved.identity.installation_owner and not cli:
             return "owner"
-        return _refused(UNBOUND_CODE)
+        refusal = unbound_refusal(mode)
+        return "none" if refusal is None else _refused(refusal)
 
     def _member_suspended(user_id: str) -> bool:
         if team_store is None:
@@ -471,7 +478,7 @@ def create_accounts_auth_router(
 
     @router.post("/login")
     async def login(request: Request, body: LoginRequest) -> Response:
-        """Verify password and mint a session cookie.
+        """Verify password and mint a session: a browser's cookie, or a CLI's body token.
 
         Returns 401 on any failure (unknown user, wrong password,
         malformed hash). The route does NOT distinguish between
@@ -482,7 +489,7 @@ def create_accounts_auth_router(
         OWASP authentication cheat-sheet guidance.
         """
         username = body.username.strip().lower()
-        binding = _login_binding(request, username, body.invite)
+        binding = _login_binding(request, username, body.invite, cli=body.issue_refresh is True)
         if isinstance(binding, JSONResponse):
             _logger.info("auth/login: refused by the front proxy's sign-in")
             return binding
@@ -571,7 +578,10 @@ def create_accounts_auth_router(
         if generation is None or not account_store.accepts_generation(username, generation):
             return JSONResponse(status_code=401, content={"error": "invalid username or password"})
         resp = JSONResponse(status_code=200, content=body_payload)
-        _set_browser_session_cookie(resp, username, generation)
+        # A CLI sign-in keeps the token from the body and gets no cookie: nothing it keeps can
+        # pass for a browser's own session.
+        if body.issue_refresh is not True:
+            _set_browser_session_cookie(resp, username, generation)
         _logger.info("auth/login: success for %s", _redact_for_log(username))
         return resp
 
