@@ -310,6 +310,12 @@ from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
 )
+from omnigent.server.turn_attribution import (
+    TurnInitiator,
+    derive_agent_initiator,
+    person_initiator,
+    startup_initiator,
+)
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     MAX_SESSION_EVENT_REQUEST_BYTES,
@@ -847,6 +853,47 @@ def register_events_routes(
             return True
         return _has_bound_runner_authority(request, conv)
 
+    def _runner_originated(
+        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+    ) -> bool:
+        """Whether software (a runner) rather than a person sent this event."""
+        if isinstance(request, _RunnerEventContext):
+            return True
+        if isinstance(request, StartupInputContext):
+            return False
+        if auth_provider is not None:
+            principal = auth_provider.principal(request)
+            if principal is not None and principal.is_machine:
+                return True
+        return _has_runner_created_by_authority(request, conv)
+
+    async def _registration(person: str | None) -> str | None:
+        """The person's current account registration (the one this request was checked against)."""
+        if person is None or permission_store is None:
+            return None
+        account = await asyncio.to_thread(permission_store.get_user, person)
+        return getattr(account, "account_generation", None) if account is not None else None
+
+    async def _resolve_turn_initiator(
+        request: Request | _RunnerEventContext | StartupInputContext,
+        conv: Any,
+        user_id: str | None,
+        *,
+        from_session_id: str | None,
+    ) -> TurnInitiator:
+        """Who starts the turn this message begins, from the server's own records."""
+        if isinstance(request, StartupInputContext):
+            return startup_initiator(_attribution_user(request.user_id), request.scheduled_task_id)
+        if from_session_id is not None or _runner_originated(request, conv):
+            return await asyncio.to_thread(
+                derive_agent_initiator,
+                conversation_store,
+                conv,
+                from_session_id=from_session_id,
+            )
+        person = _attribution_user(user_id)
+        return person_initiator(person, await _registration(person))
+
     async def _record_turn_attribution(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1219,6 +1266,7 @@ def register_events_routes(
             ),
         )
         peer_message = body.type == "session_message"
+        peer_source_id: str | None = None
         if peer_message:
             if not isinstance(request, Request):
                 raise OmnigentError(
@@ -1234,6 +1282,7 @@ def register_events_routes(
             )
             from omnigent.server.session_orchestration import orchestration_message
 
+            peer_source_id = source.id
             body = orchestration_message(source.id, body.data.get("message"))
         if body.type == "message" and _is_native_terminal_session(conv):
             _logger.info(
@@ -1262,24 +1311,26 @@ def register_events_routes(
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
         created_by = _attribution_user(user_id)
         body_created_by = _attribution_user(body.created_by)
-        if body_created_by is not None:
-            if not _has_runner_created_by_authority(request, conv):
-                raise OmnigentError(
-                    "created_by is reserved for runner-originated session events",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            try:
-                await _require_access_and_level(
-                    body_created_by,
+        if body_created_by is not None and not _has_runner_created_by_authority(request, conv):
+            raise OmnigentError(
+                "created_by is reserved for runner-originated session events",
+                code=ErrorCode.FORBIDDEN,
+            )
+        # Who started a turn comes from the server's records only. A runner's
+        # ``created_by`` is never taken: an agent's message is attributed to the
+        # person the server recorded on the thread the agent works for.
+        initiator: TurnInitiator | None = None
+        if body.type in ("message", _SLASH_COMMAND_TYPE):
+            initiator = await _resolve_turn_initiator(
+                request, conv, user_id, from_session_id=peer_source_id
+            )
+            created_by = initiator.responsible_person
+            if body_created_by is not None and body_created_by != created_by:
+                _logger.info(
+                    "Ignored a runner's created_by claim for session %s",
                     session_id,
-                    LEVEL_EDIT,
-                    permission_store,
-                    conversation_store,
+                    extra={"session_id": session_id},
                 )
-            except OmnigentError:
-                pass
-            else:
-                created_by = body_created_by
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -3556,6 +3607,7 @@ def register_events_routes(
                 created_by=created_by,
                 legacy_skill_names=_legacy_skill_names,
                 startup_input=request if isinstance(request, StartupInputContext) else None,
+                initiator=initiator,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
@@ -3584,6 +3636,7 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
+            initiator=initiator,
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

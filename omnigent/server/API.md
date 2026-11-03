@@ -321,6 +321,49 @@ the agent. User messages and function call outputs do not have `model` — the a
 is always recoverable from `response_id` if needed. To continue a conversation,
 pass the `response_id` from the last item as `previous_response_id`.
 
+#### Turn attribution
+
+The user message that starts a turn carries `attribution`: who started the
+turn, on whose thread, computer and harness login. Every value is the
+server's own record; `null` means unknown. It holds names, ids and settings
+only: never a credential, sign-in code, access assertion, prompt content or
+cost. Other items, and items saved before attribution existed (or on a
+separately hosted conversation database without the column), omit it.
+
+```json
+"attribution": {
+  "v": 1,
+  "initiator": {
+    "kind": "person",              // person | schedule | agent | terminal
+    "user": "bob",                 // the person, or a schedule's owner
+    "registration": "3f2c…",       // that person's account registration
+    "schedule_id": null,           // for schedule
+    "from_session_id": null,       // for agent: the thread whose agent sent it
+    "on_behalf_of": null,          // for agent: the person it acts for
+    "source": "signed_in"          // signed_in | schedule | thread_record |
+                                   // pending_input | terminal_attach | owner_assumed
+  },
+  "owner": {"user": "alice", "registration": "9a1b…"},
+  "host": {"id": "…", "name": "alice-laptop", "owner": "alice",
+           "kind": "personal", "runner_id": "…"},     // or null
+  "subscription": {
+    "subject": "alice",            // whose configured login: the computer's owner
+    "provider": "anthropic",
+    "source": "computer_login",    // computer_login | configured_provider | unknown
+    "login_state": "ready",        // the computer's own report
+    "login_state_reported_by": "computer",
+    "account": null,               // provider accounts are not verified
+    "verified": false
+  },
+  "harness": "claude-native",
+  "model": {"requested": "claude-opus-4-8", "reported": null},
+  "effort": {"requested": "high", "reported": "xhigh"},
+  "recorded_at": 1793700000
+}
+```
+
+The same object rides on `session.input.consumed` (`data.attribution`).
+
 ### Update Conversation
 
 ```
@@ -1217,6 +1260,46 @@ approval on a dedicated path rather than an in-band session event —
 which is what policy ASK gates rely on, so the verdict cannot be
 conflated with a generic session event. Any value other than
 `action: "accept"` denies.
+
+For a recorded approval (a policy ASK in the approval ledger) the response,
+and `GET .../elicitations/{elicitation_id}`, add `"approval"`: who asked and
+who answered under which grant, as listed below.
+
+### List a Thread's Approvals
+
+```
+GET /v1/sessions/{session_id}/approvals
+
+200 OK
+{"object": "list", "data": [{
+  "object": "approval", "elicitation_id": "elicit_…", "session_id": "…",
+  "state": "consumed",                      // pending | approved | declined | consumed
+  "phase": "tool_call", "action": "tracker__post_update", "destination": "tracker",
+  "initiator": "alice", "owner": "alice",
+  "asked": {"initiator": "alice", "contributors": ["bob"],
+            "principal": {"kind": "runner", "user": "alice", "runner": "…", "host": "…"},
+            "owner": {…}, "host": {…}, "subscription": {…},
+            "harness": "…", "model": {…}, "effort": {…}},
+  "requirements": [{"kind": "team", "resource": [2, "tracker"]}],
+  "answers": [{"by": "carol", "action": "accept", "at": 1793700100, "satisfies": [0],
+               "as": [{"requirement": 0, "role": "service_approver",
+                       "kind": "team", "resource": [2, "tracker"]}]}],
+  "decided_by": "carol", "decided_at": 1793700100,
+  "decision_digest": "8ba2…",                // sha256 of the bound decision
+  "created_at": 1793700000, "expires_at": 1793786400, "consumed_at": 1793700101
+}]}
+
+404 Not Found — no such thread, or the caller cannot read it
+403 Forbidden — a runner or host token (people only)
+```
+
+The thread's approvals and its sub-agents', newest first, for anyone who can
+read the thread. `contributors` are the people whose input joined the turn
+before it asked; where the person who started an action may not approve it,
+none of them may. `role` is the grant an answer was given under:
+`thread_owner`, `thread_approver`, `service_approver` or `team_approver`.
+Answered approvals are kept until their thread is deleted; unanswered ones
+are purged a week after they expire.
 
 ### Fork Session
 

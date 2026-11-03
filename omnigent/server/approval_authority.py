@@ -20,6 +20,12 @@ An approval is consumed once, by the operation it was bound to, and only
 while every bound fact still holds: changed arguments, rules, approvers,
 owner or connection need a new decision. A retry of the consuming
 operation inspects that operation's recorded result instead.
+
+Each ledger row also records who asked (the turn's initiator, everyone whose
+input joined the turn, the asking principal, the thread's owner, computer and
+harness login), and each answer the role it was given under. Where the person
+who started an action may not approve it, nobody whose input joined the turn
+may either: a message queued or injected by another person can have steered it.
 """
 
 from __future__ import annotations
@@ -348,7 +354,99 @@ def _record_sync(
         binding=binding.fields,
         requirements=requirements,
         expires_at=now + int(ask_timeout) + CONSUME_GRACE_SECONDS,
+        attribution=_asked_attribution(conversation_store, subject, binding.fields),
     )
+
+
+# How far back a turn's contributors are read; a turn's own inputs are recent.
+_CONTRIBUTOR_SCAN_LIMIT = 500
+
+
+def turn_contributors(conversation_store: ConversationStore, session_id: str) -> list[str]:
+    """Everyone whose input joined the thread since its current turn started; blocking.
+
+    Read from the attribution saved with each input (its answerable person),
+    or the item's author where attribution is unknown. Without a recorded turn
+    start (an older runner), nobody beyond the turn actor is known.
+    """
+    from omnigent.entities.conversation import MessageData
+    from omnigent.server.turn_attribution import TURN_STARTED_AT_LABEL
+
+    conversation = conversation_store.get_conversation(session_id)
+    raw_start = (conversation.labels or {}).get(TURN_STARTED_AT_LABEL) if conversation else None
+    try:
+        started_at = int(raw_start) if raw_start is not None else None
+    except ValueError:
+        started_at = None
+    if started_at is None:
+        return []
+    people: set[str] = set()
+    before: str | None = None
+    scanned = 0
+    while scanned < _CONTRIBUTOR_SCAN_LIMIT:
+        page = conversation_store.list_items(session_id, limit=100, order="desc", before=before)
+        for item in page.data:
+            if item.created_at < started_at:
+                return sorted(people)
+            if isinstance(item.data, MessageData) and item.data.role == "user":
+                person = (
+                    item.attribution.responsible_person()
+                    if item.attribution is not None
+                    else item.created_by
+                )
+                if person:
+                    people.add(person)
+        scanned += len(page.data)
+        if not page.has_more or not page.data:
+            break
+        before = page.data[-1].id
+    return sorted(people)
+
+
+def _asked_attribution(
+    conversation_store: ConversationStore,
+    subject: ApprovalSubject,
+    binding: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Who asked for an approval, and on whose thread, computer and login."""
+    from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
+
+    try:
+        conversation = conversation_store.get_conversation(subject.session_id)
+        if conversation is None:
+            return None
+        initiator = binding.get("initiator")
+        contributors = [
+            person
+            for person in turn_contributors(conversation_store, subject.session_id)
+            if person != initiator
+        ]
+        turn = build_turn_attribution(
+            conversation_store,
+            conversation,
+            TurnInitiator("person", initiator, "thread_record"),
+        ).model_dump(exclude={"initiator", "recorded_at", "v"})
+    except Exception:
+        _logger.warning("approval attribution could not be read", exc_info=True)
+        return None
+    return {
+        "v": 1,
+        "initiator": initiator,
+        "contributors": contributors,
+        "principal": binding.get("principal"),
+        **turn,
+    }
+
+
+def _initiators(record: VerdictRecord) -> frozenset[str | None]:
+    """The turn's initiator and everyone whose input joined it."""
+    contributors = (record.attribution or {}).get("contributors")
+    extra = (
+        [person for person in contributors if isinstance(person, str)]
+        if isinstance(contributors, list)
+        else []
+    )
+    return frozenset({record.binding.get("initiator"), *extra})
 
 
 async def record_protected_approval(
@@ -543,28 +641,55 @@ class AnswerGate:
     awaiting: tuple[str, ...] = ()
 
 
-def _eligible(
+def _role(
     requirement: dict[str, Any],
     answerer: str | None,
     *,
     owner: str | None,
-    initiator: str | None,
+    initiators: frozenset[str | None],
     approvers: dict[ApprovalResource, ResourceApprovers],
-) -> bool:
+) -> str | None:
+    """The role *answerer* may answer *requirement* under, or ``None``.
+
+    ``thread_owner`` or ``thread_approver`` for a personal requirement;
+    ``service_approver`` or ``team_approver`` for a team one.
+    """
     resource = ApprovalResource.from_json(requirement["resource"])
     named = approvers[resource]
     if requirement["kind"] == PERSONAL_NEED:
         is_owner = answerer is not None and answerer == owner
         if not is_owner and answerer not in named.approvers:
-            return False
+            return None
         # The owner approves their own work by default; a thread that refuses
         # its initiator refuses its owner's own actions too.
-        return answerer != initiator or named.initiator_may_approve()
+        if answerer in initiators and not named.initiator_may_approve():
+            return None
+        return "thread_owner" if is_owner else "thread_approver"
+    role = "service_approver"
     if resource.kind is ResourceKind.SERVICE and not named.approvers:
         named = approvers[TEAM_RESOURCE]
+        role = "team_approver"
+    elif resource.kind is ResourceKind.TEAM:
+        role = "team_approver"
     if answerer not in named.approvers:
-        return False
-    return answerer != initiator or named.initiator_may_approve()
+        return None
+    if answerer in initiators and not named.initiator_may_approve():
+        return None
+    return role
+
+
+def _eligible(
+    requirement: dict[str, Any],
+    answerer: str | None,
+    *,
+    owner: str | None,
+    initiators: frozenset[str | None],
+    approvers: dict[ApprovalResource, ResourceApprovers],
+) -> bool:
+    return (
+        _role(requirement, answerer, owner=owner, initiators=initiators, approvers=approvers)
+        is not None
+    )
 
 
 def _gate_sync(
@@ -584,6 +709,7 @@ def _gate_sync(
             "This approval expired; it must be asked again.", code=ErrorCode.CONFLICT
         )
     requirements = record.requirements
+    roles: dict[int, str] = {}
     if not auth_on:
         satisfied = set(range(len(requirements)))
     else:
@@ -595,14 +721,14 @@ def _gate_sync(
             )
         resources = requirement_resources(requirements)
         approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
-        initiator = record.binding.get("initiator")
-        satisfied = {
-            index
-            for index, requirement in enumerate(requirements)
-            if _eligible(
-                requirement, answerer, owner=owner, initiator=initiator, approvers=approvers
+        initiators = _initiators(record)
+        for index, requirement in enumerate(requirements):
+            role = _role(
+                requirement, answerer, owner=owner, initiators=initiators, approvers=approvers
             )
-        }
+            if role is not None:
+                roles[index] = role
+        satisfied = set(roles)
         if not satisfied:
             can_see = permission_store is not None and check_session_access(
                 answerer, record.session_id, LEVEL_READ, permission_store, conversation_store
@@ -627,6 +753,16 @@ def _gate_sync(
         "action": "accept" if not decline else "decline",
         "satisfies": sorted(satisfied),
         "at": now,
+        # The grant each requirement was answered under.
+        "as": [
+            {
+                "requirement": index,
+                "role": roles.get(index),
+                "kind": requirements[index]["kind"],
+                "resource": requirements[index]["resource"],
+            }
+            for index in sorted(satisfied)
+        ],
     }
     # Completion is decided from the locked row's answers, not this snapshot.
     updated = store.record_answer(record.elicitation_id, answer=answer, decline=decline, now=now)
@@ -710,16 +846,46 @@ def may_view_approval(
     owner = _owner(conversation_store, record.session_id)
     resources = requirement_resources(record.requirements)
     approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
+    initiators = _initiators(record)
     return any(
         _eligible(
             requirement,
             user_id,
             owner=owner,
-            initiator=record.binding.get("initiator"),
+            initiators=initiators,
             approvers=approvers,
         )
         for requirement in record.requirements
     )
+
+
+def approval_view(record: VerdictRecord) -> dict[str, Any]:
+    """An approval as the API shows it: who asked, who answered as what, the digest.
+
+    No content, credential or prompt text: the binding's content is only a
+    digest, and the attribution holds names, ids and settings.
+    """
+    binding = record.binding
+    return {
+        "object": "approval",
+        "elicitation_id": record.elicitation_id,
+        "session_id": record.session_id,
+        "state": record.state.name.lower(),
+        "phase": binding.get("phase"),
+        "action": binding.get("action"),
+        "destination": binding.get("destination"),
+        "initiator": binding.get("initiator"),
+        "owner": binding.get("owner"),
+        "asked": record.attribution,
+        "requirements": record.requirements,
+        "answers": record.answers,
+        "decided_by": record.decided_by,
+        "decided_at": record.decided_at,
+        "decision_digest": record.binding_digest.hex(),
+        "created_at": record.created_at,
+        "expires_at": record.expires_at,
+        "consumed_at": record.consumed_at,
+    }
 
 
 __all__ = [
@@ -729,6 +895,7 @@ __all__ = [
     "ApprovalSubject",
     "ConsumedApproval",
     "answer_credential_problem",
+    "approval_view",
     "canonical_digest",
     "consume_protected_approval",
     "current_binding",
@@ -738,5 +905,6 @@ __all__ = [
     "record_operation_outcome",
     "record_protected_approval",
     "replay_matches",
+    "turn_contributors",
     "turn_initiator",
 ]

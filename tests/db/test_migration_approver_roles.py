@@ -64,7 +64,13 @@ def _has_login_id(engine: sa.Engine) -> bool:
 
 
 def _use_every_table(db_uri: str) -> None:
-    """The store works against the migrated schema."""
+    """The store works against the migrated schema.
+
+    The store reads the current schema, which later revisions extend, so the
+    database is upgraded to head first.
+    """
+    engine = get_or_create_engine(db_uri)
+    _migrate(engine, "head")
     store = SqlAlchemyApprovalStore(db_uri)
     service = ApprovalResource(ResourceKind.SERVICE, "tracker")
     assert store.add_approver(service, "carol", granted_by="admin")

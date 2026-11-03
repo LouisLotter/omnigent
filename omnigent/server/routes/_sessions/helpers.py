@@ -123,6 +123,7 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -1789,6 +1790,7 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+            attribution=item.attribution.model_dump() if item.attribution is not None else None,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -7915,6 +7917,7 @@ async def _dispatch_skill_slash_command_to_runner(
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
     startup_input: StartupInputContext | None = None,
+    initiator: TurnInitiator | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -7984,6 +7987,15 @@ async def _dispatch_skill_slash_command_to_runner(
         stable_id=startup_input_id,
         replaces_pending_id=startup_input_id,
     )
+    if initiator is not None:
+        # The command starts a turn: its attribution is saved with it.
+        visible_item = visible_item.model_copy(
+            update={
+                "attribution": await asyncio.to_thread(
+                    build_turn_attribution, conversation_store, conv, initiator
+                )
+            }
+        )
     meta_item = NewConversationItem(
         type="message",
         response_id=response_id,
@@ -10740,11 +10752,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {WORKTREE_ROOT_LABEL_KEY!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    if _TURN_ACTOR_LABEL in labels:
-        raise OmnigentError(
-            f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    from omnigent.server.turn_attribution import TURN_STARTED_AT_LABEL
+
+    for server_label in (_TURN_ACTOR_LABEL, TURN_STARTED_AT_LABEL):
+        if server_label in labels:
+            raise OmnigentError(
+                f"label {server_label!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
     # The archive timestamp is stamped by the server on the archive transition
     # only; a client write would forge the retention clock, including on shared
     # sessions the caller does not own.

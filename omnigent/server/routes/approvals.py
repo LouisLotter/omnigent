@@ -1,6 +1,9 @@
 """Approver inbox, approver grants and protected policies.
 
 - ``GET /v1/approvals``: pending protected approvals the caller may answer.
+- ``GET /v1/sessions/{id}/approvals``: a thread's approvals (its sub-agents'
+  included) with who asked and who answered under which grant, for anyone who
+  can read the thread.
 - ``GET/POST/DELETE /v1/approvers``: named approvers for a thread, a service
   or the team; ``PUT /v1/approval-settings``: whether the person who started
   an action may approve it. A thread's actual owner manages its approvers
@@ -25,7 +28,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
-from omnigent.server.approval_authority import answer_credential_problem, may_view_approval
+from omnigent.server.approval_authority import (
+    answer_credential_problem,
+    approval_view,
+    may_view_approval,
+)
 from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_LOCAL,
@@ -140,6 +147,23 @@ def _validate_handler(handler: str, factory_params: dict[str, Any] | None) -> No
         raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
 
 
+# A thread tree's approvals are read for at most this many threads.
+_MAX_TREE_THREADS = 256
+
+
+def _thread_tree(conversation_store: ConversationStore, session_id: str) -> list[str]:
+    """The thread and its sub-agents, breadth first, bounded."""
+    tree = [session_id]
+    frontier = [session_id]
+    while frontier and len(tree) < _MAX_TREE_THREADS:
+        children = conversation_store.list_child_conversation_ids_by_parent(frontier)
+        frontier = [
+            child for parent in frontier for child in children.get(parent, []) if child not in tree
+        ][: _MAX_TREE_THREADS - len(tree)]
+        tree.extend(frontier)
+    return tree
+
+
 def _acting(resource: ApprovalResource) -> Acting:
     """The authority a change to *resource* needs, rechecked inside the write."""
     if resource.kind is ResourceKind.SESSION:
@@ -228,22 +252,28 @@ def create_approvals_router(
                 may_view_approval, store, conversation_store, record, user_id
             ):
                 continue
-            binding = record.binding
-            data.append(
-                {
-                    "elicitation_id": record.elicitation_id,
-                    "session_id": record.session_id,
-                    "phase": binding.get("phase"),
-                    "action": binding.get("action"),
-                    "destination": binding.get("destination"),
-                    "initiator": binding.get("initiator"),
-                    "owner": binding.get("owner"),
-                    "requirements": record.requirements,
-                    "answers": record.answers,
-                    "expires_at": record.expires_at,
-                }
-            )
+            data.append(approval_view(record))
         return {"object": "list", "data": data}
+
+    @router.get("/sessions/{session_id}/approvals")
+    async def list_session_approvals(request: Request, session_id: str) -> dict[str, Any]:
+        """A thread's approvals, newest first: who asked and who answered as what."""
+        user_id = _person(request, write=False)
+        thread = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if thread is None:
+            raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        if permission_store is not None and not await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        ):
+            raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        tree = await asyncio.to_thread(_thread_tree, conversation_store, session_id)
+        records = await asyncio.to_thread(store.session_verdicts, tree)
+        return {"object": "list", "data": [approval_view(record) for record in records]}
 
     @router.get("/approvers")
     async def list_approvers(

@@ -311,6 +311,13 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    def runner_capabilities(self, runner_id: str | None) -> frozenset[str] | None:
+        """The capabilities a connected runner advertised; ``None`` when not connected here."""
+        connection = self._registry.get(runner_id) if runner_id else None
+        if connection is None:
+            return None
+        return frozenset(connection.hello.capabilities)
+
     def require_mcp_registry_support(self, conversation: Conversation) -> None:
         """Validate the connected runner before sending it a registry-backed agent."""
         from omnigent.host.frames import CAP_MCP_REGISTRY

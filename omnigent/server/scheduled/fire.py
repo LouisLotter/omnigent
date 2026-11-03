@@ -1296,6 +1296,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             _launch_runner_on_host,
             _wait_for_runner_client,
         )
+        from omnigent.server.turn_attribution import schedule_initiator
 
         if deps.host_registry is None or deps.host_store is None:
             raise RuntimeError("connected host registry/store is not configured")
@@ -1368,6 +1369,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             runner_router=deps.runner_router,
             agent_revision=agent_revision,
             authorize_submission=authorize_submission,
+            initiator=schedule_initiator(task.user_id, task.id, task.account_generation),
         )
 
     return _dispatch

@@ -202,6 +202,65 @@ async def test_turn_sequencing_buffers_concurrent_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_each_turn_names_its_inputs_when_it_starts_not_when_queued() -> None:
+    """A message queued behind a running turn is named only when its own turn starts."""
+    gate = asyncio.Event()
+    app, _pm, _hc = _build_blocking_app(gate)
+    session_id = "5e1f0bd1f0cae058f05f48057e9f98c1"
+    collected: list[dict[str, Any]] = []
+
+    def _named() -> list[list[str]]:
+        queue = app.state.session_event_queues.get(session_id)
+        while queue is not None and not queue.empty():
+            collected.append(queue.get_nowait())
+        return [
+            event["input_item_ids"]
+            for event in collected
+            if event.get("type") == "session.turn_started"
+        ]
+
+    def _message(text: str, item_id: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": text}],
+            "harness": "openai-agents",
+            "persisted_item_id": item_id,
+        }
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+
+        async def _first_turn() -> None:
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events", json=_message("first", "item_alice")
+            )
+            async for _ in resp.aiter_text():
+                pass
+
+        first = asyncio.create_task(_first_turn())
+        await asyncio.sleep(0.05)
+        queued = await client.post(
+            f"/v1/sessions/{session_id}/events", json=_message("second", "item_bob")
+        )
+        assert queued.json()["status"] == "buffered"
+        assert _named() == [["item_alice"]]
+
+        gate.set()
+        await asyncio.wait_for(first, timeout=5.0)
+        for _ in range(100):
+            if len(_named()) == 2:
+                break
+            await asyncio.sleep(0.05)
+        assert _named() == [["item_alice"], ["item_bob"]]
+        await client.delete(f"/v1/sessions/{session_id}")
+
+
+@pytest.mark.asyncio
 async def test_turn_lifecycle_events() -> None:
     """Turn start/complete lifecycle events appear on the session stream."""
     app, _pm, _hc = _build_lifecycle_app()

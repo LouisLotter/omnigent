@@ -281,12 +281,16 @@ async def test_post_event_records_authenticated_poster(
 
 
 @pytest.mark.asyncio
-async def test_post_event_uses_runner_supplied_created_by(
+async def test_post_event_never_takes_a_runners_created_by_claim(
     auth_client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Runner-originated wake events preserve the triggering collaborator."""
+    """A runner's ``created_by`` is ignored: its message is the agent's, for the recorded person.
+
+    Bob has edit access, so the older code took the runner's word that Bob sent
+    it. The server's own record says the turn is Alice's.
+    """
     from omnigent.server.routes import sessions as sessions_mod
     from omnigent.server.routes.sessions import routes_events as events_mod
 
@@ -298,8 +302,10 @@ async def test_post_event_uses_runner_supplied_created_by(
 
     session_id = _seed_shared_session(
         db_uri,
-        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+        {"alice@example.com": LEVEL_OWNER, "bob@example.com": LEVEL_EDIT},
     )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(session_id, {"omnigent.turn_actor": "alice@example.com"})
     runner_headers = _bind_runner(db_uri, session_id)
 
     resp = await auth_client.post(
@@ -316,9 +322,15 @@ async def test_post_event_uses_runner_supplied_created_by(
     )
     assert resp.status_code == 202, resp.text
 
-    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
-    [persisted] = items.data
-    assert persisted.created_by == "bob@example.com"
+    [persisted] = (await asyncio.to_thread(store.list_items, session_id)).data
+    assert persisted.created_by == "alice@example.com"
+    assert persisted.attribution is not None
+    initiator = persisted.attribution.initiator
+    assert (initiator.kind, initiator.on_behalf_of, initiator.source) == (
+        "agent",
+        "alice@example.com",
+        "thread_record",
+    )
 
 
 @pytest.mark.asyncio
@@ -468,12 +480,12 @@ async def test_post_event_rejects_client_supplied_created_by(
 
 
 @pytest.mark.asyncio
-async def test_post_event_stale_runner_created_by_falls_back_to_runner_user(
+async def test_a_runners_message_without_a_recorded_person_is_the_owners(
     auth_client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A revoked collaborator cannot strand a trusted runner wake notice."""
+    """With no turn actor recorded, an agent's message acts for the owner, marked assumed."""
     from omnigent.server.routes import sessions as sessions_mod
     from omnigent.server.routes.sessions import routes_events as events_mod
 
@@ -483,7 +495,7 @@ async def test_post_event_stale_runner_created_by_falls_back_to_runner_user(
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
     monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
 
-    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_OWNER})
     runner_headers = _bind_runner(db_uri, session_id)
 
     resp = await auth_client.post(
@@ -503,6 +515,8 @@ async def test_post_event_stale_runner_created_by_falls_back_to_runner_user(
     items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
     [persisted] = items.data
     assert persisted.created_by == "alice@example.com"
+    assert persisted.attribution is not None
+    assert persisted.attribution.initiator.source == "owner_assumed"
 
 
 @pytest.mark.asyncio

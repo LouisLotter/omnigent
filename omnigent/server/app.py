@@ -2097,6 +2097,9 @@ def create_app(
     )
     app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
+    from omnigent.server.turn_attribution import set_attribution_host_store
+
+    set_attribution_host_store(host_store)
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider

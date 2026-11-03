@@ -1491,7 +1491,7 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
-    from omnigent.host.frames import CAP_MCP_REGISTRY
+    from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TURN_INPUTS
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
         CAP_FILESYSTEM_ATTACHMENTS,
@@ -1506,6 +1506,7 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
+                    CAP_TURN_INPUTS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

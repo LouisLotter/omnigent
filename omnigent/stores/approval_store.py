@@ -258,6 +258,9 @@ class VerdictRecord:
     :param outcome: The consuming operation's result state.
     :param outcome_body: The recorded result, when kept.
     :param created_at: When it was asked.
+    :param attribution: Who asked: the turn's initiator and contributors, the
+        asking principal, the thread's owner, computer and harness login.
+        ``None`` for rows recorded before attribution existed.
     """
 
     elicitation_id: str
@@ -275,6 +278,7 @@ class VerdictRecord:
     outcome: Outcome | None
     outcome_body: str | None
     created_at: int
+    attribution: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -342,7 +346,18 @@ def _to_verdict(row: SqlApprovalVerdict) -> VerdictRecord:
         outcome=Outcome(row.outcome) if row.outcome is not None else None,
         outcome_body=row.outcome_body,
         created_at=row.created_at,
+        attribution=_json_object(row.attribution),
     )
+
+
+def _json_object(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _validate_rule_target(
@@ -382,6 +397,17 @@ def remove_account_approval_authority(session: Session, user_id: str) -> None:
             SqlProtectedPolicy.owner_user_id == user_id,
         )
     )
+
+
+def delete_session_verdicts(session: Session, session_ids: Sequence[str]) -> None:
+    """Delete the approvals of threads being deleted, inside their deletion."""
+    if session_ids:
+        session.execute(
+            delete(SqlApprovalVerdict).where(
+                SqlApprovalVerdict.workspace_id == current_workspace_id(),
+                SqlApprovalVerdict.session_id.in_(list(session_ids)),
+            )
+        )
 
 
 def _lock_authority(session: Session) -> None:
@@ -828,11 +854,13 @@ class SqlAlchemyApprovalStore:
         binding: dict[str, Any],
         requirements: Sequence[dict[str, Any]],
         expires_at: int,
+        attribution: dict[str, Any] | None = None,
     ) -> VerdictRecord:
         """Record a protected approval request.
 
         Re-recording the same id with the same binding (a hook retry) returns
         the existing row. The same id with another binding is refused.
+        *attribution* (who asked) is written in the same insert.
 
         :raises OmnigentError: ``CONFLICT`` when the id is bound to another request.
         """
@@ -855,6 +883,9 @@ class SqlAlchemyApprovalStore:
                 state=int(VerdictState.PENDING),
                 expires_at=expires_at,
                 created_at=_now(),
+                attribution=(
+                    json.dumps(attribution, sort_keys=True) if attribution is not None else None
+                ),
             )
             session.add(row)
             session.flush()
@@ -867,6 +898,24 @@ class SqlAlchemyApprovalStore:
         with self._session("select_approval_verdict") as session:
             row = session.get(SqlApprovalVerdict, (current_workspace_id(), elicitation_id))
             return _to_verdict(row) if row is not None else None
+
+    def session_verdicts(
+        self, session_ids: Sequence[str], *, limit: int = 200
+    ) -> list[VerdictRecord]:
+        """A thread's approvals (pass a sub-agent tree's ids for all of it), newest first."""
+        if not session_ids:
+            return []
+        with self._session("select_session_approval_verdicts") as session:
+            rows = session.execute(
+                select(SqlApprovalVerdict)
+                .where(
+                    SqlApprovalVerdict.workspace_id == current_workspace_id(),
+                    SqlApprovalVerdict.session_id.in_(list(session_ids)),
+                )
+                .order_by(SqlApprovalVerdict.created_at.desc(), SqlApprovalVerdict.elicitation_id)
+                .limit(limit)
+            ).scalars()
+            return [_to_verdict(row) for row in rows]
 
     def pending_verdicts(self, *, now: int | None = None, limit: int = 200) -> list[VerdictRecord]:
         """Unexpired pending approvals, newest first."""
@@ -1002,7 +1051,11 @@ class SqlAlchemyApprovalStore:
         run_write_transaction(self._session_immediate, "record_approval_outcome", write)
 
     def purge_expired(self, *, before: int) -> int:
-        """Delete ledger rows that expired before *before*; returns how many."""
+        """Delete unanswered ledger rows that expired before *before*; returns how many.
+
+        A row anyone answered is the record of who decided; it stays until its
+        thread is deleted (see :func:`delete_session_verdicts`).
+        """
 
         def write(session: Session) -> int:
             result = cast(
@@ -1011,6 +1064,7 @@ class SqlAlchemyApprovalStore:
                     delete(SqlApprovalVerdict).where(
                         SqlApprovalVerdict.workspace_id == current_workspace_id(),
                         SqlApprovalVerdict.expires_at < before,
+                        SqlApprovalVerdict.answers.is_(None),
                     )
                 ),
             )
@@ -1051,6 +1105,7 @@ __all__ = [
     "VerdictRecord",
     "VerdictState",
     "canonical_digest",
+    "delete_session_verdicts",
     "grants_fingerprint",
     "remove_account_approval_authority",
     "requirement_resources",

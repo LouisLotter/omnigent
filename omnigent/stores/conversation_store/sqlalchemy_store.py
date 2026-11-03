@@ -13,6 +13,7 @@ from sqlalchemy import (
     ColumnElement,
     LargeBinary,
     Select,
+    Table,
     and_,
     asc,
     delete,
@@ -27,7 +28,10 @@ from sqlalchemy import (
     tuple_,
     update,
 )
-from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy import (
+    inspect as sqlalchemy_inspect,
+)
+from sqlalchemy.orm import QueryableAttribute, Session, load_only, undefer
 from sqlalchemy.sql.selectable import ScalarSelect, Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -91,6 +95,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.entities.attribution import TurnAttribution
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
@@ -768,6 +773,33 @@ def _fetch_search_snippets(
     return out
 
 
+def _has_item_attribution_column(engine: Any) -> bool:
+    """Whether ``conversation_items`` has the ``attribution`` column.
+
+    A separately hosted conversation database is created by ``create_all`` and
+    never migrated, so one created before the column existed lacks it. Unknown
+    (the probe failed) counts as absent: attribution then reads as unknown and
+    is not written, and no turn fails for it.
+    """
+    try:
+        columns = sqlalchemy_inspect(engine).get_columns("conversation_items")
+    except Exception:
+        _logger.warning("could not inspect conversation_items; attribution off", exc_info=True)
+        return False
+    return any(column["name"] == "attribution" for column in columns)
+
+
+def _loaded_attribution(row: object) -> TurnAttribution | None:
+    """The row's attribution if the query loaded it; never triggers a load."""
+    state = getattr(row, "__dict__", None)
+    if isinstance(state, dict) and "_sa_instance_state" in state:
+        raw = state.get("attribution")
+    else:
+        mapping = getattr(row, "_mapping", None)
+        raw = mapping.get("attribution") if mapping is not None else None
+    return TurnAttribution.from_json(raw) if isinstance(raw, str) else None
+
+
 def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
     """
     Convert a :class:`SqlConversationItem` ORM row to a
@@ -793,6 +825,7 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
+        attribution=_loaded_attribution(row),
     )
 
 
@@ -951,6 +984,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Omnigent) gets the correct lock strategy for each table group.
         self._supports_for_update = self._conv_engine.dialect.name != "sqlite"
         self._meta_supports_for_update = self._engine.dialect.name != "sqlite"
+        self._item_attribution = _has_item_attribution_column(self._conv_engine)
         # SQLite rowid is monotonically increasing absent deletions; it serves
         # as an insertion-ordered tiebreaker for timestamp ties. Note: without
         # the AUTOINCREMENT keyword, SQLite may reuse a rowid if the max-rowid
@@ -2229,7 +2263,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return []
             rows = (
                 session.execute(
-                    select(SqlConversationItem).where(
+                    self._item_select().where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.id.in_(item_ids),
                     )
@@ -2343,7 +2377,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         with self._conv_session("get_item") as session:
             row = session.execute(
-                select(SqlConversationItem).where(
+                self._item_select().where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id == conversation_id,
                     SqlConversationItem.id == item_id,
@@ -2404,6 +2438,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         # avoids a per-chunk lazy refresh that would pull the
                         # wide search_text column back in.
                         SqlConversationItem.position,
+                        *self._attribution_columns(),
                     )
                 )
                 .where(
@@ -2592,6 +2627,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return strip_nul_bytes(extract_search_text(item))
 
+    def _attribution_columns(self) -> tuple[QueryableAttribute[Any], ...]:
+        """The attribution column for ``load_only``, when the database has it."""
+        return (SqlConversationItem.attribution,) if self._item_attribution else ()
+
+    def _item_select(self) -> Select[tuple[SqlConversationItem]]:
+        """Select items, loading their attribution where the column exists."""
+        stmt = select(SqlConversationItem)
+        if self._item_attribution:
+            stmt = stmt.options(undefer(SqlConversationItem.attribution))
+        return stmt
+
     def append(
         self,
         conversation_id: str,
@@ -2647,6 +2693,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "data": data,
                 "created_by": item.created_by,
             }
+            if self._item_attribution:
+                # Saved in the turn's own insert; the key set stays uniform.
+                values["attribution"] = (
+                    item.attribution.to_json() if item.attribution is not None else None
+                )
             # A backend may omit search_text (see _item_search_text): when it
             # returns None we drop the column so a schema without it still
             # works, and skip its FTS row. The hook is all-or-nothing per
@@ -2676,7 +2727,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if stable_ids:
                 existing_rows = (
                     session.execute(
-                        select(SqlConversationItem).where(
+                        self._item_select().where(
                             SqlConversationItem.workspace_id == current_workspace_id(),
                             SqlConversationItem.conversation_id == conversation_id,
                             SqlConversationItem.id.in_(stable_ids),
@@ -2833,6 +2884,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         created_at=cast(int, values["created_at"]),
                         data=item.data,
                         created_by=item.created_by,
+                        attribution=item.attribution if self._item_attribution else None,
                     )
                 )
                 if item.stable_id is not None:
@@ -5136,7 +5188,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Copy items ordered by position so the fork preserves
             # the original chronological order.
             items_query = (
-                select(SqlConversationItem)
+                self._item_select()
                 .where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id == source_conversation_id,
@@ -5289,6 +5341,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                         ),
                         "search_text": search_text,
                         "created_by": src_item.created_by,
+                        # A copied turn keeps who did it, on whose computer.
+                        **(
+                            {"attribution": src_item.__dict__.get("attribution")}
+                            if self._item_attribution
+                            else {}
+                        ),
                     }
                 )
                 fts_rows.append((new_item_id, new_conv_id, search_text or ""))
@@ -5431,8 +5489,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise LookupError(f"conversation not found: {source_conversation_id!r}")
             new_conv = SqlConversation(**new_conv_values)
             session.add(new_conv)
-            for item_values in prepared_item_rows:
-                session.add(SqlConversationItem(**item_values))
+            if prepared_item_rows:
+                # A table insert names only the given columns; an ORM add would
+                # also name ones a separately hosted older database lacks.
+                session.execute(
+                    insert(cast(Table, SqlConversationItem.__table__)), prepared_item_rows
+                )
             insert_fts_bulk(session, fts_rows)
             if fork_labels:
                 _upsert_labels(session, new_conv_id, fork_labels, now)
@@ -5707,6 +5769,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(subtree_ids),
                 )
             )
+            # An approval's record lasts as long as its thread, no longer.
+            from omnigent.stores.approval_store import delete_session_verdicts
+
+            delete_session_verdicts(session, subtree_ids)
 
         run_write_transaction(
             self._session_immediate,

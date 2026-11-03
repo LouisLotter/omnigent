@@ -63,11 +63,13 @@ class _DispatchCall:
     :param session_id: Session the event was dispatched to.
     :param text: The ``input_text`` body the wake injected.
     :param agent_revision: The parent agent's bundle the wake named.
+    :param initiator: Who the wake is attributed to, from the server's records.
     """
 
     session_id: str
     text: str
     agent_revision: str | None = None
+    initiator: Any = None
 
 
 @pytest_asyncio.fixture
@@ -163,12 +165,14 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # TypeErrors inside the notifier task and no wake lands.
         runner_router: Any | None = None,
         agent_revision: str | None = None,
+        initiator: Any | None = None,
     ) -> str:
         delivered.append(
             _DispatchCall(
                 session_id=session_id,
                 text=body.data["content"][0]["text"],
                 agent_revision=agent_revision,
+                initiator=initiator,
             )
         )
         fired.set()
@@ -203,6 +207,8 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # The wake names the parent's current bundle, so its runner drops a
         # spec cached before the reinstall.
         assert call.agent_revision == f"{parent_agent_id}/v2"
+        # The notice is the blocked child's agent speaking, never a person.
+        assert (call.initiator.kind, call.initiator.from_session_id) == ("agent", child.id)
 
         # Resolving the block sends the woken parent a follow-up through
         # the same wiring, so it stops acting on the stale block notice.

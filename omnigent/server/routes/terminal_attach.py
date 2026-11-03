@@ -83,6 +83,7 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
+from omnigent.server import terminal_typists
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.principals import recorded_principal
@@ -183,110 +184,124 @@ def create_terminal_attach_router(
             ),
         )
 
-        ws_factory = get_runner_ws_factory()
-        if ws_factory is not None:
-            from urllib.parse import urlencode
+        # Keystrokes carry no identity: a prompt typed while attached for typing
+        # is attributed to the person attached (see omnigent.server.terminal_typists).
+        typist = (
+            auth_provider.get_user_id(websocket)
+            if auth_provider is not None and not read_only
+            else None
+        )
+        typing_token = terminal_typists.attach(session_id, typist) if typist else None
+        try:
+            ws_factory = get_runner_ws_factory()
+            if ws_factory is not None:
+                from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
-            runner_path = (
-                f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
-            )
-            try:
-                runner_cm = ws_factory(runner_path)
-            except WrongReplicaWSError:
-                # Wrong-replica routing miss: the runner tunnel is bound but not
-                # on this replica (the key routed here, but the host homed its
-                # tunnel elsewhere). Signal 4400 so the client re-dials WITHOUT
-                # the key and reaches the replica that holds the tunnel — the WS
-                # analogue of the fetch path's keyless re-address on a 400.
-                await websocket.close(
-                    code=_WS_CLOSE_WRONG_REPLICA,
-                    reason="host on another replica; retry without slice key",
+                qs = urlencode({"read_only": "true" if read_only else "false"})
+                runner_path = (
+                    f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
                 )
-                return
-            except Exception:  # noqa: BLE001
-                await websocket.close(
-                    code=_WS_CLOSE_INTERNAL_ERROR,
-                    reason="runner attach factory failed",
-                )
-                return
-            try:
-                from omnigent.runtime import telemetry
-
-                with telemetry.span(
-                    "terminal.attach",
-                    attributes={
-                        "session.id": session_id,
-                        "terminal.id": terminal_id,
-                        "terminal.read_only": read_only,
-                        "terminal.mode": "runner-proxy",
-                    },
-                ):
-                    async with runner_cm as runner_ws:
-                        await _serve_while_authorized(
-                            websocket, _shuttle_ws_frames(websocket, runner_ws), still_authorized
-                        )
-            except _RunnerWSClosed as closed:
-                code = (
-                    closed.code
-                    if closed.code and closed.code >= 1000
-                    else _WS_CLOSE_INTERNAL_ERROR
-                )
-                with contextlib.suppress(RuntimeError):
+                try:
+                    runner_cm = ws_factory(runner_path)
+                except WrongReplicaWSError:
+                    # Wrong-replica routing miss: the runner tunnel is bound but not
+                    # on this replica (the key routed here, but the host homed its
+                    # tunnel elsewhere). Signal 4400 so the client re-dials WITHOUT
+                    # the key and reaches the replica that holds the tunnel — the WS
+                    # analogue of the fetch path's keyless re-address on a 400.
                     await websocket.close(
-                        code=code,
-                        reason=closed.reason or "",
+                        code=_WS_CLOSE_WRONG_REPLICA,
+                        reason="host on another replica; retry without slice key",
                     )
-            except Exception:  # noqa: BLE001
-                with contextlib.suppress(RuntimeError):
+                    return
+                except Exception:  # noqa: BLE001
                     await websocket.close(
                         code=_WS_CLOSE_INTERNAL_ERROR,
-                        reason="runner attach proxy failed",
+                        reason="runner attach factory failed",
                     )
-            return
+                    return
+                try:
+                    from omnigent.runtime import telemetry
 
-        try:
-            terminal_registry = get_terminal_registry()
-        except RuntimeError:
-            await websocket.close(
-                code=_WS_CLOSE_TERMINAL_NOT_FOUND,
-                reason="terminal registry not available",
+                    with telemetry.span(
+                        "terminal.attach",
+                        attributes={
+                            "session.id": session_id,
+                            "terminal.id": terminal_id,
+                            "terminal.read_only": read_only,
+                            "terminal.mode": "runner-proxy",
+                        },
+                    ):
+                        async with runner_cm as runner_ws:
+                            await _serve_while_authorized(
+                                websocket,
+                                _shuttle_ws_frames(websocket, runner_ws),
+                                still_authorized,
+                            )
+                except _RunnerWSClosed as closed:
+                    code = (
+                        closed.code
+                        if closed.code and closed.code >= 1000
+                        else _WS_CLOSE_INTERNAL_ERROR
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        await websocket.close(
+                            code=code,
+                            reason=closed.reason or "",
+                        )
+                except Exception:  # noqa: BLE001
+                    with contextlib.suppress(RuntimeError):
+                        await websocket.close(
+                            code=_WS_CLOSE_INTERNAL_ERROR,
+                            reason="runner attach proxy failed",
+                        )
+                return
+
+            try:
+                terminal_registry = get_terminal_registry()
+            except RuntimeError:
+                await websocket.close(
+                    code=_WS_CLOSE_TERMINAL_NOT_FOUND,
+                    reason="terminal registry not available",
+                )
+                return
+
+            entry = resolve_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
             )
-            return
+            if entry is None or not entry.instance.running or not await entry.instance.is_alive():
+                await websocket.close(
+                    code=_WS_CLOSE_TERMINAL_NOT_FOUND,
+                    reason="terminal resource not found or not running",
+                )
+                return
 
-        entry = resolve_terminal_entry_by_resource_id(
-            session_id,
-            terminal_id,
-            terminal_registry,
-        )
-        if entry is None or not entry.instance.running or not await entry.instance.is_alive():
-            await websocket.close(
-                code=_WS_CLOSE_TERMINAL_NOT_FOUND,
-                reason="terminal resource not found or not running",
-            )
-            return
+            from omnigent.runtime import telemetry
 
-        from omnigent.runtime import telemetry
-
-        with telemetry.span(
-            "terminal.attach",
-            attributes={
-                "session.id": session_id,
-                "terminal.id": terminal_id,
-                "terminal.read_only": read_only,
-                "terminal.mode": "in-process",
-            },
-        ):
-            await _serve_while_authorized(
-                websocket,
-                bridge_tmux_control_to_websocket(
+            with telemetry.span(
+                "terminal.attach",
+                attributes={
+                    "session.id": session_id,
+                    "terminal.id": terminal_id,
+                    "terminal.read_only": read_only,
+                    "terminal.mode": "in-process",
+                },
+            ):
+                await _serve_while_authorized(
                     websocket,
-                    socket_path=str(entry.instance.socket_path),
-                    tmux_target=entry.instance.tmux_target,
-                    read_only=read_only,
-                ),
-                still_authorized,
-            )
+                    bridge_tmux_control_to_websocket(
+                        websocket,
+                        socket_path=str(entry.instance.socket_path),
+                        tmux_target=entry.instance.tmux_target,
+                        read_only=read_only,
+                    ),
+                    still_authorized,
+                )
+        finally:
+            if typing_token is not None:
+                terminal_typists.detach(session_id, typing_token)
 
     return router
 

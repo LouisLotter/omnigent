@@ -112,6 +112,8 @@ _SESSION_ROUTES: tuple[tuple[str, str, RouteRule], ...] = (
     ("DELETE", "/comments/{comment_id}", _SESSION),
     ("PATCH", "/comments/{comment_id}", _SESSION),
     ("POST", "/comments/send", _SESSION),
+    # A thread's approval records: who asked and who answered as what.
+    ("GET", "/approvals", HUMAN),
     ("GET", "/elicitations/{elicitation_id}", _SESSION),
     # Answering an approval is a person's decision.
     ("POST", "/elicitations/{elicitation_id}/resolve", HUMAN),

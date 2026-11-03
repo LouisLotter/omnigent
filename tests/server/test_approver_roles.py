@@ -23,6 +23,12 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
 from omnigent.db.db_models import SqlApprovalVerdict
+from omnigent.entities import MessageData, NewConversationItem
+from omnigent.entities.attribution import (
+    InitiatorAttribution,
+    OwnerAttribution,
+    TurnAttribution,
+)
 from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
@@ -328,14 +334,88 @@ def test_a_team_rule_and_a_personal_rule_each_need_their_approver(team) -> None:
         assert created.status_code == 201, created.text
     elicitation_id, retry = _ask(runner, session_id)
 
-    first = _answer(team["alice"], session_id, elicitation_id)
-    assert first.json() == {"queued": False, "awaiting": "team"}, first.text
+    first = _answer(team["alice"], session_id, elicitation_id).json()
+    assert (first["queued"], first["awaiting"]) == (False, "team"), first
     assert _tools_call(runner, session_id, **retry)["error"]["message"] == (
         "Tool call has not been approved"
     )
-    assert _answer(team["dave"], session_id, elicitation_id).json() == {"queued": False}
+    final = _answer(team["dave"], session_id, elicitation_id).json()
+    assert final["queued"] is False
+    # Each answer records the grant it was given under.
+    roles = [(answer["by"], answer["as"][0]["role"]) for answer in final["approval"]["answers"]]
+    assert roles == [("alice", "thread_owner"), ("dave", "team_approver")]
+    assert final["approval"]["decided_by"] == "dave"
     assert "result" in _tools_call(runner, session_id, **retry)
     team["tracker"].call_tool.assert_awaited_once()
+
+
+def _turn(team: dict[str, Any], person: str, text: str) -> Any:
+    """A message as the forward path saves it: with its turn's attribution."""
+    [item] = team["stores"]["conversation_store"].append(
+        team["session"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"turn_{uuid.uuid4().hex}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                created_by=person,
+                attribution=TurnAttribution(
+                    initiator=InitiatorAttribution(kind="person", user=person, source="signed_in"),
+                    owner=OwnerAttribution(user="alice"),
+                    recorded_at=int(time.time()),
+                ),
+            )
+        ],
+    )
+    return item
+
+
+def test_a_message_queued_behind_a_turn_lets_nobody_in_it_approve_its_actions(team) -> None:
+    """D53 + WP8.8: Bob queues during Alice's turn; the approval names Alice, and neither
+    Alice nor Bob may approve it as a service approver where self-approval is off."""
+    session_id, runner = team["session"], team["runner"]
+    conversations = team["stores"]["conversation_store"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    for approver in ("alice", "bob", "carol"):
+        _name_approver(team, "service", approver, "tracker")
+    alices = _turn(team, "alice", "post the update")
+    asyncio.run(
+        orchestration._record_reported_turn_start(
+            session_id,
+            {"type": "session.turn_started", "input_item_ids": [alices.id]},
+            conversations,
+        )
+    )
+    # Queued: the runner has not started Bob's turn, so it is still Alice's.
+    _turn(team, "bob", "and mention the outage")
+
+    elicitation_id, retry = _ask(runner, session_id)
+
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert record.binding["initiator"] == "alice"
+    assert (record.attribution["initiator"], record.attribution["contributors"]) == (
+        "alice",
+        ["bob"],
+    )
+    assert record.attribution["principal"]["kind"] == "runner"
+    assert record.attribution["owner"]["user"] == "alice"
+    for person in ("alice", "bob"):
+        refused = _answer(team[person], session_id, elicitation_id)
+        assert refused.status_code == 403, refused.text
+    approved = _answer(team["carol"], session_id, elicitation_id)
+    assert approved.status_code == 202, approved.text
+    [answer] = approved.json()["approval"]["answers"]
+    assert (answer["by"], answer["as"][0]["role"]) == ("carol", "service_approver")
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+    # The thread's approval record: anyone who reads the thread; nobody else; no runner.
+    [listed] = team["bob"].get(f"/v1/sessions/{session_id}/approvals").json()["data"]
+    assert listed["elicitation_id"] == elicitation_id
+    assert listed["asked"]["contributors"] == ["bob"]
+    assert listed["decided_by"] == "carol"
+    assert listed["decision_digest"] == record.binding_digest.hex()
+    assert team["dave"].get(f"/v1/sessions/{session_id}/approvals").status_code == 404
+    assert runner.get(f"/v1/sessions/{session_id}/approvals").status_code == 403
 
 
 def test_any_eligible_decline_declines(team) -> None:
@@ -828,10 +908,8 @@ def test_a_transformed_call_needs_both_approvers_and_a_late_rule_refuses_it(
     record = team["approvals"].get_verdict(elicitation_id)
     assert [r["kind"] for r in record.requirements] == ["personal", "team"]
 
-    assert _answer(team["alice"], session_id, elicitation_id).json() == {
-        "queued": False,
-        "awaiting": "team",
-    }
+    first = _answer(team["alice"], session_id, elicitation_id).json()
+    assert (first["queued"], first["awaiting"]) == (False, "team")
     assert "error" in _tools_call(runner, session_id, **retry)
     assert _answer(team["dave"], session_id, elicitation_id).status_code == 202
     if rule_changes_before_dispatch:

@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -3682,6 +3682,14 @@ def create_runner_app(
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
 
+    def _announce_turn_inputs(conv_id: str, bodies: Iterable[Mapping[str, object]]) -> None:
+        """Tell the server which inputs this turn starts with (see ``turn_inputs``)."""
+        from omnigent.runner.turn_inputs import turn_started_event
+
+        event = turn_started_event(bodies)
+        if event is not None:
+            _publish_event(conv_id, event)
+
     async def _codex_native_bridge_state_and_dir_for_session(
         conv_id: str,
         *,
@@ -4400,6 +4408,7 @@ def create_runner_app(
             # whenever a /compact is buffered, so each lands as its own turn.
             if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
+                turn_bodies = [next_body]
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
@@ -4411,6 +4420,7 @@ def create_runner_app(
                 )
             else:
                 all_bodies = list(buf)
+                turn_bodies = all_bodies
                 buf.clear()
                 _session_message_buffers.pop(session_id, None)
 
@@ -4439,6 +4449,7 @@ def create_runner_app(
                 )
                 _sdk_compact_inprogress.add(session_id)
             _begin_turn_slot(session_id)
+            _announce_turn_inputs(session_id, turn_bodies)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
                 _run_turn_bg(next_body, session_id),
@@ -6693,6 +6704,7 @@ def create_runner_app(
                     extra={"session_id": conversation_id},
                 )
 
+                _announce_turn_inputs(conversation_id, [message_body])
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
@@ -7798,6 +7810,14 @@ def create_runner_app(
                     and new_items[-1].get("role") == "user"
                 ):
                     _begin_turn_slot(session_id)
+                    _announce_turn_inputs(
+                        session_id,
+                        [
+                            {"persisted_item_id": raw.get("id")}
+                            for raw in all_new
+                            if raw.get("type") == "message" and raw.get("role") == "user"
+                        ],
+                    )
                     _publish_turn_status(session_id, "running")
                     agent_id = _session_agent_ids.get(session_id)
                     msg_body: _JsonObject = {
