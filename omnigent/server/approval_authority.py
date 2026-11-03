@@ -23,9 +23,15 @@ operation inspects that operation's recorded result instead.
 
 Each ledger row also records who asked (the turn's initiator, everyone whose
 input joined the turn, the asking principal, the thread's owner, computer and
-harness login), and each answer the role it was given under. Where the person
-who started an action may not approve it, nobody whose input joined the turn
-may either: a message queued or injected by another person can have steered it.
+harness login), and each answer the role it was given under.
+
+The person who started an action may approve it unless a resource's setting
+says otherwise (D59). Where it does, the people attribution recorded as having
+taken part in the turn are excluded, as best effort only: that record can be
+incomplete, and never makes an approval unanswerable. Omnigent's approvals
+record a person's consent. They are not a separation-of-duties control. Where
+an action needs several people's eyes, the external system enforces it, for
+example GitHub's required pull-request reviews and branch protection.
 """
 
 from __future__ import annotations
@@ -358,22 +364,12 @@ def _record_sync(
     )
 
 
-INCOMPLETE_AUTHORITY_REFUSAL = (
-    "Omnigent could not confirm everyone who took part in the turn that asked, "
-    "so nobody can approve this action. Ask again."
-)
-UNRESOLVED_TURN_REFUSAL = (
-    "The turn that asked started with input Omnigent has no record of, "
-    "so nobody can approve its actions."
-)
-
-
 def turn_authority_record(session_id: str) -> dict[str, Any]:
-    """Who took part in the thread's current turn, read completely; blocking.
+    """Who took part in the thread's current turn, as best effort; blocking.
 
-    ``complete`` is ``False`` when the records cannot be read (or there is no
-    turn store), and the approval then refuses every answer: a read that
-    failed or stopped early must never make someone look uninvolved.
+    ``complete`` is ``False`` when the records could not be read (or there is
+    no turn store). That only narrows the optional exclusion of the initiator
+    and contributors; it never refuses an answer.
     """
     from omnigent.runtime import get_turn_store
 
@@ -399,7 +395,7 @@ def _asked_attribution(
     subject: ApprovalSubject,
     binding: dict[str, Any],
 ) -> dict[str, Any]:
-    """Who asked for an approval: complete authorization data, then best-effort display."""
+    """Who asked for an approval, and on whose thread, computer and login (best effort)."""
     from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
 
     initiator = binding.get("initiator")
@@ -428,18 +424,15 @@ def _asked_attribution(
 
 
 def _initiators(record: VerdictRecord) -> frozenset[str | None]:
-    """Everyone who may have taken part in the turn that asked.
+    """Everyone attribution recorded as taking part in the turn that asked.
 
-    The turn's initiator, its registered initiator and every contributor.
-    Raises when the record of who took part is incomplete or the turn's input
-    is unknown: nobody can then be shown to be uninvolved.
+    The turn's initiator, its registered initiator and every recorded
+    contributor. Used only where a resource's setting excludes the initiator;
+    best effort: a missing or incomplete record excludes fewer people.
     """
     attribution = record.attribution or {}
     authority = attribution.get("authority")
-    if not isinstance(authority, dict) or authority.get("complete") is not True:
-        raise OmnigentError(INCOMPLETE_AUTHORITY_REFUSAL, code=ErrorCode.CONFLICT)
-    if authority.get("unresolved"):
-        raise OmnigentError(UNRESOLVED_TURN_REFUSAL, code=ErrorCode.CONFLICT)
+    authority = authority if isinstance(authority, dict) else {}
     contributors = attribution.get("contributors")
     extra = (
         [person for person in contributors if isinstance(person, str)]
@@ -848,10 +841,7 @@ def may_view_approval(
     owner = _owner(conversation_store, record.session_id)
     resources = requirement_resources(record.requirements)
     approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
-    try:
-        initiators = _initiators(record)
-    except OmnigentError:
-        return False
+    initiators = _initiators(record)
     return any(
         _eligible(
             requirement,

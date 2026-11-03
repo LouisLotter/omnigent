@@ -79,7 +79,17 @@ class ApproverRequest(_Resource):
 
 
 class ApprovalSettingsRequest(_Resource):
-    """Whether the initiator may approve; ``null`` restores the default."""
+    """Whether the person who started an action may approve it.
+
+    Allowed by default for a thread, a service and the team (D59); ``null``
+    restores the default. Turned off, it excludes the people attribution
+    recorded as taking part in the turn that asked, as best effort.
+
+    Omnigent's approvals record a person's consent. They are not a
+    separation-of-duties control. Where an action needs several people's eyes,
+    the external system enforces it, for example GitHub's required
+    pull-request reviews and branch protection.
+    """
 
     allow_initiator: bool | None = None
 
@@ -308,7 +318,7 @@ def create_approvals_router(
     async def list_approvers(
         request: Request, kind: ResourceKindName, resource_id: str = ""
     ) -> dict[str, Any]:
-        """A resource's named approvers and initiator setting."""
+        """A resource's named approvers and initiator setting (allowed by default)."""
         resource = _resource(kind, resource_id)
         await _resource_manager(request, resource, write=False)
         resources = [resource] if resource == TEAM_RESOURCE else [resource, TEAM_RESOURCE]
@@ -357,7 +367,15 @@ def create_approvals_router(
     async def save_approval_settings(
         request: Request, body: ApprovalSettingsRequest
     ) -> dict[str, Any]:
-        """Save whether the person who started an action may approve it."""
+        """Save whether the person who started an action may approve it.
+
+        Allowed by default (D59). Turned off, it excludes the people
+        attribution recorded as taking part in the turn that asked, as best
+        effort. Omnigent's approvals record a person's consent. They are not a
+        separation-of-duties control. Where an action needs several people's
+        eyes, the external system enforces it, for example GitHub's required
+        pull-request reviews and branch protection.
+        """
         resource = _resource(body.kind, body.resource_id)
         manager = await _resource_manager(request, resource, write=True)
         await asyncio.to_thread(

@@ -3383,11 +3383,14 @@ def _computer_owner(conversation_store: ConversationStore, conv: Conversation) -
     return owner.user_id if owner is not None else None
 
 
-def _find_queued_input(session_id: str, text: str) -> InputRecord | None:
-    """The oldest recorded, not yet transcribed queued input with this text.
+def _claim_queued_input(
+    session_id: str, text: str, claim: str
+) -> tuple[InputRecord, frozenset[str]] | None:
+    """Claim the oldest recorded, untranscribed queued input with this text; best effort.
 
-    For the transcript item's attribution only; a failed read leaves it to the
-    typed-prompt path. Approvals read the input's own record, by its id.
+    Returns it with everyone who queued the same text: more than one person
+    and the sender is not certain. A failed read leaves the record to the
+    typed-prompt path.
     """
     from omnigent.runtime import get_turn_store
 
@@ -3395,10 +3398,37 @@ def _find_queued_input(session_id: str, text: str) -> InputRecord | None:
     if turns is None:
         return None
     try:
-        return turns.find_unmapped_input(session_id, text_digest(text))
-    except Exception:  # noqa: BLE001 — display only
+        record, people = turns.claim_unmapped_input(session_id, text_digest(text), claim)
+    except Exception:  # noqa: BLE001 — attribution is best effort
         _logger.warning("could not look up a queued input", exc_info=True)
         return None
+    return (record, people) if record is not None else None
+
+
+def _settle_queued_claim(session_id: str, input_id: str, claim: str, item_id: str | None) -> None:
+    """Replace a claim with its transcript item, or release it when the save failed."""
+    from omnigent.runtime import get_turn_store
+
+    turns = get_turn_store()
+    if turns is None:
+        return
+    try:
+        turns.settle_claim(session_id, input_id, claim, item_id)
+    except Exception:  # noqa: BLE001 — attribution is best effort
+        _logger.warning("could not settle a queued input claim", exc_info=True)
+
+
+def _retire_queued_input(session_id: str, input_id: str) -> None:
+    """A queued message definitely not delivered: never match its text again."""
+    from omnigent.runtime import get_turn_store
+
+    turns = get_turn_store()
+    if turns is None:
+        return
+    try:
+        turns.retire_text_match(session_id, input_id)
+    except Exception:  # noqa: BLE001 — attribution is best effort
+        _logger.warning("could not retire an undelivered input", exc_info=True)
 
 
 def _map_turn_input(session_id: str, input_id: str, item_id: str) -> None:
@@ -3414,8 +3444,17 @@ def _map_turn_input(session_id: str, input_id: str, item_id: str) -> None:
         _logger.warning("could not map a queued input to its transcript item", exc_info=True)
 
 
-def _initiator_from_input(record: InputRecord) -> TurnInitiator:
-    """The initiator the server recorded when a queued message was accepted."""
+def _initiator_from_input(
+    record: InputRecord, same_text: frozenset[str] = frozenset()
+) -> TurnInitiator:
+    """The initiator the server recorded when a queued message was accepted.
+
+    *same_text* is everyone who queued identical text: with more than one
+    person, the text cannot say who sent this record, so all are possible.
+    """
+    if len(same_text) > 1:
+        kind: Any = "terminal" if record.kind is InputKind.TERMINAL else "person"
+        return TurnInitiator(kind, None, "pending_input", possible=tuple(sorted(same_text)))
     if record.kind is InputKind.AGENT:
         return TurnInitiator("agent", None, "pending_input", on_behalf_of=record.person)
     if record.kind is InputKind.SCHEDULE:
@@ -3490,6 +3529,10 @@ async def _persist_external_conversation_item_unlocked(
     mirror_initiator: TurnInitiator | None = None
     # The recorded input this prompt is the transcript record of.
     mirror_input_id: str | None = None
+    # A recorded input claimed by text (its queued entry lives in another
+    # process), under ``queued_claim`` until the item is saved.
+    mirror_claim_input: str | None = None
+    queued_claim = item.stable_id or f"claim:{secrets.token_hex(16)}"
     typed_prompt = False
     if (
         item.type == "message"
@@ -3565,12 +3608,13 @@ async def _persist_external_conversation_item_unlocked(
             if drained.stable_id is not None and item.stable_id is None:
                 item = item.model_copy(update={"stable_id": drained.stable_id})
         elif not replayed and (
-            queued := await asyncio.to_thread(_find_queued_input, session_id, text)
+            claimed := await asyncio.to_thread(_claim_queued_input, session_id, text, queued_claim)
         ):
             # The queued entry lives in another process (a restart, another
             # replica): the durable record of the input names its sender.
-            mirror_initiator = _initiator_from_input(queued)
-            mirror_input_id = queued.input_id
+            queued, same_text = claimed
+            mirror_initiator = _initiator_from_input(queued, same_text)
+            mirror_claim_input = queued.input_id
             item = item.model_copy(update={"created_by": mirror_initiator.responsible_person})
         elif not replayed:
             # No queued input: typed into the terminal (or, in a sub-agent's
@@ -3638,8 +3682,21 @@ async def _persist_external_conversation_item_unlocked(
         _restore_drained_inputs(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
+        if mirror_claim_input is not None:
+            await asyncio.to_thread(
+                _settle_queued_claim, session_id, mirror_claim_input, queued_claim, None
+            )
         raise
     persisted = persisted_items[len(skipped_new_items)]
+    if mirror_claim_input is not None:
+        # Settled to the item this record became; released if another attempt saved it.
+        await asyncio.to_thread(
+            _settle_queued_claim,
+            session_id,
+            mirror_claim_input,
+            queued_claim,
+            None if persisted.deduplicated else persisted.id,
+        )
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
@@ -8946,6 +9003,8 @@ async def _dispatch_session_event_to_runner_impl(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+                # Definitely not delivered: a later identical text must not match it.
+                await asyncio.to_thread(_retire_queued_input, session_id, pending_id)
         if delivery == "duplicate" and pending_id is not None:
             # The runner already took this message; its mirror drains the first entry.
             pending_inputs.resolve(session_id, pending_id)

@@ -126,20 +126,22 @@ function capitalize(text: string): string {
 }
 
 function initiatorPhrase(initiator: TurnInitiator, viewer: string | null): string {
+  const possible = initiator.possible ?? [];
+  if (!initiator.user && !initiator.on_behalf_of && possible.length > 1) {
+    // Several people may have sent it (equal text, or several typists).
+    const names = possible.map((name) => person(name, viewer, false)).join(" or ");
+    return initiator.kind === "terminal"
+      ? `${names} in the terminal (not certain)`
+      : `${names} (not certain)`;
+  }
   switch (initiator.kind) {
     case "schedule":
       // Only the generic words are capitalized; a username is shown as is.
       return `${initiator.user && initiator.user !== viewer ? possessive(initiator.user, viewer) : capitalize(possessive(initiator.user, viewer))} schedule`;
     case "agent":
       return `An agent for ${person(initiator.on_behalf_of, viewer, false)}`;
-    case "terminal": {
-      const possible = initiator.possible ?? [];
-      if (!initiator.user && possible.length > 1) {
-        const names = possible.map((name) => person(name, viewer, false)).join(" or ");
-        return `${names} in the terminal (not certain)`;
-      }
+    case "terminal":
       return `${person(initiator.user, viewer)} in the terminal`;
-    }
     default:
       return person(initiator.user, viewer);
   }
@@ -199,7 +201,7 @@ export function summarizeAttribution(
     initiator.source === "owner_assumed"
       ? " (assumed: no typing reached the server)"
       : initiator.source === "terminal_ambiguous"
-        ? " (each counts as having taken part)"
+        ? " (each is shown as having taken part)"
         : "";
   const login =
     subscription.login_state_reported_by === "computer"

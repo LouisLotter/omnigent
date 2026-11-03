@@ -73,6 +73,19 @@ export function ApprovePage() {
     let polling = false;
     let nativeDeliverySeen = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // A different approval: forget the previous one's record.
+    recordRequested.current = false;
+    setApproval(null);
+    const requestRecord = () => {
+      recordRequested.current = true;
+      // A 404 (not a recorded approval, or not readable) and a failed read both
+      // leave the page without the record line.
+      fetchApprovalRecord(sessionId, elicitationId)
+        .then((record) => {
+          if (!cancelled) setApproval(record);
+        })
+        .catch(() => undefined);
+    };
     const load = async () => {
       const revision = submission.current.revision;
       try {
@@ -88,18 +101,15 @@ export function ApprovePage() {
         const data: ElicitationData = await res.json();
         if (cancelled) return;
         data.native_delivery = parseNativePermissionDelivery(data.native_delivery);
-        // Only a policy's approve/reject prompt can be a recorded approval; read
-        // its record once, not on every poll.
+        // Read the durable record once: for a policy's approve/reject prompt
+        // while pending, and for any approval already resolved (who asked, who
+        // answered). Not on every poll.
         if (
           !recordRequested.current &&
-          data.status === "pending" &&
-          data.policy_name &&
-          !data.native_delivery
+          (data.status === "resolved" ||
+            (data.status === "pending" && data.policy_name && !data.native_delivery))
         ) {
-          recordRequested.current = true;
-          void fetchApprovalRecord(sessionId, elicitationId).then((record) => {
-            if (!cancelled) setApproval(record);
-          });
+          requestRecord();
         }
         nativeDeliverySeen ||= Boolean(data.native_delivery) || data.resolution === "unanswered";
         polling =

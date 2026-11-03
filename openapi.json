@@ -523,7 +523,7 @@
       },
       "ApprovalSettingsRequest": {
         "additionalProperties": false,
-        "description": "Whether the initiator may approve; `null` restores the default.",
+        "description": "Whether the person who started an action may approve it.\n\nAllowed by default for a thread, a service and the team (D59); `null`\nrestores the default. Turned off, it excludes the people attribution\nrecorded as taking part in the turn that asked, as best effort.\n\nOmnigent's approvals record a person's consent. They are not a\nseparation-of-duties control. Where an action needs several people's eyes,\nthe external system enforces it, for example GitHub's required\npull-request reviews and branch protection.",
         "properties": {
           "allow_initiator": {
             "anyOf": [
@@ -11609,7 +11609,7 @@
     },
     "/v1/approval-settings": {
       "put": {
-        "description": "Save whether the person who started an action may approve it.",
+        "description": "Save whether the person who started an action may approve it.\n\nAllowed by default (D59). Turned off, it excludes the people\nattribution recorded as taking part in the turn that asked, as best\neffort. Omnigent's approvals record a person's consent. They are not a\nseparation-of-duties control. Where an action needs several people's\neyes, the external system enforces it, for example GitHub's required\npull-request reviews and branch protection.",
         "operationId": "save_approval_settings_v1_approval_settings_put",
         "requestBody": {
           "content": {
@@ -11744,7 +11744,7 @@
         ]
       },
       "get": {
-        "description": "A resource's named approvers and initiator setting.",
+        "description": "A resource's named approvers and initiator setting (allowed by default).",
         "operationId": "list_approvers_v1_approvers_get",
         "parameters": [
           {

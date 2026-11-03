@@ -1,4 +1,4 @@
-"""Build the attribution of a turn from the server's own records.
+"""Build the attribution of a turn from the server's own records (best effort, D59).
 
 Who started a turn comes from the request's sign-in, a scheduled task's record,
 the turn actor the server recorded on the thread an agent works for, or the
@@ -310,26 +310,28 @@ def record_turn_input(
     digest: str | None = None,
     item_id: str | None = None,
 ) -> None:
-    """Record an accepted input and its answerable person; blocking.
+    """Record an accepted input and its answerable person; blocking, best effort.
 
-    Called before the input can reach a runner. A failure raises: approvals
-    read who took part in a turn from these records, so an input that could
-    not be recorded must not run.
+    Attribution is a display (D59): a record that cannot be written is logged
+    and the input still runs.
     """
     from omnigent.runtime import get_turn_store
 
     store = get_turn_store()
     if store is None:
         return
-    store.record_input(
-        session_id,
-        input_id,
-        kind=initiator.store_kind,
-        person=initiator.responsible_person,
-        possible=initiator.possible,
-        digest=digest,
-        item_id=item_id,
-    )
+    try:
+        store.record_input(
+            session_id,
+            input_id,
+            kind=initiator.store_kind,
+            person=initiator.responsible_person,
+            possible=initiator.possible,
+            digest=digest,
+            item_id=item_id,
+        )
+    except Exception:
+        _logger.warning("could not record an accepted input", exc_info=True)
 
 
 def with_initiator(attribution: TurnAttribution, initiator: TurnInitiator) -> TurnAttribution:

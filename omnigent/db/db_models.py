@@ -568,8 +568,7 @@ class SqlApprovalResource(OmnigentBase):
     :param kind: Int code: 1 thread, 2 service, 3 team.
     :param resource_id: The thread id, service id, or ``""`` for the team.
     :param allow_initiator: Whether the person who started the action may
-        approve it; ``NULL`` keeps the default for *kind* (allowed for a
-        thread, refused for a service or the team).
+        approve it; ``NULL`` keeps the default, allowed for every kind (D59).
     :param updated_at: Unix epoch seconds of the last change.
     :param updated_by: The administrator who changed it.
     """

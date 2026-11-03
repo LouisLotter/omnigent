@@ -112,7 +112,21 @@ describe("summarizeAttribution", () => {
     );
     expect(summary.prominent).toBe(true);
     expect(summary.detail[0]).toBe(
-      "Started by: alice or admin in the terminal (not certain) (each counts as having taken part)",
+      "Started by: alice or admin in the terminal (not certain) (each is shown as having taken part)",
+    );
+  });
+
+  it("shows a queued message whose sender equal text cannot settle as not certain", () => {
+    const queued = turn({
+      initiator: {
+        ...turn().initiator,
+        user: null,
+        possible: ["alice", "bob"],
+        source: "pending_input",
+      },
+    });
+    expect(summarizeAttribution(queued, "bob").text).toBe(
+      "alice or you (not certain), on alice's computer and alice's Claude subscription",
     );
   });
 

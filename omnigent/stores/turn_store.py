@@ -1,11 +1,11 @@
 """Who took part in a turn: every accepted input and every registered turn.
 
-Approvals decide who may answer from these records, so they are durable and
-complete: an input is recorded, with the person answerable for it, before it
-reaches a runner; a runner registers each turn, naming the inputs it starts
-with, and waits for the server's acknowledgement before its harness acts; and
-typing into a terminal is recorded per terminal and person. Every server
-replica reads the same rows, and nothing is scanned with a cap.
+Attribution's display reads these records, and an approval whose resource
+excludes its initiator reads them as best effort (D59). An input is recorded,
+with the person answerable for it, when the server accepts it; a runner
+registers each turn, naming the inputs it starts with; and typing into a
+terminal is recorded per terminal and person. Every server replica reads the
+same rows. A missing record means a less complete display, never a refusal.
 """
 
 from __future__ import annotations
@@ -86,9 +86,9 @@ class TurnAuthority:
 
     :param initiator: The registered turn's initiator, or ``None`` when no turn
         is registered or its input names no person.
-    :param people: Everyone who may have taken part: the turn's inputs and
-        every input accepted (or terminal typing) since it started; with no
-        registered turn, every input the thread ever accepted.
+    :param people: Everyone recorded as taking part: the turn's inputs and
+        every input accepted (or terminal typing) since it started; nobody
+        when no turn is registered.
     :param turn_id: The current turn, or ``None``.
     :param unresolved: The turn named an input the server never recorded.
     """
@@ -239,25 +239,61 @@ class SqlAlchemyTurnStore:
 
         return run_write_transaction(self._session_immediate, "map_session_input", write)
 
-    def find_unmapped_input(self, session_id: str, digest: str) -> InputRecord | None:
-        """The oldest queued input with this text not yet matched to a transcript item.
+    def claim_unmapped_input(
+        self, session_id: str, digest: str, claim: str
+    ) -> tuple[InputRecord | None, frozenset[str]]:
+        """Claim the oldest queued input with this text for a transcript record.
 
         Used when a queued message's in-memory entry is gone: after a restart,
-        or when the transcript record reaches another server replica.
+        or when the transcript record reaches another server replica. Select and
+        claim are one transaction, so two replicas never claim the same input.
+        Returns the claimed input and everyone who queued the same text, still
+        unclaimed: more than one person means the sender is not certain.
         """
-        with self._session("select_unmapped_session_input") as session:
-            row = session.execute(
-                select(SqlSessionInput)
-                .where(
-                    SqlSessionInput.workspace_id == current_workspace_id(),
-                    SqlSessionInput.session_id == session_id,
-                    SqlSessionInput.text_digest == digest,
-                    SqlSessionInput.item_id.is_(None),
+
+        def write(session: Session) -> tuple[InputRecord | None, frozenset[str]]:
+            rows = list(
+                session.scalars(
+                    select(SqlSessionInput)
+                    .where(
+                        SqlSessionInput.workspace_id == current_workspace_id(),
+                        SqlSessionInput.session_id == session_id,
+                        SqlSessionInput.text_digest == digest,
+                        SqlSessionInput.item_id.is_(None),
+                    )
+                    .order_by(SqlSessionInput.accepted_at, SqlSessionInput.input_id)
+                    .with_for_update()
                 )
-                .order_by(SqlSessionInput.accepted_at, SqlSessionInput.input_id)
-                .limit(1)
-            ).scalar_one_or_none()
-            return _to_input(row) if row is not None else None
+            )
+            if not rows:
+                return None, frozenset()
+            people = frozenset(person for row in rows for person in _to_input(row).people)
+            rows[0].item_id = claim
+            return _to_input(rows[0]), people
+
+        return run_write_transaction(self._session_immediate, "claim_session_input", write)
+
+    def settle_claim(
+        self, session_id: str, input_id: str, claim: str, item_id: str | None
+    ) -> None:
+        """Replace a claim with the transcript item it became, or release it (``None``)."""
+
+        def write(session: Session) -> None:
+            row = session.get(SqlSessionInput, (current_workspace_id(), session_id, input_id))
+            if row is not None and row.item_id == claim:
+                row.item_id = item_id
+
+        run_write_transaction(self._session_immediate, "settle_session_input_claim", write)
+
+    def retire_text_match(self, session_id: str, input_id: str) -> None:
+        """An input that was definitely not delivered: never match its text again."""
+
+        def write(session: Session) -> None:
+            row = session.get(SqlSessionInput, (current_workspace_id(), session_id, input_id))
+            if row is not None:
+                row.text_digest = None
+
+        run_write_transaction(self._session_immediate, "retire_session_input_match", write)
 
     def record_terminal_activity(
         self, session_id: str, terminal_id: str, user_id: str, at: int | None = None
@@ -402,10 +438,10 @@ class SqlAlchemyTurnStore:
             return _to_turn(row) if row is not None else None
 
     def turn_authority(self, session_id: str) -> TurnAuthority:
-        """Everyone who may have taken part in the thread's current turn.
+        """Everyone recorded as taking part in the thread's current turn.
 
-        Reads every row it needs, with no cap; a failed read raises, so callers
-        never mistake an unreadable record for "nobody else took part".
+        Without a registered turn there is no window to read, so nobody is
+        named beyond the thread's own record of its turn actor.
         """
         with self._session("select_turn_authority") as session:
             turn_row = session.execute(
@@ -418,18 +454,18 @@ class SqlAlchemyTurnStore:
                 .limit(1)
             ).scalar_one_or_none()
             turn = _to_turn(turn_row) if turn_row is not None else None
-            query = select(SqlSessionInput).where(
-                SqlSessionInput.workspace_id == current_workspace_id(),
-                SqlSessionInput.session_id == session_id,
-            )
+            people: set[str] = set()
             if turn is not None:
                 since_or_own = SqlSessionInput.accepted_at >= turn.started_at
                 if turn.inputs:
                     since_or_own = since_or_own | SqlSessionInput.input_id.in_(list(turn.inputs))
-                query = query.where(since_or_own)
-            people: set[str] = set()
-            for row in session.scalars(query):
-                people |= _to_input(row).people
+                query = select(SqlSessionInput).where(
+                    SqlSessionInput.workspace_id == current_workspace_id(),
+                    SqlSessionInput.session_id == session_id,
+                    since_or_own,
+                )
+                for row in session.scalars(query):
+                    people |= _to_input(row).people
         if turn is not None and turn.initiator:
             people.add(turn.initiator)
         return TurnAuthority(

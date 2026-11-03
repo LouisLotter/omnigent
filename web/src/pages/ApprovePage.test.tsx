@@ -254,6 +254,60 @@ it("shows who asked for a policy approval and on whose computer", async () => {
   ).toHaveLength(1);
 });
 
+it("shows who asked and who answered when opened on an already-resolved approval", async () => {
+  vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) =>
+    String(url).includes("/approvals/")
+      ? jsonResponse({
+          elicitation_id: "eli_1",
+          session_id: "sess_1",
+          state: "consumed",
+          initiator: "alice",
+          owner: "alice",
+          asked: null,
+          requirements: [{ kind: "team", resource: [2, "tracker"] }],
+          answers: [
+            {
+              by: "carol",
+              action: "accept",
+              as: [
+                {
+                  requirement: 0,
+                  role: "service_approver",
+                  kind: "team",
+                  resource: [2, "tracker"],
+                },
+              ],
+            },
+          ],
+          decided_by: "carol",
+          decision_digest: "ab",
+        })
+      : jsonResponse({ status: "resolved" }),
+  );
+  renderPage();
+  expect(await screen.findByText("Elicitation resolved")).toBeInTheDocument();
+  expect(await screen.findByTestId("approval-attribution")).toHaveTextContent(
+    "Approved by carol as an approver for the service",
+  );
+});
+
+it("stays usable when the approval record cannot be read", async () => {
+  vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) => {
+    if (String(url).includes("/approvals/")) throw new Error("offline");
+    return jsonResponse({ status: "resolved" });
+  });
+  renderPage();
+  expect(await screen.findByText("Elicitation resolved")).toBeInTheDocument();
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(identity.authenticatedFetch)
+        .mock.calls.some(([url]) => String(url).includes("/approvals/")),
+    ).toBe(true),
+  );
+  expect(screen.queryByTestId("approval-attribution")).toBeNull();
+});
+
 it.each(["success", "http error", "network error"])(
   "observes confirmation while submission is stalled, despite stale polls, a network blip and late %s",
   async (postOutcome) => {

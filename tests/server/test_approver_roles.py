@@ -292,31 +292,54 @@ def test_an_administrator_or_editor_is_not_an_approver_unless_named(team) -> Non
     assert "result" in _tools_call(team["runner"], session_id, **retry)
 
 
-def test_named_service_approvers_answer_and_the_initiator_does_not_by_default(team) -> None:
-    """D53: a team-shared service's actions go to its approvers, not to their initiator."""
+def test_named_service_approvers_answer_and_by_default_so_does_the_initiator(team) -> None:
+    """D59: a service's approvers answer its actions; the initiator may too unless refused."""
     session_id, runner = team["session"], team["runner"]
     _name_approver(team, "service", "carol", "tracker")
     _name_approver(team, "service", "alice", "tracker")
     elicitation_id, retry = _ask(runner, session_id)
 
-    refused = _answer(team["alice"], session_id, elicitation_id)
-    assert refused.status_code == 403, refused.text
     # Carol cannot see Alice's thread, yet sees and answers the approval.
     viewed = team["carol"].get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
     assert viewed.json()["status"] == "pending", viewed.text
     listed = team["carol"].get("/v1/approvals").json()["data"]
     assert [item["elicitation_id"] for item in listed] == [elicitation_id]
-    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    # By default the person who started the action may approve it (D59).
+    assert _answer(team["alice"], session_id, elicitation_id).status_code == 202
     assert "result" in _tools_call(runner, session_id, **retry)
 
+    _exclude_initiators(team)
+    second, retry = _ask(runner, session_id)
+    refused = _answer(team["alice"], session_id, second)
+    assert refused.status_code == 403, refused.text
+    assert _answer(team["carol"], session_id, second).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_by_default_the_initiator_approves_a_team_rules_action(team) -> None:
+    """D59: self-approval is allowed for team approvals too, not only a person's own thread."""
+    session_id, runner = team["session"], team["runner"]
+    _name_approver(team, "team", "alice")
+    _team_rule(team, _ASK_ON_POST)
+    elicitation_id, retry = _ask(runner, session_id)
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert [r["kind"] for r in record.requirements] == ["personal", "team"]
+
+    final = _answer(team["alice"], session_id, elicitation_id).json()
+
+    assert final["approval"]["state"] == "approved"
+    roles = [grant["role"] for grant in final["approval"]["answers"][0]["as"]]
+    assert roles == ["thread_owner", "team_approver"]
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def _exclude_initiators(team: dict[str, Any]) -> None:
+    """An administrator turns self-approval off for the tracker service."""
     saved = team["admin"].put(
         "/v1/approval-settings",
-        json={"kind": "service", "resource_id": "tracker", "allow_initiator": True},
+        json={"kind": "service", "resource_id": "tracker", "allow_initiator": False},
     )
-    assert saved.json() == {"allow_initiator": True}
-    second, retry = _ask(runner, session_id)
-    assert _answer(team["alice"], session_id, second).status_code == 202
-    assert "result" in _tools_call(runner, session_id, **retry)
+    assert saved.json() == {"allow_initiator": False}
 
 
 def test_a_team_rule_and_a_personal_rule_each_need_their_approver(team) -> None:
@@ -397,12 +420,13 @@ def _refused(team: dict[str, Any], person: str, elicitation_id: str) -> str:
     return refused.json()["error"]["message"]
 
 
-def test_a_message_queued_behind_a_turn_lets_nobody_in_it_approve_its_actions(team) -> None:
-    """D53 + WP8.8: Bob queues during Alice's turn; the approval names Alice, and neither
-    Alice nor Bob may approve it as a service approver where self-approval is off."""
+def test_where_self_approval_is_off_recorded_contributors_are_excluded_too(team) -> None:
+    """WP8.8 + D59: Bob queues during Alice's turn; the approval names Alice. Where the
+    service turns self-approval off, both are excluded as best effort; Carol approves."""
     session_id, runner = team["session"], team["runner"]
     team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
     _service_approvers(team, "alice", "bob", "carol")
+    _exclude_initiators(team)
     alices = _turn(team, "alice", "post the update")
     assert _register(team, alices.id)["initiator"] == "alice"
     # Queued: the runner has not started Bob's turn, so it is still Alice's.
@@ -437,11 +461,12 @@ def test_a_message_queued_behind_a_turn_lets_nobody_in_it_approve_its_actions(te
     assert runner.get(f"/v1/sessions/{session_id}/approvals").status_code == 403
 
 
-def test_a_long_turn_is_read_completely_before_anyone_approves(team) -> None:
-    """R1: Bob injects early in Alice's turn; 600 items later he still may not approve."""
+def test_a_long_turn_still_names_an_early_contributor(team) -> None:
+    """Bob injects early in Alice's turn; 600 items later he is still recorded."""
     session_id, runner = team["session"], team["runner"]
     team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
     _service_approvers(team, "bob", "carol")
+    _exclude_initiators(team)
     _register(team, _turn(team, "alice", "migrate the data").id)
     _turn(team, "bob", "and drop the old table")
     team["stores"]["conversation_store"].append(
@@ -467,13 +492,16 @@ def test_a_long_turn_is_read_completely_before_anyone_approves(team) -> None:
     assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
 
 
-def test_an_unreadable_record_of_who_took_part_refuses_every_answer(team, monkeypatch) -> None:
-    """R1: a failed read never counts as "nobody else took part"."""
+def test_an_unreadable_record_of_who_took_part_refuses_nothing(team, monkeypatch) -> None:
+    """D59: attribution is best effort; a failed read only weakens the optional exclusion."""
     from omnigent.stores.turn_store import SqlAlchemyTurnStore
 
     session_id, runner = team["session"], team["runner"]
-    _service_approvers(team, "carol")
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "bob")
+    _exclude_initiators(team)
     _register(team, _turn(team, "alice", "post the update").id)
+    _turn(team, "bob", "and mention the outage")
 
     def unreadable(self: Any, session_id: str) -> Any:
         raise sa.exc.OperationalError("SELECT", {}, Exception("database went away"))
@@ -484,36 +512,51 @@ def test_an_unreadable_record_of_who_took_part_refuses_every_answer(team, monkey
 
     record = team["approvals"].get_verdict(elicitation_id)
     assert record.attribution["authority"] == {"complete": False}
-    message = _refused(team, "carol", elicitation_id)
-    assert message.startswith("Omnigent could not confirm everyone who took part")
-    assert _state(team, elicitation_id) is VerdictState.PENDING
-    assert team["alice"].get("/v1/approvals").json()["data"] == []
-    assert "error" in _tools_call(runner, session_id, **retry)
+    # Bob's part in the turn was not read, so the exclusion cannot name him.
+    assert _answer(team["bob"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
 
 
-def test_a_held_back_turn_registration_falls_back_to_counting_every_sender(team) -> None:
-    """R4: a policy call arrives before the turn is registered; Bob still may not approve."""
+def test_a_pending_approval_from_before_the_upgrade_is_answered(team) -> None:
+    """A ledger row recorded before attribution existed has none; it is answered as usual."""
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "carol")
+    elicitation_id, retry = _ask(runner, session_id)
+    engine = sa.create_engine(team["approvals"].storage_location)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(SqlApprovalVerdict)
+            .where(SqlApprovalVerdict.elicitation_id == elicitation_id)
+            .values(attribution=None)
+        )
+    engine.dispose()
+
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_without_a_registered_turn_only_the_named_initiator_is_excluded(team) -> None:
+    """A turn whose registration has not landed: the exclusion is best effort (D59)."""
     session_id, runner = team["session"], team["runner"]
     team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
-    _service_approvers(team, "bob", "carol")
-    # Bob's first turn in Alice's thread: accepted, but its registration has not landed.
+    _service_approvers(team, "alice", "bob")
+    _exclude_initiators(team)
     _turn(team, "bob", "post the update")
 
     elicitation_id, _retry = _ask(runner, session_id)
 
     record = team["approvals"].get_verdict(elicitation_id)
     assert record.binding["initiator"] == "alice"
-    assert record.attribution["contributors"] == ["bob"]
-    assert record.attribution["authority"]["turn"] is None
-    _refused(team, "bob", elicitation_id)
+    assert record.attribution["contributors"] == []
     _refused(team, "alice", elicitation_id)
-    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    assert _answer(team["bob"], session_id, elicitation_id).status_code == 202
 
 
 def test_typing_recorded_on_another_replica_counts_as_taking_part(team) -> None:
     """R3: Dave typed into the thread's terminal through another server replica."""
     session_id, runner = team["session"], team["runner"]
     _service_approvers(team, "dave", "carol")
+    _exclude_initiators(team)
     _register(team, _turn(team, "alice", "post the update").id)
     get_turn_store().record_terminal_activity(session_id, "terminal_s1", "dave")
 
@@ -523,14 +566,17 @@ def test_typing_recorded_on_another_replica_counts_as_taking_part(team) -> None:
     assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
 
 
-def test_a_turn_started_with_unknown_input_cannot_be_approved(team) -> None:
+def test_a_turn_started_with_unknown_input_is_still_approved(team) -> None:
+    """D59: an unresolved turn is recorded as such; it refuses nothing."""
     session_id, runner = team["session"], team["runner"]
     _service_approvers(team, "carol")
     assert _register(team, "item_nobody_recorded")["unresolved"] is True
 
-    elicitation_id, _retry = _ask(runner, session_id)
+    elicitation_id, retry = _ask(runner, session_id)
 
-    assert _refused(team, "carol", elicitation_id).startswith("The turn that asked started with")
+    assert team["approvals"].get_verdict(elicitation_id).attribution["authority"]["unresolved"]
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
 
 
 def test_an_approval_record_is_read_by_thread_readers_and_its_approvers_only(team) -> None:
@@ -1148,6 +1194,7 @@ def test_the_initiator_is_the_server_recorded_turn_actor_with_or_without_the_hea
         f"/v1/sessions/{session_id}/permissions", json={"user_id": "bob", "level": LEVEL_EDIT}
     )
     _name_approver(team, "service", "bob", "tracker")
+    _exclude_initiators(team)
     # The server records the turn's actor when Bob's message is forwarded.
     team["stores"]["conversation_store"].set_labels(session_id, {_TURN_ACTOR_LABEL: "bob"})
     if not tunnel_header:

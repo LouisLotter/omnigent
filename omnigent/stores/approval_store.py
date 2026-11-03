@@ -155,7 +155,7 @@ class ResourceApprovers:
     :param resource: The resource.
     :param approvers: Named approvers, sorted.
     :param allow_initiator: The saved initiator setting, or ``None`` for the
-        default.
+        default (allowed).
     """
 
     resource: ApprovalResource
@@ -165,12 +165,15 @@ class ResourceApprovers:
     def initiator_may_approve(self) -> bool:
         """Whether the person who started an action may approve it.
 
-        By default yes for a thread (a person's own work) and no for a
-        service or the team.
+        Yes by default, for a thread, a service and the team alike (D59): an
+        approval records a person's consent, not a separation of duties. An
+        administrator (or a thread's owner) can turn it off per resource; it
+        then excludes, as best effort, the people attribution recorded as
+        having taken part in the turn.
         """
         if self.allow_initiator is not None:
             return self.allow_initiator
-        return self.resource.kind is ResourceKind.SESSION
+        return True
 
     def fingerprint(self) -> str:
         """Digest of who may answer, for binding a verdict to it."""

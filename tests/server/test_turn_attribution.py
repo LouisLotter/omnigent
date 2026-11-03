@@ -365,12 +365,19 @@ def test_an_older_runner_keeps_the_forward_time_record(people: Any) -> None:
     assert _send(bob, thread, "queued").status_code == 202
 
     assert _labels(stores, thread)[TURN_ACTOR_LABEL] == "bob"
-    # Every accepted input is still recorded for approvals.
-    assert get_turn_store().turn_authority(thread).people == {"alice", "bob"}
+    # Every accepted input is still recorded.
+    recorded = [get_turn_store().get_input(thread, turn.id) for turn in _turns(stores, thread)]
+    assert [record.person for record in recorded] == ["alice", "bob"]
 
 
 def _native_dispatch(
-    monkeypatch: pytest.MonkeyPatch, stores: dict[str, Any], thread: str, text: str, sender: str
+    monkeypatch: pytest.MonkeyPatch,
+    stores: dict[str, Any],
+    thread: str,
+    text: str,
+    sender: str,
+    *,
+    patch_forward: bool = True,
 ) -> str:
     """Send a terminal-harness message as the server does, without a client stable id."""
     delivered: dict[str, Any] = {}
@@ -387,7 +394,8 @@ def _native_dispatch(
         orchestration, "_build_native_terminal_message_event", lambda *_a, **_k: None
     )
     monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", ready)
-    monkeypatch.setattr(orchestration, "_forward_native_terminal_message", forward)
+    if patch_forward:
+        monkeypatch.setattr(orchestration, "_forward_native_terminal_message", forward)
     conversations = stores["conversation_store"]
     result = asyncio.run(
         orchestration._dispatch_session_event_to_runner_impl(
@@ -548,9 +556,9 @@ def test_typing_on_two_terminals_makes_authorship_ambiguous_and_counts_both(
     initiator = prompt.attribution.initiator
     assert (initiator.user, initiator.source) == (None, "terminal_ambiguous")
     assert initiator.possible == ["admin", "alice"]
-    # The turn's named person is not guessed; both count as taking part.
+    # The turn's named person is not guessed; both are recorded as possible.
     assert _labels(stores, thread)[TURN_ACTOR_LABEL] == "alice"
-    assert get_turn_store().turn_authority(thread).people >= {"admin", "alice"}
+    assert get_turn_store().get_input(thread, prompt.id).possible == ("admin", "alice")
 
 
 def test_typing_no_server_saw_is_assumed_to_be_the_computer_owners(
@@ -583,6 +591,101 @@ def test_a_read_only_attachment_records_no_typing(
         viewer.send_bytes(b"x\r")
         time.sleep(0.1)
     assert get_turn_store().typists_since(thread, None) == []
+
+
+@pytest.mark.timeout(30)
+def test_typing_is_never_refused_when_its_record_fails(
+    people: Any, idle_terminal: _IdleRunnerSocket, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D59: a terminal typing record that cannot be written never stops the keystrokes."""
+    from omnigent.stores.turn_store import SqlAlchemyTurnStore
+
+    def unwritable(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(SqlAlchemyTurnStore, "record_terminal_activity", unwritable)
+    admin, alice, _bob, stores = people
+    thread = _session(alice)
+    _on_computer(stores, thread, "alice", _READY)
+
+    with _attach_to(admin, thread, "terminal_s1") as typed:
+        typed.send_bytes(b"ls\r")
+        typed.send_bytes(b"pwd\r")
+        for _ in range(100):
+            if b"pwd\r" in idle_terminal.sent:
+                break
+            time.sleep(0.02)
+
+    assert [frame for frame in idle_terminal.sent if isinstance(frame, bytes)] == [
+        b"ls\r",
+        b"pwd\r",
+    ]
+
+
+def test_a_failed_input_record_never_stops_a_message(
+    people: Any, monkeypatch: pytest.MonkeyPatch, recording_runner: Any
+) -> None:
+    """D59: an input record that cannot be written is logged; the message still runs."""
+    from omnigent.stores.turn_store import SqlAlchemyTurnStore
+
+    def unwritable(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(SqlAlchemyTurnStore, "record_input", unwritable)
+    _admin, alice, _bob, stores = people
+    thread = _session(alice)
+    _on_computer(stores, thread, "alice", _READY)
+
+    assert _send(alice, thread, "deploy").status_code == 202
+
+    [body] = recording_runner.bodies
+    assert body["persisted_item_id"] == _turns(stores, thread)[-1].id
+
+
+def test_equal_text_queued_by_two_people_is_shown_as_not_certain(
+    people: Any, monkeypatch: pytest.MonkeyPatch, quiet_stream: None
+) -> None:
+    """F7: after a restart, two queued "continue" messages cannot be told apart by text."""
+    _admin, alice, _bob, stores = people
+    thread = _session(alice)
+    _on_computer(stores, thread, "alice", _READY)
+    stores["permission_store"].grant("bob", thread, LEVEL_EDIT)
+    _native_dispatch(monkeypatch, stores, thread, "continue", "alice")
+    _native_dispatch(monkeypatch, stores, thread, "continue", "bob")
+    pending_inputs.reset_for_tests()
+
+    first = _mirror(stores, thread, "continue")
+    second = _mirror(stores, thread, "continue")
+
+    first_initiator = first.attribution.initiator
+    assert (first_initiator.user, first_initiator.possible) == (None, ["alice", "bob"])
+    assert first.created_by is None
+    # The second record takes the remaining input; its own sender is then certain.
+    assert second.attribution.initiator.user in {"alice", "bob"}
+
+
+def test_a_failed_first_delivery_never_claims_a_later_equal_text(
+    people: Any, monkeypatch: pytest.MonkeyPatch, quiet_stream: None
+) -> None:
+    """F7: Alice's "continue" never reached the harness; Bob's later one is Bob's."""
+    _admin, alice, _bob, stores = people
+    thread = _session(alice)
+    _on_computer(stores, thread, "alice", _READY)
+    stores["permission_store"].grant("bob", thread, LEVEL_EDIT)
+
+    async def fails(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("the runner refused it")
+
+    with pytest.raises(RuntimeError):
+        with monkeypatch.context() as patch:
+            patch.setattr(orchestration, "_forward_native_terminal_message", fails)
+            _native_dispatch(monkeypatch, stores, thread, "continue", "alice", patch_forward=False)
+    _native_dispatch(monkeypatch, stores, thread, "continue", "bob")
+    pending_inputs.reset_for_tests()
+
+    mirrored = _mirror(stores, thread, "continue")
+
+    assert mirrored.attribution.initiator.user == "bob"
 
 
 class _RecordingRunner(_CaptureRunnerClient):

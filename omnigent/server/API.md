@@ -1281,12 +1281,14 @@ POST /v1/sessions/{session_id}/turns
     server has no turn registration (the runner proceeds as before)
 ```
 
-A runner advertising the `turn_inputs` capability registers each turn, and
-waits for this acknowledgement, before its harness acts. It names only the
-server-issued ids of the turn's inputs; the server reads their senders from
-its own records, sets `omnigent.turn_actor`, and records the turn. The same
-`turn_id` again returns the stored turn. An id the server never recorded
-leaves the turn `unresolved`, and nobody may approve its actions.
+A runner advertising the `turn_inputs` capability registers each turn beside
+its harness, as best effort: the harness never waits for it, a failed request
+is retried twice with the same `turn_id`, and one that cannot land is logged.
+Attribution is a display (D59); registration never delays or fails a turn.
+The runner names only the server-issued ids of the turn's inputs; the server
+reads their senders from its own records, sets `omnigent.turn_actor`, and
+records the turn. The same `turn_id` again returns the stored turn. An id the
+server never recorded leaves the turn's person unknown (`unresolved`).
 
 ### List a Thread's Approvals
 
@@ -1321,15 +1323,38 @@ GET /v1/sessions/{session_id}/approvals/{elicitation_id}   # one record
 
 The thread's approvals and its sub-agents', newest first, for anyone who can
 read the thread; a single record also for the approvers named to answer it.
-`contributors` are everyone who took part in the turn before it asked: the
-turn's inputs, every input accepted and all terminal typing since it was
-registered (everyone who ever sent input, with no registered turn). Where
-the person who started an action may not approve it, none of them may. When
-that record could not be read completely (`authority.complete: false`) or
-the turn is `unresolved`, every answer is refused. `role` is the grant an answer was given under:
+`contributors` are the people attribution recorded as taking part in the
+turn before it asked, as best effort: the turn's inputs, every input
+accepted and all terminal typing since it was registered (nobody beyond the
+turn actor, with no registered turn). `authority.complete: false` means
+that record could not be read. Where a resource has turned off approval by
+the initiator, they may not answer; an incomplete record only narrows who is
+excluded and never refuses an answer. `role` is the grant an answer was given under:
 `thread_owner`, `thread_approver`, `service_approver` or `team_approver`.
 Answered approvals are kept until their thread is deleted; unanswered ones
 are purged a week after they expire.
+
+### Approval Settings
+
+```
+GET /v1/approvers?kind=session|service|team&resource_id=…
+PUT /v1/approval-settings
+{"kind": "service", "resource_id": "tracker", "allow_initiator": false}
+
+200 OK
+{"allow_initiator": false}
+```
+
+Whether the person who started an action may approve it, per thread, service
+or team; the GET returns it as `allow_initiator`, with the saved value (or
+`null`) as `allow_initiator_saved`. It is allowed by default for all three
+(D59); `null` restores the default. Turned off, it excludes the people
+attribution recorded as taking part in the turn that asked, its initiator and
+contributors, as best effort. Omnigent's approvals record a person's consent.
+They are not a separation-of-duties control. Where an action needs several
+people's eyes, the external system enforces it, for example GitHub's
+required pull-request reviews and branch protection. A thread's owner
+manages their thread's setting; an administrator a service's or the team's.
 
 ### Fork Session
 

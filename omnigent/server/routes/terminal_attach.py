@@ -186,7 +186,7 @@ def create_terminal_attach_router(
         )
 
         # Keystrokes carry no identity, so who sends input to this terminal is
-        # recorded from this authenticated connection, before the input is passed on.
+        # recorded from this authenticated connection (best effort, beside the input).
         typist = (
             attribution_user(auth_provider.get_user_id(websocket))
             if auth_provider is not None and not read_only
@@ -479,17 +479,17 @@ class _RunnerWSClosed(Exception):
         self.reason = reason
 
 
-# A person typing is recorded at least this often, and on every Enter.
+# Typing is recorded at most this often, and on every Enter through the runner proxy.
 _TYPING_RECORD_INTERVAL_S = 1.0
 
 
 class _TypingRecorder:
-    """Records, durably and per terminal, that a person sends it input.
+    """Records, per terminal and person, that someone sends it input; best effort.
 
-    Approvals count everyone who typed into a thread's terminals during a turn
-    as having taken part, on every server replica. A record is written before
-    the input it covers is passed on: on every Enter (a prompt submitted) and
-    at least once a second while typing. A failed write refuses the input.
+    Attribution names whoever typed into a thread's terminals during a turn
+    (D59: a display). Writes run beside the input, never before it: on a
+    submitted line and at most once a second while typing, one at a time. A
+    failed write is logged; the input is never delayed or refused.
     """
 
     def __init__(self, session_id: str, terminal_id: str, user_id: str) -> None:
@@ -497,40 +497,41 @@ class _TypingRecorder:
         self._terminal_id = terminal_id
         self._user_id = user_id
         self._recorded_at = 0.0
-        self._interaction: asyncio.Task[None] | None = None
+        self._writing: asyncio.Task[None] | None = None
 
-    async def before_input(self, data: bytes | str) -> None:
-        """Record the typing *data* is part of; raises when it cannot be recorded."""
+    def note_input(self, data: bytes | str, *, submits_on_enter: bool = True) -> None:
+        """Note typing; schedules a record when one is due and none is in flight."""
         now = time.monotonic()
-        submits = (b"\r" in data or b"\n" in data) if isinstance(data, bytes) else False
+        submits = submits_on_enter and isinstance(data, bytes) and (b"\r" in data or b"\n" in data)
         if not submits and now - self._recorded_at < _TYPING_RECORD_INTERVAL_S:
             return
+        if self._writing is not None and not self._writing.done():
+            return
+        self._recorded_at = now
+        self._writing = asyncio.ensure_future(self._record())
+
+    def note_interaction(self) -> None:
+        """Note possible typing for a bridge whose frames this server cannot see."""
+        self.note_input(b"", submits_on_enter=False)
+
+    async def _record(self) -> None:
         from omnigent.runtime import get_turn_store
 
         store = get_turn_store()
         if store is None:
             return
-        await asyncio.to_thread(
-            store.record_terminal_activity, self._session_id, self._terminal_id, self._user_id
-        )
-        self._recorded_at = now
-
-    def note_interaction(self) -> None:
-        """Record possible typing for a bridge whose frames this server cannot see."""
-        if self._interaction is None or self._interaction.done():
-            self._interaction = asyncio.ensure_future(self._record_interaction())
-
-    async def _record_interaction(self) -> None:
         try:
-            await self.before_input(b"\r")
+            await asyncio.to_thread(
+                store.record_terminal_activity, self._session_id, self._terminal_id, self._user_id
+            )
         except Exception:
             _logger.warning("Could not record terminal typing", exc_info=True)
 
     async def flush(self) -> None:
-        """Wait for an in-flight interaction record."""
-        if self._interaction is not None and not self._interaction.done():
+        """Wait for an in-flight record."""
+        if self._writing is not None and not self._writing.done():
             with contextlib.suppress(Exception):
-                await self._interaction
+                await self._writing
 
 
 async def _shuttle_ws_frames(
@@ -569,10 +570,10 @@ async def _shuttle_ws_frames(
                 if text is not None:
                     await runner_ws.send(text)  # type: ignore[attr-defined]
                 elif data is not None:
+                    await runner_ws.send(data)  # type: ignore[attr-defined]
                     if typing is not None:
                         # Binary frames are keystrokes; text frames are controls.
-                        await typing.before_input(data)
-                    await runner_ws.send(data)  # type: ignore[attr-defined]
+                        typing.note_input(data)
         except WebSocketDisconnect:
             return
         except ConnectionClosed:

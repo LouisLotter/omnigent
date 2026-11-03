@@ -457,6 +457,10 @@ _INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
 )
 
 
+# Stands for "no turn slot at all", unlike a reserved ``None`` slot.
+_MISSING_TURN = object()
+
+
 def _input_stable_id(source: Mapping[str, object]) -> str | None:
     """Return one validated web input id from a runner or harness body."""
     value = source.get("input_stable_id") or source.get("stable_id")
@@ -3690,17 +3694,50 @@ def create_runner_app(
         if ids:
             body[TURN_INPUTS_KEY] = ids
 
-    async def _register_stashed_turn(conv_id: str, body: _JsonObject) -> None:
-        """Register the turn and wait for the server before the harness acts on it.
+    def _end_failed_stream_setup(
+        conv_id: str, body: _JsonObject, turn_epoch: int | None, exc: BaseException
+    ) -> None:
+        """Finish a streamed turn whose setup raised or was cancelled.
 
-        A turn with no server-issued inputs (a recovery or continuation) keeps
-        the turn already registered.
+        The same error publication and slot cleanup the background path gives a
+        failed setup. Only while the slot is still this turn's reservation (the
+        ``None`` sentinel of the same epoch), so an older failure never clears a
+        newer turn; otherwise every later message would buffer forever.
+        """
+        if _active_turns.get(conv_id, _MISSING_TURN) is not None:
+            return
+        if _turn_bind_epoch.get(conv_id) != turn_epoch:
+            return
+        error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
+        stable_id = _input_stable_id(body)
+        if stable_id is not None:
+            _publish_event(
+                conv_id,
+                _response_failed_payload(
+                    {**error, "undelivered": True}, input_stable_id=stable_id
+                ),
+            )
+        # The harness never took it: a resend must run it.
+        _accepted_messages.forget(conv_id, body)
+        _on_proxy_stream_end(conv_id, error=error)
+
+    def _register_stashed_turn(conv_id: str, body: _JsonObject) -> None:
+        """Tell the server which inputs this turn starts with, beside the turn.
+
+        Best effort (D59): the harness never waits for it, and a failure is
+        logged. A turn with no server-issued inputs (a recovery or
+        continuation) keeps the turn already registered.
         """
         from omnigent.runner.turn_inputs import TURN_INPUTS_KEY, register_turn
 
         ids = body.pop(TURN_INPUTS_KEY, None)
-        if isinstance(ids, list) and ids:
-            await register_turn(server_client, conv_id, ids)
+        if not isinstance(ids, list) or not ids:
+            return
+        task = asyncio.create_task(
+            register_turn(server_client, conv_id, ids), name=f"turn-register-{conv_id}"
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     async def _codex_native_bridge_state_and_dir_for_session(
         conv_id: str,
@@ -5025,8 +5062,7 @@ def create_runner_app(
         conv: str,
         handed_off: list[bool],
     ) -> None:
-        # Nothing reaches the harness before the server has recorded whose turn it is.
-        await _register_stashed_turn(conv, msg_body)
+        _register_stashed_turn(conv, msg_body)
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         await _sync_session_agent(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
@@ -6722,8 +6758,13 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    await _register_stashed_turn(conversation_id, message_body)
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    _register_stashed_turn(conversation_id, message_body)
+                    turn_epoch = _turn_bind_epoch.get(conversation_id)
+                    try:
+                        response = await _stream_message_to_harness(message_body, conversation_id)
+                    except BaseException as exc:
+                        _end_failed_stream_setup(conversation_id, message_body, turn_epoch, exc)
+                        raise
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
