@@ -16,6 +16,7 @@ import logging
 from typing import Any, Literal
 
 from omnigent.entities import ConversationItem, MessageData
+from omnigent.entities.file import StoredFile
 from omnigent.inner.native_attachments import (
     DELIVERY_KEY,
     FilesystemAttachmentPolicy,
@@ -25,6 +26,7 @@ from omnigent.inner.native_attachments import (
     uses_filesystem_delivery,
 )
 from omnigent.stores import ArtifactStore, FileStore
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -724,13 +726,7 @@ def extract_text_attachments(
             file_meta = file_store.get(file_id)
         except Exception:  # best-effort scan; never break message delivery
             continue
-        if file_meta is None:
-            continue
-        if (
-            file_meta.session_id is not None
-            and session_id is not None
-            and file_meta.session_id != session_id
-        ):
+        if file_meta is None or not file_belongs_to(file_meta, session_id):
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
         # Checked before the text-like test: delivery follows the upload's recorded
@@ -879,6 +875,24 @@ def _resolve_message_content(
     return resolved if changed else content
 
 
+def file_belongs_to(file_meta: StoredFile, session_id: str | None) -> bool:
+    """Whether a thread may use a stored file: only a file uploaded to it.
+
+    A file ID from another thread never resolves, so nobody substitutes
+    someone else's file. An unscoped (pre-scoping) record resolves only
+    where no thread is known.
+
+    :param file_meta: The stored file.
+    :param session_id: The thread using it, e.g. ``"conv_abc123"``.
+    :returns: ``True`` when the file is that thread's own.
+    """
+    if session_id is None:
+        return file_meta.session_id is None
+    return file_meta.session_id is not None and normalize_uuid(
+        file_meta.session_id
+    ) == normalize_uuid(session_id)
+
+
 def _session_id_from_block(block: dict[str, Any]) -> str | None:
     """
     Extract optional session ownership from a content block.
@@ -934,11 +948,9 @@ def _resolve_file_id_block(
         unless *defer_filesystem_files* is set.
     """
     file_id = block["file_id"]
-    owner_session_id = session_id or _session_id_from_block(block)
+    owner_session_id = session_id if session_id is not None else _session_id_from_block(block)
     file_meta = file_store.get(file_id)
-    if file_meta is None or (
-        file_meta.session_id is not None and file_meta.session_id != owner_session_id
-    ):
+    if file_meta is None or not file_belongs_to(file_meta, owner_session_id):
         raise ValueError(
             f"Referenced file '{file_id}' no longer exists — "
             f"it may have been deleted after the request was accepted"

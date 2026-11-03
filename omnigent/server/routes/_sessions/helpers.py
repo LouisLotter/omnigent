@@ -132,6 +132,9 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
 )
 from omnigent.server.routes._auth_helpers import (
+    CONNECTION_AUTHORITY_RECHECK_S,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
@@ -9729,6 +9732,8 @@ async def _stream_live_events(
     viewer_user_id: str | None = None,
     viewer_idle: bool = False,
     presence_root_id: str | None = None,
+    still_authorized: Callable[[], Awaitable[bool]] | None = None,
+    authority_recheck_s: float | None = None,
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events from the conversation's live stream.
@@ -9742,6 +9747,12 @@ async def _stream_live_events(
     An intentional session close emits ``[DONE]``. Server shutdown and
     subscriber overflow instead end without it so clients reconnect and
     reconcile from the persisted snapshot after the server returns.
+
+    An open stream is not lasting authority: at most every
+    *authority_recheck_s* (checked as events and heartbeats arrive) the
+    caller is re-authorized through *still_authorized*. A caller who lost
+    access gets no further event and the stream ends without ``[DONE]``;
+    the client's reconnect is then refused.
 
     ``finally`` is cleanup-only (presence deregistration): yielding
     from ``finally`` during client ``aclose`` / ``GeneratorExit``
@@ -9792,6 +9803,10 @@ async def _stream_live_events(
         viewers of different agents/sub-agents in one session see
         each other. Required when *viewer_user_id* is set; ignored
         otherwise.
+    :param still_authorized: Re-authorizes the caller; ``None`` skips it
+        (callers without a revocable credential or session access).
+    :param authority_recheck_s: Minimum seconds between re-authorizations;
+        defaults to :data:`CONNECTION_AUTHORITY_RECHECK_S`.
     :returns: An async iterator of SSE message strings.
     :raises ValueError: If *viewer_user_id* is set without
         *presence_root_id* — a per-conversation presence scope would
@@ -9808,6 +9823,10 @@ async def _stream_live_events(
         presence_token = presence.connect(
             presence_root_id, session_id, viewer_user_id, viewer_idle
         )
+    revoked = False
+    if authority_recheck_s is None:
+        authority_recheck_s = CONNECTION_AUTHORITY_RECHECK_S
+    next_recheck_at = time.monotonic() + authority_recheck_s
     try:
         # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
         # a bare ``async for`` would leave the subscriber slot until GC.
@@ -9828,6 +9847,11 @@ async def _stream_live_events(
             async for event in live_events:
                 if await request.is_disconnected():
                     break
+                if still_authorized is not None and time.monotonic() >= next_recheck_at:
+                    if not await still_authorized():
+                        revoked = True
+                        break
+                    next_recheck_at = time.monotonic() + authority_recheck_s
                 event_type = event.get("type")
                 if not isinstance(event_type, str):
                     raise ValueError(
@@ -9842,9 +9866,15 @@ async def _stream_live_events(
             extra={"session_id": session_id},
         )
     else:
-        # Server restart is a transport drop, not a permanent session close.
+        # Server restart and revoked access are transport drops, not a session close.
         # Never yield from finally: aclose / GeneratorExit cannot accept a yield.
-        if not shutdown_state.server_shutting_down():
+        if revoked:
+            _logger.info(
+                "session stream for %s lost its caller's access; closing",
+                session_id,
+                extra=debug_event("session_stream_revoked", session_id=session_id),
+            )
+        elif not shutdown_state.server_shutting_down():
             yield "data: [DONE]\n\n"
     finally:
         # The non-None checks besides presence_token's are type
@@ -10998,6 +11028,97 @@ def _delete_stored_session_bundle_after_failure(
         )
 
 
+MAX_SUBAGENT_DEPTH = 16
+"""How deep sub-agents nest below a top-level thread."""
+
+
+@dataclass(frozen=True)
+class ChildLineage:
+    """What a new sub-agent inherits from its parent thread.
+
+    :param parent: The parent thread, or ``None`` when it vanished meanwhile.
+    :param owner_id: Who owns the child: the parent tree's actual owner, never
+        the person who asked for the child. ``None`` with permissions off.
+    :param inherits_runner: Whether the child may run on the parent's runner:
+        only its owner (or the owner's runner) adds such children.
+    """
+
+    parent: Conversation | None
+    owner_id: str | None
+    inherits_runner: bool
+
+
+def _authorize_child_lineage_sync(
+    parent_session_id: str,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> ChildLineage:
+    """Blocking core of :func:`_authorize_child_lineage`; access already checked."""
+    parent = conversation_store.get_conversation(parent_session_id)
+    if parent is None:
+        return ChildLineage(None, None, False)
+    depth, current, seen = 1, parent, {parent.id}
+    while current.parent_conversation_id is not None:
+        ancestor = conversation_store.get_conversation(current.parent_conversation_id)
+        if ancestor is None or ancestor.id in seen or depth >= MAX_SUBAGENT_DEPTH:
+            raise OmnigentError(
+                f"Sub-agents nest at most {MAX_SUBAGENT_DEPTH} levels deep",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        seen.add(ancestor.id)
+        current, depth = ancestor, depth + 1
+    if permission_store is None:
+        return ChildLineage(parent, None, True)
+    owner = conversation_store.get_actual_session_owner(parent_session_id)
+    if owner is None:
+        raise OmnigentError(
+            "This thread has no single owner, so it can't take sub-agents",
+            code=ErrorCode.FORBIDDEN,
+        )
+    return ChildLineage(parent, owner.user_id, user_id is None or owner.user_id == user_id)
+
+
+async def _authorize_child_lineage(
+    parent_session_id: str,
+    *,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> ChildLineage:
+    """
+    Authorize adding a sub-agent below *parent_session_id*.
+
+    Needs read access to the parent, as before (an administrator keeps that
+    access). The child belongs to the tree's actual owner, never to the
+    caller: a share of the parent does not make anyone the child's owner, and
+    only the owner (or the owner's own runner) adds children that run on the
+    parent's runner and host. Lineage is bounded at :data:`MAX_SUBAGENT_DEPTH`.
+
+    :param parent_session_id: The requested parent, e.g. ``"conv_abc123"``.
+    :param user_id: Authenticated caller, e.g. ``"alice@example.com"``.
+    :param permission_store: Permission store; ``None`` with auth disabled.
+    :param conversation_store: Store for the parent chain and owner reads.
+    :returns: The authorized lineage.
+    :raises OmnigentError: 403/404 without access to the parent, 403 when the
+        tree has no single owner, 400 when nesting is too deep.
+    """
+    await _require_access(
+        user_id,
+        parent_session_id,
+        LEVEL_READ,
+        permission_store,
+        conversation_store,
+    )
+    return await asyncio.to_thread(
+        _authorize_child_lineage_sync,
+        parent_session_id,
+        user_id,
+        permission_store,
+        conversation_store,
+    )
+
+
 async def _authorize_bundled_parent_and_inherit_runner(
     parent_session_id: str,
     *,
@@ -11009,13 +11130,10 @@ async def _authorize_bundled_parent_and_inherit_runner(
     """
     Authorize a bundled create's parent link and resolve runner affinity.
 
-    The caller must have READ access to the parent session
-    before inheriting anything, mirroring the JSON create path —
-    without this, a forged parent link lets the caller inherit runner
-    bindings and parent a session they don't control. On success the
-    parent's runner binding is inherited (sub-agent co-location),
-    subject to a defense-in-depth ownership check: a runner the
-    caller doesn't own is not inherited.
+    Mirrors the JSON create path through :func:`_authorize_child_lineage`.
+    The parent's runner binding is inherited (sub-agent co-location) only
+    when the caller is the parent tree's actual owner, and, as defense in
+    depth, not when the live runner reports another owner.
 
     :param parent_session_id: The requested parent session id,
         e.g. ``"conv_abc123"``.
@@ -11027,22 +11145,19 @@ async def _authorize_bundled_parent_and_inherit_runner(
         ``None`` skips it.
     :returns: The authorized parent and inherited runner id. The runner id
         is ``None`` when absent or ownership disallows inheritance.
-    :raises OmnigentError: 403/404 when the caller may not access the
-        parent session.
+    :raises OmnigentError: As :func:`_authorize_child_lineage`.
     """
-    await _require_access(
-        user_id,
+    lineage = await _authorize_child_lineage(
         parent_session_id,
-        LEVEL_READ,
-        permission_store,
-        conversation_store,
+        user_id=user_id,
+        permission_store=permission_store,
+        conversation_store=conversation_store,
     )
-    parent_conv = await asyncio.to_thread(
-        conversation_store.get_conversation,
-        parent_session_id,
-    )
+    parent_conv = lineage.parent
     if parent_conv is None:
         return None, None
+    if not lineage.inherits_runner:
+        return parent_conv, None
     inherited_runner_id = parent_conv.runner_id
     if inherited_runner_id is not None and user_id is not None and runner_router is not None:
         runner_owner = runner_router.runner_owner(inherited_runner_id)
@@ -12266,6 +12381,7 @@ __all__ = [
     "_apply_pending_policy_ask_writes",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
+    "_authorize_child_lineage",
     "_await_settled_managed_launch",
     "_background_task_delivery_status",
     "_build_actor",

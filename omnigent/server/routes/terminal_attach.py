@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Final
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
@@ -84,7 +85,12 @@ from omnigent.runtime import (
 )
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
-from omnigent.server.routes._auth_helpers import require_access
+from omnigent.server.principals import recorded_principal
+from omnigent.server.routes._auth_helpers import (
+    CONNECTION_AUTHORITY_RECHECK_S,
+    connection_still_authorized,
+    require_access,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
@@ -99,6 +105,9 @@ _logger = logging.getLogger(__name__)
 _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
 _WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
+_REVOKED_REASON: Final[str] = "terminal access revoked"
+
+StillAuthorized = Callable[[], Awaitable[bool]]
 
 
 def create_terminal_attach_router(
@@ -152,7 +161,7 @@ def create_terminal_attach_router(
             resolve_terminal_entry_by_resource_id,
         )
 
-        await _authorize_terminal_attach(
+        still_authorized = await _authorize_terminal_attach(
             websocket,
             session_id=session_id,
             read_only=read_only,
@@ -214,7 +223,9 @@ def create_terminal_attach_router(
                     },
                 ):
                     async with runner_cm as runner_ws:
-                        await _shuttle_ws_frames(websocket, runner_ws)
+                        await _serve_while_authorized(
+                            websocket, _shuttle_ws_frames(websocket, runner_ws), still_authorized
+                        )
             except _RunnerWSClosed as closed:
                 code = (
                     closed.code
@@ -266,14 +277,72 @@ def create_terminal_attach_router(
                 "terminal.mode": "in-process",
             },
         ):
-            await bridge_tmux_control_to_websocket(
+            await _serve_while_authorized(
                 websocket,
-                socket_path=str(entry.instance.socket_path),
-                tmux_target=entry.instance.tmux_target,
-                read_only=read_only,
+                bridge_tmux_control_to_websocket(
+                    websocket,
+                    socket_path=str(entry.instance.socket_path),
+                    tmux_target=entry.instance.tmux_target,
+                    read_only=read_only,
+                ),
+                still_authorized,
             )
 
     return router
+
+
+async def _serve_while_authorized(
+    websocket: WebSocket,
+    serving: Awaitable[None],
+    still_authorized: StillAuthorized | None,
+    *,
+    recheck_s: float | None = None,
+) -> None:
+    """
+    Run an attached terminal's frame pump until it ends or the caller loses access.
+
+    An accepted attach is not lasting authority: every *recheck_s* the caller
+    is re-authorized at the level the attach was granted, and a caller who
+    signed out, lost the share or the thread is disconnected with 1008.
+
+    :param websocket: The browser-facing WebSocket.
+    :param serving: The frame pump for the attach.
+    :param still_authorized: Re-authorizes the caller; ``None`` (permissions
+        disabled) only runs *serving*.
+    :param recheck_s: Seconds between re-authorizations; defaults to
+        :data:`CONNECTION_AUTHORITY_RECHECK_S`.
+    :raises _RunnerWSClosed: Propagated from *serving*.
+    """
+    if still_authorized is None:
+        await serving
+        return
+    interval = CONNECTION_AUTHORITY_RECHECK_S if recheck_s is None else recheck_s
+
+    async def _watch() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            if not await still_authorized():
+                return
+
+    serve_task = asyncio.ensure_future(serving)
+    watch_task = asyncio.create_task(_watch())
+    try:
+        done, _ = await asyncio.wait({serve_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (serve_task, watch_task):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+    if serve_task in done:
+        serve_task.result()
+        return
+    _logger.info(
+        "terminal attach lost its caller's access; closing",
+        extra=debug_event("attach_terminal_by_resource_id", phase="revoked"),
+    )
+    with contextlib.suppress(RuntimeError):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=_REVOKED_REASON)
 
 
 async def _authorize_terminal_attach(
@@ -284,7 +353,7 @@ async def _authorize_terminal_attach(
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore | None,
-) -> None:
+) -> StillAuthorized | None:
     """
     Authorize a terminal-attach WebSocket before accepting it.
 
@@ -313,12 +382,14 @@ async def _authorize_terminal_attach(
         all checks (single-user/dev mode).
     :param conversation_store: Conversation store consulted by the
         access check. Required when *permission_store* is set.
+    :returns: A re-check of the same credential and level for the open
+        attach, or ``None`` when permissions are disabled.
     :raises WebSocketException: With ``WS_1008_POLICY_VIOLATION`` when
         auth is misconfigured, the caller is unauthenticated, or the
         caller lacks the required level for the requested mode.
     """
     if permission_store is None:
-        return
+        return None
     if auth_provider is None or conversation_store is None:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,
@@ -355,6 +426,23 @@ async def _authorize_terminal_attach(
             code=status.WS_1008_POLICY_VIOLATION,
             reason="not authorized",
         ) from exc
+
+    attached_principal = recorded_principal(websocket)
+    checked_store = conversation_store
+
+    async def _still_authorized() -> bool:
+        return await connection_still_authorized(
+            websocket,
+            auth_provider=auth_provider,
+            expected=attached_principal,
+            user_id=user_id,
+            conversation_id=session_id,
+            required_level=required_level,
+            permission_store=permission_store,
+            conversation_store=checked_store,
+        )
+
+    return _still_authorized
 
 
 class _RunnerWSClosed(Exception):
@@ -430,14 +518,18 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
 
     runner_closed: _RunnerWSClosed | None = None
     try:
-        done, pending = await asyncio.wait(
-            {b2r, r2b},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+        try:
+            done, _ = await asyncio.wait(
+                {b2r, r2b},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            # Also when cancelled (access revoked): neither pump outlives the attach.
+            for task in (b2r, r2b):
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
         for task in done:
             exc = task.exception()
             if isinstance(exc, _RunnerWSClosed):

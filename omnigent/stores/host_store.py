@@ -100,6 +100,9 @@ class SandboxInUseError(ValueError):
 
 LAUNCH_TOKEN_ONLY_REFUSAL = "This host is server-managed; it registers only with its launch token."
 SUPERSEDED_LAUNCH_TOKEN_REFUSAL = "This host's launch token has been replaced or revoked."
+REGISTRATION_REVOKED_REFUSAL = (
+    "This host was removed, or now belongs to another account or registration."
+)
 
 
 @dataclass
@@ -503,6 +506,31 @@ def resolve_runner_binding(
         host_id=host_id,
         session_id=min(owners_by_session),
         runner_id=runner_id,
+    )
+
+
+def _held_by_an_earlier_registration() -> ColumnElement[bool]:
+    """Whether a host row's owner was removed or registered again since it was stamped.
+
+    Correlated with :class:`SqlHost`; the SQL form of :meth:`HostStore.get_actual_host_owner`.
+    """
+    return (
+        select(SqlUser.id)
+        .where(
+            SqlUser.workspace_id == SqlHost.workspace_id,
+            SqlUser.id == SqlHost.user_id,
+            or_(
+                SqlUser.deleted_at.is_not(None),
+                and_(
+                    SqlUser.account_generation.is_not(None),
+                    or_(
+                        SqlHost.account_generation.is_(None),
+                        SqlHost.account_generation != SqlUser.account_generation,
+                    ),
+                ),
+            ),
+        )
+        .exists()
     )
 
 
@@ -981,7 +1009,12 @@ class HostStore:
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
     def heartbeat(
-        self, host_id: str, *, by_bearer: bool = False, launch_token: str | None = None
+        self,
+        host_id: str,
+        *,
+        by_bearer: bool = False,
+        launch_token: str | None = None,
+        owner: str | None = None,
     ) -> bool:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
@@ -992,7 +1025,8 @@ class HostStore:
         ``PING_INTERVAL_S``. Does not change ``status`` — a host whose
         ping loop is running is, by construction, still ``"online"``.
 
-        No-op if the host does not exist.
+        No-op if the host does not exist; with *owner* or *launch_token*
+        that ends the tunnel.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
@@ -1002,9 +1036,15 @@ class HostStore:
         :param launch_token: The raw token the tunnel registered with. Such a
             tunnel no longer refreshes a host once that token has been
             replaced, revoked or deleted. Its expiry alone does not end it.
+        :param owner: The person the tunnel registered for. Such a tunnel
+            ends once the host is removed, belongs to someone else, or is held
+            by an earlier registration of its owner (as
+            :meth:`get_actual_host_owner` decides). A password change carries the
+            host to the new registration, so it does not end the tunnel.
         :returns: ``False`` when the tunnel must end: *by_bearer* is set and
-            the host has become launch-token-only, or *launch_token* is no
-            longer the host's token. ``True`` otherwise.
+            the host has become launch-token-only, *launch_token* is no
+            longer the host's token, or the host no longer belongs to
+            *owner*'s current registration. ``True`` otherwise.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
@@ -1023,13 +1063,18 @@ class HostStore:
                 statement = statement.where(
                     SqlHost.token_hash == hash_host_launch_token(launch_token)
                 )
+            if owner is not None:
+                statement = statement.where(
+                    SqlHost.user_id == owner, ~_held_by_an_earlier_registration()
+                )
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(statement.values(updated_at=updated_at)),
             )
-            if result.rowcount == 1 or not (by_bearer or launch_token is not None):
+            ends = launch_token is not None or owner is not None
+            if result.rowcount == 1 or not (by_bearer or ends):
                 return True
-            if launch_token is not None:
+            if ends:
                 return False
             # Nothing matched: the host is gone, or it was armed since this tunnel registered.
             return not self._launch_token_only(session, host_id)
@@ -1704,6 +1749,7 @@ class HostStore:
         transfer_from_host_id: str | None = None,
         *,
         require_account_owner: bool = False,
+        owner_session_id: str | None = None,
     ) -> None:
         """Order final launch authorization with account deletion across replicas.
 
@@ -1712,6 +1758,9 @@ class HostStore:
         Accounts deployments also require a live session owner able to mint
         runner credentials; other auth modes retain their own owner lifecycle.
         A host with an owner runs only threads whose single owner is that person.
+        A sub-agent's owner is its thread tree's: pass the root as
+        *owner_session_id* (a root id never changes, so reading it beforehand
+        is safe).
         """
 
         def write(session: Session) -> None:
@@ -1774,7 +1823,9 @@ class HostStore:
             # requires one above.
             if owner is not None:
                 thread_owners = session.execute(
-                    select(SqlSessionPermission.user_id).where(_owner_grants(session_id)).limit(2)
+                    select(SqlSessionPermission.user_id)
+                    .where(_owner_grants(owner_session_id or session_id))
+                    .limit(2)
                 ).all()
                 if len(thread_owners) > 1 or any(row.user_id != owner for row in thread_owners):
                     raise OmnigentError(

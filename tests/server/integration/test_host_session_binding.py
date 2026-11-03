@@ -2249,8 +2249,10 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     """
     A failed bound-session lookup still logs the crash and leaves the host online.
 
-    The report is one-way; letting the callback's error escape would tear down
+    The report is one-way; letting the lookup's error escape would tear down
     the host tunnel and take every other runner on that host offline with it.
+    The lookup also decides whether the runner is this host's to report, so an
+    unverifiable report changes nothing beyond the log.
     """
     app, conv_store = _runner_exited_app(db_uri, tmp_path)
 
@@ -2261,11 +2263,8 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_crashed")
 
-    def _callback_failures() -> list[logging.LogRecord]:
-        return [r for r in caplog.records if "on_runner_exited callback failed" in r.getMessage()]
-
     async with asyncio.timeout(5.0):
-        while not _callback_failures():
+        while not _runner_exited_events(caplog):
             await asyncio.sleep(0.01)
 
     events = _runner_exited_events(caplog)

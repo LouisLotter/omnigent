@@ -73,6 +73,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.authority import ScheduledFireRefused, ScheduledOrigin
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
@@ -125,12 +126,17 @@ class _FireResult(Enum):
     IN_FLIGHT = "in_flight"
 
 
-class _CannotLaunchScheduledFire(RuntimeError):
-    """A fire cannot start because its execution target is not usable."""
+# A fire cannot start, or lost its authority; shared with startup-input delivery.
+_CannotLaunchScheduledFire = ScheduledFireRefused
 
-    def __init__(self, message: str, *, error_code: str) -> None:
-        super().__init__(message)
-        self.error_code = error_code
+
+@dataclass(frozen=True)
+class _CapturedTask:
+    """The task identity a saved prompt carries: id, owner and registration."""
+
+    id: str
+    user_id: str | None
+    account_generation: str | None
 
 
 @dataclass
@@ -545,7 +551,30 @@ async def _run_fire_for_task(
             )
 
         try:
+            # Everything above may have taken minutes (a wake, a slow host):
+            # authority held at the start of the fire does not carry over.
+            await _reauthorize_fire(
+                deps,
+                task,
+                # The host the preflight authorized; managed fires bind a new one.
+                host_id=effective.host_id if preflight is not None else None,
+                conversation_id=conv.id,
+            )
             await dispatch(conv, effective)
+        except _CannotLaunchScheduledFire as exc:
+            _logger.warning(
+                "scheduled fire: task %s lost its authority before dispatch: %s", task.id, exc
+            )
+            await _record_run(
+                deps,
+                task,
+                conv.id,
+                scheduled_at,
+                status="failed",
+                error=str(exc),
+                error_code=exc.error_code,
+            )
+            return
         except Exception:
             # The session + grant are already persisted and owner-visible, so a
             # launch/dispatch failure still records a run — just a failed one.
@@ -587,7 +616,7 @@ async def _run_fire_for_task(
         _logger.exception("scheduled fire: task %s failed", task.id)
 
 
-async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
+async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask | _CapturedTask) -> bool:
     """True when the task's captured owner registration is no longer active.
 
     A NULL owner (single-user / OSS) always resolves to
@@ -598,6 +627,70 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
     return owner is None or owner.account_generation != task.account_generation
+
+
+async def _reauthorize_fire(
+    deps: FireDeps,
+    task: ScheduledTask | _CapturedTask,
+    *,
+    host_id: str | None,
+    conversation_id: str | None,
+) -> None:
+    """Re-check, where a fire acts, that the task's owner still holds what it uses.
+
+    A fire's earlier checks do not last: a wake or a runner start can take
+    minutes, during which the task can be deleted or move to another owner,
+    the owner can be removed or registered again, and the host can be removed
+    or pass to someone else. The fire never falls back to another host.
+
+    :param task: The task as read at the start of the fire.
+    :param host_id: The connected host the fire runs on, or ``None``.
+    :param conversation_id: The fired session, or ``None`` before it exists.
+    :raises _CannotLaunchScheduledFire: When any of these no longer holds.
+    """
+    current = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+    if (
+        current is None
+        or current.state == "deleted"
+        or current.user_id != task.user_id
+        or current.account_generation != task.account_generation
+    ):
+        raise _CannotLaunchScheduledFire(
+            "the scheduled task was deleted or changed owner during this run",
+            error_code="task_authority_revoked",
+        )
+    if await _owner_is_deleted(deps, task):
+        raise _CannotLaunchScheduledFire(
+            f"owner {task.user_id!r} registration is no longer active",
+            error_code="owner_deleted",
+        )
+    if task.user_id is None:
+        return
+    if host_id is not None:
+        if deps.host_store is None:
+            raise _CannotLaunchScheduledFire(
+                "connected host registry/store is not configured",
+                error_code="host_registry_unavailable",
+            )
+        holder = await asyncio.to_thread(deps.host_store.get_actual_host_owner, host_id)
+        if (
+            holder is None
+            or holder.user_id != task.user_id
+            or holder.generation != task.account_generation
+        ):
+            raise _CannotLaunchScheduledFire(
+                f"connected host {host_id!r} no longer belongs to the scheduled task owner",
+                error_code="host_authority_revoked",
+            )
+    if conversation_id is not None and deps.permission_store is not None:
+        owner = await asyncio.to_thread(
+            deps.conversation_store.get_actual_session_owner, conversation_id
+        )
+        if owner is None or owner.user_id != task.user_id:
+            raise _CannotLaunchScheduledFire(
+                "the scheduled run's session no longer belongs to the task owner",
+                error_code="session_authority_revoked",
+            )
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -1156,6 +1249,8 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
                 else "host_wake_failed"
             ),
         ) from exc
+    # A wake can take minutes; the host must still be the owner's afterwards.
+    await _reauthorize_fire(deps, task, host_id=host_id, conversation_id=None)
 
 
 def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
@@ -1242,6 +1337,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         if runner_client is None:
             raise RuntimeError("runner did not connect before timeout")
 
+        # The runner may have taken minutes to connect: re-check before the prompt runs.
+        await _reauthorize_fire(deps, task, host_id=host_id, conversation_id=conv.id)
         # Re-read the row: the launch wrote runner_id, and the session-init
         # handshake wants the current agent binding.
         fresh = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
@@ -1250,6 +1347,14 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         await _ensure_runner_session_initialized(
             conv.id, conv_for_dispatch, runner_client, deps.conversation_store
         )
+        agent_revision = await _agent_revision(deps, conv_for_dispatch)
+
+        async def authorize_submission() -> None:
+            await _reauthorize_fire(deps, task, host_id=host_id, conversation_id=conv.id)
+
+        # Initialization can take minutes; the helper checks again right before
+        # it sends the prompt, after any wait of its own.
+        await authorize_submission()
         await _dispatch_session_event_to_runner(
             conv.id,
             conv_for_dispatch,
@@ -1261,7 +1366,8 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             artifact_store=deps.artifact_store,
             created_by=owner,
             runner_router=deps.runner_router,
-            agent_revision=await _agent_revision(deps, conv_for_dispatch),
+            agent_revision=agent_revision,
+            authorize_submission=authorize_submission,
         )
 
     return _dispatch
@@ -1282,11 +1388,14 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         if deps.startup_inputs is None:
             raise RuntimeError("managed sandboxes are not configured")
         # No browser preference applies to a fire; keep the server default.
+        # The saved prompt keeps the task's identity: delivery, possibly after
+        # a slow sandbox boot or a restart, re-checks it before sending.
         await deps.startup_inputs.enqueue(
             conv.id,
             _prompt_event(task.prompt),
             user_id=task.user_id or RESERVED_USER_LOCAL,
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
+            scheduled=ScheduledOrigin(task.id, task.account_generation),
         )
 
     return _dispatch
@@ -1318,6 +1427,14 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
         )
 
         async def _launch() -> None:
+            try:
+                # Don't provision a sandbox for a task deleted since its fire.
+                await _reauthorize_fire(deps, task, host_id=None, conversation_id=conv.id)
+            except _CannotLaunchScheduledFire as exc:
+                await _fail_running_run(deps, conv.id, str(exc), exc.error_code)
+                if deps.startup_inputs is not None:
+                    await deps.startup_inputs.discard_scheduled(conv.id, task.id)
+                return
             try:
                 await _run_managed_launch(
                     session_id=conv.id,
@@ -1356,6 +1473,50 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
         )
 
     return _start
+
+
+def build_startup_authority(
+    deps: FireDeps,
+) -> Callable[[ScheduledOrigin, str, str | None], Awaitable[None]]:
+    """Build the delivery-time check for a prompt a managed fire saved.
+
+    Runs when the prompt is about to be delivered, possibly after a slow
+    sandbox boot or a server restart: the task must still exist for the same
+    owner and registration, the owner must be active, and the sandbox host and
+    thread must still be the owner's. A refusal fails the run and raises.
+
+    :param deps: The fire path's dependencies.
+    :returns: ``authorize(origin, conversation_id, sender)``; *sender* is the
+        saved input's ``created_by``.
+    """
+
+    async def authorize(origin: ScheduledOrigin, conversation_id: str, sender: str | None) -> None:
+        try:
+            current = await asyncio.to_thread(deps.scheduled_task_store.get, origin.task_id)
+            if current is None or (current.user_id or RESERVED_USER_LOCAL) != sender:
+                raise _CannotLaunchScheduledFire(
+                    "the scheduled task was deleted or changed owner before its message was sent",
+                    error_code="task_authority_revoked",
+                )
+            conv = await asyncio.to_thread(
+                deps.conversation_store.get_conversation, conversation_id
+            )
+            # An input saved before inputs carried their registration takes it
+            # from the task row, its owner's registration (a missing row refused above).
+            generation = (
+                origin.generation if origin.registration_known else current.account_generation
+            )
+            await _reauthorize_fire(
+                deps,
+                _CapturedTask(origin.task_id, current.user_id, generation),
+                host_id=conv.host_id if conv is not None else None,
+                conversation_id=conversation_id,
+            )
+        except _CannotLaunchScheduledFire as exc:
+            await _fail_running_run(deps, conversation_id, str(exc), exc.error_code)
+            raise
+
+    return authorize
 
 
 async def _fail_running_run(

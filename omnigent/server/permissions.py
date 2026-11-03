@@ -14,6 +14,9 @@ from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
+MAX_LINEAGE_WALK = 64
+"""Ancestors an access check follows before refusing; new nesting stops at 16."""
+
 
 def check_session_access(
     user_id: str | None,
@@ -53,19 +56,17 @@ def check_session_access(
         return True
 
     conv = conversation or conversation_store.get_conversation(conversation_id)
+    seen: set[str] = set()
+    while conv is not None and conv.parent_conversation_id is not None:
+        # A cyclic or runaway parent chain grants nothing.
+        if conv.id in seen or len(seen) >= MAX_LINEAGE_WALK:
+            return False
+        seen.add(conv.id)
+        conv = conversation_store.get_conversation(conv.parent_conversation_id)
     if conv is None:
         return False
 
-    if conv.parent_conversation_id is not None:
-        return check_session_access(
-            user_id,
-            conv.parent_conversation_id,
-            required_level,
-            permission_store,
-            conversation_store,
-        )
-
-    return permission_store.check_access(user_id, conversation_id, required_level)
+    return permission_store.check_access(user_id, conv.id, required_level)
 
 
 def resolved_allows(access: ResolvedAccess, required_level: int) -> bool:

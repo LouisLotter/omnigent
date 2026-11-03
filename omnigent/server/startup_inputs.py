@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -27,9 +27,11 @@ from omnigent.entities.conversation import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.scheduled.authority import ScheduledFireRefused, ScheduledOrigin
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     ConversationNotFoundError,
     ConversationStore,
 )
@@ -87,9 +89,16 @@ class StartupInputContext:
     user_id: str | None
     input_id: str
     submitted: bool = False
+    # Re-checks a scheduled input's task right before it is claimed and sent.
+    authorize: Callable[[], Awaitable[None]] | None = None
 
     async def is_disconnected(self) -> bool:
         return False
+
+    async def authorize_submission(self) -> None:
+        """Raise :class:`ScheduledFireRefused` when the input may no longer be sent."""
+        if self.authorize is not None:
+            await self.authorize()
 
     async def claim(self, store: ConversationStore, session_id: str) -> bool:
         # Leave the row queued throughout launch, authorization and policy checks.
@@ -107,6 +116,34 @@ class StartupInputContext:
 StartupDispatch = Callable[
     [StartupInputContext, str, SessionEventInput], Coroutine[Any, Any, dict[str, bool | str]]
 ]
+ScheduledAuthority = Callable[[ScheduledOrigin, str, str | None], Awaitable[None]]
+"""``(origin, session_id, sender)``: raises :class:`ScheduledFireRefused` when refused."""
+
+
+def scheduled_origin(
+    item: ConversationItem, conv: Conversation | None = None
+) -> ScheduledOrigin | None:
+    """The automation that saved *item*, or ``None`` for a person's own input.
+
+    An input saved before inputs carried their origin is recognised only as
+    the initial input of a session a fire created (the server-set task-origin
+    label); later messages in such a session stay a person's own.
+
+    :param item: A saved startup input.
+    :param conv: Its session, needed to recognise an older initial input.
+    :returns: The origin, or ``None``.
+    """
+    options = (
+        item.data.startup_options
+        if isinstance(item.data, (MessageData, SlashCommandData))
+        else None
+    )
+    if options is not None and options.scheduled_task_id is not None:
+        return ScheduledOrigin(options.scheduled_task_id, options.scheduled_task_generation)
+    task_id = conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if conv is not None else None
+    if conv is not None and task_id and item.id == initial_input_id(conv.id):
+        return ScheduledOrigin(task_id, None, registration_known=False)
+    return None
 
 
 _services: weakref.WeakSet[ManagedStartupInputs] = weakref.WeakSet()
@@ -129,6 +166,8 @@ class ManagedStartupInputs:
         self.hosts = hosts
         _services.add(self)
         self.dispatch: StartupDispatch | None = None
+        # Checks a scheduled input's task at delivery; unset, such inputs are refused.
+        self.scheduled_authority: ScheduledAuthority | None = None
         self._workers: dict[
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
@@ -142,6 +181,7 @@ class ManagedStartupInputs:
         user_id: str | None,
         headers: Headers,
         first: bool = True,
+        scheduled: ScheduledOrigin | None = None,
     ) -> ConversationItem:
         from omnigent.server.background_session_titles import background_session_titles_enabled
         from omnigent.server.routes._sessions.helpers import (
@@ -176,6 +216,10 @@ class ManagedStartupInputs:
                     model_override=event.model_override,
                     tools=event.tools,
                     background_titles_enabled=background_session_titles_enabled(headers),
+                    scheduled_task_id=scheduled.task_id if scheduled is not None else None,
+                    scheduled_task_generation=(
+                        scheduled.generation if scheduled is not None else None
+                    ),
                 )
             }
         )
@@ -402,6 +446,17 @@ class ManagedStartupInputs:
                 if isinstance(item.data, (MessageData, SlashCommandData))
                 else None
             )
+            origin = scheduled_origin(item, conv)
+            authorize: Callable[[], Awaitable[None]] | None = None
+            if origin is not None:
+                scheduled = origin
+
+                async def authorize_origin() -> None:
+                    await self._authorize_scheduled(scheduled, session_id, item.created_by)
+
+                # A deleted automation's saved prompt is never claimed or sent.
+                await authorize_origin()
+                authorize = authorize_origin
             context = StartupInputContext(
                 app,
                 Headers(
@@ -413,6 +468,7 @@ class ManagedStartupInputs:
                 ),
                 item.created_by,
                 item.id,
+                authorize=authorize,
             )
             event = SessionEventInput(
                 type=item.type,
@@ -447,6 +503,9 @@ class ManagedStartupInputs:
                 )
         except asyncio.CancelledError:
             raise
+        except ScheduledFireRefused as exc:
+            # Refused before anything was sent, whether or not it was claimed.
+            await self._refuse_scheduled(session_id, item, context, exc)
         except Exception as exc:
             _logger.exception("Unable to deliver saved message for session %s", session_id)
             if context is None or not context.submitted:
@@ -472,6 +531,80 @@ class ManagedStartupInputs:
             )
         finally:
             self._deliveries.pop(key, None)
+
+    async def _authorize_scheduled(
+        self, origin: ScheduledOrigin, session_id: str, sender: str | None
+    ) -> None:
+        """Raise unless the automation behind a saved input still authorizes it."""
+        if self.scheduled_authority is None:
+            raise ScheduledFireRefused(
+                "the automation behind this message can't be verified",
+                error_code="schedule_authority_unavailable",
+            )
+        await self.scheduled_authority(origin, session_id, sender)
+
+    async def _refuse_scheduled(
+        self,
+        session_id: str,
+        item: ConversationItem,
+        context: StartupInputContext | None,
+        refusal: ScheduledFireRefused,
+    ) -> None:
+        """Fail a scheduled input that lost its authority; nothing was sent.
+
+        Only this input fails: messages a person queued behind it are still
+        delivered. A retry re-runs the same check, so nothing revives it.
+        """
+        _logger.warning("Not delivering the saved message for session %s: %s", session_id, refusal)
+        await asyncio.to_thread(
+            self.conversations.transition_pending_input,
+            session_id,
+            item.id,
+            expected="incomplete" if context is not None and context.submitted else "in_progress",
+            status="failed",
+        )
+        message = f"The automation's message was not sent: {str(refusal)[:1000]}"
+        if getattr(refusal, "unsent_prompt_noted", False):
+            # The forward already followed the persisted prompt with its reason.
+            from omnigent.server.routes.sessions import _publish_sandbox_status, _publish_status
+
+            _publish_sandbox_status(session_id, "failed", message)
+            _publish_status(session_id, "failed", failure_origin="startup_input_failed")
+            return
+        await self._report_failure(session_id, f"scheduled_{refusal.error_code}", message)
+
+    async def discard_scheduled(self, session_id: str, task_id: str) -> None:
+        """Fail the inputs a deleted task's fire saved in *session_id*.
+
+        A person's messages in the same session are left to be delivered.
+
+        :param session_id: The fired session.
+        :param task_id: The deleted task.
+        """
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None:
+            return
+        key = (current_workspace_id(), session_id)
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            origin = scheduled_origin(item, conv)
+            if origin is None or origin.task_id != task_id or item.status != "in_progress":
+                continue
+            delivery = self._deliveries.get(key)
+            if delivery is not None and delivery is not asyncio.current_task():
+                # Delivering it here now: its own checks refuse it.
+                continue
+            if await asyncio.to_thread(
+                self.conversations.transition_pending_input,
+                session_id,
+                item.id,
+                expected="in_progress",
+                status="failed",
+            ):
+                await self._report_failure(
+                    session_id,
+                    "scheduled_task_deleted",
+                    "The automation was deleted, so its message was not sent.",
+                )
 
     async def retry(self, session_id: str) -> bool:
         changed = False

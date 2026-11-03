@@ -71,6 +71,12 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
+# Closes a tunnel whose authority ended: its binding was retired, replaced or
+# removed, or the sign-in that opened it was revoked.
+RUNNER_AUTHORITY_REVOKED_CLOSE_CODE = 4401
+# How often an open tunnel's authority is checked again. Event batches are
+# also checked as they arrive.
+RUNNER_AUTHORITY_RECHECK_S = 30.0
 _RUNNER_RECOVERY_SLOW_SEC = 30.0
 # WebSocket close codes a runner sends on purpose: 1000 normal, 1001 going away.
 _CLEAN_CLOSE_CODES = frozenset({1000, 1001})
@@ -231,6 +237,7 @@ def create_runner_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     mint_managed_runner_token: Callable[[str, int], tuple[str, int] | None] | None = None,
+    runner_authority_current: Callable[[str, str, Principal | None], bool] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -274,6 +281,12 @@ def create_runner_tunnel_router(
         mints a runner token for it. It returns ``None`` when the binding is
         absent or held by someone else, and raises ``RUNNER_TOKENS_UNSUPPORTED``
         when the auth mode cannot mint. ``None`` disables minting.
+    :param runner_authority_current: ``(runner_id, owner, machine principal)
+        -> bool``: whether a tunnel opened with a runner token (or, with
+        ``None``, a bare binding token) still has a live binding for *owner*.
+        Checked periodically and before each event batch; a tunnel opened with
+        a person's sign-in is checked by re-validating that sign-in instead.
+        ``None`` disables the binding check.
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
@@ -514,6 +527,14 @@ def create_runner_tunnel_router(
             record_principal(
                 ws, Principal(PrincipalKind.RUNNER, tunnel_owner, runner_id=runner_id)
             )
+        still_authorized = _tunnel_authority_check(
+            ws,
+            runner_id,
+            tunnel_owner,
+            presented,
+            auth_provider=auth_provider,
+            runner_authority_current=runner_authority_current,
+        )
 
         await ws.accept()
         session: RunnerSession | None = None
@@ -620,11 +641,19 @@ def create_runner_tunnel_router(
                     name=f"tunnel-keepalive:{runner_id}",
                 )
                 receive_task = asyncio.create_task(
-                    _receive_loop(ws, session, runner_id, registry),
+                    _receive_loop(ws, session, runner_id, registry, still_authorized),
                     name=f"tunnel-receive:{runner_id}",
                 )
 
                 owned.extend((sender_task, ping_task, keepalive_task, receive_task))
+                ending = {sender_task, ping_task, receive_task}
+                if still_authorized is not None:
+                    authority_task = asyncio.create_task(
+                        _authority_loop(ws, session, runner_id, registry, still_authorized),
+                        name=f"tunnel-authority:{runner_id}",
+                    )
+                    owned.append(authority_task)
+                    ending.add(authority_task)
 
                 if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
                     getattr(ws.app.state, "runner_event_ingest", None)
@@ -640,7 +669,7 @@ def create_runner_tunnel_router(
                     )
 
                 done, _pending = await asyncio.wait(
-                    {sender_task, ping_task, receive_task},
+                    ending,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 # Every helper that had finished, by role: a server-declared
@@ -844,6 +873,7 @@ async def _receive_loop(
     session: RunnerSession,
     runner_id: str,
     registry: TunnelRegistry,
+    still_authorized: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """Receive runner frames and route response frames.
 
@@ -855,6 +885,8 @@ async def _receive_loop(
     :param runner_id: Runner id for logging and registry lookup,
         e.g. ``"runner_0123456789abcdef"``.
     :param registry: Tunnel registry shared with the transport.
+    :param still_authorized: Re-checks the tunnel's authority before each
+        event batch is applied; ``None`` skips the check.
     :returns: None when the WebSocket disconnects or the session is
         no longer current.
     """
@@ -895,6 +927,11 @@ async def _receive_loop(
             # session despite the client-side FIFO. Preserve apply order here.
             async with session_locks.setdefault(batch.session_id, asyncio.Lock()):
                 if registry.get(runner_id) is not session:
+                    return
+                # An event batch carries the runner's authority into threads:
+                # a retired, replaced or revoked tunnel applies nothing more.
+                if still_authorized is not None and not await still_authorized():
+                    await _close_revoked(ws, session, runner_id, registry)
                     return
                 ack = await ingest(
                     app=ws.app,
@@ -979,6 +1016,89 @@ async def _receive_loop(
             _logger.debug(
                 "Runner %s disconnected with %d accepted event batches", runner_id, len(active)
             )
+
+
+def _tunnel_authority_check(
+    ws: WebSocket,
+    runner_id: str,
+    owner: str | None,
+    presented: Principal | None,
+    *,
+    auth_provider: AuthProvider | None,
+    runner_authority_current: Callable[[str, str, Principal | None], bool] | None,
+) -> Callable[[], Awaitable[bool]] | None:
+    """Build the re-check of what authorized this tunnel, or ``None`` when nothing did.
+
+    A tunnel opened with a person's sign-in re-validates that sign-in; one
+    opened with a runner token or a bare binding token re-checks the runner's
+    binding (thread, host, sandbox incarnation and owner registration). The
+    single-user local runtime has no authority to lose.
+    """
+    if auth_provider is None or owner is None or owner == RESERVED_USER_LOCAL:
+        return None
+    if presented is not None and not presented.is_machine:
+        person = presented
+
+        async def sign_in_current() -> bool:
+            return await asyncio.to_thread(auth_provider.revalidate, ws, person)
+
+        return sign_in_current
+    if runner_authority_current is None:
+        return None
+    machine = presented if presented is not None and presented.is_machine else None
+    binding_owner = owner
+
+    async def binding_current() -> bool:
+        return await asyncio.to_thread(runner_authority_current, runner_id, binding_owner, machine)
+
+    return binding_current
+
+
+async def _authority_loop(
+    ws: WebSocket,
+    session: RunnerSession,
+    runner_id: str,
+    registry: TunnelRegistry,
+    still_authorized: Callable[[], Awaitable[bool]],
+) -> None:
+    """Close the tunnel once its authority ends; an open socket is not lasting authority.
+
+    A check that fails with an error (for example the database is briefly
+    unreachable) is retried at the next interval rather than closing the
+    tunnel; event batches are refused meanwhile by their own check.
+    """
+    while True:
+        await asyncio.sleep(RUNNER_AUTHORITY_RECHECK_S)
+        if registry.get(runner_id) is not session:
+            return
+        try:
+            authorized = await still_authorized()
+        except Exception:
+            _logger.warning("Runner %s authority check failed; retrying", runner_id, exc_info=True)
+            continue
+        if not authorized:
+            await _close_revoked(ws, session, runner_id, registry)
+            return
+
+
+async def _close_revoked(
+    ws: WebSocket, session: RunnerSession, runner_id: str, registry: TunnelRegistry
+) -> None:
+    """Close a tunnel whose binding or sign-in no longer authorizes it."""
+    _logger.warning(
+        "Runner %s tunnel authority ended; closing",
+        runner_id,
+        extra=debug_event(
+            "runner_authority_revoked",
+            runner_id=runner_id,
+            connection_id=session.hello.connection_id,
+        ),
+    )
+    registry.record_close(
+        session, code=RUNNER_AUTHORITY_REVOKED_CLOSE_CODE, reason="runner authority revoked"
+    )
+    with contextlib.suppress(RuntimeError):
+        await ws.close(code=RUNNER_AUTHORITY_REVOKED_CLOSE_CODE, reason="runner authority revoked")
 
 
 async def _keepalive_loop(runner_id: str) -> None:
