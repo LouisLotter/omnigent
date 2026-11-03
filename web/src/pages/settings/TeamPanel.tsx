@@ -31,8 +31,13 @@ import {
   setMemberSuspended,
 } from "@/lib/teamApi";
 
+/** The default account list: one stable reference, so renders compare equal. */
+const NO_ACCOUNTS: readonly string[] = [];
+
 interface TeamPanelProps {
   state: TeamState;
+  /** Every account on the server; an owner may link one without a membership. */
+  accounts?: readonly string[];
   /** Reload the team after a change. */
   onChanged: () => Promise<void>;
   onResetPassword: (userId: string) => void;
@@ -50,6 +55,7 @@ function mayChangeState(me: TeamMemberEntry, target: TeamMemberEntry): boolean {
 
 export function TeamPanel({
   state,
+  accounts = NO_ACCOUNTS,
   onChanged,
   onResetPassword,
   onRemove,
@@ -60,6 +66,8 @@ export function TeamPanel({
   const [showInvite, setShowInvite] = useState(false);
   const [email, setEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"admin" | "member">("member");
+  // An existing account to link instead of creating one (owners only).
+  const [linkAccount, setLinkAccount] = useState("");
   const [inviteLink, setInviteLink] = useState<{ url: string; email: string } | null>(null);
   const [stateChange, setStateChange] = useState<{
     member: TeamMemberEntry;
@@ -84,7 +92,9 @@ export function TeamPanel({
   async function onInvite() {
     setPending(true);
     setError(null);
-    const result = await inviteToTeam(email, inviteRole);
+    const result = linkAccount
+      ? await inviteToTeam(email, inviteRole, linkAccount)
+      : await inviteToTeam(email, inviteRole);
     setPending(false);
     if (!result.ok) {
       setError(result.error);
@@ -94,10 +104,13 @@ export function TeamPanel({
     setInviteLink({ url: rebaseUrl(result.invite_url), email: result.invitation.email });
     setEmail("");
     setInviteRole("member");
+    setLinkAccount("");
     await onChanged();
   }
 
   const activeMembers = state.members.filter((m) => m.state !== "removed");
+  const memberAccounts = new Set(activeMembers.map((m) => m.user_id));
+  const linkable = accounts.filter((id) => !memberAccounts.has(id));
 
   return (
     <section aria-labelledby="team-heading">
@@ -300,6 +313,24 @@ export function TeamPanel({
               </select>
             </label>
           )}
+          {isOwner && linkable.length > 0 && (
+            <label className="flex flex-col gap-1 text-ui">
+              Existing account (optional)
+              <select
+                className="rounded-md border border-border bg-background px-2 py-1 text-ui"
+                value={linkAccount}
+                onChange={(e) => setLinkAccount(e.target.value)}
+                disabled={pending}
+              >
+                <option value="">A new account they create</option>
+                {linkable.map((id) => (
+                  <option key={id} value={id}>
+                    {id}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {error !== null && (
             <div
               role="alert"
@@ -372,7 +403,7 @@ export function TeamPanel({
             <DialogDescription>
               {stateChange?.suspend
                 ? "They are signed out everywhere at once: their sessions, laptops and running work lose access to Omnigent, open pages close, and their schedules pause. Their threads and computers are kept."
-                : "They can sign in again. Every sign-in from before the suspension stays ended, so they sign in again in the browser and on each of their laptops; their cloud computers reconnect on their own, and their schedules resume."}
+                : "They can sign in again. Every sign-in and machine credential from before the suspension stays ended, so they sign in again in the browser and on each of their laptops, and each cloud computer is kept but must be started again before it reconnects. Their schedules resume."}
             </DialogDescription>
           </DialogHeader>
           {error !== null && (

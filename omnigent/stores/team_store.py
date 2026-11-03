@@ -27,6 +27,7 @@ from sqlalchemy import ColumnElement, Insert, delete, func, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
@@ -106,6 +107,9 @@ _INVITATION_ROLES: frozenset[str] = frozenset({"admin", "member"})
 _PENDING = encode_team_invitation_state("pending")
 _REDEEMED = encode_team_invitation_state("redeemed")
 _REVOKED = encode_team_invitation_state("revoked")
+_EXPIRED = encode_team_invitation_state("expired")
+_ADMIN = encode_team_member_role("admin")
+_MEMBER_ROLE = encode_team_member_role("member")
 # Bounds one admission list and one page of invitations.
 MAX_ADMITTED = 1000
 _INVENTORY_PAGE_SIZE = 500
@@ -386,39 +390,30 @@ def retire_deleted_account_membership(session: Session, user_id: str) -> bool:
 
 
 def admin_flag_for_account(session: Session, user_id: str, is_admin: bool) -> bool:
-    """Align a member's role with a direct admin-flag write; return the flag to store.
+    """The admin flag a direct admin-flag write may store; team roles win.
 
-    Promotion makes a member an admin and demotion makes an admin a member; an
-    owner's role changes only through the team. A registration whose
-    membership was removed is not promoted until it is a member again, so a
-    login-time roster cannot restore it. Accounts that never joined, including
-    a later registration of the same username, keep the requested flag. Runs
-    after :func:`lock_team` and the account lock.
+    A current membership's role is authoritative: the flag stays what its role
+    and state imply, so a login-time roster or another flag write cannot undo
+    an owner's demotion or promote anyone (roles change only through the
+    team). Accounts without a membership keep the requested flag, except a
+    registration whose membership was removed, which is not promoted until it
+    is a member again. Runs after :func:`lock_team` and the account lock.
 
     :param session: The admin-flag write's session.
     :param user_id: The account being changed, e.g. ``"alice"``.
     :param is_admin: The requested flag.
     :returns: The flag the account should carry.
-    :raises OmnigentError: ``CONFLICT`` when asked to demote an owner.
     """
     row = _lock_current_member(session, user_id)
-    if row is None:
-        if not is_admin:
-            return False
-        live, generation = _live_generation(session, user_id)
-        return not (live and _removed_from_registration(session, user_id, generation))
-    role = cast(MemberRole, decode_team_member_role(row.role))
-    if role == "owner" and not is_admin:
-        raise OmnigentError(
-            "an owner's role changes through the team, not the admin flag",
-            code=ErrorCode.CONFLICT,
+    if row is not None:
+        return account_admin_flag(
+            cast(MemberRole, decode_team_member_role(row.role)),
+            cast(MemberState, decode_team_member_state(row.state)),
         )
-    new_role: MemberRole = role if role == "owner" else ("admin" if is_admin else "member")
-    if new_role != role:
-        row.role = encode_team_member_role(new_role)
-        row.updated_at = _now()
-        session.flush()
-    return account_admin_flag(new_role, cast(MemberState, decode_team_member_state(row.state)))
+    if not is_admin:
+        return False
+    live, generation = _live_generation(session, user_id)
+    return not (live and _removed_from_registration(session, user_id, generation))
 
 
 def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
@@ -431,7 +426,7 @@ def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
     :param user_id: The new first administrator, e.g. ``"alice"``.
     :returns: The owner membership, or ``None`` when the team had members.
     """
-    lock_team(session)
+    team = lock_team(session)
     has_member = session.execute(
         select(SqlTeamMember.id)
         .where(
@@ -456,7 +451,29 @@ def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
     session.add(row)
     session.flush()
     _store_admin_flag(session, row)
+    # The proxy's sign-in of the operator may bind to this membership, once.
+    team.founding_member_id = row.id
+    session.flush()
     return _to_member(row)
+
+
+def require_actor(session: Session, actor_member_id: str, *, owner: bool) -> SqlTeamMember:
+    """Lock and return the acting membership, re-read under the team lock.
+
+    Team administration is authorized here, inside the write that applies it,
+    so a role or state change that commits first is seen.
+
+    :param owner: Require an active owner; otherwise an active owner or admin.
+    :raises OmnigentError: ``FORBIDDEN`` when the actor may not administer.
+    """
+    actor = _lock_member(session, actor_member_id)
+    allowed = (_OWNER,) if owner else (_OWNER, _ADMIN)
+    if actor is None or actor.state != _ACTIVE or actor.role not in allowed:
+        raise OmnigentError(
+            "only an owner may" if owner else "only the team's owners and admins manage it",
+            code=ErrorCode.FORBIDDEN,
+        )
+    return actor
 
 
 def _validated_identity(issuer: str, subject: str) -> tuple[str, str]:
@@ -839,11 +856,19 @@ class SqlAlchemyTeamStore:
         operation: str,
         member_id: str,
         change: Callable[[SqlTeamMember], tuple[int, int]],
+        *,
+        actor_member_id: str | None = None,
     ) -> TeamMember:
-        """Apply a role/state change under the team lock and keep the invariants."""
+        """Apply a role/state change under the team lock and keep the invariants.
+
+        With *actor_member_id*, the actor must be an active owner, re-read under
+        the same lock.
+        """
 
         def write(session: Session) -> TeamMember:
             lock_team(session)
+            if actor_member_id is not None:
+                require_actor(session, actor_member_id, owner=True)
             account = session.execute(
                 select(SqlTeamMember.current_user_id).where(
                     SqlTeamMember.workspace_id == current_workspace_id(),
@@ -874,12 +899,17 @@ class SqlAlchemyTeamStore:
 
         return run_write_transaction(self._session_immediate, operation, write)
 
-    def change_role(self, member_id: str, role: MemberRole) -> TeamMember:
+    def change_role(
+        self, member_id: str, role: MemberRole, *, actor_member_id: str | None = None
+    ) -> TeamMember:
         """Change a current member's role, keeping an active owner.
 
+        :param actor_member_id: The owner making the change, authorized inside
+            the write; ``None`` for the system.
         :raises OmnigentError: ``NOT_FOUND`` for an unknown member,
             ``CONFLICT`` for a removed one, :class:`LastActiveOwnerError` when
-            the last active owner would lose the role.
+            the last active owner would lose the role, ``FORBIDDEN`` when the
+            actor is not an active owner.
         """
         if role not in _ROLES:
             raise OmnigentError(f"unknown role {role!r}", code=ErrorCode.INVALID_INPUT)
@@ -889,7 +919,9 @@ class SqlAlchemyTeamStore:
                 raise OmnigentError("a removed member has no role", code=ErrorCode.CONFLICT)
             return encode_team_member_role(role), row.state
 
-        return self._update_member("change_team_member_role", member_id, change)
+        return self._update_member(
+            "change_team_member_role", member_id, change, actor_member_id=actor_member_id
+        )
 
     def change_state(self, member_id: str, state: MemberState) -> TeamMember:
         """Move a membership through invited → active ⇄ suspended → removed.
@@ -976,24 +1008,45 @@ class SqlAlchemyTeamStore:
     ) -> TeamMember | None:
         """Bind the proxy's identity of the installation's owner to their own membership.
 
-        The single-owner upgrade: the proxy asserts the operator (its owner pin
-        matched) and the request carries that account's own sign-in, so both
-        the address and the account are proven. Only an active owner's
-        membership is bound, with provenance ``migration``.
+        The single-owner upgrade, once: the proxy asserts the operator (its owner
+        pin matched) and the request carries that account's own sign-in, so both
+        the address and the account are proven. Only the team's designated
+        founding membership is bound, as an active owner without any binding
+        yet, with provenance ``migration``; the designation is then cleared in
+        the same transaction, so every later link goes through an invitation
+        proved by the account's password.
 
         :param user_id: The account the request's own credential speaks for.
         :param identity: The proxy-verified identity.
-        :returns: The member, or ``None`` when *user_id* is not an active owner
-            or the identity is bound elsewhere.
+        :returns: The member, or ``None`` when *user_id* is not the unbound
+            founding owner, or the identity is bound elsewhere.
         """
         if not identity.installation_owner:
             return None
 
         def write(session: Session) -> TeamMember | None:
-            lock_team(session)
+            team = lock_team(session)
             row = _lock_current_member(session, user_id)
-            if row is None or row.role != _OWNER or row.state != _ACTIVE:
+            if (
+                row is None
+                or team.founding_member_id is None
+                or row.id != team.founding_member_id
+                or row.role != _OWNER
+                or row.state != _ACTIVE
+            ):
                 return None
+            bound = session.execute(
+                select(func.count())
+                .select_from(SqlTeamIdentityBinding)
+                .where(
+                    SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
+                    SqlTeamIdentityBinding.member_id == row.id,
+                )
+            ).scalar_one()
+            if bound:
+                return None
+            team.founding_member_id = None
+            session.flush()
             bind_identity_in_session(
                 session,
                 row.id,
@@ -1147,6 +1200,13 @@ class SqlAlchemyTeamStore:
 
         def write(session: Session) -> TeamInvitation:
             lock_team(session)
+            if created_by_member_id is not None:
+                actor = require_actor(session, created_by_member_id, owner=False)
+                if actor.role != _OWNER and (role != "member" or target_user_id is not None):
+                    raise OmnigentError(
+                        "only an owner invites admins or links existing accounts",
+                        code=ErrorCode.FORBIDDEN,
+                    )
             now = _now()
             if target_user_id is not None:
                 live, _ = _live_generation(session, target_user_id)
@@ -1225,15 +1285,25 @@ class SqlAlchemyTeamStore:
             )
             return [_to_invitation(row, now) for row in rows]
 
-    def revoke_invitation(self, invitation_id: str) -> TeamInvitation:
+    def revoke_invitation(
+        self, invitation_id: str, *, actor_member_id: str | None = None
+    ) -> TeamInvitation:
         """Revoke a pending invitation.
 
+        :param actor_member_id: The owner or admin revoking it, authorized
+            inside the write (an admin revokes member invitations only).
         :raises OmnigentError: ``NOT_FOUND`` for an unknown one, ``CONFLICT``
-            for one already used or revoked.
+            for one already used or revoked, ``FORBIDDEN`` for an actor who may
+            not.
         """
 
         def write(session: Session) -> TeamInvitation:
             lock_team(session)
+            actor = (
+                require_actor(session, actor_member_id, owner=False)
+                if actor_member_id is not None
+                else None
+            )
             row = session.execute(
                 select(SqlTeamInvitation)
                 .where(
@@ -1245,6 +1315,10 @@ class SqlAlchemyTeamStore:
             ).scalar_one_or_none()
             if row is None:
                 raise OmnigentError("no such invitation", code=ErrorCode.NOT_FOUND)
+            if actor is not None and actor.role != _OWNER and row.role != _MEMBER_ROLE:
+                raise OmnigentError(
+                    "only an owner revokes an admin's invitation", code=ErrorCode.FORBIDDEN
+                )
             if row.state != _PENDING:
                 raise OmnigentError(
                     "this invitation is no longer pending", code=ErrorCode.CONFLICT
@@ -1256,6 +1330,36 @@ class SqlAlchemyTeamStore:
             return _to_invitation(row, now)
 
         return run_write_transaction(self._session_immediate, "revoke_team_invitation", write)
+
+    def expire_invitations(self) -> int:
+        """Store ``expired`` on pending invitations past their expiry; bump admission once.
+
+        Time alone changes who a proxy should admit when an invitation expires;
+        this records it as a change, so the admission list's revision moves.
+
+        :returns: How many invitations expired.
+        """
+
+        def write(session: Session) -> int:
+            lock_team(session)
+            now = _now()
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlTeamInvitation)
+                    .where(
+                        SqlTeamInvitation.workspace_id == current_workspace_id(),
+                        SqlTeamInvitation.state == _PENDING,
+                        SqlTeamInvitation.expires_at <= now,
+                    )
+                    .values(state=_EXPIRED, closed_at=now)
+                ),
+            )
+            if result.rowcount:
+                bump_admission_revision(session)
+            return result.rowcount
+
+        return run_write_transaction(self._session_immediate, "expire_team_invitations", write)
 
     def admission_snapshot(self) -> AdmissionSnapshot:
         """Who a front proxy should admit now, and the revision it reflects.
@@ -1291,9 +1395,26 @@ class SqlAlchemyTeamStore:
                     for email in session.execute(statement.limit(MAX_ADMITTED)).scalars()
                     if email
                 )
+            owners = {
+                email
+                for email in session.execute(
+                    members.where(SqlTeamMember.role == _OWNER).limit(MAX_ADMITTED)
+                ).scalars()
+                if email
+            }
+            next_expiry = session.execute(
+                select(func.min(SqlTeamInvitation.expires_at)).where(
+                    SqlTeamInvitation.workspace_id == current_workspace_id(),
+                    SqlTeamInvitation.state == _PENDING,
+                    SqlTeamInvitation.expires_at > now,
+                )
+            ).scalar_one_or_none()
+            listed = tuple(sorted(emails)[:MAX_ADMITTED])
             return AdmissionSnapshot(
                 revision=team.admission_revision if team is not None else 0,
-                emails=tuple(sorted(emails)[:MAX_ADMITTED]),
+                emails=listed,
+                owners=tuple(sorted(owners & set(listed))),
+                next_change_at=next_expiry,
             )
 
     # ── Inventory ──────────────────────────────────────────────────

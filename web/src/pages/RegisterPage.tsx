@@ -4,7 +4,9 @@
  * Reached by clicking the copyable URL an admin minted in the
  * Members page. The user chooses their own username + password,
  * the server consumes the invite + creates the account + sets the
- * session cookie, and we navigate to ``/``.
+ * session cookie, and we navigate to ``/``. A team invitation that
+ * links an existing account instead asks for that account's password:
+ * the sign-in carries the invite, so the password proves the link.
  *
  * Mounted outside the AppShell for the same reason LoginPage is —
  * the chrome loads sidebar / conversations / runner hooks that
@@ -24,7 +26,7 @@ import { AuthCardShell } from "@/pages/onboarding/AuthCardShell";
 import { JoinTeamStep } from "@/pages/onboarding/JoinTeamStep";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { register as registerRequest } from "@/lib/accountsApi";
+import { login as loginRequest, register as registerRequest } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
 import { type InvitationPreview, previewInvitation } from "@/lib/teamApi";
 
@@ -48,6 +50,8 @@ export function RegisterPage() {
   // with a generic 400. Surface the same generic UI in the
   // most-common bad case (no invite param at all).
   const missingInvite = invite === "";
+  // The invitation links an existing account: sign in to it instead of registering.
+  const linksAccount = preview?.links_account === true;
 
   useEffect(() => {
     const el = document.getElementById("register-username");
@@ -58,7 +62,9 @@ export function RegisterPage() {
     if (invite === "") return;
     let cancelled = false;
     void previewInvitation(invite).then((found) => {
-      if (!cancelled) setPreview(found);
+      if (cancelled) return;
+      setPreview(found);
+      if (found?.links_account && found.user_id) setUsername(found.user_id);
     });
     return () => {
       cancelled = true;
@@ -70,6 +76,17 @@ export function RegisterPage() {
     if (submitting) return;
     setError(null);
 
+    if (linksAccount) {
+      setSubmitting(true);
+      const result = await loginRequest({ username, password, invite });
+      if (result.ok) {
+        window.location.href = withBasePath("/");
+        return;
+      }
+      setSubmitting(false);
+      setError(result.error);
+      return;
+    }
     if (password !== confirm) {
       setError("Passwords don't match.");
       return;
@@ -92,12 +109,19 @@ export function RegisterPage() {
   const body: ReactNode = (
     <>
       <div className="space-y-1 text-center">
-        <h1 className="text-2xl font-semibold tracking-tight">Create your account</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {linksAccount ? "Sign in to join" : "Create your account"}
+        </h1>
         <p className="text-ui text-muted-foreground">
           {preview === null
             ? "You were invited to join this Omnigent server."
             : `You were invited to join ${preview.team_name ?? "this team"} as ${preview.role === "admin" ? "an admin" : "a member"}, with ${preview.email}.`}
         </p>
+        {linksAccount && (
+          <p className="text-ui text-muted-foreground">
+            The invitation is for your existing account. Enter its password to accept.
+          </p>
+        )}
       </div>
 
       {missingInvite ? (
@@ -121,6 +145,7 @@ export function RegisterPage() {
               value={username}
               onChange={(e) => setUsername(e.target.value.toLowerCase())}
               disabled={submitting}
+              readOnly={linksAccount}
               required
               pattern="[a-z0-9][a-z0-9._\-]{0,63}(@[a-z0-9.\-]+\.[a-z]{2,})?"
               title="Lowercase letters, digits, dots, hyphens, underscores (or a lowercase email)"
@@ -137,30 +162,32 @@ export function RegisterPage() {
             <Input
               id="register-password"
               type="password"
-              autoComplete="new-password"
+              autoComplete={linksAccount ? "current-password" : "new-password"}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               disabled={submitting}
               required
-              minLength={MIN_PASSWORD_LENGTH}
+              minLength={linksAccount ? 1 : MIN_PASSWORD_LENGTH}
             />
           </div>
 
-          <div className="space-y-1.5">
-            <label htmlFor="register-confirm" className="text-ui font-medium leading-none">
-              Confirm password
-            </label>
-            <Input
-              id="register-confirm"
-              type="password"
-              autoComplete="new-password"
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-              disabled={submitting}
-              required
-              minLength={MIN_PASSWORD_LENGTH}
-            />
-          </div>
+          {!linksAccount && (
+            <div className="space-y-1.5">
+              <label htmlFor="register-confirm" className="text-ui font-medium leading-none">
+                Confirm password
+              </label>
+              <Input
+                id="register-confirm"
+                type="password"
+                autoComplete="new-password"
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+                disabled={submitting}
+                required
+                minLength={MIN_PASSWORD_LENGTH}
+              />
+            </div>
+          )}
 
           {error !== null && (
             <div
@@ -174,10 +201,20 @@ export function RegisterPage() {
           <Button
             type="submit"
             className="w-full"
-            disabled={submitting || password.length < MIN_PASSWORD_LENGTH || username.length === 0}
-            componentId="register.create_account"
+            disabled={
+              submitting ||
+              username.length === 0 ||
+              (linksAccount ? password.length === 0 : password.length < MIN_PASSWORD_LENGTH)
+            }
+            componentId={linksAccount ? "register.sign_in_to_join" : "register.create_account"}
           >
-            {submitting ? "Creating…" : "Create account"}
+            {linksAccount
+              ? submitting
+                ? "Signing in…"
+                : "Sign in and join"
+              : submitting
+                ? "Creating…"
+                : "Create account"}
           </Button>
         </form>
       )}

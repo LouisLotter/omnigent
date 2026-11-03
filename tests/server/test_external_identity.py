@@ -96,12 +96,15 @@ def test_a_valid_envelope_verifies_and_every_forgery_fails() -> None:
 def test_an_expired_early_or_long_lived_envelope_fails() -> None:
     now = int(time.time())
     assert verify_envelope(sign_envelope(_identity(), _KEY), _KEY, now=now + 30) is not None
-    expired = _identity(issued_at=now - 200, expires_at=now - 60)
+    expired = _identity(issued_at=now - 70, expires_at=now - 15)
     assert verify_envelope(sign_envelope(expired, _KEY), _KEY, now=now) is None
-    early = _identity(issued_at=now + 120, expires_at=now + 180)
+    early = _identity(issued_at=now + 20, expires_at=now + 60)
     assert verify_envelope(sign_envelope(early, _KEY), _KEY, now=now) is None
-    long_lived = _identity(issued_at=now, expires_at=now + 3600)
-    assert verify_envelope(sign_envelope(long_lived, _KEY), _KEY, now=now) is None
+    # The platform signs for at most 60 seconds; anything longer is refused.
+    for lifetime in (61, 300, 3600):
+        long_lived = _identity(issued_at=now, expires_at=now + lifetime)
+        assert verify_envelope(sign_envelope(long_lived, _KEY), _KEY, now=now) is None
+    assert verify_envelope(sign_envelope(_identity(expires_at=now + 60), _KEY), _KEY, now=now)
 
 
 def test_the_expected_issuer_and_audience_are_enforced_when_set() -> None:

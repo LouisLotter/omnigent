@@ -42,7 +42,10 @@ export interface InvitationPreview {
   team_name: string | null;
   email: string;
   role: "admin" | "member";
+  /** The invitation links an existing account, proved by its password at sign-in. */
   links_account: boolean;
+  /** That account's username, when it links one. */
+  user_id?: string | null;
   expires_at: number;
 }
 
@@ -87,12 +90,17 @@ export async function getTeam(): Promise<TeamState | null> {
   return result.ok ? result : null;
 }
 
-/** POST /v1/team/invitations — the single-use link is returned once. */
+/**
+ * POST /v1/team/invitations — the single-use link is returned once. With
+ * *userId* (owners only) it links that existing account instead of creating one.
+ */
 export function inviteToTeam(
   email: string,
   role: "admin" | "member",
+  userId?: string,
 ): Promise<TeamResult<{ invitation: TeamInvitationEntry; invite_url: string }>> {
-  return teamRequest("/v1/team/invitations", jsonInit("POST", { email, role }));
+  const body = userId ? { email, role, user_id: userId } : { email, role };
+  return teamRequest("/v1/team/invitations", jsonInit("POST", body));
 }
 
 /** DELETE /v1/team/invitations/{id}. */

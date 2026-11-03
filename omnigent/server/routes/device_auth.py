@@ -367,7 +367,7 @@ def create_oauth_token_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
     *,
-    handle_device_code: Callable[[str], Response] | None = None,
+    handle_device_code: Callable[[Request, str], Response] | None = None,
     handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
     client_secret_ok: Callable[[Request], bool] | None = None,
 ) -> APIRouter:
@@ -477,7 +477,7 @@ def create_oauth_token_router(
             if handle_device_code is None:
                 return _oauth_error("unsupported_grant_type")
             try:
-                return handle_device_code(str(form.get("device_code") or ""))
+                return handle_device_code(request, str(form.get("device_code") or ""))
             except OmnigentError:
                 return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
@@ -948,7 +948,7 @@ def create_device_auth_router(
     # only addition is the device_code grant handler, injected here so
     # /oauth/token stays a single registration either way.
 
-    def _handle_device_code_grant(device_code: str) -> Response:
+    def _handle_device_code_grant(request: Request, device_code: str) -> Response:
         if not device_code:
             return _oauth_error("invalid_request")
         now = int(time.time())
@@ -972,6 +972,10 @@ def create_device_auth_router(
             return _oauth_error("invalid_grant")
         # outcome == "approved" → mint tokens, atomically single-use.
         assert grant is not None
+        if grant.user_id is None or refusal_for_user(request, grant.user_id) is not None:
+            # Behind a proxy, a device code redeems only for the person it admitted;
+            # the grant is left as it is, unconsumed.
+            return _oauth_error("access_denied")
         refresh_token = _mint_refresh_token()
         redeemed = device_grant_store.redeem_approved(
             grant.id,

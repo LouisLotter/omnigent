@@ -9,9 +9,12 @@ sign-ins. Each forbidden action sits next to its allowed neighbour.
 from __future__ import annotations
 
 import dataclasses
+import secrets
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -19,6 +22,8 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities.team import AdmissionSnapshot
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.external_identity import (
     ENVELOPE_HEADER,
     ExternalIdentity,
@@ -56,7 +61,7 @@ def _envelope(subject: str, email: str | None, *, owner: bool = False, key: str 
             email=email,
             installation_owner=owner,
             issued_at=now,
-            expires_at=now + 290,
+            expires_at=now + 55,
         ),
         key.encode(),
     )
@@ -107,6 +112,7 @@ def _join(world: World, name: str, role: str = "member") -> None:
 def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_MODE", "required")
     monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_KEY", _KEY)
+    monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
     admission = RecordingAdmission()
     for base in _build_accounts_app(
         tmp_path, monkeypatch, init_admin_password=_OWNER_PASSWORD, team_admission=admission
@@ -448,3 +454,223 @@ def test_a_team_of_one_on_the_defaults_behaves_as_before(
         legacy = client.post("/auth/invite", json={})
         assert legacy.status_code == 200 and "register_url" in legacy.json()
         assert client.get("/v1/team").json()["me"]["role"] == "owner"
+
+
+# ── R1: credentials resolved inside routes (F-1) and suspension (F-2) ──
+
+
+def _stores(world: World) -> dict[str, Any]:
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    app_state = world.app.state  # type: ignore[attr-defined]
+    url = app_state.team_store.storage_location
+    return {
+        "hosts": app_state.host_store,
+        "teams": app_state.team_store,
+        "conversations": SqlAlchemyConversationStore(url),
+        "accounts": SqlAlchemyAccountStore(url),
+    }
+
+
+def _managed_host(world: World, owner: str) -> tuple[str, str]:
+    host_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
+    _stores(world)["hosts"].register_managed_host(
+        host_id=host_id,
+        name=f"managed-{host_id[:8]}",
+        user_id=owner,
+        token=token,
+        provider="test",
+        sandbox_id=f"sandbox-{host_id[:8]}",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    return host_id, token
+
+
+def _bound_runner(world: World, owner: str) -> str:
+    """Bind a runner to a new thread of *owner* on their own host; return the binding token."""
+    from tests.server.test_account_revocation import create_session
+
+    created = create_session(world.people[owner])
+    assert created.status_code == 201, created.text
+    session_id = created.json()["session_id"]
+    stores = _stores(world)
+    binding, host_id = f"binding-{uuid.uuid4().hex}", uuid.uuid4().hex
+    stores["hosts"].upsert_on_connect(host_id, f"host-{host_id[:8]}", owner)
+    stores["conversations"].set_host_id(session_id, host_id, workspace="/tmp/workspace")
+    stores["conversations"].replace_runner_id(session_id, token_bound_runner_id(binding))
+    return binding
+
+
+def _opens(client: TestClient, path: str, headers: dict[str, str]) -> bool:
+    try:
+        with client.websocket_connect(path, headers=headers):
+            return True
+    except WebSocketDisconnect:
+        return False
+
+
+def test_bobs_device_code_is_not_redeemed_under_alices_sign_in(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import device_auth
+
+    monkeypatch.setattr(device_auth, "_POLL_INTERVAL_SECONDS", 0)
+    started = TestClient(world.app).post("/oauth/device/authorize", json={"client_id": "cli"})  # type: ignore[arg-type]
+    device_code, user_code = started.json()["device_code"], started.json()["user_code"]
+    bob = world.people["bob"]
+    time.sleep(1.1)  # approval needs a sign-in no older than the grant
+    assert (
+        bob.post("/auth/login", json={"username": "bob", "password": "bob-pw-1234"}).status_code
+        == 200
+    )
+    approved = bob.post(
+        "/oauth/device/approve",
+        data={"user_code": user_code},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert approved.status_code == 200, approved.text
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    }
+    refused = world.as_("alice-sub", "alice@example.test").post("/oauth/token", data=form)
+    assert refused.status_code == 400 and refused.json()["error"] == "access_denied"
+    allowed = world.as_("bob-sub", "bob@example.test").post("/oauth/token", data=form)
+    assert allowed.status_code == 200 and allowed.json()["access_token"]
+
+
+def test_a_launch_token_opens_the_host_tunnel_only_for_its_owners_sign_in(world: World) -> None:
+    host_id, token = _managed_host(world, "bob")
+    path, headers = f"/v1/hosts/{host_id}/tunnel", {MANAGED_HOST_TOKEN_HEADER: token}
+    assert not _opens(world.as_("alice-sub", "alice@example.test"), path, headers)
+    assert _opens(world.as_("bob-sub", "bob@example.test"), path, headers)
+    # A cloud computer's private route carries no sign-in, and keeps working.
+    assert _opens(TestClient(world.app), path, headers)  # type: ignore[arg-type]
+
+
+def test_a_runner_binding_mints_and_tunnels_only_for_its_owners_sign_in(world: World) -> None:
+    binding = _bound_runner(world, "bob")
+    runner_id = token_bound_runner_id(binding)
+    mint, headers = f"/v1/runners/{runner_id}/token", {RUNNER_TUNNEL_TOKEN_HEADER: binding}
+    assert (
+        world.as_("alice-sub", "alice@example.test").post(mint, headers=headers).status_code == 401
+    )
+    assert world.as_("bob-sub", "bob@example.test").post(mint, headers=headers).status_code == 200
+    assert TestClient(world.app).post(mint, headers=headers).status_code == 200  # type: ignore[arg-type]
+    tunnel = f"/v1/runners/{runner_id}/tunnel"
+    assert not _opens(world.as_("alice-sub", "alice@example.test"), tunnel, headers)
+    assert _opens(TestClient(world.app), tunnel, headers)  # type: ignore[arg-type]
+
+
+def test_suspension_ends_machine_credentials_and_reinstatement_needs_new_ones(
+    world: World,
+) -> None:
+    host_id, token = _managed_host(world, "bob")
+    binding = _bound_runner(world, "bob")
+    private = TestClient(world.app)  # type: ignore[arg-type]
+    host_path, host_headers = f"/v1/hosts/{host_id}/tunnel", {MANAGED_HOST_TOKEN_HEADER: token}
+    mint = f"/v1/runners/{token_bound_runner_id(binding)}/token"
+    runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: binding}
+    assert _opens(private, host_path, host_headers)
+    assert private.post(mint, headers=runner_headers).status_code == 200
+
+    bob_id = world.member_id("bob")
+    world.people["owner"].post(f"/v1/team/members/{bob_id}/suspend")
+    assert not _opens(private, host_path, host_headers)
+    assert private.post(mint, headers=runner_headers).status_code == 401
+
+    world.people["owner"].post(f"/v1/team/members/{bob_id}/reinstate")
+    # Pre-suspension machine credentials stay dead; the records stay.
+    assert not _opens(private, host_path, host_headers)
+    assert private.post(mint, headers=runner_headers).status_code == 401
+    assert _stores(world)["hosts"].get_host(host_id) is not None
+    # Fresh machine authority works: Bob signs in again and his new runner mints.
+    bob = world.people["bob"]
+    assert (
+        bob.post("/auth/login", json={"username": "bob", "password": "bob-pw-1234"}).status_code
+        == 200
+    )
+    fresh = _bound_runner(world, "bob")
+    fresh_mint = f"/v1/runners/{token_bound_runner_id(fresh)}/token"
+    assert private.post(fresh_mint, headers={RUNNER_TUNNEL_TOKEN_HEADER: fresh}).status_code == 200
+
+
+# ── R1: the founding binding is one-time (F-3) ──
+
+
+def test_the_founding_binding_is_one_time(world: World) -> None:
+    # The owner bound on first entry; a new subject with the pinned address
+    # and the owner's own cookie is no longer bound by the pin.
+    recycled = world.as_("recycled-sub", "owner@example.test", owner=True)
+    recycled.cookies.set(_COOKIE, world.people["owner"].cookies[_COOKIE])
+    refused = recycled.get("/v1/me")
+    assert refused.status_code == 403 and _code(refused) == "external_identity_unbound"
+    login = recycled.post("/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD})
+    assert login.status_code == 403
+    # A second owner gets no pin binding either.
+    carol_id = world.member_id("carol")
+    world.people["owner"].put(f"/v1/team/members/{carol_id}/role", json={"role": "owner"})
+    claim = world.as_("carol-new-sub", "owner@example.test", owner=True)
+    claim.cookies.set(_COOKIE, world.people["carol"].cookies[_COOKIE])
+    assert claim.get("/v1/me").status_code == 403
+    # The founder's own binding still works.
+    assert world.people["owner"].get("/v1/me").status_code == 200
+
+
+# ── R1: authorization inside the write (F-4) ──
+
+
+def test_a_role_promoted_while_a_request_was_checked_is_seen_by_the_write(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    teams = _stores(world)["teams"]
+    bob_id = world.member_id("bob")
+    original = teams.get_member
+
+    def promoted_meanwhile(member_id: str):
+        stale = original(member_id)
+        if member_id == bob_id:
+            teams.change_role(bob_id, "admin")  # an owner's promotion commits first
+        return stale
+
+    monkeypatch.setattr(teams, "get_member", promoted_meanwhile)
+    refused = world.people["carol"].post(f"/v1/team/members/{bob_id}/suspend")
+    assert refused.status_code == 403
+    monkeypatch.setattr(teams, "get_member", original)
+    assert teams.get_member(bob_id).state == "active"
+    # The owner may still suspend Bob.
+    assert world.people["owner"].post(f"/v1/team/members/{bob_id}/suspend").status_code == 200
+
+
+# ── R1: existing-account invitations (F-6) ──
+
+
+def test_a_link_invitation_binds_an_existing_account_proved_by_its_password(
+    world: World,
+) -> None:
+    from omnigent.server.passwords import hash_password
+
+    _stores(world)["accounts"].create_user_with_password("legacy", hash_password("legacy-pw-1234"))
+    invited = world.people["owner"].post(
+        "/v1/team/invitations",
+        json={"email": "legacy@example.test", "role": "member", "user_id": "legacy"},
+    )
+    assert invited.status_code == 200, invited.text
+    token = parse_qs(urlparse(invited.json()["invite_url"]).query)["invite"][0]
+    legacy = world.as_("legacy-sub", "legacy@example.test")
+    preview = legacy.get(f"/v1/team/invitations/preview?token={token}").json()
+    assert preview["links_account"] is True and preview["user_id"] == "legacy"
+    wrong = legacy.post(
+        "/auth/login", json={"username": "legacy", "password": "wrong-password", "invite": token}
+    )
+    assert wrong.status_code == 401
+    right = legacy.post(
+        "/auth/login", json={"username": "legacy", "password": "legacy-pw-1234", "invite": token}
+    )
+    assert right.status_code == 200, right.text
+    assert legacy.get("/v1/me").status_code == 200
+    binding = _stores(world)["teams"].get_external_identity(
+        "https://team.example.cloudflareaccess.com", "legacy-sub"
+    )
+    assert binding is not None and binding.provenance == "account_proof"

@@ -13,6 +13,8 @@ import asyncio
 import contextlib
 
 _count = 0
+# Future objects, not tenant data: a wake makes each connection re-check its own caller.
+# custom-lint: disable-next=workspace-scoped-cache -- holds future objects
 _waiters: set[asyncio.Future[None]] = set()
 
 

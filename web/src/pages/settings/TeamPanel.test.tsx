@@ -53,10 +53,11 @@ function teamAs(me: TeamMemberEntry): TeamState {
 
 const onChanged = vi.fn(async () => undefined);
 
-function renderAs(me: TeamMemberEntry) {
+function renderAs(me: TeamMemberEntry, accounts: string[] = []) {
   return render(
     <TeamPanel
       state={teamAs(me)}
+      accounts={accounts}
       onChanged={onChanged}
       onResetPassword={vi.fn()}
       onRemove={vi.fn()}
@@ -145,6 +146,37 @@ describe("TeamPanel", () => {
     );
     const link = (await screen.findByLabelText("Invitation link")) as HTMLInputElement;
     expect(link.value).toBe("https://team.example/register?invite=tok");
+  });
+
+  it("lets an owner link an existing account that has no membership", async () => {
+    vi.mocked(teamApi.inviteToTeam).mockResolvedValue({
+      ok: true,
+      invitation: { ...teamAs(owner).invitations[0], email: "frank@example.test", role: "member" },
+      invite_url: "http://server/register?invite=tok",
+    });
+    renderAs(owner, ["owner", "carol", "alice", "bob", "frank"]);
+    fireEvent.click(screen.getByRole("button", { name: /Invite someone/ }));
+    const dialog = await screen.findByRole("dialog");
+    const picker = within(dialog).getByLabelText(
+      "Existing account (optional)",
+    ) as HTMLSelectElement;
+    // Only accounts without a membership are offered.
+    expect(Array.from(picker.options).map((option) => option.value)).toEqual(["", "frank"]);
+    fireEvent.change(within(dialog).getByLabelText("Email address"), {
+      target: { value: "frank@example.test" },
+    });
+    fireEvent.change(picker, { target: { value: "frank" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create invitation" }));
+    await waitFor(() =>
+      expect(teamApi.inviteToTeam).toHaveBeenCalledWith("frank@example.test", "member", "frank"),
+    );
+  });
+
+  it("offers an admin no existing account to link", async () => {
+    renderAs(carol, ["owner", "carol", "alice", "bob", "frank"]);
+    fireEvent.click(screen.getByRole("button", { name: /Invite someone/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByLabelText("Existing account (optional)")).toBeNull();
   });
 
   it("offers an admin no admin role and shows the server's refusal", async () => {

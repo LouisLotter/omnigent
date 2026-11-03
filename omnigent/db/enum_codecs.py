@@ -177,11 +177,13 @@ TEAM_IDENTITY_PROVENANCE: dict[str, int] = {
     "migration": 3,
 }
 
-# A team invitation's stored state; "expired" is derived from ``expires_at``.
+# A team invitation's stored state. A pending one past ``expires_at`` reads as
+# expired until the expiry sweep stores ``expired`` (and bumps admission).
 TEAM_INVITATION_STATE: dict[str, int] = {
     "pending": 1,
     "redeemed": 2,
     "revoked": 3,
+    "expired": 4,
 }
 
 

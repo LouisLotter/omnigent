@@ -218,7 +218,9 @@ def create_team_router(
             raise OmnigentError(
                 "only an owner revokes an admin's invitation", code=ErrorCode.FORBIDDEN
             )
-        revoked = await asyncio.to_thread(team_store.revoke_invitation, invitation_id)
+        revoked = await asyncio.to_thread(
+            team_store.revoke_invitation, invitation_id, actor_member_id=caller.id
+        )
         _changed(None)
         return {"invitation": _invitation_json(revoked)}
 
@@ -231,7 +233,9 @@ def create_team_router(
         if caller.role != "owner":
             raise OmnigentError("only an owner changes roles", code=ErrorCode.FORBIDDEN)
         target = await asyncio.to_thread(_target, member_id)
-        changed = await asyncio.to_thread(team_store.change_role, target.id, body.role)
+        changed = await asyncio.to_thread(
+            team_store.change_role, target.id, body.role, actor_member_id=caller.id
+        )
         _changed(changed.user_id)
         _logger.info("team: %s made %s %s", caller.id, changed.id, changed.role)
         return {"member": _member_json(changed)}
@@ -242,7 +246,9 @@ def create_team_router(
         caller = await asyncio.to_thread(_caller, request, action)
         target = await asyncio.to_thread(_target, member_id)
         _may_change_state(caller, target)
-        changed = await asyncio.to_thread(account_store.change_member_state, target.id, state)
+        changed = await asyncio.to_thread(
+            account_store.change_member_state, target.id, state, actor_member_id=caller.id
+        )
         _changed(changed.user_id)
         _logger.info("team: %s set %s %s", caller.id, changed.id, changed.state)
         return changed
@@ -273,6 +279,8 @@ def create_team_router(
             "email": invitation.email,
             "role": invitation.role,
             "links_account": invitation.target_user_id is not None,
+            # The account a link invitation is for, so its page asks for that password.
+            "user_id": invitation.target_user_id,
             "expires_at": invitation.expires_at,
         }
 

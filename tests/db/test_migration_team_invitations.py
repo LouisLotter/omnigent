@@ -54,6 +54,7 @@ def _has_new_schema(engine: sa.Engine) -> bool:
         sa.inspect(engine).has_table("team_invitations")
         and "email" in _columns(engine, "team_identity_bindings")
         and "admission_revision" in _columns(engine, "teams")
+        and "founding_member_id" in _columns(engine, "teams")
     )
 
 
@@ -101,6 +102,11 @@ def test_upgrade_adds_the_schema_and_keeps_the_owner(db_uri, engine) -> None:
         )
         assert (
             connection.execute(sa.text("SELECT admission_revision FROM teams")).scalar_one() == 0
+        )
+        # The only active owner, unbound, is named the founding member.
+        assert (
+            connection.execute(sa.text("SELECT founding_member_id FROM teams")).scalar_one()
+            == connection.execute(sa.text("SELECT id FROM team_members")).scalar_one()
         )
     _use_new_schema(db_uri)
 

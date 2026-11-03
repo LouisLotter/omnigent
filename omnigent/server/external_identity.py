@@ -56,9 +56,10 @@ AUDIENCE_ENV = "OMNIGENT_EXTERNAL_IDENTITY_AUDIENCE"
 _VERSION = "v1"
 _MAC_LABEL = b"omnigent-external-identity/v1."
 MAX_ENVELOPE_CHARS = 4096
-# An envelope covers one forwarded request; a long lifetime would only widen replay.
-MAX_LIFETIME_S = 300
-CLOCK_SKEW_S = 30
+# An envelope covers one forwarded request: the front proxy signs it for at most
+# a minute (the Cloudflare platform's ENVELOPE_LIFETIME_S), with a little skew.
+MAX_LIFETIME_S = 60
+CLOCK_SKEW_S = 10
 MIN_KEY_CHARS = 32
 _MAX_ISSUER_CHARS = 512
 _MAX_SUBJECT_CHARS = 255
@@ -331,6 +332,30 @@ def refusal_for_user(connection: HTTPConnection, user_id: str) -> str | None:
     resolved = resolved_external_identity(connection)
     if resolved is None:
         return REQUIRED_CODE if mode is ExternalIdentityMode.REQUIRED else None
+    if resolved.member is None:
+        return UNBOUND_CODE
+    if resolved.member.user_id != user_id:
+        return MISMATCH_CODE
+    if resolved.member.state != "active":
+        return SUSPENDED_CODE
+    return None
+
+
+def machine_refusal_for_user(connection: HTTPConnection, user_id: str) -> str | None:
+    """Why a machine credential resolved inside a route may not act as *user_id*, or ``None``.
+
+    For launch tokens and runner binding tokens, which a route resolves to
+    their owner after the middleware ran. Without an envelope the request is
+    a machine's own private route and proceeds; with one, the owner must be
+    the active member the proxy's sign-in is bound to.
+
+    :returns: A refusal code from :data:`REFUSAL_MESSAGES`, or ``None``.
+    """
+    if external_identity_mode(connection) is ExternalIdentityMode.OFF:
+        return None
+    resolved = resolved_external_identity(connection)
+    if resolved is None:
+        return None
     if resolved.member is None:
         return UNBOUND_CODE
     if resolved.member.user_id != user_id:

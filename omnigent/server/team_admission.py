@@ -9,9 +9,11 @@ expired invitation drops out. Omnigent's own membership check never depends on
 it: a person the proxy still admits but Omnigent has suspended reaches nothing.
 
 Each change is committed with a higher admission revision before it is pushed
-(persist before effect); the adapter applies a snapshot only when it is newer
-than the last one it applied, so a late, older push cannot undo a newer one.
-A failed push is retried with backoff.
+(persist before effect); the adapter refuses a snapshot older than the last
+one it applied, so a late, older push cannot undo a newer one, and compares an
+equal one with what the proxy holds, so drift is repaired. Expired invitations
+are swept (a revision bump) before every push, and a push is due again when
+the next invitation expires. A failed read or push is retried with backoff.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -52,6 +55,7 @@ class AdmissionSync:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self.applied_revision: int | None = None
+        self.next_change_at: int | None = None
 
     def start(self) -> None:
         """Start the background loop on the running event loop; idempotent."""
@@ -73,10 +77,18 @@ class AdmissionSync:
             self.start()
 
     async def push_once(self) -> bool:
-        """Read and apply the current snapshot once; ``True`` when confirmed."""
-        snapshot = await asyncio.to_thread(self._team_store.admission_snapshot)
-        if snapshot.revision == self.applied_revision:
-            return True
+        """Sweep expiries, read and apply the current snapshot; ``True`` when confirmed.
+
+        Every push is applied, an unchanged revision included, so the proxy
+        compares it with what it holds. Nothing here raises but cancellation.
+        """
+        try:
+            await asyncio.to_thread(self._team_store.expire_invitations)
+            snapshot = await asyncio.to_thread(self._team_store.admission_snapshot)
+        except Exception as exc:  # noqa: BLE001 — a database blip is retried
+            _logger.warning("team admission: snapshot not read (%s)", type(exc).__name__)
+            return False
+        self.next_change_at = snapshot.next_change_at
         try:
             await asyncio.to_thread(self._admission.apply, snapshot)
         except Exception as exc:  # noqa: BLE001 — retried; never fatal to the server
@@ -94,13 +106,18 @@ class AdmissionSync:
         )
         return True
 
+    def _until_next_change(self) -> float:
+        if self.next_change_at is None:
+            return PERIODIC_S
+        return min(PERIODIC_S, max(1.0, self.next_change_at - time.time() + 1))
+
     async def _run(self) -> None:
         delay = RETRY_INITIAL_S
         while True:
             self._wake.clear()
             if await self.push_once():
                 delay = RETRY_INITIAL_S
-                timeout = PERIODIC_S
+                timeout = self._until_next_change()
             else:
                 timeout = delay
                 delay = min(delay * 2, RETRY_MAX_S)

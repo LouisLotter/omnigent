@@ -77,6 +77,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.external_identity import machine_refusal_for_user
 from omnigent.server.host_registry import (
     ConcurrentRegistrationError,
     HostConnection,
@@ -280,6 +281,12 @@ def create_host_tunnel_router(
                 await ws.close(code=4004, reason="unauthenticated")
                 return
             tunnel_owner = managed.user_id
+            # Behind an identity-aware proxy (a personal host), the token's owner must
+            # be the person signed in there; a private route carries no sign-in.
+            refusal = machine_refusal_for_user(ws, tunnel_owner)
+            if refusal is not None:
+                await ws.close(code=4403, reason=refusal)
+                return
         elif auth_provider is not None:
             authenticated_owner = auth_provider.get_user_id(ws)
             if authenticated_owner is None:

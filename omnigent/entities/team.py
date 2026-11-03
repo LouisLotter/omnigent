@@ -141,10 +141,16 @@ class AdmissionSnapshot:
         proxy ignores a snapshot older than the last one it applied.
     :param emails: Sorted lowercase addresses: active members' verified
         sign-ins and pending, unexpired invitations.
+    :param owners: The active owners' addresses among *emails*; a proxy
+        refuses a list without one, so no list locks every owner out.
+    :param next_change_at: When the next pending invitation expires, in Unix
+        epoch seconds, so a syncer pushes again then; ``None`` without one.
     """
 
     revision: int
     emails: tuple[str, ...]
+    owners: tuple[str, ...] = ()
+    next_change_at: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)

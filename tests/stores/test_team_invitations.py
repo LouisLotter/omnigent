@@ -381,3 +381,171 @@ def test_the_last_active_owner_cannot_be_suspended(stores) -> None:
     stores["teams"].change_role(second, "owner")
     stores["accounts"].change_member_state(_owner_id(stores), "suspended")
     assert stores["teams"].get_member_for_account("owner").state == "suspended"
+
+
+# ── R1: the founding binding is one-time (F-3) ─────────────────────
+
+
+def test_only_the_unbound_founder_binds_by_the_pin_and_only_once(stores) -> None:
+    second = _join(stores, "carol", "admin")
+    stores["teams"].change_role(second, "owner")
+    pinned = "owner@example.test"
+    # A second owner is never bound by the pin.
+    assert (
+        stores["teams"].bind_installation_owner("carol", _identity("x-sub", pinned, owner=True))
+        is None
+    )
+    first = stores["teams"].bind_installation_owner(
+        "owner", _identity("owner-sub", pinned, owner=True)
+    )
+    assert first is not None
+    # Repeated bootstraps and a recycled pinned address bind nothing more.
+    for subject in ("owner-sub-2", "recycled-sub"):
+        assert (
+            stores["teams"].bind_installation_owner(
+                "owner", _identity(subject, pinned, owner=True)
+            )
+            is None
+        )
+    assert stores["teams"].get_external_identity(_ISSUER, "owner-sub") is not None
+    assert stores["teams"].get_external_identity(_ISSUER, "recycled-sub") is None
+
+
+# ── R1: authorization inside the write (F-4) ───────────────────────
+
+
+def test_an_admin_cannot_act_on_someone_promoted_meanwhile(stores) -> None:
+    carol = _join(stores, "carol", "admin")
+    bob = _join(stores, "bob")
+    stores["teams"].change_role(bob, "admin")  # commits before Carol's write
+    with pytest.raises(OmnigentError) as caught:
+        stores["accounts"].change_member_state(bob, "suspended", actor_member_id=carol)
+    assert caught.value.code is ErrorCode.FORBIDDEN
+    assert stores["teams"].get_member(bob).state == "active"
+    with pytest.raises(OmnigentError):
+        stores["accounts"].change_member_state(carol, "suspended", actor_member_id=carol)
+
+
+def test_a_demoted_actor_can_no_longer_administer(stores) -> None:
+    carol = _join(stores, "carol", "admin")
+    bob = _join(stores, "bob")
+    owner = _owner_id(stores)
+    invitation, _ = _invite(stores, "dave@example.test")
+    stores["teams"].change_role(carol, "member")  # an owner's demotion commits first
+    for action in (
+        lambda: stores["accounts"].change_member_state(bob, "suspended", actor_member_id=carol),
+        lambda: stores["teams"].create_invitation(
+            "erin@example.test", "member", created_by_member_id=carol, ttl_seconds=3600
+        ),
+        lambda: stores["teams"].revoke_invitation(invitation.id, actor_member_id=carol),
+        lambda: stores["teams"].change_role(bob, "admin", actor_member_id=carol),
+    ):
+        with pytest.raises(OmnigentError) as caught:
+            action()
+        assert caught.value.code is ErrorCode.FORBIDDEN
+    # The owner still may.
+    stores["teams"].change_role(bob, "admin", actor_member_id=owner)
+    stores["teams"].revoke_invitation(invitation.id, actor_member_id=owner)
+
+
+def test_an_admin_may_not_invite_admins_or_revoke_their_invitations(stores) -> None:
+    carol = _join(stores, "carol", "admin")
+    admin_invite, _ = _invite(stores, "dave@example.test", "admin")
+    with pytest.raises(OmnigentError):
+        stores["teams"].create_invitation(
+            "x@example.test", "admin", created_by_member_id=carol, ttl_seconds=3600
+        )
+    with pytest.raises(OmnigentError):
+        stores["teams"].revoke_invitation(admin_invite.id, actor_member_id=carol)
+    member_invite, _ = stores["teams"].create_invitation(
+        "y@example.test", "member", created_by_member_id=carol, ttl_seconds=3600
+    )
+    assert stores["teams"].revoke_invitation(member_invite.id, actor_member_id=carol).state == (
+        "revoked"
+    )
+
+
+# ── R1: suspension ends machine credentials (F-2) ──────────────────
+
+
+def test_suspension_clears_launch_tokens_and_retires_runner_bindings(stores) -> None:
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    bob = _join(stores, "bob")
+    hosts = stores["hosts"]
+    token = "launch-token-" + uuid.uuid4().hex
+    managed = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=managed,
+        name="managed-bob",
+        user_id="bob",
+        token=token,
+        provider="test",
+        sandbox_id="sandbox-1",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    assert hosts.resolve_launch_token(managed, token) is not None
+    conversations = SqlAlchemyConversationStore(stores["db_uri"])
+    thread = conversations.create_conversation(agent_id=None)
+    SqlAlchemyPermissionStore(stores["db_uri"]).grant("bob", thread.id, 4)
+    external = uuid.uuid4().hex
+    generation = SqlAlchemyAccountStore(stores["db_uri"]).get_user("bob").account_generation
+    with account_authority_scope("bob", generation):
+        hosts.upsert_on_connect(external, "bob-laptop", "bob")
+    conversations.set_host_id(thread.id, external, workspace="/tmp/workspace")
+    conversations.replace_runner_id(thread.id, "runner-bob")
+    assert hosts.runner_binding("runner-bob") is not None
+
+    stores["accounts"].change_member_state(bob, "suspended")
+    assert hosts.resolve_launch_token(managed, token) is None
+    assert hosts.runner_binding("runner-bob") is None
+    assert hosts.heartbeat(external, owner="bob") is False
+
+    stores["accounts"].change_member_state(bob, "active")
+    # Nothing issued before the suspension works again; the records stay.
+    assert hosts.resolve_launch_token(managed, token) is None
+    assert hosts.runner_binding("runner-bob") is None
+    assert hosts.get_host(managed) is not None and hosts.get_host(external) is not None
+    assert hosts.heartbeat(external, owner="bob") is True
+
+
+# ── R1: admission (P-2, P-3) ───────────────────────────────────────
+
+
+def test_an_expired_invitation_moves_the_admission_revision(stores) -> None:
+    invitation, _ = _invite(stores, "alice@example.test")
+    before = stores["teams"].admission_snapshot()
+    assert "alice@example.test" in before.emails and before.next_change_at == invitation.expires_at
+    with stores["teams"]._session_immediate("test_expire_invitation") as session:
+        for row in session.query(SqlTeamInvitation).filter(SqlTeamInvitation.id == invitation.id):
+            row.expires_at = int(time.time()) - 1
+        session.commit()
+    assert stores["teams"].expire_invitations() == 1
+    after = stores["teams"].admission_snapshot()
+    assert "alice@example.test" not in after.emails
+    assert after.revision > before.revision and after.next_change_at is None
+    assert stores["teams"].get_invitation(invitation.id).state == "expired"
+    assert stores["teams"].expire_invitations() == 0
+
+
+def test_the_admission_list_names_the_active_owners(stores) -> None:
+    owner = _owner_id(stores)
+    stores["teams"].bind_external_identity(
+        owner,
+        issuer=_ISSUER,
+        subject="owner-sub",
+        audience=_AUDIENCE,
+        provenance="migration",
+        email="owner@example.test",
+    )
+    carol = _join(stores, "carol", "admin")
+    stores["teams"].change_role(carol, "owner")
+    assert stores["teams"].admission_snapshot().owners == (
+        "carol@example.test",
+        "owner@example.test",
+    )
+    stores["accounts"].change_member_state(owner, "suspended")
+    after = stores["teams"].admission_snapshot()
+    assert after.owners == ("carol@example.test",) and "owner@example.test" not in after.emails

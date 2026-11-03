@@ -458,6 +458,9 @@ class SqlTeam(OmnigentBase):
     admission_revision: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
     )
+    # The founding owner membership, until the proxy's sign-in of the
+    # installation's operator is bound to it once; then NULL for good.
+    founding_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
 
 class SqlTeamMember(OmnigentBase):
@@ -606,7 +609,7 @@ class SqlTeamInvitation(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint("role IN (2, 3)", name="ck_team_invitations_role"),
-        CheckConstraint("state IN (1, 2, 3)", name="ck_team_invitations_state"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_team_invitations_state"),
         UniqueConstraint("workspace_id", "token_digest", name="uq_team_invitations_token"),
         Index("ix_team_invitations_state_expiry", "workspace_id", "state", "expires_at"),
         Index("ix_team_invitations_email", "workspace_id", "email", "state"),

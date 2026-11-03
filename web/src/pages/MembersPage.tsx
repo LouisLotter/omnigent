@@ -226,6 +226,7 @@ export function MembersPage() {
       {team !== null && (
         <TeamPanel
           state={team}
+          accounts={(users ?? []).map((u) => u.id)}
           onChanged={refresh}
           onResetPassword={(userId) => void onResetPassword(userId)}
           onRemove={(userId) => setDeleteCandidate(userId)}

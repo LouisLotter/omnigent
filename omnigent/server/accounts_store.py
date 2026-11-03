@@ -44,6 +44,7 @@ from omnigent.db.enum_codecs import (
     encode_account_token_kind,
     encode_device_grant_status,
     encode_scheduled_task_state,
+    encode_team_member_role,
     encode_team_member_state,
 )
 from omnigent.db.utils import (
@@ -56,7 +57,7 @@ from omnigent.entities.team import InvitationRole, MemberState, TeamMember
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.principals import MachineBinding
 from omnigent.stores.approval_store import remove_account_approval_authority
-from omnigent.stores.host_store import resolve_runner_binding
+from omnigent.stores.host_store import RETIRED_RUNNER_INCARNATION, resolve_runner_binding
 from omnigent.stores.team_store import (
     InvitationEmailMismatchError,
     admin_flag_for_account,
@@ -69,6 +70,7 @@ from omnigent.stores.team_store import (
     lock_pending_invitation,
     lock_team,
     member_state_row,
+    require_actor,
     retire_deleted_account_membership,
     to_member,
 )
@@ -205,6 +207,40 @@ def _carry_registration_work(session: Session, user_id: str, *, old: str, new: s
             SqlHost.account_generation == old,
         )
         .values(account_generation=new)
+    )
+
+
+def _retire_machine_credentials(session: Session, user_id: str) -> None:
+    """End every launch token and runner binding *user_id* holds; keep hosts and schedules.
+
+    Runs in a suspension's transaction. A reinstated member's computers get
+    fresh launch tokens when they next start, and their threads fresh runners.
+    """
+    from omnigent.server.auth import LEVEL_OWNER
+
+    workspace_id = current_workspace_id()
+    session.execute(
+        update(SqlHost)
+        .where(
+            SqlHost.workspace_id == workspace_id,
+            SqlHost.user_id == user_id,
+            SqlHost.token_hash.is_not(None),
+        )
+        .values(token_hash=None, token_expires_at=None)
+    )
+    owned = select(SqlSessionPermission.conversation_id).where(
+        SqlSessionPermission.workspace_id == workspace_id,
+        SqlSessionPermission.user_id == user_id,
+        SqlSessionPermission.level >= LEVEL_OWNER,
+    )
+    session.execute(
+        update(SqlConversationMetadata)
+        .where(
+            SqlConversationMetadata.workspace_id == workspace_id,
+            SqlConversationMetadata.id.in_(owned),
+            SqlConversationMetadata.runner_id.is_not(None),
+        )
+        .values(runner_host_incarnation=RETIRED_RUNNER_INCARNATION)
     )
 
 
@@ -695,17 +731,27 @@ class SqlAlchemyAccountStore:
 
         return run_write_transaction(self._session_immediate, "link_team_invitation", write)
 
-    def change_member_state(self, member_id: str, state: MemberState) -> TeamMember:
+    def change_member_state(
+        self, member_id: str, state: MemberState, *, actor_member_id: str | None = None
+    ) -> TeamMember:
         """Suspend or reinstate a member, or move them on in the team lifecycle.
 
         Suspending also rotates the account's registration through the path a
         password reset uses: every session, refresh and device grant, magic
         link and runner or host token issued before dies, while hosts,
-        schedules and the membership move to the new registration. A
-        reinstated member therefore signs in again everywhere.
+        schedules and the membership move to the new registration. Managed
+        hosts' launch tokens are cleared and runner bindings retired, so no
+        machine credential from before the suspension works after
+        reinstatement: computers get fresh launch tokens at their next start,
+        threads fresh runners, and people sign in again everywhere.
 
+        :param actor_member_id: The owner or admin making the change, authorized
+            inside the write against the roles as they are then: nobody changes
+            their own state, and an admin changes members only. ``None`` for the
+            system.
         :raises OmnigentError: ``NOT_FOUND``, ``CONFLICT`` for a transition the
-            lifecycle does not allow, or :class:`LastActiveOwnerError`.
+            lifecycle does not allow, ``FORBIDDEN`` for an actor who may not, or
+            :class:`LastActiveOwnerError`.
         """
         from omnigent.errors import ErrorCode, OmnigentError
 
@@ -724,16 +770,31 @@ class SqlAlchemyAccountStore:
             row = member_state_row(session, user_id)
             if row is None or row.id != member_id:
                 raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            if actor_member_id is not None:
+                actor = require_actor(session, actor_member_id, owner=False)
+                if actor.id == row.id:
+                    raise OmnigentError("you cannot suspend yourself", code=ErrorCode.FORBIDDEN)
+                if actor.role != encode_team_member_role("owner") and row.role != (
+                    encode_team_member_role("member")
+                ):
+                    raise OmnigentError(
+                        "only an owner suspends or reinstates owners and admins",
+                        code=ErrorCode.FORBIDDEN,
+                    )
             changed = apply_member_state(session, row, state)
             generation = account.account_generation if account is not None else None
-            if changed and state == "suspended" and generation is not None:
-                new_generation = uuid.uuid4().hex
-                _carry_registration_work(session, user_id, old=generation, new=new_generation)
-                session.execute(
-                    update(SqlUser)
-                    .where(SqlUser.workspace_id == current_workspace_id(), SqlUser.id == user_id)
-                    .values(account_generation=new_generation)
-                )
+            if changed and state == "suspended":
+                if generation is not None:
+                    new_generation = uuid.uuid4().hex
+                    _carry_registration_work(session, user_id, old=generation, new=new_generation)
+                    session.execute(
+                        update(SqlUser)
+                        .where(
+                            SqlUser.workspace_id == current_workspace_id(), SqlUser.id == user_id
+                        )
+                        .values(account_generation=new_generation)
+                    )
+                _retire_machine_credentials(session, user_id)
             return to_member(row)
 
         return run_write_transaction(self._session_immediate, "change_team_member_state", write)
