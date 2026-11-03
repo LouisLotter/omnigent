@@ -1,3 +1,4 @@
+import type { TurnAttribution } from "./attribution";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
@@ -780,6 +781,8 @@ export interface SessionInputConsumedEvent {
    * and single-user sends. Threaded onto the bubble for live attribution.
    */
   createdBy?: string;
+  /** Who started the turn this item starts, on whose computer and login. */
+  attribution?: TurnAttribution;
   /** Decoded item payload — heterogeneous, `itemType`-specific. */
   data: Record<string, unknown>;
   /**

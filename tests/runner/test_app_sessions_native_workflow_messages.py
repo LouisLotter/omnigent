@@ -79,11 +79,12 @@ async def test_native_input_identity_reaches_the_harness_request(harness: str) -
 
 
 def _build_blocking_app(
-    gate: asyncio.Event,
+    gate: asyncio.Event, server_client: Any = None
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:
     """Build a runner app with a blocking harness for concurrency tests.
 
     :param gate: Event that unblocks the harness mid-stream.
+    :param server_client: The runner's client to the server; a stub by default.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
     spec = AgentSpec(spec_version=1, name="t")
@@ -102,7 +103,7 @@ def _build_blocking_app(
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client or NullServerClient(),  # type: ignore[arg-type]
     )
     return app, pm, harness_client
 
@@ -199,6 +200,195 @@ async def test_turn_sequencing_buffers_concurrent_message() -> None:
         # Unblock the harness and let the first turn complete.
         gate.set()
         await _aio.wait_for(turn_task, timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_the_harness_never_waits_for_turn_registration() -> None:
+    """D59: a turn runs while its registration is still in flight; a message queued
+    behind it is registered when its own turn starts."""
+    gate = asyncio.Event()
+    acknowledge = asyncio.Event()
+    registered: list[list[str]] = []
+
+    class _Server(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/turns"):
+                registered.append(kwargs["json"]["input_ids"])
+                await acknowledge.wait()
+            return await super().post(url, **kwargs)
+
+    app, _pm, harness = _build_blocking_app(gate, _Server())
+    session_id = "5e1f0bd1f0cae058f05f48057e9f98c1"
+
+    def _message(text: str, item_id: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": text}],
+            "harness": "openai-agents",
+            "persisted_item_id": item_id,
+        }
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+
+        async def _first_turn() -> None:
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events", json=_message("first", "item_alice")
+            )
+            async for _ in resp.aiter_text():
+                pass
+
+        first = asyncio.create_task(_first_turn())
+        # The harness runs although the server has not acknowledged the turn.
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+        assert registered == [["item_alice"]]
+        queued = await client.post(
+            f"/v1/sessions/{session_id}/events", json=_message("second", "item_bob")
+        )
+        assert queued.json()["status"] == "buffered"
+        assert registered == [["item_alice"]]
+
+        acknowledge.set()
+        gate.set()
+        await asyncio.wait_for(first, timeout=5.0)
+        for _ in range(100):
+            if len(registered) == 2:
+                break
+            await asyncio.sleep(0.05)
+        assert registered == [["item_alice"], ["item_bob"]]
+        await client.delete(f"/v1/sessions/{session_id}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registration", ["refused", "unreachable"])
+async def test_a_streamed_turn_runs_whatever_its_registration_does(registration: str) -> None:
+    """F6 + D59: through ``?stream=true``, a refused or unreachable registration neither
+    wedges the thread nor stops the turn; the next message runs."""
+    import httpx as _httpx
+
+    class _Server(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/turns"):
+                if registration == "unreachable":
+                    raise _httpx.ConnectError("down")
+                response = await super().post(url, **kwargs)
+                response.status_code = 403
+                return response
+            return await super().post(url, **kwargs)
+
+    app, _pm, harness = _build_lifecycle_app_with(_Server())
+    session_id = "5e1f0bd1f0cae058f05f48057e9f98c2"
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        for text, item_id in (("first", "item_1"), ("second", "item_2")):
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": text}],
+                    "harness": "openai-agents",
+                    "persisted_item_id": item_id,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            async for _ in resp.aiter_text():
+                pass
+        # Both turns reached the harness.
+        assert len(harness.posted_bodies) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_turn_whose_setup_fails_frees_the_thread() -> None:
+    """F6: a setup failure on the streamed path publishes the error and clears the slot."""
+    fail_next: list[BaseException] = []
+    app, _pm, harness = _build_lifecycle_app_with(NullServerClient(), fail_next=fail_next)
+    session_id = "5e1f0bd1f0cae058f05f48057e9f98c3"
+
+    def _message(text: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": [{"type": "input_text", "text": text}],
+            "harness": "openai-agents",
+            "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+        }
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        _drain_events(app, session_id)
+        # A new revision makes the runner read the spec again; that read fails.
+        fail_next.append(ValueError("spec could not be read"))
+        failed = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={**_message("first"), "agent_revision": "rev-2"},
+        )
+        assert failed.status_code >= 400
+        statuses = [
+            event.get("status")
+            for event in _drain_events(app, session_id)
+            if event.get("type") == "session.status"
+        ]
+        assert statuses[-1] == "failed", statuses
+
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true", json=_message("second")
+        )
+        assert resp.status_code == 200, resp.text
+        async for _ in resp.aiter_text():
+            pass
+        assert len(harness.posted_bodies) == 1
+
+
+def _drain_events(app: FastAPI, session_id: str) -> list[dict[str, Any]]:
+    queue = app.state.session_event_queues.get(session_id)
+    events: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        events.append(queue.get_nowait())
+    return events
+
+
+def _build_lifecycle_app_with(
+    server_client: Any, fail_next: list[BaseException] | None = None
+) -> tuple[FastAPI, _FakeProcessManager, Any]:
+    """A runner app with a scripted harness and the given server client.
+
+    :param fail_next: Exceptions the spec resolver raises, one per call, first.
+    """
+    spec = AgentSpec(spec_version=1, name="t")
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.output_text.delta", "delta": "hi"}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        if fail_next:
+            raise fail_next.pop(0)
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    return app, pm, harness_client
 
 
 @pytest.mark.asyncio

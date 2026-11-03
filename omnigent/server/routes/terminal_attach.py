@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Final
 
@@ -88,6 +89,7 @@ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.principals import recorded_principal
 from omnigent.server.routes._auth_helpers import (
     CONNECTION_AUTHORITY_RECHECK_S,
+    attribution_user,
     connection_still_authorized,
     require_access,
 )
@@ -183,110 +185,133 @@ def create_terminal_attach_router(
             ),
         )
 
-        ws_factory = get_runner_ws_factory()
-        if ws_factory is not None:
-            from urllib.parse import urlencode
+        # Keystrokes carry no identity, so who sends input to this terminal is
+        # recorded from this authenticated connection (best effort, beside the input).
+        typist = (
+            attribution_user(auth_provider.get_user_id(websocket))
+            if auth_provider is not None and not read_only
+            else None
+        )
+        typing = _TypingRecorder(session_id, terminal_id, typist) if typist else None
+        try:
+            ws_factory = get_runner_ws_factory()
+            if ws_factory is not None:
+                from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
-            runner_path = (
-                f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
-            )
-            try:
-                runner_cm = ws_factory(runner_path)
-            except WrongReplicaWSError:
-                # Wrong-replica routing miss: the runner tunnel is bound but not
-                # on this replica (the key routed here, but the host homed its
-                # tunnel elsewhere). Signal 4400 so the client re-dials WITHOUT
-                # the key and reaches the replica that holds the tunnel — the WS
-                # analogue of the fetch path's keyless re-address on a 400.
-                await websocket.close(
-                    code=_WS_CLOSE_WRONG_REPLICA,
-                    reason="host on another replica; retry without slice key",
+                qs = urlencode({"read_only": "true" if read_only else "false"})
+                runner_path = (
+                    f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
                 )
-                return
-            except Exception:  # noqa: BLE001
-                await websocket.close(
-                    code=_WS_CLOSE_INTERNAL_ERROR,
-                    reason="runner attach factory failed",
-                )
-                return
-            try:
-                from omnigent.runtime import telemetry
-
-                with telemetry.span(
-                    "terminal.attach",
-                    attributes={
-                        "session.id": session_id,
-                        "terminal.id": terminal_id,
-                        "terminal.read_only": read_only,
-                        "terminal.mode": "runner-proxy",
-                    },
-                ):
-                    async with runner_cm as runner_ws:
-                        await _serve_while_authorized(
-                            websocket, _shuttle_ws_frames(websocket, runner_ws), still_authorized
-                        )
-            except _RunnerWSClosed as closed:
-                code = (
-                    closed.code
-                    if closed.code and closed.code >= 1000
-                    else _WS_CLOSE_INTERNAL_ERROR
-                )
-                with contextlib.suppress(RuntimeError):
+                try:
+                    runner_cm = ws_factory(runner_path)
+                except WrongReplicaWSError:
+                    # Wrong-replica routing miss: the runner tunnel is bound but not
+                    # on this replica (the key routed here, but the host homed its
+                    # tunnel elsewhere). Signal 4400 so the client re-dials WITHOUT
+                    # the key and reaches the replica that holds the tunnel — the WS
+                    # analogue of the fetch path's keyless re-address on a 400.
                     await websocket.close(
-                        code=code,
-                        reason=closed.reason or "",
+                        code=_WS_CLOSE_WRONG_REPLICA,
+                        reason="host on another replica; retry without slice key",
                     )
-            except Exception:  # noqa: BLE001
-                with contextlib.suppress(RuntimeError):
+                    return
+                except Exception:  # noqa: BLE001
                     await websocket.close(
                         code=_WS_CLOSE_INTERNAL_ERROR,
-                        reason="runner attach proxy failed",
+                        reason="runner attach factory failed",
                     )
-            return
+                    return
+                try:
+                    from omnigent.runtime import telemetry
 
-        try:
-            terminal_registry = get_terminal_registry()
-        except RuntimeError:
-            await websocket.close(
-                code=_WS_CLOSE_TERMINAL_NOT_FOUND,
-                reason="terminal registry not available",
+                    with telemetry.span(
+                        "terminal.attach",
+                        attributes={
+                            "session.id": session_id,
+                            "terminal.id": terminal_id,
+                            "terminal.read_only": read_only,
+                            "terminal.mode": "runner-proxy",
+                        },
+                    ):
+                        async with runner_cm as runner_ws:
+                            await _serve_while_authorized(
+                                websocket,
+                                _shuttle_ws_frames(websocket, runner_ws, typing=typing),
+                                still_authorized,
+                            )
+                except _RunnerWSClosed as closed:
+                    code = (
+                        closed.code
+                        if closed.code and closed.code >= 1000
+                        else _WS_CLOSE_INTERNAL_ERROR
+                    )
+                    with contextlib.suppress(RuntimeError):
+                        await websocket.close(
+                            code=code,
+                            reason=closed.reason or "",
+                        )
+                except Exception:  # noqa: BLE001
+                    with contextlib.suppress(RuntimeError):
+                        await websocket.close(
+                            code=_WS_CLOSE_INTERNAL_ERROR,
+                            reason="runner attach proxy failed",
+                        )
+                return
+
+            try:
+                terminal_registry = get_terminal_registry()
+            except RuntimeError:
+                await websocket.close(
+                    code=_WS_CLOSE_TERMINAL_NOT_FOUND,
+                    reason="terminal registry not available",
+                )
+                return
+
+            entry = resolve_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
             )
-            return
+            if entry is None or not entry.instance.running or not await entry.instance.is_alive():
+                await websocket.close(
+                    code=_WS_CLOSE_TERMINAL_NOT_FOUND,
+                    reason="terminal resource not found or not running",
+                )
+                return
 
-        entry = resolve_terminal_entry_by_resource_id(
-            session_id,
-            terminal_id,
-            terminal_registry,
-        )
-        if entry is None or not entry.instance.running or not await entry.instance.is_alive():
-            await websocket.close(
-                code=_WS_CLOSE_TERMINAL_NOT_FOUND,
-                reason="terminal resource not found or not running",
-            )
-            return
+            from omnigent.runtime import telemetry
 
-        from omnigent.runtime import telemetry
-
-        with telemetry.span(
-            "terminal.attach",
-            attributes={
-                "session.id": session_id,
-                "terminal.id": terminal_id,
-                "terminal.read_only": read_only,
-                "terminal.mode": "in-process",
-            },
-        ):
-            await _serve_while_authorized(
-                websocket,
-                bridge_tmux_control_to_websocket(
-                    websocket,
-                    socket_path=str(entry.instance.socket_path),
-                    tmux_target=entry.instance.tmux_target,
-                    read_only=read_only,
-                ),
-                still_authorized,
-            )
+            with telemetry.span(
+                "terminal.attach",
+                attributes={
+                    "session.id": session_id,
+                    "terminal.id": terminal_id,
+                    "terminal.read_only": read_only,
+                    "terminal.mode": "in-process",
+                },
+            ):
+                bridge = (
+                    # In-process frames are not visible here: every client
+                    # interaction counts as possible typing.
+                    bridge_tmux_control_to_websocket(
+                        websocket,
+                        socket_path=str(entry.instance.socket_path),
+                        tmux_target=entry.instance.tmux_target,
+                        read_only=read_only,
+                        on_client_interaction=typing.note_interaction,
+                    )
+                    if typing is not None
+                    else bridge_tmux_control_to_websocket(
+                        websocket,
+                        socket_path=str(entry.instance.socket_path),
+                        tmux_target=entry.instance.tmux_target,
+                        read_only=read_only,
+                    )
+                )
+                await _serve_while_authorized(websocket, bridge, still_authorized)
+        finally:
+            if typing is not None:
+                await typing.flush()
 
     return router
 
@@ -454,7 +479,64 @@ class _RunnerWSClosed(Exception):
         self.reason = reason
 
 
-async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
+# Typing is recorded at most this often, and on every Enter through the runner proxy.
+_TYPING_RECORD_INTERVAL_S = 1.0
+
+
+class _TypingRecorder:
+    """Records, per terminal and person, that someone sends it input; best effort.
+
+    Attribution names whoever typed into a thread's terminals during a turn
+    (D59: a display). Writes run beside the input, never before it: on a
+    submitted line and at most once a second while typing, one at a time. A
+    failed write is logged; the input is never delayed or refused.
+    """
+
+    def __init__(self, session_id: str, terminal_id: str, user_id: str) -> None:
+        self._session_id = session_id
+        self._terminal_id = terminal_id
+        self._user_id = user_id
+        self._recorded_at = 0.0
+        self._writing: asyncio.Task[None] | None = None
+
+    def note_input(self, data: bytes | str, *, submits_on_enter: bool = True) -> None:
+        """Note typing; schedules a record when one is due and none is in flight."""
+        now = time.monotonic()
+        submits = submits_on_enter and isinstance(data, bytes) and (b"\r" in data or b"\n" in data)
+        if not submits and now - self._recorded_at < _TYPING_RECORD_INTERVAL_S:
+            return
+        if self._writing is not None and not self._writing.done():
+            return
+        self._recorded_at = now
+        self._writing = asyncio.ensure_future(self._record())
+
+    def note_interaction(self) -> None:
+        """Note possible typing for a bridge whose frames this server cannot see."""
+        self.note_input(b"", submits_on_enter=False)
+
+    async def _record(self) -> None:
+        from omnigent.runtime import get_turn_store
+
+        store = get_turn_store()
+        if store is None:
+            return
+        try:
+            await asyncio.to_thread(
+                store.record_terminal_activity, self._session_id, self._terminal_id, self._user_id
+            )
+        except Exception:
+            _logger.warning("Could not record terminal typing", exc_info=True)
+
+    async def flush(self) -> None:
+        """Wait for an in-flight record."""
+        if self._writing is not None and not self._writing.done():
+            with contextlib.suppress(Exception):
+                await self._writing
+
+
+async def _shuttle_ws_frames(
+    browser_ws: WebSocket, runner_ws: object, *, typing: _TypingRecorder | None = None
+) -> None:
     """
     Forward frames between *browser_ws* (FastAPI) and *runner_ws*
     (websockets client connection) until either side closes.
@@ -489,6 +571,9 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
                     await runner_ws.send(text)  # type: ignore[attr-defined]
                 elif data is not None:
                     await runner_ws.send(data)  # type: ignore[attr-defined]
+                    if typing is not None:
+                        # Binary frames are keystrokes; text frames are controls.
+                        typing.note_input(data)
         except WebSocketDisconnect:
             return
         except ConnectionClosed:

@@ -76,6 +76,9 @@ CAP_REFRESH_HARNESSES = "refresh_harnesses"
 # The host retires only explicitly named runners during a session launch.
 CAP_RUNNER_REPLACEMENT_TARGETS = "runner_replacement_targets"
 CAP_MCP_REGISTRY = "mcp_registry"
+# The runner publishes ``session.turn_started`` naming the inputs each turn starts
+# with, so the server records the turn's initiator when the turn starts.
+CAP_TURN_INPUTS = "turn_inputs"
 # The host answers ``host.quiesce`` with its live runners and host operations:
 CAP_QUIESCE = "quiesce"
 # The host keeps the result of each host-changing request, by ``request_id``, for

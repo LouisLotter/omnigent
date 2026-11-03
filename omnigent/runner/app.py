@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -455,6 +455,10 @@ _INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
         "response.incomplete",
     }
 )
+
+
+# Stands for "no turn slot at all", unlike a reserved ``None`` slot.
+_MISSING_TURN = object()
 
 
 def _input_stable_id(source: Mapping[str, object]) -> str | None:
@@ -3682,6 +3686,59 @@ def create_runner_app(
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
 
+    def _stash_turn_inputs(body: _JsonObject, bodies: Iterable[Mapping[str, object]]) -> None:
+        """Carry the turn's server-issued input ids to its registration (see ``turn_inputs``)."""
+        from omnigent.runner.turn_inputs import TURN_INPUTS_KEY, turn_input_ids
+
+        ids = turn_input_ids(bodies)
+        if ids:
+            body[TURN_INPUTS_KEY] = ids
+
+    def _end_failed_stream_setup(
+        conv_id: str, body: _JsonObject, turn_epoch: int | None, exc: BaseException
+    ) -> None:
+        """Finish a streamed turn whose setup raised or was cancelled.
+
+        The same error publication and slot cleanup the background path gives a
+        failed setup. Only while the slot is still this turn's reservation (the
+        ``None`` sentinel of the same epoch), so an older failure never clears a
+        newer turn; otherwise every later message would buffer forever.
+        """
+        if _active_turns.get(conv_id, _MISSING_TURN) is not None:
+            return
+        if _turn_bind_epoch.get(conv_id) != turn_epoch:
+            return
+        error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
+        stable_id = _input_stable_id(body)
+        if stable_id is not None:
+            _publish_event(
+                conv_id,
+                _response_failed_payload(
+                    {**error, "undelivered": True}, input_stable_id=stable_id
+                ),
+            )
+        # The harness never took it: a resend must run it.
+        _accepted_messages.forget(conv_id, body)
+        _on_proxy_stream_end(conv_id, error=error)
+
+    def _register_stashed_turn(conv_id: str, body: _JsonObject) -> None:
+        """Tell the server which inputs this turn starts with, beside the turn.
+
+        Best effort (D59): the harness never waits for it, and a failure is
+        logged. A turn with no server-issued inputs (a recovery or
+        continuation) keeps the turn already registered.
+        """
+        from omnigent.runner.turn_inputs import TURN_INPUTS_KEY, register_turn
+
+        ids = body.pop(TURN_INPUTS_KEY, None)
+        if not isinstance(ids, list) or not ids:
+            return
+        task = asyncio.create_task(
+            register_turn(server_client, conv_id, ids), name=f"turn-register-{conv_id}"
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     async def _codex_native_bridge_state_and_dir_for_session(
         conv_id: str,
         *,
@@ -4400,6 +4457,7 @@ def create_runner_app(
             # whenever a /compact is buffered, so each lands as its own turn.
             if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
+                turn_bodies = [next_body]
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
@@ -4411,6 +4469,7 @@ def create_runner_app(
                 )
             else:
                 all_bodies = list(buf)
+                turn_bodies = all_bodies
                 buf.clear()
                 _session_message_buffers.pop(session_id, None)
 
@@ -4439,6 +4498,7 @@ def create_runner_app(
                 )
                 _sdk_compact_inprogress.add(session_id)
             _begin_turn_slot(session_id)
+            _stash_turn_inputs(next_body, turn_bodies)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
                 _run_turn_bg(next_body, session_id),
@@ -5002,6 +5062,7 @@ def create_runner_app(
         conv: str,
         handed_off: list[bool],
     ) -> None:
+        _register_stashed_turn(conv, msg_body)
         _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
         await _sync_session_agent(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
@@ -6693,10 +6754,17 @@ def create_runner_app(
                     extra={"session_id": conversation_id},
                 )
 
+                _stash_turn_inputs(message_body, [message_body])
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    _register_stashed_turn(conversation_id, message_body)
+                    turn_epoch = _turn_bind_epoch.get(conversation_id)
+                    try:
+                        response = await _stream_message_to_harness(message_body, conversation_id)
+                    except BaseException as exc:
+                        _end_failed_stream_setup(conversation_id, message_body, turn_epoch, exc)
+                        raise
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
@@ -7806,6 +7874,14 @@ def create_runner_app(
                         # Catch-up has no live server dispatch carrying renderer state.
                         "browser_renderer_available": False,
                     }
+                    _stash_turn_inputs(
+                        msg_body,
+                        [
+                            {"persisted_item_id": raw.get("id")}
+                            for raw in all_new
+                            if raw.get("type") == "message" and raw.get("role") == "user"
+                        ],
+                    )
                     _turn_task = asyncio.create_task(
                         _run_turn_bg(msg_body, session_id),
                         name=f"turn-catchup-{session_id}",

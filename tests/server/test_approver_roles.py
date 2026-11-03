@@ -23,12 +23,20 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
 from omnigent.db.db_models import SqlApprovalVerdict
+from omnigent.entities import MessageData, NewConversationItem
+from omnigent.entities.attribution import (
+    InitiatorAttribution,
+    OwnerAttribution,
+    TurnAttribution,
+)
 from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.runtime import get_turn_store
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID, mint_delegated_token
 from omnigent.stores.approval_store import ApprovalResource, ResourceKind, VerdictState
+from omnigent.stores.turn_store import InputKind
 from tests.server.test_account_revocation import setup_app as setup_app
 from tests.server.test_delegated_runner_tokens import (
     _ask,
@@ -284,31 +292,54 @@ def test_an_administrator_or_editor_is_not_an_approver_unless_named(team) -> Non
     assert "result" in _tools_call(team["runner"], session_id, **retry)
 
 
-def test_named_service_approvers_answer_and_the_initiator_does_not_by_default(team) -> None:
-    """D53: a team-shared service's actions go to its approvers, not to their initiator."""
+def test_named_service_approvers_answer_and_by_default_so_does_the_initiator(team) -> None:
+    """D59: a service's approvers answer its actions; the initiator may too unless refused."""
     session_id, runner = team["session"], team["runner"]
     _name_approver(team, "service", "carol", "tracker")
     _name_approver(team, "service", "alice", "tracker")
     elicitation_id, retry = _ask(runner, session_id)
 
-    refused = _answer(team["alice"], session_id, elicitation_id)
-    assert refused.status_code == 403, refused.text
     # Carol cannot see Alice's thread, yet sees and answers the approval.
     viewed = team["carol"].get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
     assert viewed.json()["status"] == "pending", viewed.text
     listed = team["carol"].get("/v1/approvals").json()["data"]
     assert [item["elicitation_id"] for item in listed] == [elicitation_id]
-    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    # By default the person who started the action may approve it (D59).
+    assert _answer(team["alice"], session_id, elicitation_id).status_code == 202
     assert "result" in _tools_call(runner, session_id, **retry)
 
+    _exclude_initiators(team)
+    second, retry = _ask(runner, session_id)
+    refused = _answer(team["alice"], session_id, second)
+    assert refused.status_code == 403, refused.text
+    assert _answer(team["carol"], session_id, second).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_by_default_the_initiator_approves_a_team_rules_action(team) -> None:
+    """D59: self-approval is allowed for team approvals too, not only a person's own thread."""
+    session_id, runner = team["session"], team["runner"]
+    _name_approver(team, "team", "alice")
+    _team_rule(team, _ASK_ON_POST)
+    elicitation_id, retry = _ask(runner, session_id)
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert [r["kind"] for r in record.requirements] == ["personal", "team"]
+
+    final = _answer(team["alice"], session_id, elicitation_id).json()
+
+    assert final["approval"]["state"] == "approved"
+    roles = [grant["role"] for grant in final["approval"]["answers"][0]["as"]]
+    assert roles == ["thread_owner", "team_approver"]
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def _exclude_initiators(team: dict[str, Any]) -> None:
+    """An administrator turns self-approval off for the tracker service."""
     saved = team["admin"].put(
         "/v1/approval-settings",
-        json={"kind": "service", "resource_id": "tracker", "allow_initiator": True},
+        json={"kind": "service", "resource_id": "tracker", "allow_initiator": False},
     )
-    assert saved.json() == {"allow_initiator": True}
-    second, retry = _ask(runner, session_id)
-    assert _answer(team["alice"], session_id, second).status_code == 202
-    assert "result" in _tools_call(runner, session_id, **retry)
+    assert saved.json() == {"allow_initiator": False}
 
 
 def test_a_team_rule_and_a_personal_rule_each_need_their_approver(team) -> None:
@@ -328,14 +359,242 @@ def test_a_team_rule_and_a_personal_rule_each_need_their_approver(team) -> None:
         assert created.status_code == 201, created.text
     elicitation_id, retry = _ask(runner, session_id)
 
-    first = _answer(team["alice"], session_id, elicitation_id)
-    assert first.json() == {"queued": False, "awaiting": "team"}, first.text
+    first = _answer(team["alice"], session_id, elicitation_id).json()
+    assert (first["queued"], first["awaiting"]) == (False, "team"), first
     assert _tools_call(runner, session_id, **retry)["error"]["message"] == (
         "Tool call has not been approved"
     )
-    assert _answer(team["dave"], session_id, elicitation_id).json() == {"queued": False}
+    final = _answer(team["dave"], session_id, elicitation_id).json()
+    assert final["queued"] is False
+    # Each answer records the grant it was given under.
+    roles = [(answer["by"], answer["as"][0]["role"]) for answer in final["approval"]["answers"]]
+    assert roles == [("alice", "thread_owner"), ("dave", "team_approver")]
+    assert final["approval"]["decided_by"] == "dave"
     assert "result" in _tools_call(runner, session_id, **retry)
     team["tracker"].call_tool.assert_awaited_once()
+
+
+def _turn(team: dict[str, Any], person: str, text: str) -> Any:
+    """A message as the forward path saves and records it, before any runner sees it."""
+    session_id = team["session"]
+    [item] = team["stores"]["conversation_store"].append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"turn_{uuid.uuid4().hex}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                created_by=person,
+                attribution=TurnAttribution(
+                    initiator=InitiatorAttribution(kind="person", user=person, source="signed_in"),
+                    owner=OwnerAttribution(user="alice"),
+                    recorded_at=int(time.time()),
+                ),
+            )
+        ],
+    )
+    get_turn_store().record_input(session_id, item.id, kind=InputKind.PERSON, person=person)
+    return item
+
+
+def _register(team: dict[str, Any], *input_ids: str) -> Any:
+    """The bound runner registers a turn before its harness acts."""
+    registered = team["runner"].post(
+        f"/v1/sessions/{team['session']}/turns",
+        json={"turn_id": f"turn_{uuid.uuid4().hex}", "input_ids": list(input_ids)},
+    )
+    assert registered.status_code == 200, registered.text
+    return registered.json()
+
+
+def _service_approvers(team: dict[str, Any], *names: str) -> None:
+    for approver in names:
+        _name_approver(team, "service", approver, "tracker")
+
+
+def _refused(team: dict[str, Any], person: str, elicitation_id: str) -> str:
+    """The answer is refused; one who cannot read the thread is told it does not exist."""
+    refused = _answer(team[person], team["session"], elicitation_id)
+    assert refused.status_code in (403, 404, 409), refused.text
+    assert _state(team, elicitation_id) is VerdictState.PENDING
+    return refused.json()["error"]["message"]
+
+
+def test_where_self_approval_is_off_recorded_contributors_are_excluded_too(team) -> None:
+    """WP8.8 + D59: Bob queues during Alice's turn; the approval names Alice. Where the
+    service turns self-approval off, both are excluded as best effort; Carol approves."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "alice", "bob", "carol")
+    _exclude_initiators(team)
+    alices = _turn(team, "alice", "post the update")
+    assert _register(team, alices.id)["initiator"] == "alice"
+    # Queued: the runner has not started Bob's turn, so it is still Alice's.
+    _turn(team, "bob", "and mention the outage")
+
+    elicitation_id, retry = _ask(runner, session_id)
+
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert record.binding["initiator"] == "alice"
+    assert (record.attribution["initiator"], record.attribution["contributors"]) == (
+        "alice",
+        ["bob"],
+    )
+    assert record.attribution["authority"]["complete"] is True
+    assert record.attribution["principal"]["kind"] == "runner"
+    assert record.attribution["owner"]["user"] == "alice"
+    for person in ("alice", "bob"):
+        _refused(team, person, elicitation_id)
+    approved = _answer(team["carol"], session_id, elicitation_id)
+    assert approved.status_code == 202, approved.text
+    [answer] = approved.json()["approval"]["answers"]
+    assert (answer["by"], answer["as"][0]["role"]) == ("carol", "service_approver")
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+    # The thread's approval record: anyone who reads the thread; nobody else; no runner.
+    [listed] = team["bob"].get(f"/v1/sessions/{session_id}/approvals").json()["data"]
+    assert listed["elicitation_id"] == elicitation_id
+    assert listed["asked"]["contributors"] == ["bob"]
+    assert listed["decided_by"] == "carol"
+    assert listed["decision_digest"] == record.binding_digest.hex()
+    assert team["dave"].get(f"/v1/sessions/{session_id}/approvals").status_code == 404
+    assert runner.get(f"/v1/sessions/{session_id}/approvals").status_code == 403
+
+
+def test_a_long_turn_still_names_an_early_contributor(team) -> None:
+    """Bob injects early in Alice's turn; 600 items later he is still recorded."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "bob", "carol")
+    _exclude_initiators(team)
+    _register(team, _turn(team, "alice", "migrate the data").id)
+    _turn(team, "bob", "and drop the old table")
+    team["stores"]["conversation_store"].append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_long",
+                data=MessageData(
+                    role="assistant",
+                    agent="review-agent",
+                    content=[{"type": "output_text", "text": f"step {index}"}],
+                ),
+            )
+            for index in range(600)
+        ],
+    )
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    assert "bob" in team["approvals"].get_verdict(elicitation_id).attribution["contributors"]
+    _refused(team, "bob", elicitation_id)
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+
+
+def test_an_unreadable_record_of_who_took_part_refuses_nothing(team, monkeypatch) -> None:
+    """D59: attribution is best effort; a failed read only weakens the optional exclusion."""
+    from omnigent.stores.turn_store import SqlAlchemyTurnStore
+
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "bob")
+    _exclude_initiators(team)
+    _register(team, _turn(team, "alice", "post the update").id)
+    _turn(team, "bob", "and mention the outage")
+
+    def unreadable(self: Any, session_id: str) -> Any:
+        raise sa.exc.OperationalError("SELECT", {}, Exception("database went away"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyTurnStore, "turn_authority", unreadable)
+        elicitation_id, retry = _ask(runner, session_id)
+
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert record.attribution["authority"] == {"complete": False}
+    # Bob's part in the turn was not read, so the exclusion cannot name him.
+    assert _answer(team["bob"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_a_pending_approval_from_before_the_upgrade_is_answered(team) -> None:
+    """A ledger row recorded before attribution existed has none; it is answered as usual."""
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "carol")
+    elicitation_id, retry = _ask(runner, session_id)
+    engine = sa.create_engine(team["approvals"].storage_location)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(SqlApprovalVerdict)
+            .where(SqlApprovalVerdict.elicitation_id == elicitation_id)
+            .values(attribution=None)
+        )
+    engine.dispose()
+
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_without_a_registered_turn_only_the_named_initiator_is_excluded(team) -> None:
+    """A turn whose registration has not landed: the exclusion is best effort (D59)."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "alice", "bob")
+    _exclude_initiators(team)
+    _turn(team, "bob", "post the update")
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert record.binding["initiator"] == "alice"
+    assert record.attribution["contributors"] == []
+    _refused(team, "alice", elicitation_id)
+    assert _answer(team["bob"], session_id, elicitation_id).status_code == 202
+
+
+def test_typing_recorded_on_another_replica_counts_as_taking_part(team) -> None:
+    """R3: Dave typed into the thread's terminal through another server replica."""
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "dave", "carol")
+    _exclude_initiators(team)
+    _register(team, _turn(team, "alice", "post the update").id)
+    get_turn_store().record_terminal_activity(session_id, "terminal_s1", "dave")
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    _refused(team, "dave", elicitation_id)
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+
+
+def test_a_turn_started_with_unknown_input_is_still_approved(team) -> None:
+    """D59: an unresolved turn is recorded as such; it refuses nothing."""
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "carol")
+    assert _register(team, "item_nobody_recorded")["unresolved"] is True
+
+    elicitation_id, retry = _ask(runner, session_id)
+
+    assert team["approvals"].get_verdict(elicitation_id).attribution["authority"]["unresolved"]
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+    assert "result" in _tools_call(runner, session_id, **retry)
+
+
+def test_an_approval_record_is_read_by_thread_readers_and_its_approvers_only(team) -> None:
+    """R6: readers and named approvers read the record; a runner and outsiders do not."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_READ)
+    _service_approvers(team, "carol")
+    _register(team, _turn(team, "alice", "post the update").id)
+    elicitation_id, _retry = _ask(runner, session_id)
+    url = f"/v1/sessions/{session_id}/approvals/{elicitation_id}"
+
+    generic = runner.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
+    assert generic.status_code == 200 and "approval" not in generic.json()
+    assert runner.get(url).status_code == 403
+    assert team["bob"].get(url).json()["elicitation_id"] == elicitation_id
+    assert team["carol"].get(f"/v1/sessions/{session_id}").status_code == 404
+    assert team["carol"].get(url).json()["initiator"] == "alice"
+    assert team["dave"].get(url).status_code == 404
 
 
 def test_any_eligible_decline_declines(team) -> None:
@@ -828,10 +1087,8 @@ def test_a_transformed_call_needs_both_approvers_and_a_late_rule_refuses_it(
     record = team["approvals"].get_verdict(elicitation_id)
     assert [r["kind"] for r in record.requirements] == ["personal", "team"]
 
-    assert _answer(team["alice"], session_id, elicitation_id).json() == {
-        "queued": False,
-        "awaiting": "team",
-    }
+    first = _answer(team["alice"], session_id, elicitation_id).json()
+    assert (first["queued"], first["awaiting"]) == (False, "team")
     assert "error" in _tools_call(runner, session_id, **retry)
     assert _answer(team["dave"], session_id, elicitation_id).status_code == 202
     if rule_changes_before_dispatch:
@@ -937,6 +1194,7 @@ def test_the_initiator_is_the_server_recorded_turn_actor_with_or_without_the_hea
         f"/v1/sessions/{session_id}/permissions", json={"user_id": "bob", "level": LEVEL_EDIT}
     )
     _name_approver(team, "service", "bob", "tracker")
+    _exclude_initiators(team)
     # The server records the turn's actor when Bob's message is forwarded.
     team["stores"]["conversation_store"].set_labels(session_id, {_TURN_ACTOR_LABEL: "bob"})
     if not tunnel_header:

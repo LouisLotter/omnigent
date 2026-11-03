@@ -2075,6 +2075,16 @@ def create_app(
         approval_store = _default_approval_store(conversation_store)
     set_approval_store(approval_store)
     app.state.approval_store = approval_store
+    from omnigent.runtime import set_turn_store
+    from omnigent.stores.turn_store import SqlAlchemyTurnStore
+
+    turn_store = (
+        SqlAlchemyTurnStore(approval_store.storage_location)
+        if approval_store is not None
+        else None
+    )
+    set_turn_store(turn_store)
+    app.state.turn_store = turn_store
 
     telemetry.instrument_fastapi_app(app)
     # Expose the registry on app.state so integration tests and
@@ -2097,6 +2107,9 @@ def create_app(
     )
     app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
+    from omnigent.server.turn_attribution import set_attribution_host_store
+
+    set_attribution_host_store(host_store)
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider

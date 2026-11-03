@@ -234,6 +234,8 @@ class DrainedInput:
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    # Who started the turn, as the server recorded it when the message was posted.
+    initiator: Any = None
     background_titles_enabled: bool = True
     interrupted: bool = False
     # Reconstructed entries without original delivery metadata must remain unknown.
@@ -307,6 +309,8 @@ class _Entry:
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    # Who started the turn, as the server recorded it when the message was posted.
+    initiator: Any = None
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
@@ -370,6 +374,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    initiator: Any = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -393,6 +398,9 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param initiator: The server's record of who started the turn (a
+        :class:`omnigent.server.turn_attribution.TurnInitiator`), applied to the
+        mirrored item's attribution when the transcript records the message.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -416,6 +424,7 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            initiator=initiator,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -756,6 +765,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        initiator=drained.initiator,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
@@ -969,6 +979,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
         stable_id=entry.stable_id,
+        initiator=entry.initiator,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
@@ -979,6 +990,15 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
     )
+
+
+def initiator_for(conversation_id: str, *, stable_id: str) -> Any:
+    """The recorded initiator of a queued message, by its stable id, or ``None``."""
+    with _lock:
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.stable_id == stable_id:
+                return entry.initiator
+    return None
 
 
 def _content_text(content: list[dict[str, Any]]) -> str:

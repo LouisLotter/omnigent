@@ -308,6 +308,11 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
+from omnigent.server.turn_attribution import (
+    TurnInitiator,
+    build_turn_attribution,
+    record_turn_input,
+)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -1789,6 +1794,7 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+            attribution=item.attribution.model_dump() if item.attribution is not None else None,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -7915,6 +7921,7 @@ async def _dispatch_skill_slash_command_to_runner(
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
     startup_input: StartupInputContext | None = None,
+    initiator: TurnInitiator | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -7984,6 +7991,15 @@ async def _dispatch_skill_slash_command_to_runner(
         stable_id=startup_input_id,
         replaces_pending_id=startup_input_id,
     )
+    if initiator is not None:
+        # The command starts a turn: its attribution is saved with it.
+        visible_item = visible_item.model_copy(
+            update={
+                "attribution": await asyncio.to_thread(
+                    build_turn_attribution, conversation_store, conv, initiator
+                )
+            }
+        )
     meta_item = NewConversationItem(
         type="message",
         response_id=response_id,
@@ -8041,6 +8057,9 @@ async def _dispatch_skill_slash_command_to_runner(
     # time and never forwarded verbatim.
     if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
+    if initiator is not None:
+        # Recorded under the id the runner reports when it starts the turn.
+        await asyncio.to_thread(record_turn_input, session_id, persisted_items[1].id, initiator)
 
     try:
         await runner_client.post(

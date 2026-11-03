@@ -12,6 +12,7 @@
 // passed through silently as `BaseItem & Record<string, unknown>` so the
 // translator can skip them without crashing.
 
+import type { TurnAttribution } from "./attribution";
 import type { MessageContentBlock } from "./blocks";
 
 export interface BaseItem {
@@ -32,6 +33,8 @@ export interface MessageItem extends BaseItem {
   model?: string;
   /** Human author email; omitted for agent/tool/system items. */
   created_by?: string;
+  /** Who started the turn this item starts, on whose computer and login. */
+  attribution?: TurnAttribution;
   /** Human submission confirmed by the server, including anonymous input. */
   user_authored?: boolean;
   /** Hidden durable context such as injected skill instructions. */

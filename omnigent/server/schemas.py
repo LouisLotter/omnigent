@@ -3809,6 +3809,10 @@ class SessionInputConsumedPayload(BaseModel):
         client drop the matching optimistic bubble by id instead of
         by position. ``None`` for non-native messages and for messages
         that matched no pending entry (e.g. typed directly in the TUI).
+    :param attribution: Who started the turn this item starts, on whose
+        thread, computer and harness login (see
+        :class:`omnigent.entities.attribution.TurnAttribution`); ``None`` for
+        other items and when unknown.
     """
 
     item_id: str
@@ -3818,6 +3822,8 @@ class SessionInputConsumedPayload(BaseModel):
     data: dict[str, Any]
     created_by: str | None = None
     cleared_pending_id: str | None = None
+    # The turn's attribution when this item starts a turn; null fields mean unknown.
+    attribution: dict[str, Any] | None = None
 
     model_config = ConfigDict(extra="ignore")
 

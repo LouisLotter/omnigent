@@ -991,6 +991,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
         captured["agent_revision"] = kwargs.get("agent_revision")
+        captured["initiator"] = kwargs.get("initiator")
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -1022,6 +1023,13 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     assert captured["user_id"] == RESERVED_USER_LOCAL
     # The kickoff names the bundle it runs, so the runner sees a later reinstall.
     assert captured["agent_revision"] == "ag_1/rev1"
+    # The turn is the schedule's, for its owner: not the owner typing it.
+    initiator = captured["initiator"]
+    assert (initiator.kind, initiator.schedule_id, initiator.source) == (
+        "schedule",
+        "task_1",
+        "schedule",
+    )
 
 
 @pytest.mark.asyncio

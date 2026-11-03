@@ -321,6 +321,50 @@ the agent. User messages and function call outputs do not have `model` — the a
 is always recoverable from `response_id` if needed. To continue a conversation,
 pass the `response_id` from the last item as `previous_response_id`.
 
+#### Turn attribution
+
+The user message that starts a turn carries `attribution`: who started the
+turn, on whose thread, computer and harness login. Every value is the
+server's own record; `null` means unknown. It holds names, ids and settings
+only: never a credential, sign-in code, access assertion, prompt content or
+cost. Other items, and items saved before attribution existed (or on a
+separately hosted conversation database without the column), omit it.
+
+```json
+"attribution": {
+  "v": 1,
+  "initiator": {
+    "kind": "person",              // person | schedule | agent | terminal
+    "user": "bob",                 // the person, or a schedule's owner
+    "registration": "3f2c…",       // that person's account registration
+    "schedule_id": null,           // for schedule
+    "from_session_id": null,       // for agent: the thread whose agent sent it
+    "on_behalf_of": null,          // for agent: the person it acts for
+    "possible": null,              // terminal typing not certain: every possible typist
+    "source": "signed_in"          // signed_in | schedule | thread_record | pending_input |
+                                   // terminal_input | terminal_ambiguous | owner_assumed
+  },
+  "owner": {"user": "alice", "registration": "9a1b…"},
+  "host": {"id": "…", "name": "alice-laptop", "owner": "alice",
+           "kind": "personal", "runner_id": "…"},     // or null
+  "subscription": {
+    "subject": "alice",            // whose configured login: the computer's owner
+    "provider": "anthropic",
+    "source": "computer_login",    // computer_login | configured_provider | unknown
+    "login_state": "ready",        // the computer's own report
+    "login_state_reported_by": "computer",
+    "account": null,               // provider accounts are not verified
+    "verified": false
+  },
+  "harness": "claude-native",
+  "model": {"requested": "claude-opus-4-8", "reported": null},
+  "effort": {"requested": "high", "reported": "xhigh"},
+  "recorded_at": 1793700000
+}
+```
+
+The same object rides on `session.input.consumed` (`data.attribution`).
+
 ### Update Conversation
 
 ```
@@ -1217,6 +1261,100 @@ approval on a dedicated path rather than an in-band session event —
 which is what policy ASK gates rely on, so the verdict cannot be
 conflated with a generic session event. Any value other than
 `action: "accept"` denies.
+
+For a recorded approval (a policy ASK in the approval ledger) the response
+adds `"approval"`: who asked and who answered under which grant, as listed
+below. The generic `GET .../elicitations/{elicitation_id}` does not carry it;
+read it from `GET /v1/sessions/{session_id}/approvals/{elicitation_id}`.
+
+### Register a Turn (runners)
+
+```
+POST /v1/sessions/{session_id}/turns
+{"turn_id": "turn_…", "input_ids": ["<persisted item id or pending id>", …]}
+
+200 OK
+{"turn_id": "turn_…", "initiator": "bob", "unresolved": false}
+
+403 Forbidden — the caller is not the runner bound to this thread
+404 Not Found — no such thread; or, with a plain `{"detail": …}` body, the
+    server has no turn registration (the runner proceeds as before)
+```
+
+A runner advertising the `turn_inputs` capability registers each turn beside
+its harness, as best effort: the harness never waits for it, a failed request
+is retried twice with the same `turn_id`, and one that cannot land is logged.
+Attribution is a display (D59); registration never delays or fails a turn.
+The runner names only the server-issued ids of the turn's inputs; the server
+reads their senders from its own records, sets `omnigent.turn_actor`, and
+records the turn. The same `turn_id` again returns the stored turn. An id the
+server never recorded leaves the turn's person unknown (`unresolved`).
+
+### List a Thread's Approvals
+
+```
+GET /v1/sessions/{session_id}/approvals
+GET /v1/sessions/{session_id}/approvals/{elicitation_id}   # one record
+
+200 OK
+{"object": "list", "data": [{
+  "object": "approval", "elicitation_id": "elicit_…", "session_id": "…",
+  "state": "consumed",                      // pending | approved | declined | consumed
+  "phase": "tool_call", "action": "tracker__post_update", "destination": "tracker",
+  "initiator": "alice", "owner": "alice",
+  "asked": {"initiator": "alice", "contributors": ["bob"],
+            "authority": {"complete": true, "turn": "turn_…",
+                          "registered_initiator": "alice", "unresolved": false},
+            "principal": {"kind": "runner", "user": "alice", "runner": "…", "host": "…"},
+            "owner": {…}, "host": {…}, "subscription": {…},
+            "harness": "…", "model": {…}, "effort": {…}},
+  "requirements": [{"kind": "team", "resource": [2, "tracker"]}],
+  "answers": [{"by": "carol", "action": "accept", "at": 1793700100, "satisfies": [0],
+               "as": [{"requirement": 0, "role": "service_approver",
+                       "kind": "team", "resource": [2, "tracker"]}]}],
+  "decided_by": "carol", "decided_at": 1793700100,
+  "decision_digest": "8ba2…",                // sha256 of the bound decision
+  "created_at": 1793700000, "expires_at": 1793786400, "consumed_at": 1793700101
+}]}
+
+404 Not Found — no such thread, or the caller cannot read it
+403 Forbidden — a runner or host token (people only)
+```
+
+The thread's approvals and its sub-agents', newest first, for anyone who can
+read the thread; a single record also for the approvers named to answer it.
+`contributors` are the people attribution recorded as taking part in the
+turn before it asked, as best effort: the turn's inputs, every input
+accepted and all terminal typing since it was registered (nobody beyond the
+turn actor, with no registered turn). `authority.complete: false` means
+that record could not be read. Where a resource has turned off approval by
+the initiator, they may not answer; an incomplete record only narrows who is
+excluded and never refuses an answer. `role` is the grant an answer was given under:
+`thread_owner`, `thread_approver`, `service_approver` or `team_approver`.
+Answered approvals are kept until their thread is deleted; unanswered ones
+are purged a week after they expire.
+
+### Approval Settings
+
+```
+GET /v1/approvers?kind=session|service|team&resource_id=…
+PUT /v1/approval-settings
+{"kind": "service", "resource_id": "tracker", "allow_initiator": false}
+
+200 OK
+{"allow_initiator": false}
+```
+
+Whether the person who started an action may approve it, per thread, service
+or team; the GET returns it as `allow_initiator`, with the saved value (or
+`null`) as `allow_initiator_saved`. It is allowed by default for all three
+(D59); `null` restores the default. Turned off, it excludes the people
+attribution recorded as taking part in the turn that asked, its initiator and
+contributors, as best effort. Omnigent's approvals record a person's consent.
+They are not a separation-of-duties control. Where an action needs several
+people's eyes, the external system enforces it, for example GitHub's
+required pull-request reviews and branch protection. A thread's owner
+manages their thread's setting; an administrator a service's or the team's.
 
 ### Fork Session
 

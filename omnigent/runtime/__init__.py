@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from omnigent.stores.approval_store import SqlAlchemyApprovalStore
     from omnigent.stores.comment_store import CommentStore
     from omnigent.stores.policy_store import PolicyStore
+    from omnigent.stores.turn_store import SqlAlchemyTurnStore
     from omnigent.terminals import TerminalRegistry
     from omnigent.tools import ToolManager
 
@@ -177,6 +178,26 @@ def set_approval_store(store: SqlAlchemyApprovalStore | None) -> None:
     :param store: The store, or ``None`` to clear it.
     """
     _globals._approval_store = store
+
+
+def get_turn_store() -> SqlAlchemyTurnStore | None:
+    """
+    Return the store of accepted inputs and registered turns, or ``None``.
+
+    Approvals read who took part in a turn from it.
+
+    :returns: The store the server app set, or ``None``.
+    """
+    return _globals._turn_store
+
+
+def set_turn_store(store: SqlAlchemyTurnStore | None) -> None:
+    """
+    Set the turn store; the server app calls this once at startup.
+
+    :param store: The store, or ``None`` to clear it.
+    """
+    _globals._turn_store = store
 
 
 def get_agent_cache() -> AgentCache:

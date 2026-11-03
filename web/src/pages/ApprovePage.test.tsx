@@ -15,6 +15,7 @@ import * as identity from "@/lib/identity";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
+  getCurrentAuthorId: () => null,
 }));
 
 /** A Response-like stub: only `ok`, `status`, and `json()` are read. */
@@ -206,6 +207,105 @@ describe("ApprovePage submission", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
     expect(await screen.findByText(/Network error:/)).toBeInTheDocument();
   });
+});
+
+it("shows who asked for a policy approval and on whose computer", async () => {
+  vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) =>
+    String(url).includes("/approvals/")
+      ? jsonResponse({
+          elicitation_id: "eli_1",
+          session_id: "sess_1",
+          state: "pending",
+          initiator: "alice",
+          owner: "alice",
+          asked: {
+            initiator: "alice",
+            contributors: ["bob"],
+            owner: { user: "alice", registration: null },
+            host: { id: "h1", name: "laptop", owner: "alice", kind: "personal", runner_id: null },
+            subscription: {
+              subject: "alice",
+              provider: "anthropic",
+              source: "computer_login",
+              login_state: "unknown",
+              login_state_reported_by: null,
+              account: null,
+              verified: false,
+            },
+            harness: null,
+            model: { requested: null, reported: null },
+            effort: { requested: null, reported: null },
+          },
+          requirements: [],
+          answers: [],
+          decided_by: null,
+          decision_digest: "ab",
+        })
+      : jsonResponse({ status: "pending", policy_name: "approve_posts", message: "Post it?" }),
+  );
+  renderPage();
+  expect(await screen.findByTestId("approval-attribution")).toHaveTextContent(
+    "Asked during alice's turn, on alice's computer (bob also sent input to this turn)",
+  );
+  expect(
+    vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.filter(([url]) => String(url).includes("/approvals/")),
+  ).toHaveLength(1);
+});
+
+it("shows who asked and who answered when opened on an already-resolved approval", async () => {
+  vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) =>
+    String(url).includes("/approvals/")
+      ? jsonResponse({
+          elicitation_id: "eli_1",
+          session_id: "sess_1",
+          state: "consumed",
+          initiator: "alice",
+          owner: "alice",
+          asked: null,
+          requirements: [{ kind: "team", resource: [2, "tracker"] }],
+          answers: [
+            {
+              by: "carol",
+              action: "accept",
+              as: [
+                {
+                  requirement: 0,
+                  role: "service_approver",
+                  kind: "team",
+                  resource: [2, "tracker"],
+                },
+              ],
+            },
+          ],
+          decided_by: "carol",
+          decision_digest: "ab",
+        })
+      : jsonResponse({ status: "resolved" }),
+  );
+  renderPage();
+  expect(await screen.findByText("Elicitation resolved")).toBeInTheDocument();
+  expect(await screen.findByTestId("approval-attribution")).toHaveTextContent(
+    "Approved by carol as an approver for the service",
+  );
+});
+
+it("stays usable when the approval record cannot be read", async () => {
+  vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) => {
+    if (String(url).includes("/approvals/")) throw new Error("offline");
+    return jsonResponse({ status: "resolved" });
+  });
+  renderPage();
+  expect(await screen.findByText("Elicitation resolved")).toBeInTheDocument();
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(identity.authenticatedFetch)
+        .mock.calls.some(([url]) => String(url).includes("/approvals/")),
+    ).toBe(true),
+  );
+  expect(screen.queryByTestId("approval-attribution")).toBeNull();
 });
 
 it.each(["success", "http error", "network error"])(

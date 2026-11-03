@@ -86,8 +86,8 @@ def _approve(store: SqlAlchemyApprovalStore, elicitation_id: str) -> None:
     assert approved is not None and approved.state is VerdictState.APPROVED
 
 
-def test_approvers_are_named_per_resource_and_default_initiator_rules_differ(store) -> None:
-    """A thread allows its initiator by default; a service or the team does not."""
+def test_approvers_are_named_per_resource_and_the_initiator_may_approve_by_default(store) -> None:
+    """D59: a thread, a service and the team all allow their initiator unless set otherwise."""
     thread = ApprovalResource(ResourceKind.SESSION, uuid.uuid4().hex)
     assert store.add_approver(_SERVICE, "carol", granted_by="admin")
     assert not store.add_approver(_SERVICE, "carol", granted_by="admin")
@@ -96,9 +96,13 @@ def test_approvers_are_named_per_resource_and_default_initiator_rules_differ(sto
     service, team, own = store.approvers_for([_SERVICE, TEAM_RESOURCE, thread])
 
     assert (service.approvers, team.approvers, own.approvers) == (("carol",), ("dave",), ())
-    assert not service.initiator_may_approve() and not team.initiator_may_approve()
+    assert (service.allow_initiator, team.allow_initiator) == (None, None)
+    assert service.initiator_may_approve() and team.initiator_may_approve()
     assert own.initiator_may_approve()
-    store.set_allow_initiator(_SERVICE, True, updated_by="admin")
+    # A saved refusal stays a refusal; clearing it restores the default.
+    store.set_allow_initiator(_SERVICE, False, updated_by="admin")
+    assert not store.approvers_for([_SERVICE])[0].initiator_may_approve()
+    store.set_allow_initiator(_SERVICE, None, updated_by="admin")
     assert store.approvers_for([_SERVICE])[0].initiator_may_approve()
     assert store.resources_for_approver("carol") == [_SERVICE]
 
@@ -305,8 +309,8 @@ def test_parallel_answers_record_one_decision(store) -> None:
     assert record is not None and len(record.answers) == 1
 
 
-def test_large_outcomes_are_not_kept_and_old_rows_are_purged(store) -> None:
-    """A result too large to keep is dropped; expired rows go after the purge window."""
+def test_large_outcomes_are_not_kept_and_unanswered_rows_are_purged(store) -> None:
+    """A result too large to keep is dropped; only unanswered expired rows are purged."""
     digest = hashlib.sha256(b"bound").digest()
     elicitation_id = _request(store, digest=digest)
     _approve(store, elicitation_id)
@@ -314,9 +318,12 @@ def test_large_outcomes_are_not_kept_and_old_rows_are_purged(store) -> None:
     store.record_outcome(elicitation_id, outcome=Outcome.SUCCEEDED, body="x" * 60_000)
     record = store.get_verdict(elicitation_id)
     assert record is not None and record.outcome_body is None
+    unanswered = _request(store, digest=digest)
 
-    assert store.purge_expired(before=record.expires_at + 1) >= 1
-    assert store.get_verdict(elicitation_id) is None
+    assert store.purge_expired(before=record.expires_at + 1) == 1
+    # The answered row is the record of who decided: it stays with its thread.
+    assert store.get_verdict(elicitation_id) is not None
+    assert store.get_verdict(unanswered) is None
     assert store.pending_verdicts() == []
 
 

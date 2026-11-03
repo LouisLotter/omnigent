@@ -1,3 +1,4 @@
+import type { TurnAttribution } from "./attribution";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -36,6 +37,8 @@ import type { AgyPermission, CodexPersistMode, RememberScope, Response } from ".
  *   is finalized, lifecycle markers like `response_start`).
  * - `createdBy`: email of the human author. Omitted for agent/tool/system
  *   items and older history.
+ * - `attribution`: who started the turn this item starts, on whose thread,
+ *   computer and harness login. Only on a turn's first user message.
  */
 export interface BlockContext {
   agent: string | null;
@@ -45,6 +48,7 @@ export interface BlockContext {
   responseId: string;
   itemId: string | null;
   createdBy?: string;
+  attribution?: TurnAttribution;
   /** Server-side creation time (unix epoch seconds), when the item came
    *  from history hydration. A DIFFERENT clock from `timestamp` (page-
    *  relative `performance.now()` seconds, live streaming only) — never

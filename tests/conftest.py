@@ -537,10 +537,11 @@ def _isolate_databricks_org_pin(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _isolate_approval_store(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Start each test without an approval store; an app built in the test sets its own."""
+    """Start each test without approval or turn stores; an app built in the test sets its own."""
     from omnigent.runtime import _globals
 
     monkeypatch.setattr(_globals, "_approval_store", None)
+    monkeypatch.setattr(_globals, "_turn_store", None)
 
 
 @pytest.fixture

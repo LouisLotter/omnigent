@@ -1,3 +1,4 @@
+import { parseTurnAttribution } from "./attribution";
 import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_sse.py.
 //
@@ -851,12 +852,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // the nested item data. Keep only a real string so null carries no author.
     const createdBy = p.created_by;
     const clearedPendingId = p.cleared_pending_id;
+    const attribution = parseTurnAttribution(p.attribution);
     return {
       type: "session_input_consumed",
       itemId,
       itemType,
       isMeta: payload.is_meta === true,
       ...(typeof createdBy === "string" ? { createdBy } : {}),
+      ...(attribution !== undefined ? { attribution } : {}),
       data: payload,
       clearedPendingId: typeof clearedPendingId === "string" ? clearedPendingId : null,
     } satisfies SessionInputConsumedEvent;

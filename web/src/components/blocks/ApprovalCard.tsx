@@ -48,6 +48,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
+import { ApprovalAttribution, useApprovalRecord } from "./ApprovalAttribution";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -967,29 +968,40 @@ export function ElicitationCard({
     item.targetSessionId && conversationId && item.targetSessionId !== conversationId
       ? { sessionId: item.targetSessionId, ancestorSessionId: conversationId }
       : null;
+  // Only a policy's approve/reject prompt can be a recorded approval.
+  const policyApproval =
+    Boolean(item.policyName) && !item.askUserQuestion && !item.exitPlanMode && !item.codexCommand;
+  const approvalRecord = useApprovalRecord(
+    policyApproval ? (item.targetSessionId ?? conversationId) : null,
+    item.elicitationId,
+    item.status,
+  );
   return (
-    <ApprovalCard
-      elicitationId={item.elicitationId}
-      nativeDelivery={item.nativeDelivery}
-      message={item.message}
-      phase={item.phase}
-      policyName={item.policyName}
-      contentPreview={item.contentPreview}
-      requestedSchema={item.requestedSchema}
-      url={item.url}
-      status={item.status}
-      response={item.response}
-      askUserQuestion={item.askUserQuestion}
-      exitPlanMode={item.exitPlanMode}
-      codexCommand={item.codexCommand}
-      allowAllEdits={item.allowAllEdits}
-      allowAutoMode={item.allowAutoMode}
-      permissionDirectories={item.permissionDirectories}
-      rememberScope={item.rememberScope}
-      codexPersistModes={item.codexPersistModes}
-      agyPermission={item.agyPermission}
-      onSubmit={onSubmit}
-      requester={requester}
-    />
+    <>
+      <ApprovalCard
+        elicitationId={item.elicitationId}
+        nativeDelivery={item.nativeDelivery}
+        message={item.message}
+        phase={item.phase}
+        policyName={item.policyName}
+        contentPreview={item.contentPreview}
+        requestedSchema={item.requestedSchema}
+        url={item.url}
+        status={item.status}
+        response={item.response}
+        askUserQuestion={item.askUserQuestion}
+        exitPlanMode={item.exitPlanMode}
+        codexCommand={item.codexCommand}
+        allowAllEdits={item.allowAllEdits}
+        allowAutoMode={item.allowAutoMode}
+        permissionDirectories={item.permissionDirectories}
+        rememberScope={item.rememberScope}
+        codexPersistModes={item.codexPersistModes}
+        agyPermission={item.agyPermission}
+        onSubmit={onSubmit}
+        requester={requester}
+      />
+      <ApprovalAttribution record={approvalRecord} />
+    </>
   );
 }

@@ -91,6 +91,8 @@ class StartupInputContext:
     submitted: bool = False
     # Re-checks a scheduled input's task right before it is claimed and sent.
     authorize: Callable[[], Awaitable[None]] | None = None
+    # The scheduled task that saved this input; ``None`` for a person's own input.
+    scheduled_task_id: str | None = None
 
     async def is_disconnected(self) -> bool:
         return False
@@ -469,6 +471,7 @@ class ManagedStartupInputs:
                 item.created_by,
                 item.id,
                 authorize=authorize,
+                scheduled_task_id=origin.task_id if origin is not None else None,
             )
             event = SessionEventInput(
                 type=item.type,

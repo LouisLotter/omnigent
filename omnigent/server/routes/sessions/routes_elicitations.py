@@ -24,7 +24,11 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
-from omnigent.server.approval_authority import gate_approval_answer, may_view_approval
+from omnigent.server.approval_authority import (
+    approval_view,
+    gate_approval_answer,
+    may_view_approval,
+)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
@@ -89,6 +93,18 @@ def register_elicitations_routes(
         return await asyncio.to_thread(
             may_view_approval, store, conversation_store, record, user_id
         )
+
+    async def _approval_record(
+        elicitation_id: str, *, session_id: str | None = None
+    ) -> dict[str, Any]:
+        """``{"approval": ...}`` for a recorded protected approval, else nothing."""
+        store = get_approval_store()
+        if store is None:
+            return {}
+        record = await asyncio.to_thread(store.get_verdict, elicitation_id)
+        if record is None or (session_id is not None and record.session_id != session_id):
+            return {}
+        return {"approval": approval_view(record)}
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
@@ -165,7 +181,11 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
             if not gate.final:
-                return {"queued": False, "awaiting": ",".join(gate.awaiting)}
+                return {
+                    "queued": False,
+                    "awaiting": ",".join(gate.awaiting),
+                    **(await _approval_record(elicitation_id)),
+                }
             _resolve_data: dict[str, Any] = {
                 "elicitation_id": elicitation_id,
                 "action": gate.action,
@@ -196,7 +216,10 @@ def register_elicitations_routes(
         await _apply_pending_policy_ask_writes(
             session_id, conv, conversation_store, agent_store, _resolve_data
         )
-        return {"queued": False}
+        return {
+            "queued": False,
+            **(await _approval_record(elicitation_id) if gate.protected else {}),
+        }
 
     @router.get(
         "/sessions/{session_id}/elicitations/{elicitation_id}",

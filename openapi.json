@@ -523,7 +523,7 @@
       },
       "ApprovalSettingsRequest": {
         "additionalProperties": false,
-        "description": "Whether the initiator may approve; `null` restores the default.",
+        "description": "Whether the person who started an action may approve it.\n\nAllowed by default for a thread, a service and the team (D59); `null`\nrestores the default. Turned off, it excludes the people attribution\nrecorded as taking part in the turn that asked, as best effort.\n\nOmnigent's approvals record a person's consent. They are not a\nseparation-of-duties control. Where an action needs several people's eyes,\nthe external system enforces it, for example GitHub's required\npull-request reviews and branch protection.",
         "properties": {
           "allow_initiator": {
             "anyOf": [
@@ -1651,6 +1651,17 @@
       "ConversationItem": {
         "description": "A persisted item with a store-assigned ID.",
         "properties": {
+          "attribution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnAttribution"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Who started the turn this item starts, on whose thread, computer and harness login, or `None` for other items and when it is unknown."
+          },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
             "format": "int64",
@@ -3277,6 +3288,63 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostAttribution": {
+        "description": "The computer that ran the turn and the person it belongs to.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "personal",
+              "cloud_computer",
+              "sandbox"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Id"
+          }
+        },
+        "required": [
+          "id",
+          "kind"
+        ],
+        "title": "HostAttribution",
+        "type": "object"
+      },
       "HostModelOptionsResponse": {
         "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
         "properties": {
@@ -3600,6 +3668,117 @@
           "response"
         ],
         "title": "IncompleteEvent",
+        "type": "object"
+      },
+      "InitiatorAttribution": {
+        "description": "Who started a turn.",
+        "properties": {
+          "from_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The thread whose agent sent it, for `agent`; `None` when an agent returned a result into its own thread.",
+            "title": "From Session Id"
+          },
+          "kind": {
+            "description": "See `InitiatorKind`.",
+            "enum": [
+              "person",
+              "schedule",
+              "agent",
+              "terminal"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "on_behalf_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The person an agent acted for, for `agent`.",
+            "title": "On Behalf Of"
+          },
+          "possible": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Everyone who may have typed it, when authorship of terminal typing is not certain; each counts as having taken part.",
+            "title": "Possible"
+          },
+          "registration": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "That person's account registration, when known; a username registered again gets a new one, so the two never merge.",
+            "title": "Registration"
+          },
+          "schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The scheduled task, for `schedule`.",
+            "title": "Schedule Id"
+          },
+          "source": {
+            "description": "See `InitiatorSource`.",
+            "enum": [
+              "signed_in",
+              "schedule",
+              "thread_record",
+              "pending_input",
+              "terminal_input",
+              "terminal_ambiguous",
+              "owner_assumed"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The person (`person`/`terminal`) or the schedule's owner.",
+            "title": "User"
+          }
+        },
+        "required": [
+          "kind",
+          "source"
+        ],
+        "title": "InitiatorAttribution",
         "type": "object"
       },
       "LaunchRunnerRequest": {
@@ -4704,6 +4883,35 @@
         "title": "OutputTextDeltaEvent",
         "type": "object"
       },
+      "OwnerAttribution": {
+        "description": "The thread's actual owner (a sub-agent's is its top-level thread's).",
+        "properties": {
+          "registration": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registration"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User"
+          }
+        },
+        "title": "OwnerAttribution",
+        "type": "object"
+      },
       "PaginatedList": {
         "description": "A paginated list response following cursor-based pagination.",
         "properties": {
@@ -5468,6 +5676,35 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "RequestedReported": {
+        "description": "A setting as requested for the session and as the harness last reported it.",
+        "properties": {
+          "reported": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported"
+          },
+          "requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested"
+          }
+        },
+        "title": "RequestedReported",
         "type": "object"
       },
       "ResetSessionModelOverrideRequest": {
@@ -7070,6 +7307,20 @@
       "SessionInputConsumedPayload": {
         "description": "Inner payload of a `SessionInputConsumedEvent`.\n\nEmitted by the sessions route handler at the moment a client\ninput is persisted into `conversation_items`. Carries the\npersisted-item shape so clients can render the input (e.g.\nthe user's message bubble) at the moment of acceptance.",
         "properties": {
+          "attribution": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Who started the turn this item starts, on whose thread, computer and harness login (see `omnigent.entities.attribution.TurnAttribution`); `None` for other items and when unknown.",
+            "title": "Attribution"
+          },
           "cleared_pending_id": {
             "anyOf": [
               {
@@ -9683,6 +9934,91 @@
         "title": "StoreHarnessCredentialRequest",
         "type": "object"
       },
+      "SubscriptionAttribution": {
+        "description": "Whose configured harness login the turn used.",
+        "properties": {
+          "account": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A non-secret provider account id. Omnigent does not verify provider accounts, so this is `None`.",
+            "title": "Account"
+          },
+          "login_state": {
+            "default": "unknown",
+            "description": "The computer's own report of its harness login.",
+            "enum": [
+              "ready",
+              "needs_auth",
+              "unavailable",
+              "unknown"
+            ],
+            "title": "Login State",
+            "type": "string"
+          },
+          "login_state_reported_by": {
+            "anyOf": [
+              {
+                "const": "computer",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"computer\"` when `login_state` came from the computer's report rather than the server.",
+            "title": "Login State Reported By"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The harness's provider family, e.g. `\"anthropic\"`.",
+            "title": "Provider"
+          },
+          "source": {
+            "default": "unknown",
+            "description": "`computer_login` for the login configured on that computer; `configured_provider` for a provider the installation configured for the session; `unknown` without a computer.",
+            "enum": [
+              "computer_login",
+              "configured_provider",
+              "unknown"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The person whose login it is: the computer's owner.",
+            "title": "Subject"
+          },
+          "verified": {
+            "default": false,
+            "description": "Always `False`: the provider account is not verified.",
+            "title": "Verified",
+            "type": "boolean"
+          }
+        },
+        "title": "SubscriptionAttribution",
+        "type": "object"
+      },
       "TerminalCommandData": {
         "description": "Data payload for a runner-side terminal command (`!cmd`) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per `!cmd`\ninvocation: one `<bash-input>` record and one combined\n`<bash-stdout>`/`<bash-stderr>` record. Each maps to one\n`terminal_command` item with `kind=\"input\"` or\n`kind=\"output\"` respectively.",
         "properties": {
@@ -9777,6 +10113,72 @@
           "delta"
         ],
         "title": "ToolOutputDeltaEvent",
+        "type": "object"
+      },
+      "TurnAttribution": {
+        "description": "The attribution of one turn, recorded with the item that starts it.",
+        "properties": {
+          "effort": {
+            "$ref": "#/components/schemas/RequestedReported",
+            "default": {}
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostAttribution"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "initiator": {
+            "$ref": "#/components/schemas/InitiatorAttribution"
+          },
+          "model": {
+            "$ref": "#/components/schemas/RequestedReported",
+            "default": {}
+          },
+          "owner": {
+            "$ref": "#/components/schemas/OwnerAttribution"
+          },
+          "recorded_at": {
+            "format": "int64",
+            "title": "Recorded At",
+            "type": "integer"
+          },
+          "subscription": {
+            "$ref": "#/components/schemas/SubscriptionAttribution",
+            "default": {
+              "login_state": "unknown",
+              "source": "unknown",
+              "verified": false
+            }
+          },
+          "v": {
+            "default": 1,
+            "format": "int64",
+            "title": "V",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "initiator",
+          "owner",
+          "recorded_at"
+        ],
+        "title": "TurnAttribution",
         "type": "object"
       },
       "TurnCancelledEvent": {
@@ -11207,7 +11609,7 @@
     },
     "/v1/approval-settings": {
       "put": {
-        "description": "Save whether the person who started an action may approve it.",
+        "description": "Save whether the person who started an action may approve it.\n\nAllowed by default (D59). Turned off, it excludes the people\nattribution recorded as taking part in the turn that asked, as best\neffort. Omnigent's approvals record a person's consent. They are not a\nseparation-of-duties control. Where an action needs several people's\neyes, the external system enforces it, for example GitHub's required\npull-request reviews and branch protection.",
         "operationId": "save_approval_settings_v1_approval_settings_put",
         "requestBody": {
           "content": {
@@ -11342,7 +11744,7 @@
         ]
       },
       "get": {
-        "description": "A resource's named approvers and initiator setting.",
+        "description": "A resource's named approvers and initiator setting (allowed by default).",
         "operationId": "list_approvers_v1_approvers_get",
         "parameters": [
           {
@@ -14878,6 +15280,105 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/approvals": {
+      "get": {
+        "description": "A thread's approvals, newest first: who asked and who answered as what.",
+        "operationId": "list_session_approvals_v1_sessions__session_id__approvals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Session Approvals V1 Sessions  Session Id  Approvals Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Approvals",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/approvals/{elicitation_id}": {
+      "get": {
+        "description": "One approval of a thread (or its sub-agents): for readers and its approvers.",
+        "operationId": "get_session_approval_v1_sessions__session_id__approvals__elicitation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "elicitation_id",
+            "required": true,
+            "schema": {
+              "title": "Elicitation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Session Approval V1 Sessions  Session Id  Approvals  Elicitation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Approval",
+        "tags": [
+          "approvals"
         ]
       }
     },

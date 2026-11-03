@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from omnigent.entities.attribution import TurnAttribution
 from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     reject_authored_framework_notices,
@@ -876,12 +877,16 @@ class NewConversationItem(BaseModel):
         item (e.g. ``"alice@example.com"``), or ``None`` for
         agent/tool/system-generated items and single-user mode.
         Mirrors the comment ``created_by`` contract.
+    :param attribution: Who started the turn this item starts, on whose
+        thread, computer and harness login; set only on the item that starts
+        a turn and saved in the same write.
     """
 
     type: str
     response_id: str
     data: ItemData
     created_by: str | None = None
+    attribution: TurnAttribution | None = None
     # Deterministic item id for idempotent appends. When set, the store uses
     # it as the item's id and treats an already-persisted item with this id
     # as the append's result instead of inserting a duplicate — the retry
@@ -920,6 +925,9 @@ class ConversationItem(BaseModel):
     :param created_by: Identity of the human actor who authored this
         item, or ``None`` for agent/tool/system items and single-user
         mode. Lets owner and collaborator messages be distinguished.
+    :param attribution: Who started the turn this item starts, on whose
+        thread, computer and harness login, or ``None`` for other items and
+        when it is unknown.
     """
 
     id: str
@@ -929,6 +937,7 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    attribution: TurnAttribution | None = None
     # In-process signal only (excluded from every dump / API shape): ``True``
     # when an idempotent append found this item already persisted under its
     # ``stable_id``, so the caller can skip a duplicate's side effects.
@@ -988,4 +997,10 @@ class ConversationItem(BaseModel):
             # omitted (not null) for agent/tool/system messages so the
             # two stay distinguishable, matching exclude_none above.
             **({"created_by": self.created_by} if self.created_by is not None else {}),
+            # Only on the item that starts a turn; null fields inside mean unknown.
+            **(
+                {"attribution": self.attribution.model_dump()}
+                if self.attribution is not None
+                else {}
+            ),
         }

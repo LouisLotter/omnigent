@@ -1,6 +1,10 @@
 """Approver inbox, approver grants and protected policies.
 
 - ``GET /v1/approvals``: pending protected approvals the caller may answer.
+- ``GET /v1/sessions/{id}/approvals``: a thread's approvals (its sub-agents'
+  included) with who asked and who answered under which grant, for anyone who
+  can read the thread. ``GET /v1/sessions/{id}/approvals/{elicitation_id}``:
+  one of them, also for the approvers named to answer it.
 - ``GET/POST/DELETE /v1/approvers``: named approvers for a thread, a service
   or the team; ``PUT /v1/approval-settings``: whether the person who started
   an action may approve it. A thread's actual owner manages its approvers
@@ -25,7 +29,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
-from omnigent.server.approval_authority import answer_credential_problem, may_view_approval
+from omnigent.server.approval_authority import (
+    answer_credential_problem,
+    approval_view,
+    may_read_approval,
+    may_view_approval,
+)
 from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_LOCAL,
@@ -70,7 +79,17 @@ class ApproverRequest(_Resource):
 
 
 class ApprovalSettingsRequest(_Resource):
-    """Whether the initiator may approve; ``null`` restores the default."""
+    """Whether the person who started an action may approve it.
+
+    Allowed by default for a thread, a service and the team (D59); ``null``
+    restores the default. Turned off, it excludes the people attribution
+    recorded as taking part in the turn that asked, as best effort.
+
+    Omnigent's approvals record a person's consent. They are not a
+    separation-of-duties control. Where an action needs several people's eyes,
+    the external system enforces it, for example GitHub's required
+    pull-request reviews and branch protection.
+    """
 
     allow_initiator: bool | None = None
 
@@ -138,6 +157,23 @@ def _validate_handler(handler: str, factory_params: dict[str, Any] | None) -> No
     problem = validate_factory_params(handler, factory_params)
     if problem:
         raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
+
+
+# A thread tree's approvals are read for at most this many threads.
+_MAX_TREE_THREADS = 256
+
+
+def _thread_tree(conversation_store: ConversationStore, session_id: str) -> list[str]:
+    """The thread and its sub-agents, breadth first, bounded."""
+    tree = [session_id]
+    frontier = [session_id]
+    while frontier and len(tree) < _MAX_TREE_THREADS:
+        children = conversation_store.list_child_conversation_ids_by_parent(frontier)
+        frontier = [
+            child for parent in frontier for child in children.get(parent, []) if child not in tree
+        ][: _MAX_TREE_THREADS - len(tree)]
+        tree.extend(frontier)
+    return tree
 
 
 def _acting(resource: ApprovalResource) -> Acting:
@@ -228,28 +264,61 @@ def create_approvals_router(
                 may_view_approval, store, conversation_store, record, user_id
             ):
                 continue
-            binding = record.binding
-            data.append(
-                {
-                    "elicitation_id": record.elicitation_id,
-                    "session_id": record.session_id,
-                    "phase": binding.get("phase"),
-                    "action": binding.get("action"),
-                    "destination": binding.get("destination"),
-                    "initiator": binding.get("initiator"),
-                    "owner": binding.get("owner"),
-                    "requirements": record.requirements,
-                    "answers": record.answers,
-                    "expires_at": record.expires_at,
-                }
-            )
+            data.append(approval_view(record))
         return {"object": "list", "data": data}
+
+    @router.get("/sessions/{session_id}/approvals")
+    async def list_session_approvals(request: Request, session_id: str) -> dict[str, Any]:
+        """A thread's approvals, newest first: who asked and who answered as what."""
+        user_id = _person(request, write=False)
+        thread = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if thread is None:
+            raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        if permission_store is not None and not await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        ):
+            raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+        tree = await asyncio.to_thread(_thread_tree, conversation_store, session_id)
+        records = await asyncio.to_thread(store.session_verdicts, tree)
+        return {"object": "list", "data": [approval_view(record) for record in records]}
+
+    @router.get("/sessions/{session_id}/approvals/{elicitation_id}")
+    async def get_session_approval(
+        request: Request, session_id: str, elicitation_id: str
+    ) -> dict[str, Any]:
+        """One approval of a thread (or its sub-agents): for readers and its approvers."""
+        user_id = _person(request, write=False)
+        record = await asyncio.to_thread(store.get_verdict, elicitation_id)
+        if record is None:
+            raise OmnigentError("Approval not found", code=ErrorCode.NOT_FOUND)
+        tree = await asyncio.to_thread(_thread_tree, conversation_store, session_id)
+        if record.session_id not in tree:
+            raise OmnigentError("Approval not found", code=ErrorCode.NOT_FOUND)
+        if permission_store is not None:
+            reads = await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_READ,
+                permission_store,
+                conversation_store,
+            )
+            if not reads and not await asyncio.to_thread(
+                may_read_approval, store, conversation_store, record, user_id
+            ):
+                raise OmnigentError("Approval not found", code=ErrorCode.NOT_FOUND)
+        return approval_view(record)
 
     @router.get("/approvers")
     async def list_approvers(
         request: Request, kind: ResourceKindName, resource_id: str = ""
     ) -> dict[str, Any]:
-        """A resource's named approvers and initiator setting."""
+        """A resource's named approvers and initiator setting (allowed by default)."""
         resource = _resource(kind, resource_id)
         await _resource_manager(request, resource, write=False)
         resources = [resource] if resource == TEAM_RESOURCE else [resource, TEAM_RESOURCE]
@@ -298,7 +367,15 @@ def create_approvals_router(
     async def save_approval_settings(
         request: Request, body: ApprovalSettingsRequest
     ) -> dict[str, Any]:
-        """Save whether the person who started an action may approve it."""
+        """Save whether the person who started an action may approve it.
+
+        Allowed by default (D59). Turned off, it excludes the people
+        attribution recorded as taking part in the turn that asked, as best
+        effort. Omnigent's approvals record a person's consent. They are not a
+        separation-of-duties control. Where an action needs several people's
+        eyes, the external system enforces it, for example GitHub's required
+        pull-request reviews and branch protection.
+        """
         resource = _resource(body.kind, body.resource_id)
         manager = await _resource_manager(request, resource, write=True)
         await asyncio.to_thread(

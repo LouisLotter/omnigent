@@ -568,8 +568,7 @@ class SqlApprovalResource(OmnigentBase):
     :param kind: Int code: 1 thread, 2 service, 3 team.
     :param resource_id: The thread id, service id, or ``""`` for the team.
     :param allow_initiator: Whether the person who started the action may
-        approve it; ``NULL`` keeps the default for *kind* (allowed for a
-        thread, refused for a service or the team).
+        approve it; ``NULL`` keeps the default, allowed for every kind (D59).
     :param updated_at: Unix epoch seconds of the last change.
     :param updated_by: The administrator who changed it.
     """
@@ -711,6 +710,9 @@ class SqlApprovalVerdict(OmnigentBase):
     :param outcome: Int code once consumed: 1 executing, 2 succeeded, 3 failed.
     :param outcome_body: The operation's recorded result, for retries.
     :param created_at: Unix epoch seconds when it was asked.
+    :param attribution: JSON record of who asked: the turn's initiator and the
+        people whose input joined the turn, the asking principal, the thread's
+        owner and the computer and harness login the turn ran on.
     """
 
     __tablename__ = "approval_verdicts"
@@ -733,6 +735,7 @@ class SqlApprovalVerdict(OmnigentBase):
     outcome: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     outcome_body: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attribution: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_approval_verdicts_state"),
@@ -741,6 +744,96 @@ class SqlApprovalVerdict(OmnigentBase):
         ),
         # Pending approvals (the approver inbox) and expiry purges.
         Index("ix_approval_verdicts_state_expiry", "workspace_id", "state", "expires_at"),
+        # A thread's approvals, listed and deleted with the thread.
+        Index(
+            "ix_approval_verdicts_session",
+            "workspace_id",
+            "session_id",
+            "created_at",
+            "elicitation_id",
+        ),
+    )
+
+
+class SqlSessionInput(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_inputs`` table.
+
+    Every input the server accepted into a thread, with the person answerable
+    for it, written before the input reaches a runner. Approvals read who took
+    part in a turn from these rows, so a person can never be missed because a
+    record lived only in one server's memory.
+
+    :param input_id: The server-issued id the runner reports for the input: a
+        persisted item id, a queued terminal-harness message's pending id, or
+        ``terminal:<terminal id>:<person>`` for typing into a terminal.
+    :param kind: Int code (see ``omnigent.stores.turn_store.InputKind``).
+    :param person: The person answerable for it, or ``NULL`` when not known
+        for certain (see ``possible``).
+    :param possible: JSON list of every person who may have sent it, when
+        authorship is ambiguous (several typists, or nobody recorded).
+    :param item_id: The transcript item the input became, once recorded.
+    :param text_digest: sha256 hex of the input's text, to match a terminal
+        harness's transcript record to its queued input after a restart.
+    :param accepted_at: Epoch milliseconds the server accepted it (or, for
+        terminal typing, the last input frame).
+    """
+
+    __tablename__ = "session_inputs"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    input_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    person: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    possible: Mapped[str | None] = mapped_column(Text, nullable=True)
+    item_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    text_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    accepted_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("kind IN (1, 2, 3, 4, 5)", name="ck_session_inputs_kind"),
+        # Everything accepted into a thread since a turn started.
+        Index("ix_session_inputs_accepted", "workspace_id", "session_id", "accepted_at"),
+    )
+
+
+class SqlSessionTurn(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_turns`` table.
+
+    One row per turn a runner started, registered and acknowledged before the
+    runner lets its harness act, naming the inputs the turn starts with.
+
+    :param turn_id: The runner's id for the turn; a retried registration of the
+        same turn returns the stored row.
+    :param runner_id: The runner that registered it.
+    :param initiator: The person answerable for the turn's first input, or
+        ``NULL`` when it has none.
+    :param inputs: JSON list of the input ids the turn starts with.
+    :param unresolved: ``True`` when an input id named nothing the server
+        recorded; nobody may then approve the turn's actions.
+    :param started_at: Epoch milliseconds the server registered it.
+    """
+
+    __tablename__ = "session_turns"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    turn_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    initiator: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    inputs: Mapped[str] = mapped_column(Text, nullable=False)
+    unresolved: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    started_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        # A thread's latest turn.
+        Index("ix_session_turns_started", "workspace_id", "session_id", "started_at"),
     )
 
 
@@ -1340,6 +1433,8 @@ class SqlConversationItem(ConversationBase):
     :param created_by: Identity of the human actor who authored the
         item, or ``None`` for agent/tool/system items and single-user
         mode. Mirrors :class:`SqlComment.created_by`.
+    :param attribution: JSON attribution of the turn the item starts, written
+        in the same insert; ``NULL`` for other items.
     """
 
     __tablename__ = "conversation_items"
@@ -1376,6 +1471,11 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # JSON attribution of the turn this item starts (who, whose thread, computer
+    # and harness login); NULL for every other item. Deferred: a separately
+    # hosted conversation database created before this column has none, and the
+    # store loads it only where it exists.
+    attribution: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
