@@ -72,7 +72,7 @@ describe("ApprovalAttribution", () => {
 
   it("reads the record from the prompt's endpoint", async () => {
     const fetchMock = vi.fn(
-      async () =>
+      async (_input: RequestInfo | URL) =>
         new Response(JSON.stringify({ status: "resolved", approval: record }), { status: 200 }),
     );
     vi.stubGlobal("fetch", fetchMock);

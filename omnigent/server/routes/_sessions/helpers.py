@@ -123,7 +123,6 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
-from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -309,6 +308,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
+from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
