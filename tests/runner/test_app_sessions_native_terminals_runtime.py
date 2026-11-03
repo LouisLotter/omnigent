@@ -2139,6 +2139,11 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     path the spy would never fire here; if it regressed to
     ``await_notify=True`` the assertion on that kwarg would fail.
 
+    The relay must also start before codex does: codex lists the bridge's
+    tools once, when the TUI starts its thread, and ignores
+    tools/list_changed, so a relay started after the TUI leaves the whole
+    session without Omnigent's tools.
+
     A rotated session's bridge dir is its bridge id label's: the fresh-thread
     discovery, the startup timeout marker and the relay must all share it.
 
@@ -2208,6 +2213,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
         async def start(self) -> None:
             """:returns: None."""
+            launch_order.append("app_server_start")
 
         async def close(self) -> None:
             """:returns: None."""
@@ -2240,6 +2246,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         ) -> SessionResourceView:
             """:returns: A fixed terminal resource view."""
             del terminal_name, session_key, spec, resource_role
+            launch_order.append("tui_launch")
             return SessionResourceView(
                 id="terminal_codex_main",
                 type="terminal",
@@ -2248,6 +2255,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
             )
 
     discover_calls: list[dict[str, Any]] = []
+    launch_order: list[str] = []
 
     async def _fake_discover(**kwargs: Any) -> None:
         """:returns: None — stands in for the discovery forwarder."""
@@ -2295,6 +2303,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     async def _spy_ensure_relay(sid: str, **kwargs: Any) -> None:
         """Record the relay-start invocation."""
         relay_calls.append({"session_id": sid, **kwargs})
+        launch_order.append("relay_start")
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -2325,6 +2334,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     assert relay_calls[0]["session_id"] == session_id
     assert relay_calls[0]["explicit_bridge_dir"] == bridge_dir
     assert relay_calls[0]["await_notify"] is False
+    assert launch_order == ["relay_start", "app_server_start", "tui_launch"], launch_order
     assert len(discover_calls) == 1
     assert discover_calls[0]["bridge_dir"] == bridge_dir
     # A failed marker write falls the forwarder back to the legacy timeout
