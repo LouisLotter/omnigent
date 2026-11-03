@@ -60,9 +60,9 @@ describe("ApprovalAttribution", () => {
     expect(lines).toHaveAttribute("title", "Decision digest 8ba2");
   });
 
-  it("shows nothing for a prompt that is not a recorded approval", async () => {
+  it("shows nothing for a prompt that is not a recorded approval, or not readable", async () => {
     const fetchMock = vi.fn(
-      async () => new Response(JSON.stringify({ status: "pending" }), { status: 200 }),
+      async () => new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 }),
     );
     vi.stubGlobal("fetch", fetchMock);
     render(<Probe status="pending" />);
@@ -70,10 +70,9 @@ describe("ApprovalAttribution", () => {
     expect(screen.queryByTestId("approval-attribution")).toBeNull();
   });
 
-  it("reads the record from the prompt's endpoint", async () => {
+  it("reads the record from the authorized approval endpoint", async () => {
     const fetchMock = vi.fn(
-      async (_input: RequestInfo | URL) =>
-        new Response(JSON.stringify({ status: "resolved", approval: record }), { status: 200 }),
+      async (_input: RequestInfo | URL) => new Response(JSON.stringify(record), { status: 200 }),
     );
     vi.stubGlobal("fetch", fetchMock);
     render(<Probe status="responded" />);
@@ -81,7 +80,7 @@ describe("ApprovalAttribution", () => {
       "Approved by carol",
     );
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
-      "/v1/sessions/conv_1/elicitations/elicit_1",
+      "/v1/sessions/conv_1/approvals/elicit_1",
     );
   });
 });

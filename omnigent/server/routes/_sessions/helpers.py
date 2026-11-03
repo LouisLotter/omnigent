@@ -308,7 +308,11 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.session_metadata_logging import harness_attributes
 from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
-from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
+from omnigent.server.turn_attribution import (
+    TurnInitiator,
+    build_turn_attribution,
+    record_turn_input,
+)
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -8053,6 +8057,9 @@ async def _dispatch_skill_slash_command_to_runner(
     # time and never forwarded verbatim.
     if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
+    if initiator is not None:
+        # Recorded under the id the runner reports when it starts the turn.
+        await asyncio.to_thread(record_turn_input, session_id, persisted_items[1].id, initiator)
 
     try:
         await runner_client.post(
@@ -10752,14 +10759,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {WORKTREE_ROOT_LABEL_KEY!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    from omnigent.server.turn_attribution import TURN_STARTED_AT_LABEL
-
-    for server_label in (_TURN_ACTOR_LABEL, TURN_STARTED_AT_LABEL):
-        if server_label in labels:
-            raise OmnigentError(
-                f"label {server_label!r} is server-internal and cannot be set by clients",
-                code=ErrorCode.INVALID_INPUT,
-            )
+    if _TURN_ACTOR_LABEL in labels:
+        raise OmnigentError(
+            f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     # The archive timestamp is stamped by the server on the archive transition
     # only; a client write would forge the retention clock, including on shared
     # sessions the caller does not own.

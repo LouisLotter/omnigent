@@ -82,7 +82,7 @@ describe("summarizeAttribution", () => {
     expect(detail).toContain("Effort: xhigh (requested high)");
   });
 
-  it("marks terminal typing nobody was attached for as assumed", () => {
+  it("marks terminal typing the server saw nobody send as assumed", () => {
     const typed = turn({
       initiator: { ...turn().initiator, kind: "terminal", user: "alice", source: "owner_assumed" },
     });
@@ -92,7 +92,27 @@ describe("summarizeAttribution", () => {
     );
     expect(summary.prominent).toBe(false);
     expect(summary.detail[0]).toBe(
-      "Started by: alice in the terminal (assumed: nobody was attached)",
+      "Started by: alice in the terminal (assumed: no typing reached the server)",
+    );
+  });
+
+  it("names every possible typist when terminal authorship is not certain", () => {
+    const typed = turn({
+      initiator: {
+        ...turn().initiator,
+        kind: "terminal",
+        user: null,
+        possible: ["alice", "admin"],
+        source: "terminal_ambiguous",
+      },
+    });
+    const summary = summarizeAttribution(typed, "bob");
+    expect(summary.text).toBe(
+      "alice or admin in the terminal (not certain), on alice's computer and alice's Claude subscription",
+    );
+    expect(summary.prominent).toBe(true);
+    expect(summary.detail[0]).toBe(
+      "Started by: alice or admin in the terminal (not certain) (each counts as having taken part)",
     );
   });
 

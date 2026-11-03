@@ -79,11 +79,12 @@ async def test_native_input_identity_reaches_the_harness_request(harness: str) -
 
 
 def _build_blocking_app(
-    gate: asyncio.Event,
+    gate: asyncio.Event, server_client: Any = None
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:
     """Build a runner app with a blocking harness for concurrency tests.
 
     :param gate: Event that unblocks the harness mid-stream.
+    :param server_client: The runner's client to the server; a stub by default.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
     spec = AgentSpec(spec_version=1, name="t")
@@ -102,7 +103,7 @@ def _build_blocking_app(
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client or NullServerClient(),  # type: ignore[arg-type]
     )
     return app, pm, harness_client
 
@@ -202,22 +203,22 @@ async def test_turn_sequencing_buffers_concurrent_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_each_turn_names_its_inputs_when_it_starts_not_when_queued() -> None:
-    """A message queued behind a running turn is named only when its own turn starts."""
+async def test_the_harness_acts_only_after_the_server_acknowledges_the_turn() -> None:
+    """R4: a turn is registered, and acknowledged, before the harness sees it; a message
+    queued behind it is registered only when its own turn starts."""
     gate = asyncio.Event()
-    app, _pm, _hc = _build_blocking_app(gate)
-    session_id = "5e1f0bd1f0cae058f05f48057e9f98c1"
-    collected: list[dict[str, Any]] = []
+    acknowledge = asyncio.Event()
+    registered: list[list[str]] = []
 
-    def _named() -> list[list[str]]:
-        queue = app.state.session_event_queues.get(session_id)
-        while queue is not None and not queue.empty():
-            collected.append(queue.get_nowait())
-        return [
-            event["input_item_ids"]
-            for event in collected
-            if event.get("type") == "session.turn_started"
-        ]
+    class _Server(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/turns"):
+                await acknowledge.wait()
+                registered.append(kwargs["json"]["input_ids"])
+            return await super().post(url, **kwargs)
+
+    app, _pm, harness = _build_blocking_app(gate, _Server())
+    session_id = "5e1f0bd1f0cae058f05f48057e9f98c1"
 
     def _message(text: str, item_id: str) -> dict[str, Any]:
         return {
@@ -243,20 +244,25 @@ async def test_each_turn_names_its_inputs_when_it_starts_not_when_queued() -> No
                 pass
 
         first = asyncio.create_task(_first_turn())
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
+        assert not harness.post_seen.is_set(), "the harness ran before the turn was registered"
+
+        acknowledge.set()
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+        assert registered == [["item_alice"]]
         queued = await client.post(
             f"/v1/sessions/{session_id}/events", json=_message("second", "item_bob")
         )
         assert queued.json()["status"] == "buffered"
-        assert _named() == [["item_alice"]]
+        assert registered == [["item_alice"]]
 
         gate.set()
         await asyncio.wait_for(first, timeout=5.0)
         for _ in range(100):
-            if len(_named()) == 2:
+            if len(registered) == 2:
                 break
             await asyncio.sleep(0.05)
-        assert _named() == [["item_alice"], ["item_bob"]]
+        assert registered == [["item_alice"], ["item_bob"]]
         await client.delete(f"/v1/sessions/{session_id}")
 
 

@@ -11,6 +11,8 @@ export interface TurnInitiator {
   schedule_id: string | null;
   from_session_id: string | null;
   on_behalf_of: string | null;
+  /** Everyone who may have typed it, when authorship is not certain. */
+  possible?: string[] | null;
   source: string;
 }
 
@@ -130,8 +132,14 @@ function initiatorPhrase(initiator: TurnInitiator, viewer: string | null): strin
       return `${initiator.user && initiator.user !== viewer ? possessive(initiator.user, viewer) : capitalize(possessive(initiator.user, viewer))} schedule`;
     case "agent":
       return `An agent for ${person(initiator.on_behalf_of, viewer, false)}`;
-    case "terminal":
+    case "terminal": {
+      const possible = initiator.possible ?? [];
+      if (!initiator.user && possible.length > 1) {
+        const names = possible.map((name) => person(name, viewer, false)).join(" or ");
+        return `${names} in the terminal (not certain)`;
+      }
       return `${person(initiator.user, viewer)} in the terminal`;
+    }
     default:
       return person(initiator.user, viewer);
   }
@@ -187,7 +195,12 @@ export function summarizeAttribution(
     initiator.kind === "schedule" ||
     initiator.kind === "agent" ||
     (initiator.user ?? null) !== (machineOwner ?? null);
-  const assumed = initiator.source === "owner_assumed" ? " (assumed: nobody was attached)" : "";
+  const assumed =
+    initiator.source === "owner_assumed"
+      ? " (assumed: no typing reached the server)"
+      : initiator.source === "terminal_ambiguous"
+        ? " (each counts as having taken part)"
+        : "";
   const login =
     subscription.login_state_reported_by === "computer"
       ? `; login reported by the computer: ${subscription.login_state.replace("_", " ")}`

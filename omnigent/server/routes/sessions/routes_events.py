@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import re
 import secrets
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -20,6 +21,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
@@ -72,6 +74,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.transport import runner_request_may_have_been_delivered
 from omnigent.runtime import (
+    get_turn_store,
     inflight_text,
     pending_elicitations,
     pending_inputs,
@@ -309,6 +312,9 @@ from omnigent.server.status_edges import StatusEdges, status_edge_id
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
+)
+from omnigent.server.turn_attribution import (
+    TURN_ACTOR_LABEL as _TURN_ACTOR_LABEL,
 )
 from omnigent.server.turn_attribution import (
     TurnInitiator,
@@ -786,6 +792,17 @@ async def _retry_session_single_flight(
 
 class _RunnerNotBoundError(OmnigentError):
     """A runner sent events for a session that is now bound to another runner."""
+
+
+class TurnRegistration(BaseModel):
+    """A turn the bound runner is about to start, and the inputs it starts with."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    turn_id: str = Field(min_length=1, max_length=128)
+    input_ids: list[Annotated[str, StringConstraints(min_length=1, max_length=160)]] = Field(
+        default_factory=list, max_length=64
+    )
 
 
 @dataclass(frozen=True)
@@ -3659,6 +3676,80 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+
+    # ── POST /sessions/{session_id}/turns ────────────────────────
+
+    def _turn_registrant(request: Request, conv: Any) -> bool:
+        """Whether the caller is the runner currently bound to this thread.
+
+        The same runner authority the events route accepts for runner-originated
+        events: a runner token for this thread's runner, the thread's runner
+        binding token, or a server-launched runner's tunnel token. Without
+        authentication there is no person to protect.
+        """
+        if auth_provider is None:
+            return True
+        principal = recorded_principal(request)
+        if principal is not None and principal.is_machine:
+            return principal.runner_id is not None and principal.runner_id == conv.runner_id
+        return _has_runner_created_by_authority(request, conv)
+
+    @router.post("/sessions/{session_id}/turns", include_in_schema=False, response_model=None)
+    async def register_session_turn(
+        request: Request, session_id: str, body: TurnRegistration
+    ) -> dict[str, Any]:
+        """Record a turn the bound runner is about to start, before its harness acts.
+
+        The runner names the server-issued ids of the inputs the turn starts
+        with; the server reads their senders from its own records, names the
+        turn's person on the thread, and acknowledges. A retry with the same
+        turn id returns the stored turn.
+
+        :raises OmnigentError: 404 for an unknown thread; 403 unless the caller
+            is the runner currently bound to it.
+        :raises HTTPException: 404 without a turn store (the runner proceeds as
+            with an older server).
+        """
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if not _turn_registrant(request, conv):
+            raise OmnigentError(
+                "Only the runner bound to this thread registers its turns.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        turns = get_turn_store()
+        if turns is None:
+            raise HTTPException(status_code=404, detail="turn registration is unavailable")
+
+        def resolve(input_id: str) -> tuple[bool, str | None]:
+            # An input saved before inputs were recorded: read its own item.
+            if not re.fullmatch(r"[0-9a-f]{32}", input_id):
+                return False, None
+            item = conversation_store.get_item(session_id, input_id)
+            if item is None:
+                return False, None
+            if item.attribution is not None:
+                return True, item.attribution.responsible_person()
+            return True, item.created_by
+
+        record = await asyncio.to_thread(
+            turns.register_turn,
+            session_id,
+            body.turn_id,
+            runner_id=conv.runner_id,
+            input_ids=body.input_ids,
+            resolve=resolve,
+        )
+        if record.initiator:
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {_TURN_ACTOR_LABEL: record.initiator}
+            )
+        return {
+            "turn_id": record.turn_id,
+            "initiator": record.initiator,
+            "unresolved": record.unresolved,
+        }
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

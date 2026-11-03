@@ -27,15 +27,18 @@ InitiatorSource = Literal[
     "schedule",
     "thread_record",
     "pending_input",
-    "terminal_attach",
+    "terminal_input",
+    "terminal_ambiguous",
     "owner_assumed",
 ]
 """Where the initiator came from. ``signed_in``: the request's own sign-in.
 ``schedule``: the scheduled task's record. ``thread_record``: the turn actor the
 server recorded on the thread the agent works for. ``pending_input``: the
 sender the server recorded when a message was queued for a terminal harness.
-``terminal_attach``: the person attached to the terminal with typing rights.
-``owner_assumed``: typing nobody could be linked to, assumed to be the owner's."""
+``terminal_input``: the one person who sent input to the thread's terminals
+since the turn started. ``terminal_ambiguous``: several did; all are listed in
+``possible``. ``owner_assumed``: typing the server saw nobody send (a direct
+local attach), assumed to be the computer owner's."""
 
 HostKind = Literal["personal", "cloud_computer", "sandbox"]
 SubscriptionSource = Literal["computer_login", "configured_provider", "unknown"]
@@ -57,6 +60,8 @@ class InitiatorAttribution(_Part):
     :param from_session_id: The thread whose agent sent it, for ``agent``;
         ``None`` when an agent returned a result into its own thread.
     :param on_behalf_of: The person an agent acted for, for ``agent``.
+    :param possible: Everyone who may have typed it, when authorship of
+        terminal typing is not certain; each counts as having taken part.
     :param source: See :data:`InitiatorSource`.
     """
 
@@ -66,6 +71,7 @@ class InitiatorAttribution(_Part):
     schedule_id: str | None = None
     from_session_id: str | None = None
     on_behalf_of: str | None = None
+    possible: list[str] | None = None
     source: InitiatorSource
 
 

@@ -16,7 +16,7 @@
  *   or the id is unknown.
  */
 
-import { ApprovalAttribution } from "@/components/blocks/ApprovalAttribution";
+import { ApprovalAttribution, fetchApprovalRecord } from "@/components/blocks/ApprovalAttribution";
 import { ApprovalCard } from "@/components/blocks/ApprovalCard";
 import {
   parseNativePermissionDelivery,
@@ -41,8 +41,6 @@ interface ElicitationData {
   content_preview?: string;
   native_delivery?: NativePermissionDelivery;
   permission_directories?: string[];
-  /** The recorded approval: who asked, who answered under which grant. */
-  approval?: unknown;
 }
 
 type PageState =
@@ -89,7 +87,9 @@ export function ApprovePage() {
         const data: ElicitationData = await res.json();
         if (cancelled) return;
         data.native_delivery = parseNativePermissionDelivery(data.native_delivery);
-        setApproval(parseApprovalRecord(data.approval));
+        void fetchApprovalRecord(sessionId, elicitationId).then((record) => {
+          if (!cancelled) setApproval(record);
+        });
         nativeDeliverySeen ||= Boolean(data.native_delivery) || data.resolution === "unanswered";
         polling =
           (nativeDeliverySeen && data.resolution !== "confirmed") ||

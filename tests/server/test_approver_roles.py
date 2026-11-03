@@ -30,11 +30,13 @@ from omnigent.entities.attribution import (
     TurnAttribution,
 )
 from omnigent.runner.transports.ws_tunnel.frames import EventBatchFrame
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.runtime import get_turn_store
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID, mint_delegated_token
 from omnigent.stores.approval_store import ApprovalResource, ResourceKind, VerdictState
+from omnigent.stores.turn_store import InputKind
 from tests.server.test_account_revocation import setup_app as setup_app
 from tests.server.test_delegated_runner_tokens import (
     _ask,
@@ -350,9 +352,10 @@ def test_a_team_rule_and_a_personal_rule_each_need_their_approver(team) -> None:
 
 
 def _turn(team: dict[str, Any], person: str, text: str) -> Any:
-    """A message as the forward path saves it: with its turn's attribution."""
+    """A message as the forward path saves and records it, before any runner sees it."""
+    session_id = team["session"]
     [item] = team["stores"]["conversation_store"].append(
-        team["session"],
+        session_id,
         [
             NewConversationItem(
                 type="message",
@@ -367,25 +370,41 @@ def _turn(team: dict[str, Any], person: str, text: str) -> Any:
             )
         ],
     )
+    get_turn_store().record_input(session_id, item.id, kind=InputKind.PERSON, person=person)
     return item
+
+
+def _register(team: dict[str, Any], *input_ids: str) -> Any:
+    """The bound runner registers a turn before its harness acts."""
+    registered = team["runner"].post(
+        f"/v1/sessions/{team['session']}/turns",
+        json={"turn_id": f"turn_{uuid.uuid4().hex}", "input_ids": list(input_ids)},
+    )
+    assert registered.status_code == 200, registered.text
+    return registered.json()
+
+
+def _service_approvers(team: dict[str, Any], *names: str) -> None:
+    for approver in names:
+        _name_approver(team, "service", approver, "tracker")
+
+
+def _refused(team: dict[str, Any], person: str, elicitation_id: str) -> str:
+    """The answer is refused; one who cannot read the thread is told it does not exist."""
+    refused = _answer(team[person], team["session"], elicitation_id)
+    assert refused.status_code in (403, 404, 409), refused.text
+    assert _state(team, elicitation_id) is VerdictState.PENDING
+    return refused.json()["error"]["message"]
 
 
 def test_a_message_queued_behind_a_turn_lets_nobody_in_it_approve_its_actions(team) -> None:
     """D53 + WP8.8: Bob queues during Alice's turn; the approval names Alice, and neither
     Alice nor Bob may approve it as a service approver where self-approval is off."""
     session_id, runner = team["session"], team["runner"]
-    conversations = team["stores"]["conversation_store"]
     team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
-    for approver in ("alice", "bob", "carol"):
-        _name_approver(team, "service", approver, "tracker")
+    _service_approvers(team, "alice", "bob", "carol")
     alices = _turn(team, "alice", "post the update")
-    asyncio.run(
-        orchestration._record_reported_turn_start(
-            session_id,
-            {"type": "session.turn_started", "input_item_ids": [alices.id]},
-            conversations,
-        )
-    )
+    assert _register(team, alices.id)["initiator"] == "alice"
     # Queued: the runner has not started Bob's turn, so it is still Alice's.
     _turn(team, "bob", "and mention the outage")
 
@@ -397,11 +416,11 @@ def test_a_message_queued_behind_a_turn_lets_nobody_in_it_approve_its_actions(te
         "alice",
         ["bob"],
     )
+    assert record.attribution["authority"]["complete"] is True
     assert record.attribution["principal"]["kind"] == "runner"
     assert record.attribution["owner"]["user"] == "alice"
     for person in ("alice", "bob"):
-        refused = _answer(team[person], session_id, elicitation_id)
-        assert refused.status_code == 403, refused.text
+        _refused(team, person, elicitation_id)
     approved = _answer(team["carol"], session_id, elicitation_id)
     assert approved.status_code == 202, approved.text
     [answer] = approved.json()["approval"]["answers"]
@@ -416,6 +435,120 @@ def test_a_message_queued_behind_a_turn_lets_nobody_in_it_approve_its_actions(te
     assert listed["decision_digest"] == record.binding_digest.hex()
     assert team["dave"].get(f"/v1/sessions/{session_id}/approvals").status_code == 404
     assert runner.get(f"/v1/sessions/{session_id}/approvals").status_code == 403
+
+
+def test_a_long_turn_is_read_completely_before_anyone_approves(team) -> None:
+    """R1: Bob injects early in Alice's turn; 600 items later he still may not approve."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "bob", "carol")
+    _register(team, _turn(team, "alice", "migrate the data").id)
+    _turn(team, "bob", "and drop the old table")
+    team["stores"]["conversation_store"].append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_long",
+                data=MessageData(
+                    role="assistant",
+                    agent="review-agent",
+                    content=[{"type": "output_text", "text": f"step {index}"}],
+                ),
+            )
+            for index in range(600)
+        ],
+    )
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    assert "bob" in team["approvals"].get_verdict(elicitation_id).attribution["contributors"]
+    _refused(team, "bob", elicitation_id)
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+
+
+def test_an_unreadable_record_of_who_took_part_refuses_every_answer(team, monkeypatch) -> None:
+    """R1: a failed read never counts as "nobody else took part"."""
+    from omnigent.stores.turn_store import SqlAlchemyTurnStore
+
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "carol")
+    _register(team, _turn(team, "alice", "post the update").id)
+
+    def unreadable(self: Any, session_id: str) -> Any:
+        raise sa.exc.OperationalError("SELECT", {}, Exception("database went away"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyTurnStore, "turn_authority", unreadable)
+        elicitation_id, retry = _ask(runner, session_id)
+
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert record.attribution["authority"] == {"complete": False}
+    message = _refused(team, "carol", elicitation_id)
+    assert message.startswith("Omnigent could not confirm everyone who took part")
+    assert _state(team, elicitation_id) is VerdictState.PENDING
+    assert team["alice"].get("/v1/approvals").json()["data"] == []
+    assert "error" in _tools_call(runner, session_id, **retry)
+
+
+def test_a_held_back_turn_registration_falls_back_to_counting_every_sender(team) -> None:
+    """R4: a policy call arrives before the turn is registered; Bob still may not approve."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_EDIT)
+    _service_approvers(team, "bob", "carol")
+    # Bob's first turn in Alice's thread: accepted, but its registration has not landed.
+    _turn(team, "bob", "post the update")
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    record = team["approvals"].get_verdict(elicitation_id)
+    assert record.binding["initiator"] == "alice"
+    assert record.attribution["contributors"] == ["bob"]
+    assert record.attribution["authority"]["turn"] is None
+    _refused(team, "bob", elicitation_id)
+    _refused(team, "alice", elicitation_id)
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+
+
+def test_typing_recorded_on_another_replica_counts_as_taking_part(team) -> None:
+    """R3: Dave typed into the thread's terminal through another server replica."""
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "dave", "carol")
+    _register(team, _turn(team, "alice", "post the update").id)
+    get_turn_store().record_terminal_activity(session_id, "terminal_s1", "dave")
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    _refused(team, "dave", elicitation_id)
+    assert _answer(team["carol"], session_id, elicitation_id).status_code == 202
+
+
+def test_a_turn_started_with_unknown_input_cannot_be_approved(team) -> None:
+    session_id, runner = team["session"], team["runner"]
+    _service_approvers(team, "carol")
+    assert _register(team, "item_nobody_recorded")["unresolved"] is True
+
+    elicitation_id, _retry = _ask(runner, session_id)
+
+    assert _refused(team, "carol", elicitation_id).startswith("The turn that asked started with")
+
+
+def test_an_approval_record_is_read_by_thread_readers_and_its_approvers_only(team) -> None:
+    """R6: readers and named approvers read the record; a runner and outsiders do not."""
+    session_id, runner = team["session"], team["runner"]
+    team["stores"]["permission_store"].grant("bob", session_id, LEVEL_READ)
+    _service_approvers(team, "carol")
+    _register(team, _turn(team, "alice", "post the update").id)
+    elicitation_id, _retry = _ask(runner, session_id)
+    url = f"/v1/sessions/{session_id}/approvals/{elicitation_id}"
+
+    generic = runner.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
+    assert generic.status_code == 200 and "approval" not in generic.json()
+    assert runner.get(url).status_code == 403
+    assert team["bob"].get(url).json()["elicitation_id"] == elicitation_id
+    assert team["carol"].get(f"/v1/sessions/{session_id}").status_code == 404
+    assert team["carol"].get(url).json()["initiator"] == "alice"
+    assert team["dave"].get(url).status_code == 404
 
 
 def test_any_eligible_decline_declines(team) -> None:

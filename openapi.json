@@ -3708,6 +3708,21 @@
             "description": "The person an agent acted for, for `agent`.",
             "title": "On Behalf Of"
           },
+          "possible": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Everyone who may have typed it, when authorship of terminal typing is not certain; each counts as having taken part.",
+            "title": "Possible"
+          },
           "registration": {
             "anyOf": [
               {
@@ -3739,7 +3754,8 @@
               "schedule",
               "thread_record",
               "pending_input",
-              "terminal_attach",
+              "terminal_input",
+              "terminal_ambiguous",
               "owner_assumed"
             ],
             "title": "Source",
@@ -15307,6 +15323,60 @@
           }
         },
         "summary": "List Session Approvals",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/approvals/{elicitation_id}": {
+      "get": {
+        "description": "One approval of a thread (or its sub-agents): for readers and its approvers.",
+        "operationId": "get_session_approval_v1_sessions__session_id__approvals__elicitation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "elicitation_id",
+            "required": true,
+            "schema": {
+              "title": "Elicitation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Session Approval V1 Sessions  Session Id  Approvals  Elicitation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Approval",
         "tags": [
           "approvals"
         ]

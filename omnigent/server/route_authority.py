@@ -114,10 +114,14 @@ _SESSION_ROUTES: tuple[tuple[str, str, RouteRule], ...] = (
     ("POST", "/comments/send", _SESSION),
     # A thread's approval records: who asked and who answered as what.
     ("GET", "/approvals", HUMAN),
+    ("GET", "/approvals/{elicitation_id}", HUMAN),
     ("GET", "/elicitations/{elicitation_id}", _SESSION),
     # Answering an approval is a person's decision.
     ("POST", "/elicitations/{elicitation_id}/resolve", HUMAN),
     ("POST", "/events", _SESSION),
+    # The bound runner registers each turn before its harness acts; the route
+    # refuses any other caller.
+    ("POST", "/turns", _SESSION),
     ("POST", "/hooks/antigravity-elicitation-request", _SESSION),
     ("POST", "/hooks/codex-elicitation-request", _SESSION),
     ("POST", "/hooks/cursor-permission-request", _SESSION),

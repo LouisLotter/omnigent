@@ -8,6 +8,22 @@ import { useEffect, useState } from "react";
 import { getCurrentAuthorId, authenticatedFetch } from "@/lib/identity";
 import { parseApprovalRecord, summarizeApproval, type ApprovalRecord } from "@/lib/attribution";
 
+/**
+ * Read one recorded approval, or `null` when it is not one (a question, a plan
+ * review, a harness prompt) or the caller may not read it. The server allows
+ * readers of the thread and the approvers named to answer it.
+ */
+export async function fetchApprovalRecord(
+  sessionId: string,
+  elicitationId: string,
+): Promise<ApprovalRecord | null> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(elicitationId)}`,
+  );
+  if (!res.ok) return null;
+  return parseApprovalRecord(await res.json());
+}
+
 /** Fetch an approval's record; refetched when its card's status changes. */
 export function useApprovalRecord(
   sessionId: string | null | undefined,
@@ -20,14 +36,8 @@ export function useApprovalRecord(
     let cancelled = false;
     void (async () => {
       try {
-        const res = await authenticatedFetch(
-          `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}`,
-        );
-        if (!res.ok) return;
-        const body: unknown = await res.json();
-        const approval =
-          body && typeof body === "object" ? (body as { approval?: unknown }).approval : undefined;
-        if (!cancelled) setRecord(parseApprovalRecord(approval));
+        const res = await fetchApprovalRecord(sessionId, elicitationId);
+        if (!cancelled) setRecord(res);
       } catch {
         // Attribution is informational; a failed read leaves the card as it was.
       }

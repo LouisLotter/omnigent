@@ -358,95 +358,97 @@ def _record_sync(
     )
 
 
-# How far back a turn's contributors are read; a turn's own inputs are recent.
-_CONTRIBUTOR_SCAN_LIMIT = 500
+INCOMPLETE_AUTHORITY_REFUSAL = (
+    "Omnigent could not confirm everyone who took part in the turn that asked, "
+    "so nobody can approve this action. Ask again."
+)
+UNRESOLVED_TURN_REFUSAL = (
+    "The turn that asked started with input Omnigent has no record of, "
+    "so nobody can approve its actions."
+)
 
 
-def turn_contributors(conversation_store: ConversationStore, session_id: str) -> list[str]:
-    """Everyone whose input joined the thread since its current turn started; blocking.
+def turn_authority_record(session_id: str) -> dict[str, Any]:
+    """Who took part in the thread's current turn, read completely; blocking.
 
-    Read from the attribution saved with each input (its answerable person),
-    or the item's author where attribution is unknown. Without a recorded turn
-    start (an older runner), nobody beyond the turn actor is known.
+    ``complete`` is ``False`` when the records cannot be read (or there is no
+    turn store), and the approval then refuses every answer: a read that
+    failed or stopped early must never make someone look uninvolved.
     """
-    from omnigent.entities.conversation import MessageData
-    from omnigent.server.turn_attribution import TURN_STARTED_AT_LABEL
+    from omnigent.runtime import get_turn_store
 
-    conversation = conversation_store.get_conversation(session_id)
-    raw_start = (conversation.labels or {}).get(TURN_STARTED_AT_LABEL) if conversation else None
+    turns = get_turn_store()
+    if turns is None:
+        return {"complete": False}
     try:
-        started_at = int(raw_start) if raw_start is not None else None
-    except ValueError:
-        started_at = None
-    if started_at is None:
-        return []
-    people: set[str] = set()
-    before: str | None = None
-    scanned = 0
-    while scanned < _CONTRIBUTOR_SCAN_LIMIT:
-        page = conversation_store.list_items(session_id, limit=100, order="desc", before=before)
-        for item in page.data:
-            if item.created_at < started_at:
-                return sorted(people)
-            if isinstance(item.data, MessageData) and item.data.role == "user":
-                person = (
-                    item.attribution.responsible_person()
-                    if item.attribution is not None
-                    else item.created_by
-                )
-                if person:
-                    people.add(person)
-        scanned += len(page.data)
-        if not page.has_more or not page.data:
-            break
-        before = page.data[-1].id
-    return sorted(people)
+        authority = turns.turn_authority(session_id)
+    except Exception:
+        _logger.warning("could not read who took part in a turn", exc_info=True)
+        return {"complete": False}
+    return {
+        "complete": True,
+        "turn": authority.turn_id,
+        "registered_initiator": authority.initiator,
+        "people": sorted(authority.people),
+        "unresolved": authority.unresolved,
+    }
 
 
 def _asked_attribution(
     conversation_store: ConversationStore,
     subject: ApprovalSubject,
     binding: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Who asked for an approval, and on whose thread, computer and login."""
+) -> dict[str, Any]:
+    """Who asked for an approval: complete authorization data, then best-effort display."""
     from omnigent.server.turn_attribution import TurnInitiator, build_turn_attribution
 
+    initiator = binding.get("initiator")
+    authority = turn_authority_record(subject.session_id)
+    people = authority.pop("people", [])
+    record: dict[str, Any] = {
+        "v": 2,
+        "initiator": initiator,
+        "contributors": [person for person in people if person != initiator],
+        "authority": authority,
+        "principal": binding.get("principal"),
+    }
     try:
         conversation = conversation_store.get_conversation(subject.session_id)
-        if conversation is None:
-            return None
-        initiator = binding.get("initiator")
-        contributors = [
-            person
-            for person in turn_contributors(conversation_store, subject.session_id)
-            if person != initiator
-        ]
-        turn = build_turn_attribution(
-            conversation_store,
-            conversation,
-            TurnInitiator("person", initiator, "thread_record"),
-        ).model_dump(exclude={"initiator", "recorded_at", "v"})
+        if conversation is not None:
+            record.update(
+                build_turn_attribution(
+                    conversation_store,
+                    conversation,
+                    TurnInitiator("person", initiator, "thread_record"),
+                ).model_dump(exclude={"initiator", "recorded_at", "v"})
+            )
     except Exception:
-        _logger.warning("approval attribution could not be read", exc_info=True)
-        return None
-    return {
-        "v": 1,
-        "initiator": initiator,
-        "contributors": contributors,
-        "principal": binding.get("principal"),
-        **turn,
-    }
+        _logger.warning("approval display attribution could not be read", exc_info=True)
+    return record
 
 
 def _initiators(record: VerdictRecord) -> frozenset[str | None]:
-    """The turn's initiator and everyone whose input joined it."""
-    contributors = (record.attribution or {}).get("contributors")
+    """Everyone who may have taken part in the turn that asked.
+
+    The turn's initiator, its registered initiator and every contributor.
+    Raises when the record of who took part is incomplete or the turn's input
+    is unknown: nobody can then be shown to be uninvolved.
+    """
+    attribution = record.attribution or {}
+    authority = attribution.get("authority")
+    if not isinstance(authority, dict) or authority.get("complete") is not True:
+        raise OmnigentError(INCOMPLETE_AUTHORITY_REFUSAL, code=ErrorCode.CONFLICT)
+    if authority.get("unresolved"):
+        raise OmnigentError(UNRESOLVED_TURN_REFUSAL, code=ErrorCode.CONFLICT)
+    contributors = attribution.get("contributors")
     extra = (
         [person for person in contributors if isinstance(person, str)]
         if isinstance(contributors, list)
         else []
     )
-    return frozenset({record.binding.get("initiator"), *extra})
+    return frozenset(
+        {record.binding.get("initiator"), authority.get("registered_initiator"), *extra}
+    )
 
 
 async def record_protected_approval(
@@ -846,7 +848,10 @@ def may_view_approval(
     owner = _owner(conversation_store, record.session_id)
     resources = requirement_resources(record.requirements)
     approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
-    initiators = _initiators(record)
+    try:
+        initiators = _initiators(record)
+    except OmnigentError:
+        return False
     return any(
         _eligible(
             requirement,
@@ -857,6 +862,37 @@ def may_view_approval(
         )
         for requirement in record.requirements
     )
+
+
+def may_read_approval(
+    store: SqlAlchemyApprovalStore,
+    conversation_store: ConversationStore,
+    record: VerdictRecord,
+    user_id: str | None,
+) -> bool:
+    """Whether *user_id* is named to answer *record* (or answered it), in any state.
+
+    Readers of the thread may read its approvals too; the caller checks that.
+    """
+    if user_id is None:
+        return False
+    if any(answer.get("by") == user_id for answer in record.answers):
+        return True
+    owner = _owner(conversation_store, record.session_id)
+    resources = requirement_resources(record.requirements)
+    approvers = {entry.resource: entry for entry in store.approvers_for(resources)}
+    for requirement in record.requirements:
+        resource = ApprovalResource.from_json(requirement["resource"])
+        named = approvers[resource]
+        if requirement["kind"] == PERSONAL_NEED:
+            if user_id == owner or user_id in named.approvers:
+                return True
+            continue
+        if resource.kind is ResourceKind.SERVICE and not named.approvers:
+            named = approvers[TEAM_RESOURCE]
+        if user_id in named.approvers:
+            return True
+    return False
 
 
 def approval_view(record: VerdictRecord) -> dict[str, Any]:
@@ -901,10 +937,11 @@ __all__ = [
     "current_binding",
     "final_check_problem",
     "gate_approval_answer",
+    "may_read_approval",
     "may_view_approval",
     "record_operation_outcome",
     "record_protected_approval",
     "replay_matches",
-    "turn_contributors",
+    "turn_authority_record",
     "turn_initiator",
 ]

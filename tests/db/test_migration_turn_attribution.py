@@ -25,6 +25,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.attribution import InitiatorAttribution, OwnerAttribution, TurnAttribution
 from omnigent.stores.approval_store import SqlAlchemyApprovalStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.turn_store import InputKind, SqlAlchemyTurnStore
 
 _PREVIOUS = "ap1a2b3c4d5e"
 _REVISION = "at1a2b3c4d5e"
@@ -62,11 +63,13 @@ def _has_index(engine: sa.Engine) -> bool:
     }
 
 
-def _added(engine: sa.Engine) -> tuple[bool, bool, bool]:
+def _added(engine: sa.Engine) -> tuple[bool, bool, bool, bool]:
+    tables = set(sa.inspect(engine).get_table_names())
     return (
         "attribution" in _columns(engine, "conversation_items"),
         "attribution" in _columns(engine, "approval_verdicts"),
         _has_index(engine),
+        {"session_inputs", "session_turns"} <= tables,
     )
 
 
@@ -123,17 +126,27 @@ def _use_both_columns(db_uri: str) -> None:
     )
     [record] = approvals.session_verdicts([thread.id])
     assert record.attribution == {"initiator": "bob", "contributors": []}
+    turns = SqlAlchemyTurnStore(db_uri)
+    [item_id] = [item.id for item in conversations.list_items(thread.id).data]
+    turns.record_input(thread.id, item_id, kind=InputKind.PERSON, person="bob")
+    assert (
+        turns.register_turn(thread.id, "turn_1", runner_id=None, input_ids=[item_id]).initiator
+        == "bob"
+    )
+    # Typing during the turn counts as taking part in it.
+    turns.record_terminal_activity(thread.id, "terminal_s1", "carol")
+    assert turns.turn_authority(thread.id).people == {"bob", "carol"}
 
 
 def test_upgrade_adds_the_columns_and_index_and_changes_nothing_else(db_uri, engine) -> None:
     _migrate(engine, _PREVIOUS, downgrade=True)
-    assert _added(engine) == (False, False, False)
+    assert _added(engine) == (False, False, False, False)
     thread_id = _seed_old_item(db_uri)
 
     _migrate(engine, _REVISION)
 
     assert _get_current_db_heads(engine) == (_REVISION,)
-    assert _added(engine) == (True, True, True)
+    assert _added(engine) == (True, True, True, True)
     # The item saved before the revision is unchanged and reads as unknown.
     [old] = SqlAlchemyConversationStore(db_uri).list_items(thread_id).data
     assert (old.created_by, old.attribution) == ("alice", None)
@@ -154,6 +167,7 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
     for statement, parameters in (
         (drop_index, {}),
         ("ALTER TABLE approval_verdicts DROP COLUMN attribution", {}),
+        ("DROP TABLE session_turns", {}),
         # The item column stays: the retry must not add it twice.
         ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
     ):
@@ -164,17 +178,17 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
     _migrate(engine, _REVISION)
 
     assert _get_current_db_heads(engine) == (_REVISION,)
-    assert _added(engine) == (True, True, True)
+    assert _added(engine) == (True, True, True, True)
     _use_both_columns(db_uri)
 
 
 def test_downgrade_drops_only_what_it_added(db_uri, engine) -> None:
     _use_both_columns(db_uri)
-    tables = set(sa.inspect(engine).get_table_names())
+    tables = set(sa.inspect(engine).get_table_names()) - {"session_inputs", "session_turns"}
 
     _migrate(engine, _PREVIOUS, downgrade=True)
 
-    assert _added(engine) == (False, False, False)
+    assert _added(engine) == (False, False, False, False)
     assert set(sa.inspect(engine).get_table_names()) == tables
     with engine.connect() as connection:
         assert (

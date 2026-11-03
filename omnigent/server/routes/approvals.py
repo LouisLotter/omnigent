@@ -3,7 +3,8 @@
 - ``GET /v1/approvals``: pending protected approvals the caller may answer.
 - ``GET /v1/sessions/{id}/approvals``: a thread's approvals (its sub-agents'
   included) with who asked and who answered under which grant, for anyone who
-  can read the thread.
+  can read the thread. ``GET /v1/sessions/{id}/approvals/{elicitation_id}``:
+  one of them, also for the approvers named to answer it.
 - ``GET/POST/DELETE /v1/approvers``: named approvers for a thread, a service
   or the team; ``PUT /v1/approval-settings``: whether the person who started
   an action may approve it. A thread's actual owner manages its approvers
@@ -31,6 +32,7 @@ from omnigent.policies.registry import is_registered_handler, validate_factory_p
 from omnigent.server.approval_authority import (
     answer_credential_problem,
     approval_view,
+    may_read_approval,
     may_view_approval,
 )
 from omnigent.server.auth import (
@@ -274,6 +276,33 @@ def create_approvals_router(
         tree = await asyncio.to_thread(_thread_tree, conversation_store, session_id)
         records = await asyncio.to_thread(store.session_verdicts, tree)
         return {"object": "list", "data": [approval_view(record) for record in records]}
+
+    @router.get("/sessions/{session_id}/approvals/{elicitation_id}")
+    async def get_session_approval(
+        request: Request, session_id: str, elicitation_id: str
+    ) -> dict[str, Any]:
+        """One approval of a thread (or its sub-agents): for readers and its approvers."""
+        user_id = _person(request, write=False)
+        record = await asyncio.to_thread(store.get_verdict, elicitation_id)
+        if record is None:
+            raise OmnigentError("Approval not found", code=ErrorCode.NOT_FOUND)
+        tree = await asyncio.to_thread(_thread_tree, conversation_store, session_id)
+        if record.session_id not in tree:
+            raise OmnigentError("Approval not found", code=ErrorCode.NOT_FOUND)
+        if permission_store is not None:
+            reads = await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_READ,
+                permission_store,
+                conversation_store,
+            )
+            if not reads and not await asyncio.to_thread(
+                may_read_approval, store, conversation_store, record, user_id
+            ):
+                raise OmnigentError("Approval not found", code=ErrorCode.NOT_FOUND)
+        return approval_view(record)
 
     @router.get("/approvers")
     async def list_approvers(

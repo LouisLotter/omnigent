@@ -146,7 +146,8 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
 def test_downgrade_drops_only_the_new_tables(db_uri, engine) -> None:
     SqlAlchemyAccountStore(db_uri).create_user_with_password("alice", "password-hash")
     _use_every_table(db_uri)
-    before = _tables(engine) - set(_TABLES)
+    # Downgrading through the later turn-attribution revision drops its tables too.
+    before = _tables(engine) - set(_TABLES) - {"session_inputs", "session_turns"}
 
     _migrate(engine, _PREVIOUS, downgrade=True)
 

@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Final
 
@@ -83,12 +84,12 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
-from omnigent.server import terminal_typists
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.principals import recorded_principal
 from omnigent.server.routes._auth_helpers import (
     CONNECTION_AUTHORITY_RECHECK_S,
+    attribution_user,
     connection_still_authorized,
     require_access,
 )
@@ -184,14 +185,14 @@ def create_terminal_attach_router(
             ),
         )
 
-        # Keystrokes carry no identity: a prompt typed while attached for typing
-        # is attributed to the person attached (see omnigent.server.terminal_typists).
+        # Keystrokes carry no identity, so who sends input to this terminal is
+        # recorded from this authenticated connection, before the input is passed on.
         typist = (
-            auth_provider.get_user_id(websocket)
+            attribution_user(auth_provider.get_user_id(websocket))
             if auth_provider is not None and not read_only
             else None
         )
-        typing_token = terminal_typists.attach(session_id, typist) if typist else None
+        typing = _TypingRecorder(session_id, terminal_id, typist) if typist else None
         try:
             ws_factory = get_runner_ws_factory()
             if ws_factory is not None:
@@ -235,7 +236,7 @@ def create_terminal_attach_router(
                         async with runner_cm as runner_ws:
                             await _serve_while_authorized(
                                 websocket,
-                                _shuttle_ws_frames(websocket, runner_ws),
+                                _shuttle_ws_frames(websocket, runner_ws, typing=typing),
                                 still_authorized,
                             )
                 except _RunnerWSClosed as closed:
@@ -289,19 +290,28 @@ def create_terminal_attach_router(
                     "terminal.mode": "in-process",
                 },
             ):
-                await _serve_while_authorized(
-                    websocket,
+                bridge = (
+                    # In-process frames are not visible here: every client
+                    # interaction counts as possible typing.
                     bridge_tmux_control_to_websocket(
                         websocket,
                         socket_path=str(entry.instance.socket_path),
                         tmux_target=entry.instance.tmux_target,
                         read_only=read_only,
-                    ),
-                    still_authorized,
+                        on_client_interaction=typing.note_interaction,
+                    )
+                    if typing is not None
+                    else bridge_tmux_control_to_websocket(
+                        websocket,
+                        socket_path=str(entry.instance.socket_path),
+                        tmux_target=entry.instance.tmux_target,
+                        read_only=read_only,
+                    )
                 )
+                await _serve_while_authorized(websocket, bridge, still_authorized)
         finally:
-            if typing_token is not None:
-                terminal_typists.detach(session_id, typing_token)
+            if typing is not None:
+                await typing.flush()
 
     return router
 
@@ -469,7 +479,63 @@ class _RunnerWSClosed(Exception):
         self.reason = reason
 
 
-async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
+# A person typing is recorded at least this often, and on every Enter.
+_TYPING_RECORD_INTERVAL_S = 1.0
+
+
+class _TypingRecorder:
+    """Records, durably and per terminal, that a person sends it input.
+
+    Approvals count everyone who typed into a thread's terminals during a turn
+    as having taken part, on every server replica. A record is written before
+    the input it covers is passed on: on every Enter (a prompt submitted) and
+    at least once a second while typing. A failed write refuses the input.
+    """
+
+    def __init__(self, session_id: str, terminal_id: str, user_id: str) -> None:
+        self._session_id = session_id
+        self._terminal_id = terminal_id
+        self._user_id = user_id
+        self._recorded_at = 0.0
+        self._interaction: asyncio.Task[None] | None = None
+
+    async def before_input(self, data: bytes | str) -> None:
+        """Record the typing *data* is part of; raises when it cannot be recorded."""
+        now = time.monotonic()
+        submits = (b"\r" in data or b"\n" in data) if isinstance(data, bytes) else False
+        if not submits and now - self._recorded_at < _TYPING_RECORD_INTERVAL_S:
+            return
+        from omnigent.runtime import get_turn_store
+
+        store = get_turn_store()
+        if store is None:
+            return
+        await asyncio.to_thread(
+            store.record_terminal_activity, self._session_id, self._terminal_id, self._user_id
+        )
+        self._recorded_at = now
+
+    def note_interaction(self) -> None:
+        """Record possible typing for a bridge whose frames this server cannot see."""
+        if self._interaction is None or self._interaction.done():
+            self._interaction = asyncio.ensure_future(self._record_interaction())
+
+    async def _record_interaction(self) -> None:
+        try:
+            await self.before_input(b"\r")
+        except Exception:
+            _logger.warning("Could not record terminal typing", exc_info=True)
+
+    async def flush(self) -> None:
+        """Wait for an in-flight interaction record."""
+        if self._interaction is not None and not self._interaction.done():
+            with contextlib.suppress(Exception):
+                await self._interaction
+
+
+async def _shuttle_ws_frames(
+    browser_ws: WebSocket, runner_ws: object, *, typing: _TypingRecorder | None = None
+) -> None:
     """
     Forward frames between *browser_ws* (FastAPI) and *runner_ws*
     (websockets client connection) until either side closes.
@@ -503,6 +569,9 @@ async def _shuttle_ws_frames(browser_ws: WebSocket, runner_ws: object) -> None:
                 if text is not None:
                     await runner_ws.send(text)  # type: ignore[attr-defined]
                 elif data is not None:
+                    if typing is not None:
+                        # Binary frames are keystrokes; text frames are controls.
+                        await typing.before_input(data)
                     await runner_ws.send(data)  # type: ignore[attr-defined]
         except WebSocketDisconnect:
             return

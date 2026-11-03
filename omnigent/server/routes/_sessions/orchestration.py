@@ -44,6 +44,7 @@ from omnigent.entities import (
     SlashCommandData,
     TerminalCommandData,
 )
+from omnigent.entities.attribution import TurnAttribution
 from omnigent.entities.conversation import (
     FunctionCallData,
     FunctionCallOutputData,
@@ -423,7 +424,7 @@ from omnigent.server.turn_attribution import (
     build_turn_attribution,
     derive_agent_initiator,
     person_initiator,
-    record_turn_start,
+    record_turn_input,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -446,6 +447,7 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.turn_store import InputKind, InputRecord, text_digest
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.anon import current_anon_user_id as _tel_current_anon
@@ -3338,116 +3340,89 @@ async def _persist_external_conversation_item_serialized(
         )
 
 
-_MAX_TURN_INPUT_IDS = 64
-
-
-def _reported_ids(event: dict[str, Any], key: str) -> list[str]:
-    raw = event.get(key)
-    if not isinstance(raw, list):
-        return []
-    return [value for value in raw if isinstance(value, str) and value][:_MAX_TURN_INPUT_IDS]
-
-
-def _turn_start_people(
-    conversation_store: ConversationStore,
-    session_id: str,
-    item_ids: list[str],
-    stable_ids: list[str],
-) -> tuple[list[str | None], int | None]:
-    """The answerable person of each input the server can verify, and the earliest time.
-
-    Read from the server's own records: the attribution saved with each input
-    item, or for a terminal harness the sender recorded when the message was
-    queued. The runner only names which inputs; it never names a person, and
-    an id that names nothing in this thread is ignored.
-    """
-    people: list[str | None] = []
-    earliest: int | None = None
-    for item_id in item_ids:
-        item = conversation_store.get_item(session_id, item_id)
-        if item is None or not isinstance(item.data, MessageData) or item.data.role != "user":
-            continue
-        person = (
-            item.attribution.responsible_person()
-            if item.attribution is not None
-            else item.created_by
-        )
-        people.append(person)
-        earliest = item.created_at if earliest is None else min(earliest, item.created_at)
-    for stable_id in stable_ids:
-        queued = pending_inputs.initiator_for(session_id, stable_id=stable_id)
-        if isinstance(queued, TurnInitiator):
-            people.append(queued.responsible_person)
-            continue
-        item = conversation_store.get_item(session_id, stable_id)
-        if item is not None and item.attribution is not None:
-            people.append(item.attribution.responsible_person())
-    return people, earliest
-
-
-async def _record_reported_turn_start(
-    session_id: str, event: dict[str, Any], conversation_store: ConversationStore
-) -> None:
-    """Record who a turn the runner just started belongs to.
-
-    A message queued behind a running turn therefore never relabels that turn:
-    the person changes only when the runner starts the turn the message is in.
-    A turn with no verifiable input (a recovery, a continuation, or ids that
-    name nothing in this thread) changes nothing, so the turn's window of
-    contributors only ever restarts at an input the server recorded.
-    """
-    item_ids = _reported_ids(event, "input_item_ids")
-    stable_ids = _reported_ids(event, "input_stable_ids")
-    if not item_ids and not stable_ids:
-        return
-    try:
-        people, earliest = await asyncio.to_thread(
-            _turn_start_people, conversation_store, session_id, item_ids, stable_ids
-        )
-        if not people:
-            return
-        now = int(time.time())
-        named = next((person for person in people if person), None)
-        await asyncio.to_thread(
-            record_turn_start,
-            conversation_store,
-            session_id,
-            named,
-            min(earliest, now) if earliest is not None else now,
-        )
-    except Exception:  # noqa: BLE001 — the relay must keep streaming whatever a record read raises
-        _logger.warning(
-            "Could not record the start of a turn for session %s",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-
-
 def _typed_prompt_initiator(
     conversation_store: ConversationStore, conv: Conversation, forwarder: str | None
 ) -> TurnInitiator:
     """Who typed a prompt no queued message accounts for; blocking.
 
     A sub-agent's transcript prompt is its parent agent's, for the parent's
-    person. Otherwise the person attached to the terminal with typing rights
-    typed it; with nobody attached here, it is assumed to be the owner's (the
-    forwarder's own identity, the runner's person, when no owner is recorded).
+    person. Otherwise it was typed into the thread's terminal: the server
+    records who sends input to each terminal, so the typist is whoever sent
+    input since the turn (or the previous typed prompt) started. Several
+    possible typists are all named as possible; with none recorded (a direct
+    local attach the server never saw), the computer's owner is assumed.
     """
-    from omnigent.server import terminal_typists
+    from omnigent.runtime import get_turn_store
 
     if conv.parent_conversation_id is not None:
         return derive_agent_initiator(conversation_store, conv)
-    attached = _attribution_user(terminal_typists.typist(conv.id))
-    if attached is not None:
-        return TurnInitiator("terminal", attached, "terminal_attach")
-    owner = actual_owner_or_none(conversation_store, conv.id)
+    turns = get_turn_store()
+    typists = turns.typists_for_prompt(conv.id) if turns is not None else []
+    if len(typists) == 1:
+        return TurnInitiator("terminal", typists[0], "terminal_input")
+    if typists:
+        return TurnInitiator("terminal", None, "terminal_ambiguous", possible=tuple(typists))
+    assumed = _computer_owner(conversation_store, conv) or forwarder
     return TurnInitiator(
         "terminal",
-        owner.user_id if owner is not None else forwarder,
+        assumed,
         "owner_assumed",
-        registration=owner.generation if owner is not None else None,
+        possible=(assumed,) if assumed else (),
     )
+
+
+def _computer_owner(conversation_store: ConversationStore, conv: Conversation) -> str | None:
+    """The owner of the computer the thread runs on, else the thread's owner."""
+    from omnigent.server.turn_attribution import _host_store
+
+    if conv.host_id and _host_store is not None:
+        host = _host_store.get_host(conv.host_id)
+        if host is not None:
+            return host.user_id
+    owner = actual_owner_or_none(conversation_store, conv.id)
+    return owner.user_id if owner is not None else None
+
+
+def _find_queued_input(session_id: str, text: str) -> InputRecord | None:
+    """The oldest recorded, not yet transcribed queued input with this text.
+
+    For the transcript item's attribution only; a failed read leaves it to the
+    typed-prompt path. Approvals read the input's own record, by its id.
+    """
+    from omnigent.runtime import get_turn_store
+
+    turns = get_turn_store()
+    if turns is None:
+        return None
+    try:
+        return turns.find_unmapped_input(session_id, text_digest(text))
+    except Exception:  # noqa: BLE001 — display only
+        _logger.warning("could not look up a queued input", exc_info=True)
+        return None
+
+
+def _map_turn_input(session_id: str, input_id: str, item_id: str) -> None:
+    """Note the transcript item a recorded input became (a cross-reference only)."""
+    from omnigent.runtime import get_turn_store
+
+    turns = get_turn_store()
+    if turns is None:
+        return
+    try:
+        turns.map_input(session_id, input_id, item_id)
+    except Exception:  # noqa: BLE001 — the input's own record is what approvals read
+        _logger.warning("could not map a queued input to its transcript item", exc_info=True)
+
+
+def _initiator_from_input(record: InputRecord) -> TurnInitiator:
+    """The initiator the server recorded when a queued message was accepted."""
+    if record.kind is InputKind.AGENT:
+        return TurnInitiator("agent", None, "pending_input", on_behalf_of=record.person)
+    if record.kind is InputKind.SCHEDULE:
+        return TurnInitiator("schedule", record.person, "pending_input")
+    if record.kind is InputKind.TERMINAL:
+        return TurnInitiator("terminal", record.person, "pending_input", possible=record.possible)
+    return TurnInitiator("person", record.person, "pending_input")
 
 
 async def _persist_external_conversation_item_unlocked(
@@ -3513,6 +3488,8 @@ async def _persist_external_conversation_item_unlocked(
     held_older: list[pending_inputs.DrainedInput] = []
     # Who started the turn this mirrored prompt begins; ``None`` when unknown.
     mirror_initiator: TurnInitiator | None = None
+    # The recorded input this prompt is the transcript record of.
+    mirror_input_id: str | None = None
     typed_prompt = False
     if (
         item.type == "message"
@@ -3574,6 +3551,7 @@ async def _persist_external_conversation_item_unlocked(
             # settlement alone does not establish authorship of the mirror.
             if isinstance(drained.initiator, TurnInitiator) and match_method != "fifo_fallback":
                 mirror_initiator = drained.initiator
+                mirror_input_id = drained.pending_id
                 item = item.model_copy(update={"created_by": mirror_initiator.responsible_person})
             elif (
                 drained.created_by is not None
@@ -3586,10 +3564,17 @@ async def _persist_external_conversation_item_unlocked(
             # source_id from the forwarder takes precedence when both are set.
             if drained.stable_id is not None and item.stable_id is None:
                 item = item.model_copy(update={"stable_id": drained.stable_id})
+        elif not replayed and (
+            queued := await asyncio.to_thread(_find_queued_input, session_id, text)
+        ):
+            # The queued entry lives in another process (a restart, another
+            # replica): the durable record of the input names its sender.
+            mirror_initiator = _initiator_from_input(queued)
+            mirror_input_id = queued.input_id
+            item = item.model_copy(update={"created_by": mirror_initiator.responsible_person})
         elif not replayed:
-            # No pending entry: typed into the terminal (or, in a sub-agent's
-            # transcript, written by its parent agent). Keystrokes carry no
-            # identity; the person attached for typing is named.
+            # No queued input: typed into the terminal (or, in a sub-agent's
+            # transcript, written by its parent agent).
             mirror_initiator = await asyncio.to_thread(
                 _typed_prompt_initiator, conversation_store, conv, created_by
             )
@@ -3672,11 +3657,17 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    if mirror_input_id is not None:
+        await asyncio.to_thread(_map_turn_input, session_id, mirror_input_id, persisted.id)
     if typed_prompt and mirror_initiator is not None:
-        # No runner dispatch started this turn, so no turn-start report names it.
-        # The turn's start time is left alone: everyone whose input joined since
-        # the last reported start still counts for approvals.
-        person = mirror_initiator.responsible_person
+        # Typed input reached the harness without a registered turn: record it
+        # with every possible typist, so each counts as having taken part.
+        await asyncio.to_thread(
+            record_turn_input, session_id, persisted.id, mirror_initiator, item_id=persisted.id
+        )
+        person = mirror_initiator.user if mirror_initiator.source == "terminal_input" else None
+        if mirror_initiator.kind == "agent":
+            person = mirror_initiator.responsible_person
         try:
             if person:
                 await asyncio.to_thread(
@@ -7546,14 +7537,29 @@ async def _forward_event_to_runner(
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     persisted_items: list[ConversationItem] = []
-    attribution = (
-        await asyncio.to_thread(
-            build_turn_attribution, conversation_store, conv, initiator, host_store=host_store
-        )
-        if initiator is not None and _starts_turn(item)
-        else None
+    attribution: TurnAttribution | None = None
+    attributed = initiator is not None and _starts_turn(item)
+    # Routing below can change the turn's harness and model: such a turn's item
+    # is saved after it, so its attribution records what is actually dispatched.
+    routes_turn = body.type == "message" and (
+        conv.harness_override == "auto"
+        or conv.cost_control_mode_override == "on"
+        or conv.parent_conversation_id is not None
     )
-    if attribution is not None:
+
+    async def attribute(harness: str | None, model: str | None) -> None:
+        nonlocal item, attribution
+        if not attributed or initiator is None:
+            return
+        attribution = await asyncio.to_thread(
+            build_turn_attribution,
+            conversation_store,
+            conv,
+            initiator,
+            host_store=host_store,
+            harness=harness,
+            model=model,
+        )
         item = item.model_copy(update={"attribution": attribution})
 
     async def persist() -> None:
@@ -7582,7 +7588,12 @@ async def _forward_event_to_runner(
                 [item],
             )
 
-    if not scheduled:
+    persisted_early = not scheduled and not (attributed and routes_turn)
+    if persisted_early:
+        await attribute(
+            conv.harness_override,
+            body.model_override if body.model_override is not None else conv.model_override,
+        )
         await persist()
     await _seed_missing_title_from_user_message(
         conv,
@@ -7994,9 +8005,12 @@ async def _forward_event_to_runner(
     if _effective_harness is not None and _effective_harness != "auto":
         runner_body["harness_override"] = _effective_harness
 
+    if not persisted_early:
+        # The dispatched settings are final: record them with the item.
+        await attribute(_effective_harness, effective_runner_override)
+        await persist()
     if authorize_submission is not None:
         # Persisted only now, then checked again right before it is sent.
-        await persist()
         try:
             await authorize_submission()
         except Exception as refusal:
@@ -8009,6 +8023,15 @@ async def _forward_event_to_runner(
     # PRE-resolution form) and drops it by id, appending its own
     # resolved copy — id-based dedup, not a role/content guess.
     runner_body["persisted_item_id"] = persisted_items[0].id
+    if initiator is not None and _starts_turn(item):
+        # Recorded before the runner can start a turn with it: approvals read
+        # who took part in a turn from these records.
+        await asyncio.to_thread(
+            record_turn_input,
+            session_id,
+            persisted_items[0].id,
+            initiator,
+        )
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
@@ -8855,6 +8878,19 @@ async def _dispatch_session_event_to_runner_impl(
         try:
             # Routing above may have waited: check once more, right before sending.
             await authorize_final()
+            if pending_id is not None and initiator is not None:
+                # Durable before the runner can start a turn with it, and on
+                # every replica: the turn's registration and the transcript's
+                # record find its sender here, not in this process's memory.
+                await asyncio.to_thread(
+                    record_turn_input,
+                    session_id,
+                    pending_id,
+                    initiator,
+                    digest=text_digest(
+                        (_message_text(content) if isinstance(content, list) else None) or ""
+                    ),
+                )
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
             delivery = await _forward_native_terminal_message(
@@ -9770,10 +9806,6 @@ async def _relay_runner_stream_once(
                     # Runner-emitted keepalive — consumed to reset the
                     # read timeout; not forwarded to the session stream
                     # (the Omnigent subscriber generates its own heartbeats).
-                    if evt_type == "session.turn_started":
-                        # Internal: names the inputs a turn starts with. Not for clients.
-                        await _record_reported_turn_start(session_id, event, conversation_store)
-                        continue
                     if evt_type == "session.heartbeat":
                         if not heartbeat_seen:
                             heartbeat_seen = True

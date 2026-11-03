@@ -340,8 +340,9 @@ separately hosted conversation database without the column), omit it.
     "schedule_id": null,           // for schedule
     "from_session_id": null,       // for agent: the thread whose agent sent it
     "on_behalf_of": null,          // for agent: the person it acts for
-    "source": "signed_in"          // signed_in | schedule | thread_record |
-                                   // pending_input | terminal_attach | owner_assumed
+    "possible": null,              // terminal typing not certain: every possible typist
+    "source": "signed_in"          // signed_in | schedule | thread_record | pending_input |
+                                   // terminal_input | terminal_ambiguous | owner_assumed
   },
   "owner": {"user": "alice", "registration": "9a1b…"},
   "host": {"id": "…", "name": "alice-laptop", "owner": "alice",
@@ -1261,14 +1262,37 @@ which is what policy ASK gates rely on, so the verdict cannot be
 conflated with a generic session event. Any value other than
 `action: "accept"` denies.
 
-For a recorded approval (a policy ASK in the approval ledger) the response,
-and `GET .../elicitations/{elicitation_id}`, add `"approval"`: who asked and
-who answered under which grant, as listed below.
+For a recorded approval (a policy ASK in the approval ledger) the response
+adds `"approval"`: who asked and who answered under which grant, as listed
+below. The generic `GET .../elicitations/{elicitation_id}` does not carry it;
+read it from `GET /v1/sessions/{session_id}/approvals/{elicitation_id}`.
+
+### Register a Turn (runners)
+
+```
+POST /v1/sessions/{session_id}/turns
+{"turn_id": "turn_…", "input_ids": ["<persisted item id or pending id>", …]}
+
+200 OK
+{"turn_id": "turn_…", "initiator": "bob", "unresolved": false}
+
+403 Forbidden — the caller is not the runner bound to this thread
+404 Not Found — no such thread; or, with a plain `{"detail": …}` body, the
+    server has no turn registration (the runner proceeds as before)
+```
+
+A runner advertising the `turn_inputs` capability registers each turn, and
+waits for this acknowledgement, before its harness acts. It names only the
+server-issued ids of the turn's inputs; the server reads their senders from
+its own records, sets `omnigent.turn_actor`, and records the turn. The same
+`turn_id` again returns the stored turn. An id the server never recorded
+leaves the turn `unresolved`, and nobody may approve its actions.
 
 ### List a Thread's Approvals
 
 ```
 GET /v1/sessions/{session_id}/approvals
+GET /v1/sessions/{session_id}/approvals/{elicitation_id}   # one record
 
 200 OK
 {"object": "list", "data": [{
@@ -1277,6 +1301,8 @@ GET /v1/sessions/{session_id}/approvals
   "phase": "tool_call", "action": "tracker__post_update", "destination": "tracker",
   "initiator": "alice", "owner": "alice",
   "asked": {"initiator": "alice", "contributors": ["bob"],
+            "authority": {"complete": true, "turn": "turn_…",
+                          "registered_initiator": "alice", "unresolved": false},
             "principal": {"kind": "runner", "user": "alice", "runner": "…", "host": "…"},
             "owner": {…}, "host": {…}, "subscription": {…},
             "harness": "…", "model": {…}, "effort": {…}},
@@ -1294,9 +1320,13 @@ GET /v1/sessions/{session_id}/approvals
 ```
 
 The thread's approvals and its sub-agents', newest first, for anyone who can
-read the thread. `contributors` are the people whose input joined the turn
-before it asked; where the person who started an action may not approve it,
-none of them may. `role` is the grant an answer was given under:
+read the thread; a single record also for the approvers named to answer it.
+`contributors` are everyone who took part in the turn before it asked: the
+turn's inputs, every input accepted and all terminal typing since it was
+registered (everyone who ever sent input, with no registered turn). Where
+the person who started an action may not approve it, none of them may. When
+that record could not be read completely (`authority.complete: false`) or
+the turn is `unresolved`, every answer is refused. `role` is the grant an answer was given under:
 `thread_owner`, `thread_approver`, `service_approver` or `team_approver`.
 Answered approvals are kept until their thread is deleted; unanswered ones
 are purged a week after they expire.

@@ -272,11 +272,7 @@ def register_elicitations_routes(
         found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
         if found is None:
             resolution = pending_elicitations.native_resolution_for(session_id, elicitation_id)
-            return {
-                "status": "resolved",
-                **({"resolution": resolution} if resolution else {}),
-                **(await _approval_record(elicitation_id, session_id=session_id)),
-            }
+            return {"status": "resolved", **({"resolution": resolution} if resolution else {})}
 
         _conv_id, event = found
         params_value = event.get("params")
@@ -284,7 +280,6 @@ def register_elicitations_routes(
         if params.get("target_session_id") not in (None, session_id):
             return {"status": "resolved"}
         return {
-            **(await _approval_record(elicitation_id, session_id=session_id)),
             "status": "pending",
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),

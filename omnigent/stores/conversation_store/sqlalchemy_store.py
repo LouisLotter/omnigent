@@ -5771,8 +5771,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             # An approval's record lasts as long as its thread, no longer.
             from omnigent.stores.approval_store import delete_session_verdicts
+            from omnigent.stores.turn_store import delete_session_records
 
             delete_session_verdicts(session, subtree_ids)
+            delete_session_records(session, subtree_ids)
 
         run_write_transaction(
             self._session_immediate,
