@@ -89,6 +89,9 @@ def test_upgrade_and_downgrade_keep_other_data_and_remove_service_logins(db_uri:
 
     assert {"mcp_registry_services", "mcp_registry_service_tools"} <= _tables(engine)
     assert "ix_connections_provider" in _connection_indexes(engine)
+    # The stores read the current schema, which later revisions extend.
+    _migrate(engine, "head")
+    engine.dispose()
     assert credentials.get("alice", "mcp:shipped") is not None
     assert credentials.get("alice", "github") is not None
     assert services.scan() == ([], [])
