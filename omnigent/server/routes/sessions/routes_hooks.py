@@ -97,6 +97,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate,
     _pending_mcp_approval_for_call,
     _publish_and_wait_for_harness_elicitation,
+    _replayed_gate_answer_allowed,
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
     answered_ask_verdict,
@@ -894,6 +895,25 @@ def register_hooks_routes(
             hook_elicitation_id = mcp_approval_id
         if hook_elicitation_id is not None and not is_read_only:
             answered = answered_ask_verdict(session_id, hook_elicitation_id, phase, data)
+            if (
+                answered is not None
+                and answered.approved
+                and mcp_approval_id is None
+                and not await _replayed_gate_answer_allowed(
+                    request, session_id, phase, data, conversation_store, hook_elicitation_id
+                )
+            ):
+                # The approval was given in another context: the person must
+                # decide again, under a new question.
+                return Response(
+                    content=json.dumps(
+                        {
+                            "result": "POLICY_ACTION_DENY",
+                            "reason": "The approval no longer matches this action; ask again.",
+                        }
+                    ),
+                    media_type="application/json",
+                )
             if answered is not None:
                 # A re-post whose earlier answer was lost: the same verdict, with
                 # nothing evaluated or written again.
@@ -1105,6 +1125,12 @@ def register_hooks_routes(
                                 result=gate_result,
                                 conversation_store=conversation_store,
                                 elicitation_id=hook_elicitation_id,
+                                # The MCP call records and consumes its own approval.
+                                **(
+                                    {"approval_owned_by_call": True}
+                                    if mcp_approval_id is not None
+                                    else {}
+                                ),
                             )
                         except ElicitationDeclinedError as exc:
                             # Explicit user decline: interrupt the native

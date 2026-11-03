@@ -263,6 +263,8 @@ def _build_event(ctx: EvaluationContext) -> PolicyEvent:
     }
     if ctx.request_data is not None:
         event["request_data"] = ctx.request_data
+    if ctx.protected is not None:
+        cast("dict[str, object]", event["context"])["protected"] = dict(ctx.protected)
     return cast(PolicyEvent, event)
 
 

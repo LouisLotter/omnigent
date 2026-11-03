@@ -46,6 +46,39 @@ class PrincipalKind(str, Enum):
 
 MACHINE_KINDS = frozenset({PrincipalKind.RUNNER, PrincipalKind.HOST})
 
+
+class CredentialKind(str, Enum):
+    """How a principal authenticated.
+
+    - ``BROWSER_SESSION``: a session token minted for a browser, presented in
+      the session cookie.
+    - ``SESSION_COOKIE``: a session token in the session cookie without the
+      browser mark: a browser signed in before the mark existed or through
+      a link from the CLI, or a CLI's token copied into the cookie.
+    - ``SESSION_BEARER``: a session token in a bearer header, such as a
+      CLI's stored sign-in.
+    - ``LOGIN_GRANT``: an access token renewed from a first-party login grant
+      (the CLI's or a personal host's refresh grant).
+    - ``DEVICE_GRANT``: an access token of a device-authorization client.
+    - ``CLIENT_CREDENTIALS``: a machine client's token.
+    - ``PROXY_HEADER``: an identity asserted by a trusted proxy, or the
+      single-user local server's own user.
+    - ``MACHINE``: a runner or host token.
+    """
+
+    BROWSER_SESSION = "browser_session"
+    SESSION_COOKIE = "session_cookie"
+    SESSION_BEARER = "session_bearer"
+    LOGIN_GRANT = "login_grant"
+    DEVICE_GRANT = "device_grant"
+    CLIENT_CREDENTIALS = "client_credentials"
+    PROXY_HEADER = "proxy_header"
+    MACHINE = "machine"
+
+
+# Credentials that never sit on a person's computers for software to reuse.
+_INTERACTIVE_CREDENTIALS = frozenset({CredentialKind.BROWSER_SESSION, CredentialKind.PROXY_HEADER})
+
 # Operations a runner token may perform. Each machine-reachable route names one
 # (see ``omnigent.server.route_authority``); a token without it is refused.
 SCOPE_SESSION = "session"
@@ -96,6 +129,8 @@ class Principal:
     :param audience: The machine token's audience.
     :param expires_at: The machine token's expiry, in epoch seconds.
     :param scopes: Operations a machine principal may perform.
+    :param credential: How the principal authenticated, or ``None`` when the
+        recording site did not say.
     """
 
     kind: PrincipalKind
@@ -108,11 +143,22 @@ class Principal:
     audience: str | None = None
     expires_at: int | None = None
     scopes: frozenset[str] = frozenset()
+    credential: CredentialKind | None = None
 
     @property
     def is_human(self) -> bool:
         """Whether the person is acting in person rather than through software."""
         return self.kind is PrincipalKind.HUMAN
+
+    @property
+    def is_interactive_human(self) -> bool:
+        """Whether the person is signed in through a browser (or a trusted proxy).
+
+        A CLI sign-in, a login grant and a device grant are the person's too,
+        but they are stored where software running for that person can reuse
+        them, so decisions such as approvals refuse them.
+        """
+        return self.is_human and self.credential in _INTERACTIVE_CREDENTIALS
 
     @property
     def is_machine(self) -> bool:
@@ -269,6 +315,7 @@ def decode_machine_token(token: str, secret: bytes) -> Principal | None:
         audience=_AUDIENCES[kind],
         expires_at=expires_at,
         scopes=frozenset(scope) & default_scopes(kind),
+        credential=CredentialKind.MACHINE,
     )
 
 

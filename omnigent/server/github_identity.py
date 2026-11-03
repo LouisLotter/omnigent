@@ -11,6 +11,7 @@ import logging
 
 import httpx
 
+from omnigent.connections import check_expected_login
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server.github_app import GitHubAppError
@@ -32,6 +33,7 @@ async def resolve_access_token(
     *,
     store: GithubConnectionStore,
     client: GitHubAppClient,
+    expected_login: str | None = None,
 ) -> str | None:
     """Resolve a valid user access token for *user_id*, or ``None``.
 
@@ -44,9 +46,17 @@ async def resolve_access_token(
     :param user_id: The user whose token to resolve.
     :param store: The connection store (also used to persist a refresh).
     :param client: The GitHub App client.
+    :param expected_login: The login marker an approved call is bound to
+        (``""`` for none); ``None`` skips the check.
     :returns: A usable access token, or ``None``.
+    :raises LoginChangedError: When *expected_login* is given and the stored
+        login is another one (the only exception this raises).
     """
     connection = await _run_sync(store.get, user_id, with_tokens=True)
+    if expected_login is not None:
+        check_expected_login(
+            connection.login_marker if connection is not None else None, expected_login
+        )
     if connection is None or not connection.access_token:
         return None
     expires_at = connection.token_expires_at
@@ -98,6 +108,7 @@ async def resolve_github_credential(
     *,
     store: GithubConnectionStore,
     client: GitHubAppClient,
+    expected_login: str | None = None,
 ) -> dict[str, object] | None:
     """Resolve the GitHub broker payload for *user_id*, or ``None``.
 
@@ -106,8 +117,11 @@ async def resolve_github_credential(
     token plus the attribution metadata git needs (``username``/``login``), or
     ``None`` when the owner has not linked GitHub. The ``owner``/``login`` let
     the host attribute commits to the human, decoupled from the push credential.
+    *expected_login* binds the token to one login (see :func:`resolve_access_token`).
     """
-    token = await resolve_access_token(user_id, store=store, client=client)
+    token = await resolve_access_token(
+        user_id, store=store, client=client, expected_login=expected_login
+    )
     if token is None:
         return None
     connection = await _run_sync(store.get, user_id)

@@ -215,6 +215,15 @@ class EvaluationContext:
         policies should skip only explicit ``False`` to preserve those
         callers. The relay skips empty and whitespace-only segments.
         Surfaced as ``event["context"]["turn_final"]``.
+    :param protected: Server-derived facts for an enforcement site that
+        knows them, e.g. ``{"initiator": "bob", "destination": "tracker",
+        "connection": "..."}``. Only protected rules see them, as
+        ``event["context"]["protected"]``; never sourced from labels or
+        session state.
+    :param transforms_applied: The enforcement site executes the transformed
+        content itself (the MCP gateway). ``False`` where the caller decides
+        whether to apply a transform; protected rules then judge the posted
+        content as well as the transformed one.
     """
 
     phase: Phase
@@ -233,6 +242,27 @@ class EvaluationContext:
     conversation_id: str | None = None
     conversation_title: str | None = None
     turn_final: bool | None = None
+    protected: dict[str, object] | None = None
+    transforms_applied: bool = False
+
+
+@dataclass(frozen=True)
+class ApprovalNeed:
+    """One approval a composed ASK requires.
+
+    :param kind: ``"personal"`` (the thread's person or its named approvers)
+        or ``"team"`` (named approvers of :attr:`resource`).
+    :param policy: The policy or protected rule that asked.
+    :param resource: For a team need, ``(kind_code, resource_id)`` of the
+        resource whose approvers answer: ``(2, service_id)`` or ``(3, "")``.
+    :param protected: The need comes from a protected rule, so it is never
+        rerouted (a personal protected rule always asks its person).
+    """
+
+    kind: str
+    policy: str
+    resource: tuple[int, str] | None = None
+    protected: bool = False
 
 
 @dataclass(frozen=True)
@@ -289,6 +319,10 @@ class PolicyResult:
         denied ASK must leave no trace). ``None`` means "no
         state changes." e.g.
         ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
+    :param approval_needs: Engine-set on a composed ASK: every approval it
+        requires. An ordinary policy's ASK needs the thread's person; a
+        protected team rule's ASK needs its named approvers. ``None``
+        otherwise.
     :param deciding_policy_workspace_id: Databricks workspace id
         that owns the deciding policy (``deciding_policies[0]``).
         Engine-set on DENY / ASK when the deciding policy is a
@@ -305,6 +339,7 @@ class PolicyResult:
     data: object | None = None
     state_updates: list[StateUpdate] | None = None
     deciding_policy_workspace_id: int | None = None
+    approval_needs: tuple[ApprovalNeed, ...] | None = None
 
     @property
     def deciding_policy(self) -> str | None:

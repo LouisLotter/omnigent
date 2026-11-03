@@ -153,6 +153,13 @@ class _FixedPolicyEngine:
     """
 
     result: PolicyResult
+    ask_timeout: int = 30
+
+    def spec_for(self, name: str | None) -> None:
+        """No per-policy timeout; the ASK uses :attr:`ask_timeout`.
+
+        :param name: Ignored.
+        """
 
     async def evaluate(self, ctx: EvaluationContext) -> PolicyResult:
         """

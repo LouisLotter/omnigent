@@ -43,6 +43,7 @@ class DatabricksConnectionStore(ConnectionStore[DatabricksConnection]):
             scopes=str(meta.get("scopes") or ""),
             created_at=conn.created_at,
             updated_at=conn.updated_at,
+            login_marker=conn.login_marker(),
         )
 
     @staticmethod

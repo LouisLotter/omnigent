@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import logging
 import math
@@ -12,6 +13,8 @@ import secrets
 import threading
 import time
 from builtins import ExceptionGroup
+from collections.abc import Iterator
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, urlencode, urlsplit
@@ -23,6 +26,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from omnigent.connections import LoginChangedError
 from omnigent.entities import ProviderConnection
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.mcp_destinations import (
@@ -47,6 +51,58 @@ from omnigent.stores.mcp_service_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+# The login an approved call was approved for: (service id, user id, login marker).
+_PINNED_LOGIN: ContextVar[tuple[str, str, str | None] | None] = ContextVar(
+    "omnigent_pinned_mcp_login", default=None
+)
+
+
+@contextlib.contextmanager
+def pinned_login(service_id: str, user_id: str | None, marker: str | None) -> Iterator[None]:
+    """Use only this login of *service_id* for calls made inside the block.
+
+    An approved call is bound to one login; if the login is replaced (a
+    reconnect) between the approval and the token read, the call is refused
+    rather than sent with the replacement.
+
+    :param marker: :meth:`ProviderConnection.login_marker` of the approved
+        login, or ``None`` when the service had no login for the user.
+    """
+    token = _PINNED_LOGIN.set((service_id, user_id or "", marker))
+    try:
+        yield
+    finally:
+        _PINNED_LOGIN.reset(token)
+
+
+_LOGIN_CHANGED = "The MCP login changed after this call was approved; ask again"
+
+
+def _pinned_marker(service_id: str, user_id: str) -> str | None:
+    """The pinned login for *service_id*: its marker, ``""`` for none, ``None`` unpinned."""
+    pinned = _PINNED_LOGIN.get()
+    if pinned is None or pinned[:2] != (service_id, user_id):
+        return None
+    return pinned[2] or ""
+
+
+def current_pinned_login() -> tuple[str, str, str | None] | None:
+    """The login an approved call is pinned to, for a gateway backend to enforce.
+
+    :returns: ``(service_id, user_id, login_marker)``, or ``None`` outside an
+        approved call.
+    """
+    return _PINNED_LOGIN.get()
+
+
+def _check_pinned_login(service_id: str, user_id: str, conn: ProviderConnection | None) -> None:
+    expected = _pinned_marker(service_id, user_id)
+    if expected is None:
+        return
+    if (conn.login_marker() if conn is not None else "") != expected:
+        raise ConnectionError(_LOGIN_CHANGED)
+
 
 #: Connection metadata key set when the provider rejects a saved login; the value
 #: names the rejection. Saving a new grant replaces the metadata and clears it.
@@ -523,7 +579,15 @@ class McpRegistry:
             client = getattr(app_state, f"{provider.name}_client", None)
             if store is None or provider.credential_resolver is None:
                 raise ConnectionError(f"Connect {provider.name} in Sandbox Integrations")
-            payload = await provider.credential_resolver(user_id, store=store, client=client)
+            expected = _pinned_marker(service.id, user_id)
+            # An approved call resolves the token of the approved login only.
+            pinned_kwargs = {} if expected is None else {"expected_login": expected}
+            try:
+                payload = await provider.credential_resolver(
+                    user_id, store=store, client=client, **pinned_kwargs
+                )
+            except LoginChangedError:
+                raise ConnectionError(_LOGIN_CHANGED) from None
             if not payload or not isinstance(payload.get("token"), str):
                 raise ConnectionError(f"Reconnect {provider.name} in Sandbox Integrations")
             return payload["token"]
@@ -537,6 +601,7 @@ class McpRegistry:
             conn, revision = await asyncio.to_thread(
                 self.store.get_with_revision, user_id, f"mcp:{service.id}"
             )
+            _check_pinned_login(service.id, user_id, conn)
             if (
                 conn is None
                 or not login_matches(service, conn)

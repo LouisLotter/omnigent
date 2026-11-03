@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+from omnigent.connections import check_expected_login
 from omnigent.connections.databricks import DatabricksConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server.databricks_app import DatabricksAppError
@@ -33,6 +34,7 @@ async def resolve_databricks_token(
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
     refresh_margin_s: int = _REFRESH_MARGIN_S,
+    expected_login: str | None = None,
 ) -> tuple[str, str] | None:
     """Resolve a valid ``(access_token, workspace_host)`` for *user_id*, or ``None``.
 
@@ -42,8 +44,16 @@ async def resolve_databricks_token(
 
     :param refresh_margin_s: Refresh when the token expires within this many
         seconds, so the returned token stays valid at least that long.
+    :param expected_login: The login marker an approved call is bound to
+        (``""`` for none); ``None`` skips the check.
+    :raises LoginChangedError: When *expected_login* is given and the stored
+        login is another one.
     """
     connection = await _run_sync(store.get, user_id, with_tokens=True)
+    if expected_login is not None:
+        check_expected_login(
+            connection.login_marker if connection is not None else None, expected_login
+        )
     if connection is None or not connection.access_token or not connection.workspace_host:
         return None
     access_token = connection.access_token
@@ -68,6 +78,7 @@ async def resolve_databricks_credential(
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
     refresh_margin_s: int = _REFRESH_MARGIN_S,
+    expected_login: str | None = None,
 ) -> dict[str, object] | None:
     """Resolve the Databricks broker payload for *user_id*, or ``None``.
 
@@ -79,7 +90,11 @@ async def resolve_databricks_credential(
     :func:`omnigent.server.github_identity.resolve_github_credential`.
     """
     resolved = await resolve_databricks_token(
-        user_id, store=store, client=client, refresh_margin_s=refresh_margin_s
+        user_id,
+        store=store,
+        client=client,
+        refresh_margin_s=refresh_margin_s,
+        expected_login=expected_login,
     )
     if resolved is None:
         return None

@@ -29,6 +29,8 @@ def backend(app, launch_registry, monkeypatch, request):
     backend.list_tools.return_value = tools
     backend.call_tool.return_value = result
     if request.param == "custom":
+        # A test double with no credentials of its own: it honours any pinned login.
+        backend.enforces_pinned_login = True
         app.state.mcp_gateway_backend = backend
     else:
 

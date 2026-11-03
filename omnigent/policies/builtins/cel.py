@@ -90,6 +90,7 @@ def cel_policy(
     *,
     expression: str,
     reason: str = "Denied by policy.",
+    fail_closed: bool = False,
 ) -> PolicyCallable:
     """Factory: compile a CEL expression into a policy callable.
 
@@ -119,6 +120,8 @@ def cel_policy(
     :param reason: Fallback reason for DENY/ASK results when
         the map omits a ``"reason"`` key, e.g.
         ``"Shell access is blocked."``.
+    :param fail_closed: Deny when the expression cannot be evaluated against
+        an event, instead of abstaining. Protected rules always set it.
     :returns: A policy callable following the
         :class:`PolicyCallable` contract.
     :raises ValueError: If the expression has CEL syntax errors.
@@ -157,7 +160,12 @@ def cel_policy(
             cel_event["data"] = request_user_text(event.get("data"))
         try:
             result = prog.evaluate({"event": json_to_cel(cel_event)})
-        except (CELEvalError, ValueError, TypeError):
+        except (CELEvalError, ValueError, TypeError) as exc:
+            if fail_closed:
+                return {
+                    "result": "DENY",
+                    "reason": f"Policy expression could not be evaluated: {exc}",
+                }
             _log.debug(
                 "CEL policy eval error on event type %r, abstaining",
                 event.get("type"),
@@ -288,6 +296,14 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                             "Fallback reason for DENY/ASK when the map omits a reason key."
                         ),
                         "default": "Denied by policy.",
+                    },
+                    "fail_closed": {
+                        "type": "boolean",
+                        "description": (
+                            "Deny when the expression cannot be evaluated against an event "
+                            "instead of abstaining. Protected rules always deny."
+                        ),
+                        "default": False,
                     },
                 },
                 "required": ["expression"],

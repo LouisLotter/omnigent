@@ -51,6 +51,7 @@ from omnigent.db.utils import (
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.principals import MachineBinding
+from omnigent.stores.approval_store import remove_account_approval_authority
 from omnigent.stores.host_store import resolve_runner_binding
 from omnigent.stores.team_store import (
     admin_flag_for_account,
@@ -499,6 +500,8 @@ class SqlAlchemyAccountStore:
                     return False
             if not retire_deleted_account_membership(session, user_id):
                 return False
+            # A username registered again must not inherit approval authority.
+            remove_account_approval_authority(session, user_id)
             session.execute(
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),

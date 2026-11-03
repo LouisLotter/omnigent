@@ -557,6 +557,193 @@ class SqlTeamIdentityBinding(OmnigentBase):
     )
 
 
+class SqlApprovalResource(OmnigentBase):
+    """
+    SQLAlchemy model for the ``approval_resources`` table.
+
+    Per-resource approval settings: a thread, a service or the team. A row
+    exists only once a setting was saved; a missing row means the defaults.
+
+    :param resource_cksum: sha256 of ``"<kind>:<resource_id>"``, the key.
+    :param kind: Int code: 1 thread, 2 service, 3 team.
+    :param resource_id: The thread id, service id, or ``""`` for the team.
+    :param allow_initiator: Whether the person who started the action may
+        approve it; ``NULL`` keeps the default for *kind* (allowed for a
+        thread, refused for a service or the team).
+    :param updated_at: Unix epoch seconds of the last change.
+    :param updated_by: The administrator who changed it.
+    """
+
+    __tablename__ = "approval_resources"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    resource_cksum: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    allow_initiator: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (CheckConstraint("kind IN (1, 2, 3)", name="ck_approval_resources_kind"),)
+
+
+class SqlApproverGrant(OmnigentBase):
+    """
+    SQLAlchemy model for the ``approver_grants`` table.
+
+    Names a person who may answer approvals for one resource. Separate from
+    a thread's read/edit/manage/owner grants: approving needs no thread
+    access, and thread access confers no approval.
+
+    :param resource_cksum: The resource's key (see :class:`SqlApprovalResource`).
+    :param approver_user_id: The approver's account id.
+    :param granted_by: The administrator who named them.
+    :param created_at: Unix epoch seconds when they were named.
+    """
+
+    __tablename__ = "approver_grants"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    resource_cksum: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    approver_user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    granted_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_approver_grants_kind"),
+        # An approver's inbox: every resource they may answer for.
+        Index(
+            "ix_approver_grants_approver",
+            "workspace_id",
+            "approver_user_id",
+            "resource_cksum",
+        ),
+    )
+
+
+class SqlProtectedPolicy(OmnigentBase):
+    """
+    SQLAlchemy model for the ``protected_policies`` table.
+
+    A protected rule: a team rule administrators keep, or a personal rule its
+    person keeps. Protected rules run after every other policy, on the final
+    arguments, without labels or session state, and their verdicts can only
+    add restrictions.
+
+    :param id: Rule id stored as 16 raw bytes (see :class:`Uuid16`).
+    :param domain: Int code: 1 team, 2 personal.
+    :param owner_user_id: The person a personal rule belongs to; ``NULL`` for
+        a team rule.
+    :param name: Display name.
+    :param handler: Registered policy handler path.
+    :param factory_params: JSON factory arguments, or ``NULL``.
+    :param approval_kind: For a team rule, who answers its ASK: 2 the
+        service's approvers, 3 the team's approvers. ``NULL`` for personal.
+    :param approval_resource_id: The service id when *approval_kind* is 2.
+    :param enabled: Whether the rule runs.
+    :param created_by: Who created it.
+    :param created_at: Unix epoch seconds when it was created.
+    :param updated_at: Unix epoch seconds of the last change.
+    """
+
+    __tablename__ = "protected_policies"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    domain: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    handler: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    factory_params: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    approval_kind: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    approval_resource_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("domain IN (1, 2)", name="ck_protected_policies_domain"),
+        CheckConstraint(
+            "(domain = 1 AND owner_user_id IS NULL) OR (domain = 2 AND owner_user_id IS NOT NULL)",
+            name="ck_protected_policies_owner",
+        ),
+        CheckConstraint(
+            "approval_kind IS NULL OR approval_kind IN (2, 3)",
+            name="ck_protected_policies_approval_kind",
+        ),
+        # The rules one evaluation loads: the team's and one person's.
+        Index(
+            "ix_protected_policies_domain_owner", "workspace_id", "domain", "owner_user_id", "id"
+        ),
+    )
+
+
+class SqlApprovalVerdict(OmnigentBase):
+    """
+    SQLAlchemy model for the ``approval_verdicts`` table.
+
+    One protected approval: what was asked (bound by digest), who must
+    answer, the answers given, and the single consumption of an approval.
+
+    :param elicitation_id: The approval prompt's id.
+    :param session_id: The thread that asked.
+    :param binding_digest: sha256 of the canonical binding (principal,
+        initiator, owner, thread, action, destination, content, connection,
+        policy and grant fingerprints, operation id).
+    :param binding: The binding as JSON, without secrets or content.
+    :param requirements: JSON list of approvals required.
+    :param answers: JSON list of answers recorded so far.
+    :param state: Int code: 1 pending, 2 approved, 3 declined, 4 consumed.
+    :param decided_by: Who completed the decision.
+    :param decided_at: Unix epoch seconds of the decision.
+    :param expires_at: After this no answer or consumption is accepted.
+    :param consumed_at: Unix epoch seconds of the one consumption.
+    :param operation_id: The operation the approval was consumed by.
+    :param outcome: Int code once consumed: 1 executing, 2 succeeded, 3 failed.
+    :param outcome_body: The operation's recorded result, for retries.
+    :param created_at: Unix epoch seconds when it was asked.
+    """
+
+    __tablename__ = "approval_verdicts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    elicitation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    binding_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    binding: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    requirements: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    answers: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    decided_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    decided_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    consumed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    outcome: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    outcome_body: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_approval_verdicts_state"),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN (1, 2, 3)", name="ck_approval_verdicts_outcome"
+        ),
+        # Pending approvals (the approver inbox) and expiry purges.
+        Index("ix_approval_verdicts_state_expiry", "workspace_id", "state", "expires_at"),
+    )
+
+
 class SqlConnection(OmnigentBase):
     """
     SQLAlchemy model for the ``connections`` table.
@@ -584,6 +771,8 @@ class SqlConnection(OmnigentBase):
     :param metadata_json: Non-secret provider metadata as a JSON object.
     :param created_at: Unix epoch seconds the connection was first made.
     :param updated_at: Unix epoch seconds of the last refresh/reconnect.
+    :param login_id: Random id of this login, replaced on every connect or
+        reconnect but kept by token refreshes; approvals bind to it.
     """
 
     __tablename__ = "connections"
@@ -610,6 +799,9 @@ class SqlConnection(OmnigentBase):
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Replaced whenever the login itself is (connect, reconnect), not when its
+    # tokens refresh; NULL for a login saved before the column existed.
+    login_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
         # Every user's login for one provider, e.g. when an administrator changes or

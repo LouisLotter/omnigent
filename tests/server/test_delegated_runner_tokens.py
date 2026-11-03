@@ -53,6 +53,8 @@ def tracker(setup_app: Any) -> AsyncMock:
     backend.call_tool.return_value = CallToolResult(
         content=[TextContent(type="text", text="posted")]
     )
+    # A test double with no credentials of its own: it honours any pinned login.
+    backend.enforces_pinned_login = True
     alice.app.state.mcp_gateway_backend = backend
     return backend
 
@@ -151,7 +153,7 @@ def test_browser_approval_runs_the_runners_retry_once(setup_app: Any, tracker: A
 
     assert approved.status_code == 202, approved.text
     assert executed["result"]["content"][0]["text"] == "posted", executed
-    assert repeated["error"]["message"] == "Elicitation not found or already resolved"
+    assert repeated["error"]["message"] == "Approval was already used"
     tracker.call_tool.assert_awaited_once()
     assert tracker.call_tool.await_args.args[2:] == ("post_update", {"text": "hello"})
     assert _approved_posts(stores, session_id) == 1
