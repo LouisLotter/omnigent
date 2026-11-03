@@ -210,7 +210,8 @@ from omnigent.onboarding.sandboxes.base import (
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace, SandboxOwner
+from omnigent.server.sandbox_owners import launcher_call, takes_owner
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -4158,8 +4159,13 @@ async def _start_sandbox_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     start_attempt: int | None = None,
+    owner: SandboxOwner | None = None,
 ) -> str:
-    """Start a host without sending absent optional arguments to legacy launchers."""
+    """Start a host without sending absent optional arguments to legacy launchers.
+
+    *owner* reaches only a launcher declaring ``owner_context`` that takes a
+    claimed attempt (persistent hosts; see :mod:`omnigent.server.sandbox_owners`).
+    """
     # Gated on the capability, not on the value: start_host is side-effecting and
     # non-idempotent, so we never probe the signature by passing then retrying.
     # `agent_name` is declared on the classifying launcher's `start_host` alone,
@@ -4172,6 +4178,11 @@ async def _start_sandbox_host(
         # Only a launcher with start claims takes the claimed attempt (see
         # SandboxLifecycle.claim_start); like the classifier below it is current.
         start_claimed = cast(Callable[..., str], launcher.start_host)
+        owned = (
+            {"owner": owner}
+            if owner is not None and takes_owner(launcher)
+            else {}
+        )
         return await asyncio.to_thread(
             start_claimed,
             sandbox_id,
@@ -4183,6 +4194,7 @@ async def _start_sandbox_host(
             host_config=host_config,
             on_stage=on_stage,
             start_attempt=start_attempt,
+            **owned,
         )
     if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
         start_classified = cast(Callable[..., str], launcher.start_host)
@@ -4719,6 +4731,8 @@ async def terminate_managed_host(
                 sandbox_id,
                 host_id=tombstone.host_id,
                 provider=tombstone.sandbox_provider,
+                host=tombstone,
+                host_store=host_store,
             )
             if terminated:
                 await asyncio.to_thread(
@@ -4734,8 +4748,14 @@ async def _terminate_sandbox_best_effort(
     *,
     host_id: str,
     provider: str | None,
+    host: Host | None = None,
+    host_store: HostStore | None = None,
 ) -> bool:
-    """Terminate one provider sandbox id without touching its host row."""
+    """Terminate one provider sandbox id without touching its host row.
+
+    With *host*, a launcher declaring ``owner_context`` is told its owner
+    (:mod:`omnigent.server.sandbox_owners`).
+    """
     if launcher is None:
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
@@ -4745,7 +4765,7 @@ async def _terminate_sandbox_best_effort(
         )
         return False
     try:
-        await asyncio.to_thread(launcher.terminate, sandbox_id)
+        await asyncio.to_thread(launcher_call, launcher, "terminate", host, host_store, sandbox_id)
         return True
     except Exception:  # provider cleanup must remain best-effort.
         _logger.warning(

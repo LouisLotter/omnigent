@@ -14,6 +14,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     _launcher_for_teardown,
 )
+from omnigent.server.sandbox_owners import launcher_call
 from omnigent.stores.host_store import (
     Host,
     HostStore,
@@ -227,7 +228,9 @@ class ManagedSandboxReaper:
                             sandbox_id = tombstone.terminating_sandbox_id or tombstone.sandbox_id
                             if sandbox_id is None:
                                 continue
-                            acting.terminate(sandbox_id)
+                            launcher_call(
+                                acting, "terminate", tombstone, self._host_store, sandbox_id
+                            )
                             if self._host_store.mark_sandbox_terminated(
                                 candidate.host_id,
                                 sandbox_id=sandbox_id,
@@ -253,7 +256,7 @@ class ManagedSandboxReaper:
                                 candidate.host_id,
                             )
                             continue
-                        acting.terminate(sandbox_id)
+                        launcher_call(acting, "terminate", candidate, self._host_store, sandbox_id)
                         if self._host_store.mark_sandbox_terminated(
                             candidate.host_id,
                             sandbox_id=sandbox_id,

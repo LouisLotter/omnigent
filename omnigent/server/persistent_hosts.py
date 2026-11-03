@@ -69,6 +69,7 @@ from omnigent.server.managed_hosts import (
     _terminate_sandbox_best_effort,
     terminate_managed_host,
 )
+from omnigent.server.sandbox_owners import launcher_call, owner_for
 from omnigent.stores.host_store import SandboxInUseError
 
 if TYPE_CHECKING:
@@ -619,7 +620,9 @@ async def _fresh_report(
         return None
     epoch = state.epoch
     try:
-        report = await asyncio.to_thread(launcher.admission, host.sandbox_id)
+        report = await asyncio.to_thread(
+            launcher_call, launcher, "admission", host, _host_store, host.sandbox_id
+        )
     except SandboxGoneError:
         raise
     except Exception:
@@ -750,7 +753,9 @@ async def _provision(
     state.publish("provisioning")
     await asyncio.to_thread(launcher.prepare_for_launch, agent_name=None)
     await asyncio.to_thread(launcher.prepare)
-    sandbox_id = await asyncio.to_thread(launcher.provision, sandbox_name(host.host_id))
+    sandbox_id = await asyncio.to_thread(
+        launcher_call, launcher, "provision", host, _host_store, sandbox_name(host.host_id)
+    )
     try:
         attached = await asyncio.to_thread(
             _host_store.attach_persistent_sandbox,
@@ -767,7 +772,12 @@ async def _provision(
         )
         raise
     if attached is None and not await _terminate_sandbox_best_effort(
-        launcher, sandbox_id, host_id=host.host_id, provider=launcher.provider
+        launcher,
+        sandbox_id,
+        host_id=host.host_id,
+        provider=launcher.provider,
+        host=host,
+        host_store=_host_store,
     ):
         await asyncio.to_thread(
             _host_store.retain_orphan_sandbox,
@@ -830,7 +840,11 @@ async def _bring_up_untyped(
     deadline, never taken as stopped.
     """
     assert host.sandbox_id is not None
-    while (running := await asyncio.to_thread(launcher.is_running, host.sandbox_id)) is None:
+    while (
+        running := await asyncio.to_thread(
+            launcher_call, launcher, "is_running", host, _host_store, host.sandbox_id
+        )
+    ) is None:
         if await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S):
             return
         if time.monotonic() >= deadline:
@@ -843,7 +857,7 @@ async def _bring_up_untyped(
         return
     if not running:
         state.publish("provisioning")
-        await _call_launcher(host, launcher.resume, host.sandbox_id)
+        await _call_launcher(host, launcher, "resume", host.sandbox_id)
     claim = await _claim_start(host, launcher, uuid.uuid4().hex, deadline)
     if claim.granted:
         current = await asyncio.to_thread(_require_host, host.host_id)
@@ -896,7 +910,7 @@ async def _bring_up_typed(
             continue
         if status == "stopped":
             state.publish("provisioning")
-            await _call_launcher(host, launcher.resume, host.sandbox_id)
+            await _call_launcher(host, launcher, "resume", host.sandbox_id)
             await _await_online(host.host_id, deadline, at_most_s=_STATUS_POLL_S)
             continue
         if status in pending and started_at is not None:
@@ -930,13 +944,15 @@ def _require_host(host_id: str) -> Host:
     return host
 
 
-async def _call_launcher(host: Host, method: Callable[..., Any], *args: Any) -> None:
+async def _call_launcher(
+    host: Host, launcher: SandboxHostLauncher, method: str, *args: Any
+) -> None:
     """Call a launcher step whose refusal is final and whose lost reply is retried.
 
     :raises OmnigentError: With the provider's readable message on a refusal.
     """
     try:
-        await asyncio.to_thread(method, *args)
+        await asyncio.to_thread(launcher_call, launcher, method, host, _host_store, *args)
     except click.ClickException as exc:
         raise _unavailable(f"{host.name} could not wake: {exc.message}") from exc
     except SandboxGoneError:
@@ -955,7 +971,13 @@ async def _claim_start(
     while True:
         try:
             return await asyncio.to_thread(
-                launcher.claim_start, host.sandbox_id, operation_id=operation_id
+                launcher_call,
+                launcher,
+                "claim_start",
+                host,
+                _host_store,
+                host.sandbox_id,
+                operation_id=operation_id,
             )
         except click.ClickException as exc:
             raise _unavailable(f"{host.name} could not start: {exc.message}") from exc
@@ -1007,6 +1029,7 @@ async def _arm_and_start(
             repos=(),
             host_config=entry.host_config,
             start_attempt=attempt,
+            owner=await asyncio.to_thread(owner_for, launcher, host, _host_store),
         )
         delivered = True
     except click.ClickException as exc:
@@ -1114,12 +1137,22 @@ def _busy_reason(
 
 
 async def _call_suspend(
-    launcher: SandboxHostLauncher, sandbox_id: str, operation_id: str
+    launcher: SandboxHostLauncher, host: Host, operation_id: str
 ) -> SuspendResult:
     try:
-        return await asyncio.to_thread(launcher.suspend, sandbox_id, operation_id=operation_id)
+        return await asyncio.to_thread(
+            launcher_call,
+            launcher,
+            "suspend",
+            host,
+            _host_store,
+            host.sandbox_id,
+            operation_id=operation_id,
+        )
     except Exception:
-        _logger.warning("suspend %s of sandbox %s failed", operation_id, sandbox_id, exc_info=True)
+        _logger.warning(
+            "suspend %s of sandbox %s failed", operation_id, host.sandbox_id, exc_info=True
+        )
         return SuspendResult(outcome="unknown")
 
 
@@ -1184,7 +1217,7 @@ async def sleep_if_idle(host_id: str, *, only_operation: str | None = None) -> s
                 return outcome
             outcome = "unknown"
             state.unknown_suspend_operation = operation_id
-            result = await _call_suspend(launcher, host.sandbox_id, operation_id)
+            result = await _call_suspend(launcher, host, operation_id)
             _logger.info(
                 "Sleep %s of host %s: %s%s",
                 operation_id,

@@ -513,6 +513,9 @@ class SandboxLifecycle(ABC):
     supports_cli_bootstrap: ClassVar[bool] = True
     can_resume: ClassVar[bool] = False
     supports_managed_launch: ClassVar[bool] = True
+    # The provider takes ``owner=`` on a persistent host's lifecycle calls
+    # (``SandboxCapabilities.owner_context``).
+    supports_owner_context: ClassVar[bool] = False
 
     @property
     def capabilities(self) -> _sandbox_types.SandboxCapabilities:
@@ -543,6 +546,7 @@ class SandboxLifecycle(ABC):
             suspend=self._is_capability_overridden("suspend"),
             admission=self._is_capability_overridden("admission"),
             start_claims=self._is_capability_overridden("claim_start"),
+            owner_context=self.supports_owner_context,
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
