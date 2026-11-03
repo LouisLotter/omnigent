@@ -16,6 +16,7 @@
  *   or the id is unknown.
  */
 
+import { ApprovalAttribution } from "@/components/blocks/ApprovalAttribution";
 import { ApprovalCard } from "@/components/blocks/ApprovalCard";
 import {
   parseNativePermissionDelivery,
@@ -29,6 +30,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
 import { formatPreview } from "@/lib/previewFormat";
+import { parseApprovalRecord, type ApprovalRecord } from "@/lib/attribution";
 
 interface ElicitationData {
   status: "pending" | "resolved";
@@ -39,6 +41,8 @@ interface ElicitationData {
   content_preview?: string;
   native_delivery?: NativePermissionDelivery;
   permission_directories?: string[];
+  /** The recorded approval: who asked, who answered under which grant. */
+  approval?: unknown;
 }
 
 type PageState =
@@ -55,6 +59,7 @@ export function ApprovePage() {
     elicitationId: string;
   }>();
   const [state, setState] = useState<PageState>({ kind: "loading" });
+  const [approval, setApproval] = useState<ApprovalRecord | null>(null);
   const submission = useRef<{ revision: number; pending: boolean; attempt?: string }>({
     revision: 0,
     pending: false,
@@ -84,6 +89,7 @@ export function ApprovePage() {
         const data: ElicitationData = await res.json();
         if (cancelled) return;
         data.native_delivery = parseNativePermissionDelivery(data.native_delivery);
+        setApproval(parseApprovalRecord(data.approval));
         nativeDeliverySeen ||= Boolean(data.native_delivery) || data.resolution === "unanswered";
         polling =
           (nativeDeliverySeen && data.resolution !== "confirmed") ||
@@ -156,6 +162,13 @@ export function ApprovePage() {
         );
         if (!res.ok && submission.current === submitted) {
           setState({ kind: "error", message: `Resolve failed: ${res.status}` });
+        } else if (res.ok) {
+          const answered: unknown = await res.json().catch(() => null);
+          const record =
+            answered && typeof answered === "object"
+              ? parseApprovalRecord((answered as { approval?: unknown }).approval)
+              : null;
+          if (record) setApproval(record);
         }
       } catch (err) {
         if (submission.current === submitted) {
@@ -192,6 +205,7 @@ export function ApprovePage() {
             This approval request is no longer pending. It may have been resolved, timed out, or
             cancelled.
           </AlertDescription>
+          <ApprovalAttribution record={approval} />
         </Alert>
       )}
 
@@ -218,6 +232,7 @@ export function ApprovePage() {
             )}
           </AlertTitle>
           <AlertDescription className="text-sm">You can close this page.</AlertDescription>
+          <ApprovalAttribution record={approval} />
         </Alert>
       )}
 
@@ -253,6 +268,7 @@ export function ApprovePage() {
             </AlertTitle>
             <AlertDescription className="flex flex-col gap-2">
               <ElicitationMessage message={state.data.message ?? ""} />
+              <ApprovalAttribution record={approval} />
               {state.data.content_preview && (
                 <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                   {formatPreview(state.data.content_preview)}

@@ -66,6 +66,7 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { TurnAttributionLine } from "./TurnAttributionLine";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
@@ -939,6 +940,14 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {/* Who started the turn, when it was not simply the computer's owner. */}
+        {bubble.attribution && (
+          <TurnAttributionLine
+            attribution={bubble.attribution}
+            viewer={getCurrentAuthorId()}
+            placement="transcript"
+          />
+        )}
         {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
         {bubble.pending && bubble.awaitingAgent && (
           <div
@@ -951,6 +960,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          {bubble.attribution && (
+            <TurnAttributionLine
+              attribution={bubble.attribution}
+              viewer={getCurrentAuthorId()}
+              placement="hover"
+            />
+          )}
           {ts && (
             <span
               className="select-none text-[11px] leading-4 text-foreground/56"

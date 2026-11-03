@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -631,6 +632,66 @@ describe("UserBubble shell prompts", () => {
     expect(prompt).toHaveAttribute("data-user-message-id", "shell-input");
     expect(prompt.querySelector("pre")?.textContent).toBe(`!${command}`);
     expect(screen.getByTestId("copy-message-link")).toBeEnabled();
+  });
+});
+
+describe("UserBubble turn attribution", () => {
+  function attributed(user: string): Extract<Bubble, { kind: "user" }> {
+    return {
+      kind: "user",
+      itemId: `msg_${user}`,
+      content: [{ type: "input_text", text: "run the report" }],
+      createdBy: user,
+      attribution: {
+        v: 1,
+        initiator: {
+          kind: "person",
+          user,
+          registration: null,
+          schedule_id: null,
+          from_session_id: null,
+          on_behalf_of: null,
+          source: "signed_in",
+        },
+        owner: { user: "alice", registration: null },
+        host: { id: "h1", name: "alice-laptop", owner: "alice", kind: "personal", runner_id: null },
+        subscription: {
+          subject: "alice",
+          provider: "anthropic",
+          source: "computer_login",
+          login_state: "unknown",
+          login_state_reported_by: null,
+          account: null,
+          verified: false,
+        },
+        harness: "claude-native",
+        model: { requested: null, reported: null },
+        effort: { requested: null, reported: null },
+        recorded_at: 1,
+      },
+    };
+  }
+
+  it("shows a colleague's turn on the owner's computer in the transcript", () => {
+    render(
+      <TooltipProvider>
+        <BubbleView bubble={attributed("bob")} />
+      </TooltipProvider>,
+    );
+    const line = screen.getByTestId("turn-attribution");
+    expect(line).toHaveAttribute("data-placement", "transcript");
+    expect(line).toHaveTextContent("bob, on alice's computer and alice's Claude subscription");
+  });
+
+  it("keeps the owner's own turn in the hover row", () => {
+    render(
+      <TooltipProvider>
+        <BubbleView bubble={attributed("alice")} />
+      </TooltipProvider>,
+    );
+    const line = screen.getByTestId("turn-attribution");
+    expect(line).toHaveAttribute("data-placement", "hover");
+    expect(line).toHaveTextContent("alice, on alice's computer and alice's Claude subscription");
   });
 });
 

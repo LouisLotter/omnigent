@@ -42,6 +42,7 @@
 //     stream, fetches the items snapshot, and merges into blocks
 //     deduping by item id.
 
+import type { TurnAttribution } from "@/lib/attribution";
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import type {
@@ -7783,6 +7784,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  attribution?: TurnAttribution,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -7796,6 +7798,7 @@ function committedUserBlock(
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
+      ...(attribution !== undefined ? { attribution } : {}),
       // Client clock — see blockStream.ctx; keeps server-stamped
       // `createdAtS` comparisons single-clock. A promoted optimistic
       // bubble keeps its send-time stamp rather than re-stamping now.
@@ -8736,6 +8739,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  event.attribution,
                 ),
               ],
             };
@@ -8772,6 +8776,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
+                event.attribution,
               ),
             ],
           };
@@ -8783,7 +8788,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              event.attribution,
+            ),
           ],
         };
       });

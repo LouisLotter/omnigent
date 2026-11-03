@@ -9,6 +9,7 @@
 // in the same flat list (so the bubble walker doesn't special-case
 // "where did the user input come from").
 
+import { parseTurnAttribution } from "./attribution";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -507,6 +508,7 @@ function ctxFor(item: ConversationItem): BlockContext {
   // Preserve human authorship only when the server sent it.
   const createdBy =
     "created_by" in item && typeof item.created_by === "string" ? item.created_by : undefined;
+  const attribution = "attribution" in item ? parseTurnAttribution(item.attribution) : undefined;
   return {
     agent,
     depth,
@@ -515,6 +517,7 @@ function ctxFor(item: ConversationItem): BlockContext {
     responseId: item.response_id,
     itemId: item.id,
     ...(createdBy !== undefined ? { createdBy } : {}),
+    ...(attribution !== undefined ? { attribution } : {}),
     ...(typeof item.created_at === "number" && item.created_at > 0
       ? { createdAtS: item.created_at }
       : {}),
