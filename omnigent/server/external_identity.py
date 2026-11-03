@@ -426,10 +426,12 @@ def _route_path(scope: Scope) -> str:
     return path
 
 
-# The founding owner binds from a browser's sign-in only: a CLI's, a host's or a grant's
-# credential under the owner's proxy sign-in never becomes the founding binding, so a device
-# whose sign-in differs from the browser's cannot take it first.
-_FOUNDING_CREDENTIALS = frozenset({CredentialKind.BROWSER_SESSION, CredentialKind.SESSION_COOKIE})
+# The founding owner binds from a browser's sign-in only: a session marked as a browser's when it
+# was minted. A CLI's, a host's or a grant's credential under the owner's proxy sign-in never
+# becomes the founding binding, nor does an unmarked session token in the cookie (an older
+# browser session, or a CLI's token copied there): that one needs a fresh password sign-in, so a
+# device whose sign-in differs from the browser's cannot take it first.
+_FOUNDING_CREDENTIALS = frozenset({CredentialKind.BROWSER_SESSION})
 
 
 class ExternalIdentityMiddleware:

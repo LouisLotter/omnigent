@@ -246,8 +246,9 @@ def test_an_unbound_sign_in_is_refused_only_in_required() -> None:
 def test_the_founding_binding_needs_a_browsers_sign_in() -> None:
     from omnigent.server.external_identity import _FOUNDING_CREDENTIALS
 
-    assert CredentialKind.BROWSER_SESSION in _FOUNDING_CREDENTIALS
+    assert {CredentialKind.BROWSER_SESSION} == _FOUNDING_CREDENTIALS
     for credential in (
+        CredentialKind.SESSION_COOKIE,
         CredentialKind.SESSION_BEARER,
         CredentialKind.LOGIN_GRANT,
         CredentialKind.DEVICE_GRANT,
