@@ -37,6 +37,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxCapabilityError,
     resolve_managed_keepalive_interval_s,
 )
+from omnigent.server.sandbox_owners import launcher_call
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedSandboxDeployment
@@ -212,7 +213,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                 from omnigent.server.managed_hosts import build_owner_launcher
 
                 launcher = build_owner_launcher(config, deployment, host.user_id)
-                extended = launcher.keep_alive(host.sandbox_id)
+                extended = launcher_call(launcher, "keep_alive", host, host_store, host.sandbox_id)
                 # INFO from the server layer so the keepalive is visible in the
                 # server log (onboarding-layer loggers do not surface there); the
                 # provider logs the new deadline at debug. A provider returns

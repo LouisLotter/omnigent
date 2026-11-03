@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 from omnigent.db.db_models import current_workspace_id
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError, SandboxGoneError
 from omnigent.server.managed_hosts import _launcher_for_teardown
+from omnigent.server.sandbox_owners import launcher_call
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -479,7 +480,9 @@ class TurnCheckpointScheduler:
         if launcher is None:
             return
         try:
-            operation_id = launcher.checkpoint(host.sandbox_id, reason=reason)
+            operation_id = launcher_call(
+                launcher, "checkpoint", host, self._host_store, host.sandbox_id, reason=reason
+            )
         except SandboxCapabilityError:
             self._drop_provider(target.provider)
             return

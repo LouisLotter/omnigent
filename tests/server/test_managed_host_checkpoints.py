@@ -859,3 +859,34 @@ def test_publish_status_reports_every_publish_past_the_sticky_failure(
         ("conv_edges", "idle", "failed"),
         ("conv_edges", "failed", "running"),
     ]
+
+
+async def test_checkpoint_names_the_hosts_owner_to_a_provider_that_asks(
+    make_harness: Callable[..., _Harness],
+) -> None:
+    """A provider declaring ``owner_context`` is told whose sandbox it saves (WP8.4)."""
+    from omnigent.onboarding.sandboxes.types import SandboxOwner
+
+    owners: list[object] = []
+
+    class OwnedLauncher(_CheckpointLauncher):
+        supports_owner_context: ClassVar[bool] = True
+
+        def checkpoint(  # type: ignore[override]
+            self, sandbox_id: str, *, reason: str, owner: object = None
+        ) -> str | None:
+            owners.append(owner)
+            return super().checkpoint(sandbox_id, reason=reason)
+
+    harness = make_harness(launcher_type=OwnedLauncher)
+    harness.stores.add_session("conv1")
+    host = harness.stores.hosts["host1"]
+    host.host_id, host.account_generation = "h" * 32, None
+    harness.stores.owner_membership = lambda user_id, generation: ("m" * 32, "t" * 32)  # type: ignore[attr-defined]
+    harness.publish("conv1", "running", "idle")
+    await harness.time.advance_to(_DEBOUNCE_S)
+
+    assert harness.reasons == ["turn_completed"]
+    assert owners == [
+        SandboxOwner(user_id="alice", host_id="h" * 32, member_id="m" * 32, team_id="t" * 32)
+    ]

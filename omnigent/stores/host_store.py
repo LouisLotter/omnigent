@@ -44,6 +44,8 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
     SqlSessionPermission,
+    SqlTeam,
+    SqlTeamMember,
     SqlUser,
     current_workspace_id,
 )
@@ -1258,6 +1260,52 @@ class HostStore:
             if row is None:
                 return None
             return _row_to_host(row)
+
+    def owner_membership(
+        self, user_id: str, account_generation: str | None
+    ) -> tuple[str, str] | None:
+        """
+        Return the team membership of the registration that owns a host.
+
+        Reads the account's current membership as
+        :meth:`~omnigent.stores.team_store.SqlAlchemyTeamStore.member_for_owner`
+        does: a live account, a membership carried to its current
+        generation, and the host's recorded generation (when it has one)
+        equal to that generation. A sandbox provider uses it to name the
+        person a sandbox belongs to (``SandboxOwner``).
+
+        :param user_id: The host's owner, e.g. ``"alice"``.
+        :param account_generation: The generation the host records, or
+            ``None`` for an identity without an accounts registration.
+        :returns: ``(member_id, team_id)``, or ``None`` when the account has
+            no current membership or the host belongs to an earlier
+            registration.
+        """
+        with self._session("select_host_owner_membership") as session:
+            row = session.execute(
+                select(
+                    SqlTeamMember.id.label("member_id"),
+                    SqlTeamMember.account_generation.label("member_generation"),
+                    SqlUser.account_generation.label("current_generation"),
+                    SqlTeam.id.label("team_id"),
+                )
+                .join(
+                    SqlUser,
+                    (SqlUser.workspace_id == SqlTeamMember.workspace_id)
+                    & (SqlUser.id == SqlTeamMember.current_user_id),
+                )
+                .join(SqlTeam, SqlTeam.workspace_id == SqlTeamMember.workspace_id)
+                .where(
+                    SqlTeamMember.workspace_id == current_workspace_id(),
+                    SqlTeamMember.current_user_id == user_id,
+                    SqlUser.deleted_at.is_(None),
+                )
+            ).one_or_none()
+        if row is None or row.member_generation != row.current_generation:
+            return None
+        if account_generation is not None and account_generation != row.current_generation:
+            return None
+        return row.member_id, row.team_id
 
     def get_actual_host_owner(self, host_id: str) -> AccountAuthority | None:
         """

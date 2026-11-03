@@ -106,6 +106,13 @@ class SandboxCapabilities:
     :param start_claims: Provider fences host starts with start claims
         (:meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.claim_start`),
         and its ``start_host`` accepts the claimed ``start_attempt``.
+    :param owner_context: Provider takes ``owner=``, a :class:`SandboxOwner`,
+        on every lifecycle call the server makes for a persistent host
+        (``provision``, ``claim_start``, ``start_host``, ``resume``,
+        ``keep_alive``, ``is_running``, ``admission``, ``checkpoint``,
+        ``suspend`` and ``terminate``), so it can bind each sandbox to one
+        person and refuse calls for anyone else's. Providers that leave it
+        ``False`` never receive the keyword.
     """
 
     cli_bootstrap: bool = False
@@ -126,6 +133,33 @@ class SandboxCapabilities:
     suspend: bool = False
     admission: bool = False
     start_claims: bool = False
+    owner_context: bool = False
+
+
+@dataclass(frozen=True)
+class SandboxOwner:
+    """Who a persistent host's sandbox belongs to, from the server's own records.
+
+    The server derives it for each lifecycle call from the host row and the
+    account's team membership; nothing a caller sends chooses it. A provider
+    declaring :attr:`SandboxCapabilities.owner_context` receives it as
+    ``owner=`` and can bind the sandbox to that person, so a sandbox (and the
+    personal logins saved in it) never serves anyone else.
+
+    :param user_id: The account that owns the host (``users.id``), e.g.
+        ``"alice"``.
+    :param host_id: The host the sandbox serves, e.g.
+        ``"7f3c2a9e4b1d4e8a9c2f1a2b3c4d5e6f"``.
+    :param member_id: The account's current team member id, stable across
+        password changes and never reused; ``None`` when the account has no
+        current membership (no team, or the member was removed).
+    :param team_id: The team's id; ``None`` exactly when ``member_id`` is.
+    """
+
+    user_id: str
+    host_id: str
+    member_id: str | None = None
+    team_id: str | None = None
 
 
 CheckpointReason = Literal["turn_completed", "long_turn"]
