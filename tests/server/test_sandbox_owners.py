@@ -53,6 +53,20 @@ from tests.server.persistent_host_fakes import (
 pytestmark = [pytest.mark.timeout(60)]
 
 
+@pytest.fixture(autouse=True)
+def _bounded_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lifecycle's waits shortened as ``test_persistent_hosts`` shortens them.
+
+    Without them each wake idles through the production status poll (2 s), and
+    under a parallel run a wake can outlast the tests' own waits. Each test runs
+    on its own event loop, so the host's lifecycle lock starts fresh too.
+    """
+    monkeypatch.setattr(persistent_hosts, "FENCE_DRAIN_S", 5.0)
+    monkeypatch.setattr(persistent_hosts, "_STATUS_POLL_S", 0.05)
+    monkeypatch.setattr(persistent_hosts, "_UNKNOWN_RETRY_S", 0.05)
+    monkeypatch.setattr(persistent_hosts, "_resume_locks", {})
+
+
 @dataclass
 class OwnedComputer(FakeComputer):
     """:class:`FakeComputer` declaring ``owner_context``: records each call's owner."""
