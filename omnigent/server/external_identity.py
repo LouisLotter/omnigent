@@ -344,10 +344,11 @@ def refusal_for_user(connection: HTTPConnection, user_id: str) -> str | None:
 def machine_refusal_for_user(connection: HTTPConnection, user_id: str) -> str | None:
     """Why a machine credential resolved inside a route may not act as *user_id*, or ``None``.
 
-    For launch tokens and runner binding tokens, which a route resolves to
-    their owner after the middleware ran. Without an envelope the request is
-    a machine's own private route and proceeds; with one, the owner must be
-    the active member the proxy's sign-in is bound to.
+    For launch tokens, runner binding tokens and the client-credentials
+    grant's subject, which a route resolves after the middleware ran. Without
+    an envelope the request is a machine's own private route and proceeds;
+    with one, the account must be the active member the proxy's sign-in is
+    bound to.
 
     :returns: A refusal code from :data:`REFUSAL_MESSAGES`, or ``None``.
     """

@@ -9,7 +9,9 @@ sign-ins. Each forbidden action sits next to its allowed neighbour.
 from __future__ import annotations
 
 import dataclasses
+import json
 import secrets
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -24,6 +26,8 @@ from starlette.websockets import WebSocketDisconnect
 from omnigent.entities.team import AdmissionSnapshot
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.server.authority_changes import authority_changed
+from omnigent.server.device_grant_store import hash_secret
 from omnigent.server.external_identity import (
     ENVELOPE_HEADER,
     ExternalIdentity,
@@ -32,6 +36,8 @@ from omnigent.server.external_identity import (
 )
 from omnigent.server.principals import Principal, PrincipalKind
 from omnigent.server.route_authority import rule_for
+from omnigent.stores.host_store import REGISTRATION_REVOKED_REFUSAL, HostStore
+from tests.server.integration.test_host_tunnel_route import _make_hello
 from tests.server.test_accounts import _build_accounts_app
 
 _KEY = "cfo-test-envelope-key-0123456789abcdef"
@@ -39,6 +45,15 @@ _ISSUER = "https://team.example.cloudflareaccess.com"
 _AUDIENCE = "aud-tag-1"
 _OWNER_PASSWORD = "admin-pw-12345"
 _COOKIE = "ap_session"
+# The optional machine client (client-credentials grant), on a dedicated identity.
+_MACHINE_CLIENT_ID = "svc-client"
+_MACHINE_CLIENT_SECRET = "svc-client-secret-0123456789abcdef"
+_SERVICE = "svc-machine"
+_MACHINE_GRANT = {
+    "grant_type": "client_credentials",
+    "client_id": _MACHINE_CLIENT_ID,
+    "client_secret": _MACHINE_CLIENT_SECRET,
+}
 
 
 class RecordingAdmission:
@@ -109,13 +124,27 @@ def _join(world: World, name: str, role: str = "member") -> None:
 
 
 @pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+def world(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[World]:
+    """The team behind the proxy; an ``indirect`` parameter names the machine client's subject."""
     monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_MODE", "required")
     monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_KEY", _KEY)
     monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
+    cookie_secret = secrets.token_hex(32)
+    monkeypatch.setenv("OMNIGENT_MACHINE_CLIENT_ID", _MACHINE_CLIENT_ID)
+    monkeypatch.setenv(
+        "OMNIGENT_MACHINE_CLIENT_SECRET_HASH",
+        hash_secret(_MACHINE_CLIENT_SECRET, bytes.fromhex(cookie_secret)),
+    )
+    monkeypatch.setenv("OMNIGENT_MACHINE_SUB", getattr(request, "param", _SERVICE))
     admission = RecordingAdmission()
     for base in _build_accounts_app(
-        tmp_path, monkeypatch, init_admin_password=_OWNER_PASSWORD, team_admission=admission
+        tmp_path,
+        monkeypatch,
+        init_admin_password=_OWNER_PASSWORD,
+        cookie_secret=cookie_secret,
+        team_admission=admission,
     ):
         world = World(base.app, admission, {}, {})
         owner = world.as_("owner-sub", "owner@example.test", owner=True)
@@ -594,6 +623,104 @@ def test_suspension_ends_machine_credentials_and_reinstatement_needs_new_ones(
     fresh = _bound_runner(world, "bob")
     fresh_mint = f"/v1/runners/{token_bound_runner_id(fresh)}/token"
     assert private.post(fresh_mint, headers={RUNNER_TUNNEL_TOKEN_HEADER: fresh}).status_code == 200
+
+
+# ── R2: an open personal-host tunnel and the client-credentials grant ──
+
+
+def test_an_open_host_tunnel_stays_ended_after_suspension_and_reinstatement(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bob's laptop tunnel, opened with his CLI sign-in, does not outlive his suspension.
+
+    The tunnel's checks are held until the owner has suspended and reinstated
+    Bob through the team page, so they run only after the reinstatement, when
+    Bob is active again: the tunnel still ends, and only a fresh sign-in
+    connects his laptop again.
+    """
+    real_heartbeat = HostStore.heartbeat
+    release = threading.Event()
+    checks: list[bool] = []
+
+    def held_heartbeat(self: HostStore, host_id: str, **kwargs: Any) -> bool:
+        release.wait(timeout=10)
+        kept = real_heartbeat(self, host_id, **kwargs)
+        checks.append(kept)
+        return kept
+
+    monkeypatch.setattr(HostStore, "heartbeat", held_heartbeat)
+    registry = world.app.state.host_registry  # type: ignore[attr-defined]
+    host_id = uuid.uuid4().hex
+    path = f"/v1/hosts/{host_id}/tunnel"
+    laptop = world.as_("bob-sub", "bob@example.test")
+    old_sign_in = {"Authorization": f"Bearer {world.tokens['bob']}"}
+    bob_id = world.member_id("bob")
+    owner = world.people["owner"]
+
+    with laptop.websocket_connect(path, headers=old_sign_in) as tunnel:
+        tunnel.send_text(_make_hello("bob-laptop"))
+        assert _wait_for(lambda: registry.get(host_id) is not None)
+        opened = registry.get(host_id)
+        assert owner.post(f"/v1/team/members/{bob_id}/suspend").status_code == 200
+        assert owner.post(f"/v1/team/members/{bob_id}/reinstate").status_code == 200
+        release.set()
+        # Woken by the change, the check ran after the reinstatement and ended the tunnel.
+        assert _wait_for(lambda: registry.get(host_id) is not opened)
+        assert checks[0] is False
+        received: list[str] = []
+        with pytest.raises(WebSocketDisconnect) as closed:
+            for _ in range(20):
+                received.append(tunnel.receive_text())
+        assert closed.value.code == 4009
+        assert any(REGISTRATION_REVOKED_REFUSAL in json.dumps(json.loads(m)) for m in received)
+
+    # The old sign-in cannot open it again; a fresh one can, and the tunnel stays.
+    assert not _opens(laptop, path, old_sign_in)
+    fresh = laptop.post("/auth/login", json={"username": "bob", "password": "bob-pw-1234"})
+    assert fresh.status_code == 200
+    with laptop.websocket_connect(
+        path, headers={"Authorization": f"Bearer {fresh.json()['token']}"}
+    ) as tunnel:
+        tunnel.send_text(_make_hello("bob-laptop"))
+        assert _wait_for(lambda: registry.get(host_id) is not None)
+        reconnected = registry.get(host_id)
+        done = len(checks)
+        authority_changed()
+        assert _wait_for(lambda: len(checks) > done)
+        assert checks[-1] is True and registry.get(host_id) is reconnected
+
+
+def test_the_client_credentials_grant_follows_the_same_person_rule(world: World) -> None:
+    # A machine's own request carries no sign-in: its dedicated identity gets a token.
+    issued = TestClient(world.app).post("/oauth/token", data=_MACHINE_GRANT)  # type: ignore[arg-type]
+    assert issued.status_code == 200 and issued.json()["access_token"]
+    # Under a person's sign-in it gets none: another person, an unbound one, a suspended one.
+    bob_id = world.member_id("bob")
+    assert world.people["owner"].post(f"/v1/team/members/{bob_id}/suspend").status_code == 200
+    for signed_in in (
+        world.as_("alice-sub", "alice@example.test"),
+        world.as_("stranger-sub", "stranger@example.test"),
+        world.as_("bob-sub", "bob@example.test"),
+    ):
+        refused = signed_in.post("/oauth/token", data=_MACHINE_GRANT)
+        assert refused.status_code == 400 and refused.json()["error"] == "access_denied"
+        assert "access_token" not in refused.json()
+
+
+@pytest.mark.parametrize("world", ["bob"], indirect=True)
+def test_a_client_credentials_subject_that_is_a_member_gets_no_token(world: World) -> None:
+    """A machine client configured as Bob never acts as Bob, with or without his sign-in."""
+
+    def refused(client: TestClient) -> bool:
+        answer = client.post("/oauth/token", data=_MACHINE_GRANT)
+        return answer.status_code == 400 and answer.json()["error"] == "unauthorized_client"
+
+    assert refused(TestClient(world.app))  # type: ignore[arg-type]
+    assert refused(world.as_("bob-sub", "bob@example.test"))
+    bob_id = world.member_id("bob")
+    assert world.people["owner"].post(f"/v1/team/members/{bob_id}/suspend").status_code == 200
+    assert refused(TestClient(world.app))  # type: ignore[arg-type]
+    assert refused(world.as_("bob-sub", "bob@example.test"))
 
 
 # ── R1: the founding binding is one-time (F-3) ──

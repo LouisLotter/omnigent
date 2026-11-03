@@ -75,6 +75,13 @@ own every tenant's session. The machine ``sub`` must therefore be a distinct,
 non-admin principal — vetted at mount and again on every mint, so promoting it
 to admin later stops new tokens instead of waiting for a restart.
 
+It must also be a dedicated identity, never a person's: a ``sub`` with an
+account (every team member has one) is refused at mount and on every mint, so
+its tokens never act as a person or a member, whose suspension they would
+otherwise outlive. Behind an identity-aware proxy, a request carrying the
+proxy's sign-in gets a token only when that sign-in is the ``sub``'s own, which
+for a dedicated identity it never is; a machine's own request carries none.
+
 See ``designs/CLIENT_CREDENTIALS.md`` for the full design + threat model.
 """
 
@@ -103,6 +110,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.device_grant_store import hash_secret
+from omnigent.server.external_identity import machine_refusal_for_user
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
     RATE_LIMITER_MAX_KEYS,
@@ -135,11 +143,6 @@ _TOKEN_ENDPOINT_REALM = "omnigent"
 # token endpoint, so it never throttles a login grant's refresh traffic.
 _TOKEN_RATE_MAX = 10  # max token requests…
 _TOKEN_RATE_WINDOW_SECONDS = 60  # …per client IP per this window.
-
-# Bound on the mount-time roster scan behind the dedicated-identity warning.
-# Advisory only: a deploy with more users than this may not spot a match, which
-# leaves the warning unsaid rather than changing what the grant does.
-_ACCOUNT_SCAN_LIMIT = 1000
 
 _CLIENT_ID_ENV = "OMNIGENT_MACHINE_CLIENT_ID"
 _CLIENT_SECRET_HASH_ENV = "OMNIGENT_MACHINE_CLIENT_SECRET_HASH"
@@ -315,80 +318,55 @@ def _invalid_client(request: Request) -> JSONResponse:
 class _SubVerdict(str, Enum):
     """Outcome of vetting the machine principal against the permission store.
 
-    ``ADMIN`` and ``UNVERIFIABLE`` both refuse the grant, but they are separate
-    values so a caller's log can name the cause it actually hit: a store that
-    could not answer is not an admin principal, and reporting it as one sends
-    the operator to audit config that is fine.
+    ``ADMIN``, ``PERSON`` and ``UNVERIFIABLE`` all refuse the grant, but they
+    are separate values so a caller's log can name the cause it actually hit: a
+    store that could not answer is not an admin principal, and reporting it as
+    one sends the operator to audit config that is fine.
     """
 
     OK = "ok"
     ADMIN = "admin"
+    PERSON = "person"
     UNVERIFIABLE = "unverifiable"
 
 
 def _vet_machine_sub(permission_store: PermissionStore | None, sub: str) -> _SubVerdict:
-    """Vet the machine *sub* against the ``is_admin`` → OWNER override.
+    """Vet the machine *sub*: a dedicated, non-admin identity, never a person's.
 
     The path allowlist confines a machine token to the session APIs but does
     not limit its privilege there: /v1/sessions grants ``LEVEL_OWNER`` to any
     ``is_admin`` identity, so an admin ``sub`` would own every tenant's
-    session. Enabling such a client is a misconfiguration, checked at mount and
-    again before every mint.
+    session. A ``sub`` with an account is a person's (every team member has
+    one): its tokens would act as that person and skip the checks a person's
+    credentials get, such as a team suspension. Either is a misconfiguration,
+    checked at mount and again before every mint. Using a machine token never
+    creates an account, so a dedicated ``sub`` stays one.
 
     :param permission_store: The permission store, or ``None`` when the deploy
         has none — the store-backed override cannot fire then, so the sub is
         ``OK``.
     :param sub: The configured machine principal.
     :returns: ``OK`` when the sub may be granted, ``ADMIN`` when it inherits
-        the override, ``UNVERIFIABLE`` when the store could not answer. The
-        last fails closed: a machine client we cannot vet gets no token.
+        the override, ``PERSON`` when it names an account, ``UNVERIFIABLE``
+        when the store could not answer. The last fails closed: a machine
+        client we cannot vet gets no token.
     """
     if permission_store is None:
         return _SubVerdict.OK
     try:
         is_admin = permission_store.is_admin(sub)
+        has_account = permission_store.user_exists(sub)
     except Exception:
         _logger.exception(
-            "client-credentials: the permission store could not answer whether %s=%r is an admin",
+            "client-credentials: the permission store could not answer whether %s=%r is "
+            "an admin or an existing account",
             _SUB_ENV,
             sub,
         )
         return _SubVerdict.UNVERIFIABLE
-    return _SubVerdict.ADMIN if is_admin else _SubVerdict.OK
-
-
-def _warn_if_sub_is_a_real_account(permission_store: PermissionStore | None, sub: str) -> None:
-    """Warn at mount when the machine principal is an identity a human uses.
-
-    Nothing forces ``OMNIGENT_MACHINE_SUB`` to be a *dedicated* identity, so
-    pointing it at a real person's address silently mints tokens acting as that
-    person. The roster scan is bounded and advisory — a store fault or a deploy
-    larger than :data:`_ACCOUNT_SCAN_LIMIT` just leaves the warning unsaid.
-    """
-    if permission_store is None:
-        return
-    try:
-        accounts = permission_store.list_users(limit=_ACCOUNT_SCAN_LIMIT)
-    except Exception:
-        _logger.debug(
-            "client-credentials: could not scan the roster to check whether %s=%r is a "
-            "real account",
-            _SUB_ENV,
-            sub,
-            exc_info=True,
-        )
-        return
-    if not any(account.id == sub for account in accounts):
-        return
-    _logger.warning(
-        "client-credentials: %s=%r is an existing account. Tokens minted by this "
-        "grant will act as that identity, and its session history and grants are "
-        "indistinguishable from the machine client's. Point %s at a dedicated "
-        "principal that no human logs in as.",
-        _SUB_ENV,
-        sub,
-        _SUB_ENV,
-    )
+    if is_admin:
+        return _SubVerdict.ADMIN
+    return _SubVerdict.PERSON if has_account else _SubVerdict.OK
 
 
 def create_client_credentials_handler(
@@ -455,12 +433,23 @@ def create_client_credentials_handler(
             _SUB_ENV,
         )
         return None
+    if verdict is _SubVerdict.PERSON:
+        _logger.error(
+            "client-credentials: %s=%r is an existing account, a person's or a team "
+            "member's; refusing to enable the machine grant. Its tokens would act as "
+            "that person without the checks a person's credentials get, such as a "
+            "team suspension. Point %s at a dedicated principal that no one signs in as.",
+            _SUB_ENV,
+            config.sub,
+            _SUB_ENV,
+        )
+        return None
     if verdict is _SubVerdict.UNVERIFIABLE:
         _logger.error(
             "client-credentials: the permission store could not say whether %s=%r "
-            "is an admin (traceback above); refusing to enable the machine grant "
-            "rather than allow an unvetted principal. This is a store fault, not "
-            "necessarily a bad %s — retry once the store answers.",
+            "is an admin or an existing account (traceback above); refusing to "
+            "enable the machine grant rather than allow an unvetted principal. This "
+            "is a store fault, not necessarily a bad %s — retry once the store answers.",
             _SUB_ENV,
             config.sub,
             _SUB_ENV,
@@ -474,7 +463,6 @@ def create_client_credentials_handler(
             _SUB_ENV,
             config.sub,
         )
-    _warn_if_sub_is_a_real_account(permission_store, config.sub)
     _logger.info(
         "client-credentials: grant_type=client_credentials enabled on /oauth/token "
         "for client_id=%s (sub=%s); cookie_secret keys both %s verification and "
@@ -493,8 +481,10 @@ def create_client_credentials_handler(
         """Exchange machine client credentials for a delegated token.
 
         The principal is re-vetted once the client has authenticated, so
-        promoting the machine ``sub`` to admin stops new tokens without a
-        restart (issued ones are bounded by the TTL).
+        promoting the machine ``sub`` to admin, or an account taking its name,
+        stops new tokens without a restart (issued ones are bounded by the TTL).
+        A request carrying an identity-aware proxy's sign-in gets a token only
+        when that sign-in is the ``sub``'s own.
         """
         # Ahead of the credential comparison: a limiter that only counted
         # failed authentications would still answer the guess that happened to
@@ -521,15 +511,34 @@ def create_client_credentials_handler(
                 config.sub,
             )
             return oauth_error("unauthorized_client")
-        if verdict is _SubVerdict.UNVERIFIABLE:
+        if verdict is _SubVerdict.PERSON:
             _logger.error(
-                "oauth/token: refusing to mint for %s=%r — the permission store "
-                "could not say whether the principal is an admin (traceback "
-                "above), so the grant fails closed until it answers",
+                "oauth/token: refusing to mint for %s=%r — the principal is an "
+                "existing account, a person's or a team member's, and a machine "
+                "token must never act as a person",
                 _SUB_ENV,
                 config.sub,
             )
             return oauth_error("unauthorized_client")
+        if verdict is _SubVerdict.UNVERIFIABLE:
+            _logger.error(
+                "oauth/token: refusing to mint for %s=%r — the permission store "
+                "could not say whether the principal is an admin or an existing "
+                "account (traceback above), so the grant fails closed until it answers",
+                _SUB_ENV,
+                config.sub,
+            )
+            return oauth_error("unauthorized_client")
+        # Behind an identity-aware proxy: another person's sign-in gets no token.
+        refusal = machine_refusal_for_user(request, config.sub)
+        if refusal is not None:
+            _logger.warning(
+                "oauth/token: refusing to mint for %s=%r under another sign-in (%s)",
+                _SUB_ENV,
+                config.sub,
+                refusal,
+            )
+            return oauth_error("access_denied")
 
         access_token = mint_delegated_token(
             config.sub,

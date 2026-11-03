@@ -498,17 +498,25 @@ def test_suspension_clears_launch_tokens_and_retires_runner_bindings(stores) -> 
     conversations.replace_runner_id(thread.id, "runner-bob")
     assert hosts.runner_binding("runner-bob") is not None
 
+    opened = {"owner": "bob", "generation": generation}
+    assert hosts.heartbeat(external, by_bearer=True, **opened) is True
+
     stores["accounts"].change_member_state(bob, "suspended")
     assert hosts.resolve_launch_token(managed, token) is None
     assert hosts.runner_binding("runner-bob") is None
-    assert hosts.heartbeat(external, owner="bob") is False
+    assert hosts.heartbeat(external, by_bearer=True, **opened) is False
 
     stores["accounts"].change_member_state(bob, "active")
     # Nothing issued before the suspension works again; the records stay.
     assert hosts.resolve_launch_token(managed, token) is None
     assert hosts.runner_binding("runner-bob") is None
     assert hosts.get_host(managed) is not None and hosts.get_host(external) is not None
-    assert hosts.heartbeat(external, owner="bob") is True
+    # The tunnel opened before the suspension stays ended; one opened under
+    # Bob's new registration (a fresh sign-in) is current.
+    assert hosts.heartbeat(external, by_bearer=True, **opened) is False
+    current = SqlAlchemyAccountStore(stores["db_uri"]).get_user("bob").account_generation
+    assert current != generation
+    assert hosts.heartbeat(external, by_bearer=True, owner="bob", generation=current) is True
 
 
 # ── R1: admission (P-2, P-3) ───────────────────────────────────────

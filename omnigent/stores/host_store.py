@@ -557,6 +557,24 @@ def _held_by_an_earlier_registration() -> ColumnElement[bool]:
     )
 
 
+def _owner_registration_is(generation: str) -> ColumnElement[bool]:
+    """Whether a host row's owner is still on registration *generation*, undeleted.
+
+    Correlated with :class:`SqlHost`. A password reset or a team suspension
+    rotates the registration, and a reinstatement never restores an old one.
+    """
+    return (
+        select(SqlUser.id)
+        .where(
+            SqlUser.workspace_id == SqlHost.workspace_id,
+            SqlUser.id == SqlHost.user_id,
+            SqlUser.deleted_at.is_(None),
+            SqlUser.account_generation == generation,
+        )
+        .exists()
+    )
+
+
 class HostStore:
     """
     Persistent store for host registrations backed by SQLAlchemy.
@@ -1038,6 +1056,7 @@ class HostStore:
         by_bearer: bool = False,
         launch_token: str | None = None,
         owner: str | None = None,
+        generation: str | None = None,
     ) -> bool:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
@@ -1063,11 +1082,17 @@ class HostStore:
             ends once the host is removed, belongs to someone else, or is held
             by an earlier registration of its owner (as
             :meth:`get_actual_host_owner` decides). A password change carries the
-            host to the new registration, so it does not end the tunnel.
+            host to the new registration, so this alone does not end the tunnel.
+        :param generation: With *owner*, the registration the tunnel's own
+            credential was issued under, for a tunnel a person's sign-in opened.
+            Such a tunnel ends once the owner's registration changes (a password
+            reset or a team suspension rotates it), and a reinstatement never
+            makes it current again: an open socket is not lasting authority.
         :returns: ``False`` when the tunnel must end: *by_bearer* is set and
             the host has become launch-token-only, *launch_token* is no
-            longer the host's token, or the host no longer belongs to
-            *owner*'s current registration. ``True`` otherwise.
+            longer the host's token, the host no longer belongs to *owner*'s
+            current registration, or that registration is no longer
+            *generation*. ``True`` otherwise.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
@@ -1090,6 +1115,8 @@ class HostStore:
                 statement = statement.where(
                     SqlHost.user_id == owner, ~_held_by_an_earlier_registration()
                 )
+                if generation is not None:
+                    statement = statement.where(_owner_registration_is(generation))
             if launch_token is not None or owner is not None:
                 # A suspended owner's host tunnel ends at its next heartbeat.
                 statement = statement.where(~owner_suspended_clause(SqlHost.user_id))

@@ -238,13 +238,10 @@ async def test_host_tunnel_ends_once_its_host_is_removed(
     """T7: a removed computer's open tunnel ends at its next heartbeat."""
     monkeypatch.setattr(host_tunnel, "PING_INTERVAL_S", _FAST)
     monkeypatch.setattr(host_tunnel, "PING_MISS_THRESHOLD", 100_000)
-    admin, alice, _bob, stores = people
+    _admin, alice, _bob, stores = people
     host_id = uuid.uuid4().hex
     connection = await _host_tunnel(alice.app, alice, host_id)
     try:
-        # A password change carries the host to the new registration: it stays.
-        reset = await asyncio.to_thread(admin.post, "/auth/users/alice/reset")
-        assert reset.status_code == 200, reset.text
         await asyncio.sleep(0.3)
         assert alice.app.state.host_registry.get(host_id) is not None
 
@@ -255,6 +252,33 @@ async def test_host_tunnel_ends_once_its_host_is_removed(
             await connection.send_input({"type": "websocket.disconnect", "code": 1000})
     assert code == 4009
     assert any(REGISTRATION_REVOKED_REFUSAL in text for text in texts), texts
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_password_reset_ends_a_host_tunnel_its_sign_in_opened(
+    people: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sign-in behind a laptop's tunnel ends with the reset, and so does the tunnel.
+
+    The host row moves to the new registration and stays; the tunnel opened
+    under the old one does not, so only a new sign-in connects the laptop again.
+    """
+    monkeypatch.setattr(host_tunnel, "PING_INTERVAL_S", _FAST)
+    monkeypatch.setattr(host_tunnel, "PING_MISS_THRESHOLD", 100_000)
+    admin, alice, _bob, stores = people
+    host_id = uuid.uuid4().hex
+    connection = await _host_tunnel(alice.app, alice, host_id)
+    try:
+        reset = await asyncio.to_thread(admin.post, "/auth/users/alice/reset")
+        assert reset.status_code == 200, reset.text
+        code, texts = await _until_closed(connection)
+    finally:
+        with contextlib.suppress(Exception):
+            await connection.send_input({"type": "websocket.disconnect", "code": 1000})
+    assert code == 4009
+    assert any(REGISTRATION_REVOKED_REFUSAL in text for text in texts), texts
+    assert stores["host_store"].get_host(host_id) is not None
 
 
 def test_heartbeat_holds_only_the_owners_current_registration(db_uri: str) -> None:
