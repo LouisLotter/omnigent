@@ -25,18 +25,24 @@ import time
 import uuid
 from collections.abc import Iterable, Sequence
 from enum import IntEnum
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from sqlalchemy import CursorResult, and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.account_authority import lock_account
+from omnigent.db.account_authority import (
+    current_account_user,
+    lock_account,
+    require_active_account,
+)
 from omnigent.db.db_models import (
     SqlApprovalResource,
     SqlApprovalVerdict,
     SqlApproverGrant,
     SqlProtectedPolicy,
+    SqlSessionPermission,
+    SqlUser,
     current_workspace_id,
 )
 from omnigent.db.utils import (
@@ -383,6 +389,71 @@ def _lock_authority(session: Session) -> None:
     lock_team(session)
 
 
+@dataclasses.dataclass(frozen=True)
+class Acting:
+    """The authority the acting person must still hold when a write commits.
+
+    The route checks it first; the write checks it again inside its
+    transaction, after the team lock, so a request authorized before its
+    actor's account was deleted (or demoted) cannot complete afterwards.
+
+    :param role: ``"admin"`` (a team service or rule), ``"thread_owner"``
+        (the thread's actual owner) or ``"rule_owner"`` (a personal rule's
+        person).
+    :param thread_id: The thread, for ``"thread_owner"``.
+    :param owner_user_id: The rule's person, for ``"rule_owner"``.
+    """
+
+    role: Literal["admin", "thread_owner", "rule_owner"]
+    thread_id: str | None = None
+    owner_user_id: str | None = None
+
+
+def _require_acting(session: Session, acting: Acting | None) -> None:
+    """Validate the acting person's registration and authority under the locks.
+
+    The captured account generation of the request's actor is checked with
+    the ordered account lock discipline; then the role is read again. A
+    request without an accounts identity (authentication off, or a trusted
+    proxy) relies on the route's check.
+
+    :raises OmnigentError: ``UNAUTHORIZED`` when the actor's registration was
+        revoked; ``FORBIDDEN`` when the actor no longer holds the role.
+    """
+    require_active_account(session, None)
+    actor = current_account_user()
+    if acting is None or actor is None:
+        return
+    if acting.role == "admin":
+        row = session.get(SqlUser, (current_workspace_id(), actor))
+        if row is not None and (row.deleted_at is not None or not row.is_admin):
+            raise OmnigentError(
+                "Administrator privileges required to manage approvals",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return
+    if acting.role == "thread_owner":
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+
+        owners = session.execute(
+            select(SqlSessionPermission.user_id)
+            .where(
+                SqlSessionPermission.workspace_id == current_workspace_id(),
+                SqlSessionPermission.conversation_id == acting.thread_id,
+                SqlSessionPermission.level >= LEVEL_OWNER,
+                SqlSessionPermission.user_id != RESERVED_USER_PUBLIC,
+            )
+            .limit(2)
+        ).scalars()
+        if list(owners) != [actor]:
+            raise OmnigentError(
+                "Only the thread's owner names its approvers.", code=ErrorCode.FORBIDDEN
+            )
+        return
+    if acting.owner_user_id != actor:
+        raise OmnigentError("Protected policy not found", code=ErrorCode.NOT_FOUND)
+
+
 def _approvers_in(
     session: Session, resources: Iterable[ApprovalResource]
 ) -> list[ResourceApprovers]:
@@ -444,6 +515,15 @@ def _authority_fingerprints(
     return grants_fingerprint(approvers), rules_fingerprint(_rules_in(session, owner))
 
 
+def _acting_for(row: SqlProtectedPolicy, acting: Acting | None) -> Acting | None:
+    """The authority a change to *row* needs: its person's, or an administrator's."""
+    if acting is None:
+        return None
+    if row.domain == int(PolicyDomain.PERSONAL):
+        return Acting("rule_owner", owner_user_id=row.owner_user_id)
+    return Acting("admin")
+
+
 class SqlAlchemyApprovalStore:
     """SQLAlchemy persistence for approver grants, protected rules and verdicts.
 
@@ -476,7 +556,12 @@ class SqlAlchemyApprovalStore:
             return _authority_fingerprints(session, requirements, owner)
 
     def add_approver(
-        self, resource: ApprovalResource, user_id: str, *, granted_by: str | None
+        self,
+        resource: ApprovalResource,
+        user_id: str,
+        *,
+        granted_by: str | None,
+        acting: Acting | None = None,
     ) -> bool:
         """Name *user_id* an approver for *resource*; ``False`` if already named.
 
@@ -484,11 +569,14 @@ class SqlAlchemyApprovalStore:
         registers the username next. The account and team locks order this
         write with account deletion, which removes the account's grants.
 
-        :raises OmnigentError: ``INVALID_INPUT`` for a deleted account.
+        :param acting: The authority the actor must still hold (see :class:`Acting`).
+        :raises OmnigentError: ``INVALID_INPUT`` for a deleted account; see
+            :func:`_require_acting` for a revoked actor.
         """
 
         def write(session: Session) -> bool:
             _lock_authority(session)
+            _require_acting(session, acting)
             account = lock_account(session, user_id)
             if account is not None and account.deleted_at is not None:
                 raise OmnigentError(f"no account {user_id!r}", code=ErrorCode.INVALID_INPUT)
@@ -515,11 +603,14 @@ class SqlAlchemyApprovalStore:
 
         return run_write_transaction(self._session_immediate, "insert_approver_grant", write)
 
-    def remove_approver(self, resource: ApprovalResource, user_id: str) -> bool:
+    def remove_approver(
+        self, resource: ApprovalResource, user_id: str, *, acting: Acting | None = None
+    ) -> bool:
         """Stop *user_id* approving for *resource*; ``False`` if they were not named."""
 
         def write(session: Session) -> bool:
             _lock_authority(session)
+            _require_acting(session, acting)
             result = cast(
                 "CursorResult[Any]",
                 session.execute(
@@ -535,12 +626,18 @@ class SqlAlchemyApprovalStore:
         return run_write_transaction(self._session_immediate, "delete_approver_grant", write)
 
     def set_allow_initiator(
-        self, resource: ApprovalResource, value: bool | None, *, updated_by: str | None
+        self,
+        resource: ApprovalResource,
+        value: bool | None,
+        *,
+        updated_by: str | None,
+        acting: Acting | None = None,
     ) -> None:
         """Save whether the initiator may approve for *resource*; ``None`` restores the default."""
 
         def write(session: Session) -> None:
             _lock_authority(session)
+            _require_acting(session, acting)
             row = session.get(SqlApprovalResource, (current_workspace_id(), resource.cksum))
             if row is None:
                 session.add(
@@ -586,12 +683,24 @@ class SqlAlchemyApprovalStore:
         approval: ApprovalResource | None,
         created_by: str | None,
         enabled: bool = True,
+        acting: Acting | None = None,
     ) -> ProtectedRule:
-        """Create a protected rule."""
+        """Create a protected rule.
+
+        A personal rule's person must be a live account: a rule written for a
+        deleted username would govern whoever registers it next.
+        """
         _validate_rule_target(domain, owner_user_id, approval)
 
         def write(session: Session) -> ProtectedRule:
             _lock_authority(session)
+            _require_acting(session, acting)
+            if owner_user_id is not None:
+                owner = lock_account(session, owner_user_id)
+                if owner is not None and owner.deleted_at is not None:
+                    raise OmnigentError(
+                        f"no account {owner_user_id!r}", code=ErrorCode.INVALID_INPUT
+                    )
             now = _now()
             row = SqlProtectedPolicy(
                 id=uuid.uuid4().hex,
@@ -626,6 +735,7 @@ class SqlAlchemyApprovalStore:
         name: str | None = None,
         factory_params: dict[str, Any] | None = None,
         enabled: bool | None = None,
+        acting: Acting | None = None,
     ) -> ProtectedRule | None:
         """Change a rule's name, arguments or enabled flag; ``None`` if missing."""
 
@@ -634,6 +744,7 @@ class SqlAlchemyApprovalStore:
             row = session.get(SqlProtectedPolicy, (current_workspace_id(), rule_id))
             if row is None:
                 return None
+            _require_acting(session, _acting_for(row, acting))
             if name is not None:
                 row.name = name
             if factory_params is not None:
@@ -647,11 +758,15 @@ class SqlAlchemyApprovalStore:
 
         return run_write_transaction(self._session_immediate, "update_protected_policy", write)
 
-    def delete_rule(self, rule_id: str) -> bool:
+    def delete_rule(self, rule_id: str, *, acting: Acting | None = None) -> bool:
         """Delete a rule; ``False`` if it did not exist."""
 
         def write(session: Session) -> bool:
             _lock_authority(session)
+            row = session.get(SqlProtectedPolicy, (current_workspace_id(), rule_id))
+            if row is None:
+                return False
+            _require_acting(session, _acting_for(row, acting))
             result = cast(
                 "CursorResult[Any]",
                 session.execute(
@@ -924,6 +1039,7 @@ def _refusal(record: VerdictRecord | None, binding_digest: bytes, now: int) -> s
 __all__ = [
     "MAX_OUTCOME_BODY_CHARS",
     "TEAM_RESOURCE",
+    "Acting",
     "ApprovalResource",
     "ConsumeResult",
     "Outcome",

@@ -30,6 +30,8 @@ class GithubConnection:
     :param created_at: Unix epoch seconds the connection was first made.
     :param updated_at: Unix epoch seconds of the last token refresh /
         reconnect.
+    :param login_marker: This login instance's identity: a reconnect changes
+        it, a token refresh keeps it (see ``ProviderConnection.login_marker``).
     """
 
     user_id: str
@@ -42,3 +44,4 @@ class GithubConnection:
     scopes: str
     created_at: int
     updated_at: int
+    login_marker: str | None = None

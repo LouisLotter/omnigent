@@ -391,6 +391,8 @@ class PolicyEngine:
         ctx = self._inject_llm_client(ctx)
         ctx = self._inject_conversation_id(ctx)
         ctx = self._inject_conversation_title(ctx)
+        # The call as posted: what a gate that cannot apply transforms executes.
+        posted_content = ctx.content
 
         for policy in self.policies:
             if not self._should_fire(policy.spec, ctx):
@@ -429,7 +431,7 @@ class PolicyEngine:
                 deciding_ask_policies.append(policy.spec.name)
 
         # Protected rules run last, on the final content, and only restrict.
-        protected = await self._evaluate_protected(ctx, composed_data, context)
+        protected = await self._evaluate_protected(ctx, composed_data, posted_content, context)
         if protected.deny is not None:
             return self._compose_deny(
                 protected.deny[0],
@@ -474,22 +476,41 @@ class PolicyEngine:
         )
 
     async def _evaluate_protected(
-        self, ctx: EvaluationContext, composed_data: Any, context: dict[str, Any]
+        self,
+        ctx: EvaluationContext,
+        composed_data: Any,
+        posted_content: Any,
+        context: dict[str, Any],
     ) -> Any:
-        """Run the protected rules on the final content with trusted facts only."""
+        """Run the protected rules on what will execute, with trusted facts only.
+
+        Where the server itself executes the transformed call (the MCP
+        gateway, ``ctx.transforms_applied``), that call is judged. Elsewhere
+        the caller decides whether to apply a transform (native hooks never
+        do; the runner's harness proxy may), so both the posted call and the
+        transformed one are judged: whichever runs passed the protected rules.
+        """
         from omnigent.runtime.policies.protected import ProtectedVerdict
 
         if not self.protected_policies:
             return ProtectedVerdict(None, [])
-        final = (
-            canonical_tool_call(ctx.tool_name, ctx.content, composed_data)
-            if ctx.phase == Phase.TOOL_CALL
-            else (composed_data if composed_data is not None else ctx.content)
-        )
         facts = protected_facts(ctx, self._protected_owner, self._conversation_id)
-        return await evaluate_protected(
-            self.protected_policies, protected_context(ctx, final, facts), context
-        )
+        candidates = [_final_content(ctx, composed_data, posted_content)]
+        if not ctx.transforms_applied and composed_data is not None:
+            posted = _final_content(ctx, None, posted_content)
+            if posted != candidates[0]:
+                candidates.insert(0, posted)
+        verdicts = [
+            await evaluate_protected(
+                self.protected_policies, protected_context(ctx, content, facts), context
+            )
+            for content in candidates
+        ]
+        deny = next((v.deny for v in verdicts if v.deny is not None), None)
+        asks: list[tuple[str, str, ApprovalNeed]] = []
+        for verdict in verdicts:
+            asks += [ask for ask in verdict.asks if ask[0] not in {a[0] for a in asks}]
+        return ProtectedVerdict(deny, asks)
 
     def _compose_deny(
         self,
@@ -1174,6 +1195,13 @@ async def _dispatch_policy(
             set_labels=None,
         )
     return result
+
+
+def _final_content(ctx: EvaluationContext, composed_data: Any, posted_content: Any) -> Any:
+    """The content a protected rule judges: one canonical shape for a tool call."""
+    if ctx.phase == Phase.TOOL_CALL:
+        return canonical_tool_call(ctx.tool_name, posted_content, composed_data)
+    return composed_data if composed_data is not None else posted_content
 
 
 def protected_facts(

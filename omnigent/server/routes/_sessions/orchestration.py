@@ -2796,25 +2796,23 @@ async def _native_gate_subject(
     session_id: str,
     phase: Phase,
     data: object,
-    result: PolicyResult | None,
     conversation_store: ConversationStore,
 ) -> ApprovalSubject:
-    """What a server-held ASK gate's approval is bound to.
+    """What a server-held ASK gate's approval is bound to: the call as posted.
 
-    :param result: The composed ASK, or ``None`` when checking a re-posted
-        question before evaluating it (its final content is then unknown).
+    A native or request gate cannot apply a policy's transform, so the
+    posted call is what runs (protected rules judged it, see
+    :meth:`PolicyEngine._evaluate_protected`).
     """
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     labels = conv.labels if conv is not None else {}
     tool_name = data.get("name") if phase == Phase.TOOL_CALL and isinstance(data, dict) else None
-    if phase == Phase.TOOL_CALL:
-        content: object = canonical_tool_call(
-            tool_name if isinstance(tool_name, str) else None,
-            data,
-            result.data if result is not None else None,
-        )
-    else:
-        content = result.data if result is not None and result.data is not None else data
+    # A native or request gate executes the call as posted, never a transform.
+    content: object = (
+        canonical_tool_call(tool_name if isinstance(tool_name, str) else None, data, None)
+        if phase == Phase.TOOL_CALL
+        else data
+    )
     return ApprovalSubject(
         session_id=session_id,
         phase=phase.value,
@@ -2843,9 +2841,7 @@ async def _replayed_gate_answer_allowed(
 
     if get_approval_store() is None:
         return True
-    subject = await _native_gate_subject(
-        request, session_id, phase, data, None, conversation_store
-    )
+    subject = await _native_gate_subject(request, session_id, phase, data, conversation_store)
     matches = await replay_matches(
         request, conversation_store, subject, elicitation_id=elicitation_id
     )
@@ -2956,7 +2952,7 @@ async def _hold_native_ask_gate_impl(
     from omnigent.runtime import get_approval_store
 
     subject = (
-        await _native_gate_subject(request, session_id, phase, data, result, conversation_store)
+        await _native_gate_subject(request, session_id, phase, data, conversation_store)
         if get_approval_store() is not None and not approval_owned_by_call
         else None
     )
@@ -10564,7 +10560,10 @@ async def _evaluate_tool_call_policy(
             session_id=session_id,
             phase=Phase.TOOL_CALL.value,
             tool_name=tool_name,
-            content=result.data if result.data is not None else args_payload,
+            # The runner executes the call as posted; the relay never sends a transform.
+            content=canonical_tool_call(
+                tool_name, {"name": tool_name, "arguments": args_payload}, None
+            ),
             initiator=turn_initiator(
                 request, conv.labels.get(_TURN_ACTOR_LABEL), (actor or {}).get("run_as")
             ),
@@ -12952,38 +12951,60 @@ def _mcp_destination(
     return config.name if config is not None else None
 
 
-def _registry_connection_generation(
-    request: Request | None, service_id: str, credential_user: str | None
-) -> str | None:
-    """The generation of the login a registry call would use.
+@dataclasses.dataclass(frozen=True)
+class _LoginSnapshot:
+    """One read of the login a registry call would use.
 
-    Changes when an administrator changes the service's destination or login
-    type, or when the person disconnects and connects again.
+    :param generation: The service's version, the user and the login's
+        identity together; an approval is bound to it.
+    :param marker: The login's identity alone (``None`` without a login),
+        the value pinned for the call.
+    """
+
+    generation: str
+    marker: str | None
+
+
+def _registry_login_snapshot(
+    request: Request | None, service_id: str, credential_user: str | None
+) -> _LoginSnapshot | None:
+    """Read, once, the login a registry call would use.
+
+    The generation changes when an administrator changes the service's
+    destination or login type, or when the person reconnects (a new login
+    id); a token refresh keeps it. A GitHub or Databricks service uses the
+    person's provider login, so its identity is that login's.
     """
     registry = cast(
         "McpRegistry | None",
         getattr(request.app.state, "mcp_registry", None) if request is not None else None,
     )
     service = registry.lookup(service_id) if registry is not None else None
-    if registry is None or service is None:
+    if registry is None or service is None or request is None:
         return None
     version = getattr(service, "credential_version", None) or canonical_digest(
         [service.url, service.auth]
     )
-    marker = _registry_login_marker(registry, service_id, credential_user)
-    return f"{service_id}:{version}:{credential_user}:{marker}"
+    marker: str | None = None
+    if credential_user and service.auth in ("github", "databricks"):
+        provider_store = getattr(request.app.state, f"{service.auth}_store", None)
+        marker = provider_store.login_marker(credential_user) if provider_store else None
+    elif credential_user and registry.store is not None:
+        login = registry.store.get(credential_user, f"mcp:{service_id}")
+        marker = login.login_marker() if login is not None else None
+    return _LoginSnapshot(f"{service_id}:{version}:{credential_user}:{marker}", marker)
 
 
-def _registry_login_marker(
-    registry: McpRegistry, service_id: str, credential_user: str | None
-) -> str | None:
-    """The identity of the login a registry call would use, or ``None`` without one."""
-    login = (
-        registry.store.get(credential_user, f"mcp:{service_id}")
-        if registry.store is not None and credential_user
-        else None
-    )
-    return login.login_marker() if login is not None else None
+def _gateway_cannot_honour_approvals(request: Request | None) -> bool:
+    """Whether the configured MCP gateway backend cannot honour an approval's login.
+
+    The built-in backend resolves credentials through the registry, which
+    enforces the pinned login. A custom backend uses its own credentials; it
+    is trusted with an approved call only when it declares that it enforces
+    :func:`omnigent.server.mcp_registry.current_pinned_login`.
+    """
+    backend = getattr(request.app.state, "mcp_gateway_backend", None) if request else None
+    return backend is not None and getattr(backend, "enforces_pinned_login", False) is not True
 
 
 async def _recheck_protected_before_effect(
@@ -13216,13 +13237,14 @@ async def _handle_mcp_tools_call_once(
     # Protected facts come from server state only: the configured service, its
     # login's generation, the authenticated principal and the turn's initiator.
     destination = _mcp_destination(request, spec, namespaced_name, execute_tool)
-    connection = (
-        await asyncio.to_thread(
-            _registry_connection_generation, request, destination, credential_user
-        )
+    # One read of the login: bound into any approval, compared again before
+    # sending, and the very login pinned for the call.
+    login = (
+        await asyncio.to_thread(_registry_login_snapshot, request, destination, credential_user)
         if destination is not None
         else None
     )
+    connection = login.generation if login is not None else None
     # A runner acts for the owner; the turn's initiator is the server-recorded
     # turn actor, whatever optional headers the runner sends.
     initiator = turn_initiator(
@@ -13268,6 +13290,8 @@ async def _handle_mcp_tools_call_once(
             tool_name=namespaced_name,
             actor=actor,
             protected=facts,
+            # The gateway sends the transformed arguments itself.
+            transforms_applied=True,
         )
         engine, retry_result = await _evaluate_policy_with_fresh_engine(
             session_id, spec, conversation_store, conv, retry_ctx
@@ -13377,6 +13401,8 @@ async def _handle_mcp_tools_call_once(
             tool_name=namespaced_name,
             actor=actor,
             protected=facts,
+            # The gateway sends the transformed arguments itself.
+            transforms_applied=True,
         )
         engine, call_result = await _evaluate_policy_with_fresh_engine(
             session_id, spec, conversation_store, conv, call_ctx
@@ -13505,25 +13531,26 @@ async def _handle_mcp_tools_call_once(
     )
     if refusal is not None:
         return _mcp_error_response(rpc_id, -32000, refusal)
-    login_marker: str | None = None
     if destination is not None:
-        # The login is pinned: the one the call was evaluated (and approved) for.
-        if (
-            await asyncio.to_thread(
-                _registry_connection_generation, request, destination, credential_user
-            )
-            != connection
-        ):
+        current = await asyncio.to_thread(
+            _registry_login_snapshot, request, destination, credential_user
+        )
+        if (current.generation if current is not None else None) != connection:
             return _mcp_error_response(
                 rpc_id,
                 -32000,
                 "The service's login changed after this call was checked; ask again",
             )
-        registry = cast("McpRegistry", request.app.state.mcp_registry) if request else None
-        if registry is not None:
-            login_marker = await asyncio.to_thread(
-                _registry_login_marker, registry, destination, credential_user
+        if "record" in approval_use and _gateway_cannot_honour_approvals(request):
+            return _mcp_error_response(
+                rpc_id,
+                -32000,
+                "This server's MCP gateway backend cannot bind an approved call to the "
+                "approved login, so approved calls through it are refused",
             )
+    # Pinned: the login read when this call was checked (and, if approved,
+    # the one its approval is bound to), never a later read.
+    login_marker = login.marker if login is not None else None
     # An approved call runs only on its runner connection; the tunnel transport
     # refuses every runner request of this call on any other one.
     pinned: dict[str, Any] = (
@@ -13698,6 +13725,8 @@ async def _handle_mcp_tools_call_once(
         tool_name=namespaced_name,
         request_data={"name": namespaced_name, "arguments": arguments},
         actor=actor,
+        # The gateway returns the transformed result itself.
+        transforms_applied=True,
     )
     engine, result_policy = await _evaluate_policy_with_fresh_engine(
         session_id, spec, conversation_store, conv, result_ctx

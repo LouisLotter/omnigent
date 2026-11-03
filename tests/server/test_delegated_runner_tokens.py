@@ -53,6 +53,8 @@ def tracker(setup_app: Any) -> AsyncMock:
     backend.call_tool.return_value = CallToolResult(
         content=[TextContent(type="text", text="posted")]
     )
+    # A test double with no credentials of its own: it honours any pinned login.
+    backend.enforces_pinned_login = True
     alice.app.state.mcp_gateway_backend = backend
     return backend
 

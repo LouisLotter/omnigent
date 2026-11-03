@@ -22,6 +22,23 @@ from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 EntityT = TypeVar("EntityT")
 
 
+class LoginChangedError(Exception):
+    """The provider login is not the one an approved call was bound to."""
+
+
+def check_expected_login(login_marker: str | None, expected_login: str | None) -> None:
+    """Refuse a login other than *expected_login*.
+
+    :param login_marker: The read connection's marker, or ``None`` with no
+        connection.
+    :param expected_login: The approved login's marker, ``""`` when the call
+        was approved with no login, or ``None`` to skip the check.
+    :raises LoginChangedError: When they differ.
+    """
+    if expected_login is not None and (login_marker or "") != expected_login:
+        raise LoginChangedError
+
+
 class ConnectionStore(ABC, Generic[EntityT]):
     """Typed per-provider façade over the shared :class:`CredentialStore`.
 
@@ -48,6 +65,11 @@ class ConnectionStore(ABC, Generic[EntityT]):
         """
         conn = self._store.get(user_id, self._PROVIDER, with_secret=with_tokens)
         return self._to_entity(conn) if conn is not None else None
+
+    def login_marker(self, user_id: str) -> str | None:
+        """The identity of the user's current login, or ``None`` without one."""
+        conn = self._store.get(user_id, self._PROVIDER)
+        return conn.login_marker() if conn is not None else None
 
     def delete(self, user_id: str) -> bool:
         """Remove the user's connection for this provider. ``True`` if a row went."""

@@ -220,6 +220,10 @@ class EvaluationContext:
         "connection": "..."}``. Only protected rules see them, as
         ``event["context"]["protected"]``; never sourced from labels or
         session state.
+    :param transforms_applied: The enforcement site executes the transformed
+        content itself (the MCP gateway). ``False`` where the caller decides
+        whether to apply a transform; protected rules then judge the posted
+        content as well as the transformed one.
     """
 
     phase: Phase
@@ -239,6 +243,7 @@ class EvaluationContext:
     conversation_title: str | None = None
     turn_final: bool | None = None
     protected: dict[str, object] | None = None
+    transforms_applied: bool = False
 
 
 @dataclass(frozen=True)

@@ -37,6 +37,7 @@ from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.stores import ConversationStore
 from omnigent.stores.approval_store import (
     TEAM_RESOURCE,
+    Acting,
     ApprovalResource,
     PolicyDomain,
     ProtectedRule,
@@ -137,6 +138,13 @@ def _validate_handler(handler: str, factory_params: dict[str, Any] | None) -> No
     problem = validate_factory_params(handler, factory_params)
     if problem:
         raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
+
+
+def _acting(resource: ApprovalResource) -> Acting:
+    """The authority a change to *resource* needs, rechecked inside the write."""
+    if resource.kind is ResourceKind.SESSION:
+        return Acting("thread_owner", thread_id=resource.resource_id)
+    return Acting("admin")
 
 
 def create_approvals_router(
@@ -268,7 +276,9 @@ def create_approvals_router(
         resource = _resource(body.kind, body.resource_id)
         manager = await _resource_manager(request, resource, write=True)
         added = await asyncio.to_thread(
-            store.add_approver, resource, body.user_id, granted_by=manager
+            lambda: store.add_approver(
+                resource, body.user_id, granted_by=manager, acting=_acting(resource)
+            )
         )
         return {"added": added}
 
@@ -279,7 +289,9 @@ def create_approvals_router(
         """Stop someone approving for a resource; pending approvals bound to it lapse."""
         resource = _resource(kind, resource_id)
         await _resource_manager(request, resource, write=True)
-        removed = await asyncio.to_thread(store.remove_approver, resource, user_id)
+        removed = await asyncio.to_thread(
+            lambda: store.remove_approver(resource, user_id, acting=_acting(resource))
+        )
         return {"removed": removed}
 
     @router.put("/approval-settings")
@@ -290,7 +302,9 @@ def create_approvals_router(
         resource = _resource(body.kind, body.resource_id)
         manager = await _resource_manager(request, resource, write=True)
         await asyncio.to_thread(
-            store.set_allow_initiator, resource, body.allow_initiator, updated_by=manager
+            lambda: store.set_allow_initiator(
+                resource, body.allow_initiator, updated_by=manager, acting=_acting(resource)
+            )
         )
         (entry,) = await asyncio.to_thread(store.approvers_for, [resource])
         return {"allow_initiator": entry.initiator_may_approve()}
@@ -343,6 +357,11 @@ def create_approvals_router(
                 approval=approval,
                 created_by=creator,
                 enabled=body.enabled,
+                acting=(
+                    Acting("admin")
+                    if domain is PolicyDomain.TEAM
+                    else Acting("rule_owner", owner_user_id=owner)
+                ),
             )
         )
         return _rule_response(rule)
@@ -368,6 +387,8 @@ def create_approvals_router(
                 name=body.name,
                 factory_params=body.factory_params,
                 enabled=body.enabled,
+                # The store derives the authority from the rule it locked.
+                acting=Acting("admin"),
             )
         )
         if updated is None:
@@ -379,7 +400,9 @@ def create_approvals_router(
         """Delete a protected rule."""
         rule = await _existing(policy_id)
         await _may_manage(request, rule, write=True)
-        deleted = await asyncio.to_thread(store.delete_rule, policy_id)
+        deleted = await asyncio.to_thread(
+            lambda: store.delete_rule(policy_id, acting=Acting("admin"))
+        )
         return {"deleted": deleted}
 
     return router

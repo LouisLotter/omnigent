@@ -432,3 +432,70 @@ def test_account_deletion_and_a_grant_write_never_leave_a_grant(
     with pytest.raises(OmnigentError) as raised:
         store.add_approver(_SERVICE, "carol", granted_by="admin")
     assert raised.value.code == ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("operation", ["grant", "team_rule", "personal_rule", "setting"])
+def test_a_write_under_a_deleted_actors_authority_is_refused(db_uri, store, operation) -> None:
+    """r2-3: the actor's captured registration is checked inside the write, after the lock."""
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.approval_store import Acting
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("owner", "hash", is_admin=True, team_owner=True)
+    accounts.create_user_with_password("alice", "hash", is_admin=True)
+    accounts.create_user_with_password("bob", "hash")
+    generation = accounts.get_user("alice").account_generation
+    rule = store.create_rule(
+        domain=PolicyDomain.TEAM,
+        owner_user_id=None,
+        name="keep",
+        handler=_CEL,
+        factory_params={"expression": "{}"},
+        approval=None,
+        created_by="owner",
+    )
+    assert accounts.delete_user("alice") is True
+
+    with account_authority_scope("alice", generation), pytest.raises(OmnigentError) as raised:
+        if operation == "grant":
+            store.add_approver(_SERVICE, "bob", granted_by="alice", acting=Acting("admin"))
+        elif operation == "team_rule":
+            store.delete_rule(rule.id, acting=Acting("admin"))
+        elif operation == "personal_rule":
+            store.create_rule(
+                domain=PolicyDomain.PERSONAL,
+                owner_user_id="alice",
+                name="late",
+                handler=_CEL,
+                factory_params=None,
+                approval=None,
+                created_by="alice",
+                acting=Acting("rule_owner", owner_user_id="alice"),
+            )
+        else:
+            store.set_allow_initiator(_SERVICE, True, updated_by="alice", acting=Acting("admin"))
+
+    assert raised.value.code == ErrorCode.UNAUTHORIZED
+    assert store.approvers_for([_SERVICE])[0].approvers == ()
+    assert store.approvers_for([_SERVICE])[0].allow_initiator is None
+    assert store.get_rule(rule.id) is not None
+    assert store.list_rules(domain=PolicyDomain.PERSONAL, owner_user_id="alice") == []
+
+
+def test_a_demoted_administrator_cannot_complete_an_admin_write(db_uri, store) -> None:
+    """r2-3: the administrator flag is read again inside the write."""
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.approval_store import Acting
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("owner", "hash", is_admin=True, team_owner=True)
+    accounts.create_user_with_password("carol", "hash")
+    generation = accounts.get_user("carol").account_generation
+
+    with account_authority_scope("carol", generation), pytest.raises(OmnigentError) as raised:
+        store.add_approver(_SERVICE, "carol", granted_by="carol", acting=Acting("admin"))
+
+    assert raised.value.code == ErrorCode.FORBIDDEN
+    assert store.approvers_for([_SERVICE])[0].approvers == ()
