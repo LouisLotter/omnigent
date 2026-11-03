@@ -865,7 +865,12 @@ def test_bind_never_founds_from_a_cli_and_still_refuses_another_members_sign_in(
 def test_a_cli_session_token_never_founds_as_a_bearer_or_as_a_cookie(
     moving_world: World,
 ) -> None:
-    """The same valid CLI session token, both ways, under the owner's own proxy sign-in."""
+    """A CLI sign-in's credentials, every way a client could keep them, never found.
+
+    Under the owner's own proxy sign-in: whatever the CLI login's response sets, kept and sent
+    back as a client with a cookie jar would; its session token as a bearer; and that token
+    copied into the session cookie. A browser's own sign-in then founds its own subject.
+    """
     world = moving_world
     device = world.as_("device-sub", "owner@example.test", owner=True)
     cli = device.post(
@@ -874,7 +879,12 @@ def test_a_cli_session_token_never_founds_as_a_bearer_or_as_a_cookie(
     )
     assert cli.status_code == 200, cli.text
     token = cli.json()["token"]
-    device.cookies.clear()
+    assert cli.json()["refresh_token"]
+    # The response's own cookies, kept by the client: the CLI login sets none.
+    kept = device.get("/v1/me")
+    assert _team_status(world).owners_bound == 0
+    assert _COOKIE not in cli.cookies
+    assert kept.status_code == 401, kept.text
     as_bearer = device.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
     assert as_bearer.status_code == 200, as_bearer.text
     assert _team_status(world).owners_bound == 0
@@ -888,10 +898,19 @@ def test_a_cli_session_token_never_founds_as_a_bearer_or_as_a_cookie(
     browser = TestClient(world.app)  # type: ignore[arg-type]
     login = browser.post("/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD})
     assert login.status_code == 200, login.text
+    assert _COOKIE in login.cookies
     assert _team_status(world).owners_bound == 0  # no proxy sign-in on that request
     browser.headers[ENVELOPE_HEADER] = _envelope("browser-sub", "owner@example.test", owner=True)
     assert browser.get("/v1/me").status_code == 200
     assert _team_status(world).owners_bound == 1
+    assert _bound_subjects(world, "admin") == ["browser-sub"]
+
+
+def _bound_subjects(world: World, user_id: str) -> list[str]:
+    """The proxy subjects bound to *user_id*'s membership."""
+    store = world.app.state.team_store  # type: ignore[attr-defined]
+    member = store.get_member_for_account(user_id)
+    return sorted(binding.subject for binding in store.list_external_identities(member.id))
 
 
 # ── R1: the founding binding is one-time (F-3) ──
