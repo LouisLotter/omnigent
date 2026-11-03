@@ -177,6 +177,15 @@ TEAM_IDENTITY_PROVENANCE: dict[str, int] = {
     "migration": 3,
 }
 
+# A team invitation's stored state. A pending one past ``expires_at`` reads as
+# expired until the expiry sweep stores ``expired`` (and bumps admission).
+TEAM_INVITATION_STATE: dict[str, int] = {
+    "pending": 1,
+    "redeemed": 2,
+    "revoked": 3,
+    "expired": 4,
+}
+
 
 def _assert_item_type_codes_cover_data_classes() -> None:
     """
@@ -474,3 +483,13 @@ def encode_team_identity_provenance(name: str) -> int:
 def decode_team_identity_provenance(code: int) -> str:
     """Decode a ``team_identity_bindings.provenance`` int code to its name."""
     return _decode(TEAM_IDENTITY_PROVENANCE, code, field="team_identity_bindings.provenance")
+
+
+def encode_team_invitation_state(name: str) -> int:
+    """Encode a ``team_invitations.state`` name to its int code."""
+    return _encode(TEAM_INVITATION_STATE, name, field="team_invitations.state")
+
+
+def decode_team_invitation_state(code: int) -> str:
+    """Decode a ``team_invitations.state`` int code to its name."""
+    return _decode(TEAM_INVITATION_STATE, code, field="team_invitations.state")

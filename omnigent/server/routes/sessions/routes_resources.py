@@ -55,6 +55,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.authority_changes import authority_change_count
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -142,8 +143,12 @@ async def _while_authorized(
     """
     checked = time.monotonic() if authorized_at is None else authorized_at
     next_check = checked + CONNECTION_AUTHORITY_RECHECK_S
+    checked_changes = authority_change_count()
     async for chunk in chunks:
-        if still_authorized is not None and time.monotonic() >= next_check:
+        if still_authorized is not None and (
+            time.monotonic() >= next_check or authority_change_count() != checked_changes
+        ):
+            checked_changes = authority_change_count()
             if not await still_authorized():
                 _logger.info("Download lost its caller's access; aborting it")
                 raise DownloadAccessRevoked("download access revoked")

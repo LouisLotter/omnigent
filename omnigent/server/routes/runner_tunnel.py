@@ -54,6 +54,13 @@ from omnigent.runner.transports.ws_tunnel.registry import (
 )
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.authority_changes import sleep_until_authority_change
+from omnigent.server.external_identity import (
+    ExternalIdentityMode,
+    external_identity_mode,
+    machine_refusal_for_user,
+    resolved_external_identity,
+)
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.principals import (
     Principal,
@@ -407,6 +414,18 @@ def create_runner_tunnel_router(
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token or token_bound_runner_id(token) != runner_id:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        if (
+            external_identity_mode(request) is not ExternalIdentityMode.OFF
+            and resolved_external_identity(request) is not None
+        ):
+            # Behind a proxy, the binding's owner must be the person signed in there.
+            owner = (
+                await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
+                if resolve_managed_runner_owner is not None
+                else None
+            )
+            if owner is None or machine_refusal_for_user(request, owner) is not None:
+                raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
         if mint_managed_runner_token is None:
             raise OmnigentError(
                 "runner token minting is unsupported in this auth mode",
@@ -517,6 +536,10 @@ def create_runner_tunnel_router(
             # attacker-chosen token cannot map to a victim's runner_id.
             if resolve_managed_runner_owner is not None:
                 tunnel_owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
+            if tunnel_owner is not None and machine_refusal_for_user(ws, tunnel_owner) is not None:
+                # Behind a proxy, the binding's owner must be the person signed in there.
+                await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
+                return
             if tunnel_owner is None:
                 # No managed-launch record either: a genuinely
                 # unauthenticated non-loopback peer. Refuse the handshake
@@ -1068,7 +1091,7 @@ async def _authority_loop(
     tunnel; event batches are refused meanwhile by their own check.
     """
     while True:
-        await asyncio.sleep(RUNNER_AUTHORITY_RECHECK_S)
+        await sleep_until_authority_change(RUNNER_AUTHORITY_RECHECK_S)
         if registry.get(runner_id) is not session:
             return
         try:

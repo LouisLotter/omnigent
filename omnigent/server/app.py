@@ -96,6 +96,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.durability import DurabilityBarrier
+from omnigent.server.external_identity import ExternalIdentityConfig, ExternalIdentityMode
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -150,6 +151,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
 )
+from omnigent.server.team_admission import AdmissionSync, MembershipAdmission
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1422,6 +1424,8 @@ def create_app(
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
     approval_store: SqlAlchemyApprovalStore | None = None,
+    team_admission: MembershipAdmission | None = None,
+    external_identity: ExternalIdentityConfig | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1455,6 +1459,12 @@ def create_app(
     :param approval_store: Store for approver grants, protected policies and
         the approval ledger. ``None`` builds one on the conversation store's
         database when that is a SQL database.
+    :param team_admission: The deployment's adapter that keeps a front
+        proxy's admission list (who may reach the server) in step with the
+        team; ``None`` when nothing in front needs it.
+    :param external_identity: The front proxy's signed-identity settings
+        (:mod:`omnigent.server.external_identity`); ``None`` reads them from
+        the environment, where they default to off.
     :param scheduled_task_store: Store backing the recurring-task
         scheduler. When provided, the FastAPI lifespan
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
@@ -1903,6 +1913,7 @@ def create_app(
                 managed_launches=app_inst.state.managed_launches,
                 startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
+                team_store=getattr(app_inst.state, "team_store", None),
             )
             on_fire = build_on_fire(fire_deps)
             if app_inst.state.startup_inputs is not None:
@@ -2011,11 +2022,16 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
         await persistent_host_monitor.start()
+        admission_sync = getattr(app_inst.state, "team_admission_sync", None)
+        if admission_sync is not None:
+            admission_sync.start()
 
         try:
             with monitor_event_loop():
                 yield
         finally:
+            if admission_sync is not None:
+                await admission_sync.stop()
             await persistent_host_monitor.shutdown()
             if turn_checkpoints is not None:
                 await turn_checkpoints.aclose()
@@ -2085,6 +2101,26 @@ def create_app(
     )
     set_turn_store(turn_store)
     app.state.turn_store = turn_store
+
+    # The team: memberships, roles, invitations and external identities, on the
+    # accounts database. Accounts mode only.
+    from omnigent.stores.team_store import SqlAlchemyTeamStore
+
+    team_store = (
+        SqlAlchemyTeamStore(account_store.storage_location) if account_store is not None else None
+    )
+    app.state.team_store = team_store
+    external_identity_config = (
+        external_identity if external_identity is not None else ExternalIdentityConfig.from_env()
+    )
+    if external_identity_config.mode is not ExternalIdentityMode.OFF and team_store is None:
+        raise RuntimeError("a front proxy's signed identity needs accounts mode")
+    app.state.external_identity_config = external_identity_config
+    app.state.team_admission_sync = (
+        AdmissionSync(team_store, team_admission)
+        if team_store is not None and team_admission is not None
+        else None
+    )
 
     telemetry.instrument_fastapi_app(app)
     # Expose the registry on app.state so integration tests and
@@ -4939,6 +4975,18 @@ def create_app(
             # A deleted account's still-signed session JWTs must stop
             # authenticating; every request checks the generation and tombstone.
             auth_provider.set_account_check(account_store.accepts_generation)
+            if team_store is not None and external_identity_config.mode is not (
+                ExternalIdentityMode.OFF
+            ):
+                from omnigent.server.external_identity import ExternalIdentityMiddleware
+
+                # Inside authentication (added first), so the principal is known.
+                app.add_middleware(
+                    ExternalIdentityMiddleware,
+                    config=external_identity_config,
+                    team_store=team_store,
+                    auth_provider=auth_provider,
+                )
             app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(
@@ -4948,10 +4996,27 @@ def create_app(
                     permission_store,
                     device_grant_store,
                     scheduled_task_store,
+                    team_store=team_store,
+                    admission_sync=app.state.team_admission_sync,
                 ),
                 prefix="/auth",
                 tags=["auth"],
             )
+            if team_store is not None and auth_provider._accounts_config is not None:
+                from omnigent.server.routes.team import create_team_router
+
+                app.include_router(
+                    create_team_router(
+                        team_store,
+                        account_store,
+                        auth_provider=auth_provider,
+                        base_url=auth_provider._accounts_config.base_url,
+                        invite_ttl_seconds=auth_provider._accounts_config.invite_ttl_seconds,
+                        admission_sync=app.state.team_admission_sync,
+                    ),
+                    prefix="/v1",
+                    tags=["team"],
+                )
         elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 

@@ -22,6 +22,8 @@ import { withBasePath } from "./basePath";
 export interface LoginRequest {
   username: string;
   password: string;
+  /** A team invitation that links this existing account (proved by its password). */
+  invite?: string;
 }
 
 /** Successful login response — token is also set as a cookie. */

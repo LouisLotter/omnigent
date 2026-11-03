@@ -14,6 +14,7 @@ import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
 import * as accountsApi from "@/lib/accountsApi";
 import * as identity from "@/lib/identity";
+import * as teamApi from "@/lib/teamApi";
 
 const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
@@ -33,6 +34,13 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: vi.fn(),
   getCurrentIsAdmin: vi.fn(),
+}));
+vi.mock("@/lib/teamApi", () => ({
+  getTeam: vi.fn(),
+  inviteToTeam: vi.fn(),
+  revokeInvitation: vi.fn(),
+  changeMemberRole: vi.fn(),
+  setMemberSuspended: vi.fn(),
 }));
 vi.mock("@/lib/accountsApi", () => ({
   listUsers: vi.fn(),
@@ -68,6 +76,7 @@ beforeEach(() => {
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
+  vi.mocked(teamApi.getTeam).mockResolvedValue(null);
   vi.mocked(accountsApi.createInvite).mockResolvedValue({
     ok: true,
     token: "tok",
@@ -241,5 +250,47 @@ describe("MembersPage under OIDC (read-only)", () => {
     expect(within(bobRow).queryByRole("button", { name: /Reset/ })).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Remove/ })).toBeNull();
     expect(screen.getByText(/provisioned automatically on first sign-in/)).toBeInTheDocument();
+  });
+});
+
+describe("MembersPage with a team", () => {
+  it("shows the team's members, roles and states instead of the plain account list", async () => {
+    vi.mocked(teamApi.getTeam).mockResolvedValue({
+      team: { team_id: "t", name: null },
+      me: {
+        member_id: "o",
+        user_id: "admin",
+        role: "owner",
+        state: "active",
+        created_at: 1,
+        updated_at: 1,
+      },
+      members: [
+        {
+          member_id: "o",
+          user_id: "admin",
+          role: "owner",
+          state: "active",
+          created_at: 1,
+          updated_at: 1,
+        },
+        {
+          member_id: "b",
+          user_id: "bob",
+          role: "member",
+          state: "suspended",
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      invitations: [],
+      external_identity: "required",
+    });
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
+    renderPage();
+    expect(await screen.findByRole("heading", { name: "Team" })).toBeTruthy();
+    expect(screen.getByText("Suspended")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Invite someone/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Invite member/ })).toBeNull();
   });
 });

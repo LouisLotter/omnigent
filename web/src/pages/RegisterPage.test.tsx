@@ -11,8 +11,10 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RegisterPage } from "./RegisterPage";
 import * as accountsApi from "@/lib/accountsApi";
+import * as teamApi from "@/lib/teamApi";
 
-vi.mock("@/lib/accountsApi", () => ({ register: vi.fn() }));
+vi.mock("@/lib/accountsApi", () => ({ register: vi.fn(), login: vi.fn() }));
+vi.mock("@/lib/teamApi", () => ({ previewInvitation: vi.fn() }));
 
 const ORIGIN = "https://app.example.com";
 let hrefWrites: string[];
@@ -53,6 +55,7 @@ beforeEach(() => {
     token: "t",
     expires_in: 3600,
   });
+  vi.mocked(teamApi.previewInvitation).mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -178,5 +181,104 @@ describe("RegisterPage v2 (?login-v2=1) flow", () => {
     renderRegisterAt("?login-v2=1");
     expect(screen.queryByRole("button", { name: /accept invitation/i })).not.toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent(/invite token/i);
+  });
+});
+
+describe("RegisterPage with a team invitation", () => {
+  it("names the role and the address the invitation is for", async () => {
+    vi.mocked(teamApi.previewInvitation).mockResolvedValue({
+      team_name: "Acme",
+      email: "erin@example.test",
+      role: "admin",
+      links_account: false,
+      expires_at: 9_999_999_999,
+    });
+    renderRegisterAt("?invite=tok");
+    expect(
+      await screen.findByText("You were invited to join Acme as an admin, with erin@example.test."),
+    ).toBeTruthy();
+    expect(teamApi.previewInvitation).toHaveBeenCalledWith("tok");
+  });
+
+  it("shows the server's refusal for another address", async () => {
+    vi.mocked(accountsApi.register).mockResolvedValue({
+      ok: false,
+      error: "this invitation is for another email address; sign in with the invited address",
+      status: 403,
+    });
+    renderRegisterAt("?invite=tok");
+    fillForm("dave", "dave-pw-1234", "dave-pw-1234");
+    fireEvent.click(screen.getByRole("button", { name: /create account/i }));
+    expect((await screen.findByRole("alert")).textContent).toContain("another email address");
+    expect(hrefWrites).toEqual([]);
+  });
+});
+
+describe("RegisterPage with an invitation for an existing account", () => {
+  const linkPreview = {
+    team_name: "Acme",
+    email: "frank@example.test",
+    role: "member" as const,
+    links_account: true,
+    user_id: "frank",
+    expires_at: 9_999_999_999,
+  };
+
+  beforeEach(() => {
+    vi.mocked(teamApi.previewInvitation).mockResolvedValue(linkPreview);
+  });
+
+  async function signInForm() {
+    renderRegisterAt("?invite=tok");
+    expect(await screen.findByRole("heading", { name: "Sign in to join" })).toBeTruthy();
+    const username = screen.getByLabelText(/username/i) as HTMLInputElement;
+    expect(username.value).toBe("frank");
+    expect(username.readOnly).toBe(true);
+    // The account exists: no new password to confirm.
+    expect(screen.queryByLabelText(/confirm password/i)).toBeNull();
+    return username;
+  }
+
+  it("asks for the account's password and shows a wrong one's refusal", async () => {
+    vi.mocked(accountsApi.login).mockResolvedValue({
+      ok: false,
+      error: "Invalid username or password.",
+      status: 401,
+    });
+    await signInForm();
+    fireEvent.change(screen.getByLabelText(/^password/i), { target: { value: "wrong" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in and join" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "Invalid username or password",
+    );
+    expect(accountsApi.login).toHaveBeenCalledWith({
+      username: "frank",
+      password: "wrong",
+      invite: "tok",
+    });
+    expect(accountsApi.register).not.toHaveBeenCalled();
+    expect(hrefWrites).toEqual([]);
+  });
+
+  it("signs in with the invite and goes home", async () => {
+    vi.mocked(accountsApi.login).mockResolvedValue({
+      ok: true,
+      user: { id: "frank", is_admin: false },
+      token: "t",
+      expires_in: 3600,
+    });
+    await signInForm();
+    fireEvent.change(screen.getByLabelText(/^password/i), { target: { value: "frank-pw" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in and join" }));
+
+    await waitFor(() =>
+      expect(accountsApi.login).toHaveBeenCalledWith({
+        username: "frank",
+        password: "frank-pw",
+        invite: "tok",
+      }),
+    );
+    await waitFor(() => expect(hrefWrites[0]).toBe("/"));
   });
 });

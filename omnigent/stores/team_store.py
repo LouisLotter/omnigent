@@ -13,17 +13,21 @@ a change reaches cached permission decisions within their short TTL.
 
 from __future__ import annotations
 
+import hashlib
+import re
+import secrets
 import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
 from enum import Enum
-from typing import TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from sqlalchemy import ColumnElement, Insert, delete, func, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
@@ -36,6 +40,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlTeam,
     SqlTeamIdentityBinding,
+    SqlTeamInvitation,
     SqlTeamMember,
     SqlUser,
     current_workspace_id,
@@ -43,11 +48,13 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.enum_codecs import (
     decode_team_identity_provenance,
+    decode_team_invitation_state,
     decode_team_member_role,
     decode_team_member_state,
     encode_conversation_kind,
     encode_scheduled_task_state,
     encode_team_identity_provenance,
+    encode_team_invitation_state,
     encode_team_member_role,
     encode_team_member_state,
 )
@@ -57,19 +64,26 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities.team import (
+    AdmissionSnapshot,
     ExternalIdentityBinding,
     IdentityProvenance,
     InventoryAccount,
+    InvitationRole,
+    InvitationState,
     MemberRole,
     MemberState,
     OwnershipFinding,
     Team,
     TeamInventory,
+    TeamInvitation,
     TeamMember,
     account_admin_flag,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+
+if TYPE_CHECKING:
+    from omnigent.server.external_identity import ExternalIdentity
 
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _ROLES: frozenset[str] = frozenset({"owner", "admin", "member"})
@@ -87,6 +101,17 @@ MAX_IDENTITIES_PER_MEMBER = 8
 _ISSUER_MAX_CHARS = 512
 _SUBJECT_MAX_CHARS = 255
 _AUDIENCE_MAX_CHARS = 255
+_EMAIL_MAX_CHARS = 320
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_INVITATION_ROLES: frozenset[str] = frozenset({"admin", "member"})
+_PENDING = encode_team_invitation_state("pending")
+_REDEEMED = encode_team_invitation_state("redeemed")
+_REVOKED = encode_team_invitation_state("revoked")
+_EXPIRED = encode_team_invitation_state("expired")
+_ADMIN = encode_team_member_role("admin")
+_MEMBER_ROLE = encode_team_member_role("member")
+# Bounds one admission list and one page of invitations.
+MAX_ADMITTED = 1000
 _INVENTORY_PAGE_SIZE = 500
 _Row = TypeVar("_Row")
 
@@ -105,6 +130,23 @@ class IdentityBindingConflictError(OmnigentError):
         super().__init__(
             "this external identity is already bound to a different member or audience",
             code=ErrorCode.CONFLICT,
+        )
+
+
+class InvitationUnavailableError(OmnigentError):
+    """The invitation is unknown, expired, revoked or already used."""
+
+    def __init__(self) -> None:
+        super().__init__("this invitation is invalid or has expired", code=ErrorCode.INVALID_INPUT)
+
+
+class InvitationEmailMismatchError(OmnigentError):
+    """The verified sign-in carries another address than the invitation's."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this invitation is for another email address; sign in with the invited address",
+            code=ErrorCode.FORBIDDEN,
         )
 
 
@@ -136,6 +178,7 @@ def _to_binding(row: SqlTeamIdentityBinding) -> ExternalIdentityBinding:
         provenance=cast(IdentityProvenance, decode_team_identity_provenance(row.provenance)),
         bound_by_member_id=row.bound_by_member_id,
         created_at=row.created_at,
+        email=row.email,
     )
 
 
@@ -347,39 +390,30 @@ def retire_deleted_account_membership(session: Session, user_id: str) -> bool:
 
 
 def admin_flag_for_account(session: Session, user_id: str, is_admin: bool) -> bool:
-    """Align a member's role with a direct admin-flag write; return the flag to store.
+    """The admin flag a direct admin-flag write may store; team roles win.
 
-    Promotion makes a member an admin and demotion makes an admin a member; an
-    owner's role changes only through the team. A registration whose
-    membership was removed is not promoted until it is a member again, so a
-    login-time roster cannot restore it. Accounts that never joined, including
-    a later registration of the same username, keep the requested flag. Runs
-    after :func:`lock_team` and the account lock.
+    A current membership's role is authoritative: the flag stays what its role
+    and state imply, so a login-time roster or another flag write cannot undo
+    an owner's demotion or promote anyone (roles change only through the
+    team). Accounts without a membership keep the requested flag, except a
+    registration whose membership was removed, which is not promoted until it
+    is a member again. Runs after :func:`lock_team` and the account lock.
 
     :param session: The admin-flag write's session.
     :param user_id: The account being changed, e.g. ``"alice"``.
     :param is_admin: The requested flag.
     :returns: The flag the account should carry.
-    :raises OmnigentError: ``CONFLICT`` when asked to demote an owner.
     """
     row = _lock_current_member(session, user_id)
-    if row is None:
-        if not is_admin:
-            return False
-        live, generation = _live_generation(session, user_id)
-        return not (live and _removed_from_registration(session, user_id, generation))
-    role = cast(MemberRole, decode_team_member_role(row.role))
-    if role == "owner" and not is_admin:
-        raise OmnigentError(
-            "an owner's role changes through the team, not the admin flag",
-            code=ErrorCode.CONFLICT,
+    if row is not None:
+        return account_admin_flag(
+            cast(MemberRole, decode_team_member_role(row.role)),
+            cast(MemberState, decode_team_member_state(row.state)),
         )
-    new_role: MemberRole = role if role == "owner" else ("admin" if is_admin else "member")
-    if new_role != role:
-        row.role = encode_team_member_role(new_role)
-        row.updated_at = _now()
-        session.flush()
-    return account_admin_flag(new_role, cast(MemberState, decode_team_member_state(row.state)))
+    if not is_admin:
+        return False
+    live, generation = _live_generation(session, user_id)
+    return not (live and _removed_from_registration(session, user_id, generation))
 
 
 def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
@@ -392,7 +426,7 @@ def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
     :param user_id: The new first administrator, e.g. ``"alice"``.
     :returns: The owner membership, or ``None`` when the team had members.
     """
-    lock_team(session)
+    team = lock_team(session)
     has_member = session.execute(
         select(SqlTeamMember.id)
         .where(
@@ -417,7 +451,29 @@ def claim_founding_owner(session: Session, user_id: str) -> TeamMember | None:
     session.add(row)
     session.flush()
     _store_admin_flag(session, row)
+    # The proxy's sign-in of the operator may bind to this membership, once.
+    team.founding_member_id = row.id
+    session.flush()
     return _to_member(row)
+
+
+def require_actor(session: Session, actor_member_id: str, *, owner: bool) -> SqlTeamMember:
+    """Lock and return the acting membership, re-read under the team lock.
+
+    Team administration is authorized here, inside the write that applies it,
+    so a role or state change that commits first is seen.
+
+    :param owner: Require an active owner; otherwise an active owner or admin.
+    :raises OmnigentError: ``FORBIDDEN`` when the actor may not administer.
+    """
+    actor = _lock_member(session, actor_member_id)
+    allowed = (_OWNER,) if owner else (_OWNER, _ADMIN)
+    if actor is None or actor.state != _ACTIVE or actor.role not in allowed:
+        raise OmnigentError(
+            "only an owner may" if owner else "only the team's owners and admins manage it",
+            code=ErrorCode.FORBIDDEN,
+        )
+    return actor
 
 
 def _validated_identity(issuer: str, subject: str) -> tuple[str, str]:
@@ -426,6 +482,223 @@ def _validated_identity(issuer: str, subject: str) -> tuple[str, str]:
     if not subject or len(subject) > _SUBJECT_MAX_CHARS:
         raise OmnigentError("subject must be 1-255 characters", code=ErrorCode.INVALID_INPUT)
     return issuer, subject
+
+
+def normalize_invitation_email(email: str) -> str:
+    """Return *email* trimmed and lowercased, or raise for a malformed address."""
+    normalized = email.strip().lower()
+    if len(normalized) > _EMAIL_MAX_CHARS or not _EMAIL_RE.match(normalized):
+        raise OmnigentError("enter a valid email address", code=ErrorCode.INVALID_INPUT)
+    return normalized
+
+
+def _token_digest(token: str) -> bytes:
+    return hashlib.sha256(token.encode()).digest()
+
+
+def _invitation_state(row: SqlTeamInvitation, now: int) -> InvitationState:
+    state = cast(InvitationState, decode_team_invitation_state(row.state))
+    return "expired" if state == "pending" and row.expires_at <= now else state
+
+
+def _to_invitation(row: SqlTeamInvitation, now: int) -> TeamInvitation:
+    return TeamInvitation(
+        id=row.id,
+        email=row.email,
+        role=cast(InvitationRole, decode_team_member_role(row.role)),
+        target_user_id=row.target_user_id,
+        created_by_member_id=row.created_by_member_id,
+        created_at=row.created_at,
+        expires_at=row.expires_at,
+        state=_invitation_state(row, now),
+        redeemed_member_id=row.redeemed_member_id,
+    )
+
+
+def bump_admission_revision(session: Session) -> int:
+    """Record that who a front proxy should admit changed; returns the new revision.
+
+    Runs in the changing transaction, after :func:`lock_team`.
+    """
+    team = lock_team(session)
+    team.admission_revision = (team.admission_revision or 0) + 1
+    session.flush()
+    return team.admission_revision
+
+
+def bind_identity_in_session(
+    session: Session,
+    member_id: str,
+    *,
+    issuer: str,
+    subject: str,
+    audience: str,
+    provenance: IdentityProvenance,
+    bound_by_member_id: str | None,
+    email: str | None,
+) -> ExternalIdentityBinding:
+    """Bind a verified identity to a current member inside the caller's transaction.
+
+    The same identity bound again to the same member and audience converges;
+    any other existing binding is a conflict.
+
+    :raises IdentityBindingConflictError: When bound differently.
+    :raises OmnigentError: ``NOT_FOUND`` for an unknown or removed member,
+        ``CONFLICT`` at the binding limit, ``INVALID_INPUT`` for bad values.
+    """
+    issuer, subject = _validated_identity(issuer, subject)
+    if not audience or len(audience) > _AUDIENCE_MAX_CHARS:
+        raise OmnigentError("audience must be 1-255 characters", code=ErrorCode.INVALID_INPUT)
+    if email is not None and len(email) > _EMAIL_MAX_CHARS:
+        raise OmnigentError("email must be at most 320 characters", code=ErrorCode.INVALID_INPUT)
+    # Team row first, as every membership write does.
+    lock_team(session)
+    member = _lock_member(session, member_id)
+    if member is None or member.state == _REMOVED:
+        raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+    existing = session.execute(
+        select(SqlTeamIdentityBinding)
+        .where(
+            SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
+            SqlTeamIdentityBinding.identity_cksum == external_identity_cksum(issuer, subject),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if existing is not None:
+        if (existing.issuer, existing.subject, existing.member_id, existing.audience) != (
+            issuer,
+            subject,
+            member_id,
+            audience,
+        ):
+            raise IdentityBindingConflictError()
+        return _to_binding(existing)
+    bound = session.execute(
+        select(func.count())
+        .select_from(SqlTeamIdentityBinding)
+        .where(
+            SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
+            SqlTeamIdentityBinding.member_id == member_id,
+        )
+    ).scalar_one()
+    if bound >= MAX_IDENTITIES_PER_MEMBER:
+        raise OmnigentError(
+            "this member already has the maximum number of external identities",
+            code=ErrorCode.CONFLICT,
+        )
+    row = SqlTeamIdentityBinding(
+        identity_cksum=external_identity_cksum(issuer, subject),
+        issuer=issuer,
+        subject=subject,
+        audience=audience,
+        member_id=member_id,
+        provenance=encode_team_identity_provenance(provenance),
+        bound_by_member_id=bound_by_member_id,
+        created_at=_now(),
+        email=email,
+    )
+    session.add(row)
+    session.flush()
+    if email is not None:
+        bump_admission_revision(session)
+    return _to_binding(row)
+
+
+def lock_pending_invitation(session: Session, token: str, now: int) -> SqlTeamInvitation:
+    """Lock the pending, unexpired invitation for *token*.
+
+    :raises InvitationUnavailableError: For any other token, without saying why.
+    """
+    row = session.execute(
+        select(SqlTeamInvitation)
+        .where(
+            SqlTeamInvitation.workspace_id == current_workspace_id(),
+            SqlTeamInvitation.token_digest == _token_digest(token),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if row is None or row.state != _PENDING or row.expires_at <= now:
+        raise InvitationUnavailableError()
+    return row
+
+
+def close_redeemed_invitation(
+    session: Session, row: SqlTeamInvitation, member_id: str, now: int
+) -> None:
+    """Mark a locked invitation used by *member_id*; it can never be redeemed again."""
+    row.state = _REDEEMED
+    row.closed_at = now
+    row.redeemed_member_id = member_id
+    session.flush()
+
+
+def insert_active_membership(
+    session: Session, user_id: str, role: InvitationRole, generation: str | None
+) -> SqlTeamMember:
+    """Create an active membership for a live account that has none.
+
+    Runs after :func:`lock_team` and the account lock.
+
+    :raises OmnigentError: ``CONFLICT`` when the account already has a current
+        membership.
+    """
+    if _lock_current_member(session, user_id) is not None:
+        raise OmnigentError(f"{user_id!r} already has a team membership", code=ErrorCode.CONFLICT)
+    now = _now()
+    row = SqlTeamMember(
+        id=uuid.uuid4().hex,
+        user_id=user_id,
+        account_generation=generation,
+        current_user_id=user_id,
+        role=encode_team_member_role(role),
+        state=_ACTIVE,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(row)
+    session.flush()
+    _store_admin_flag(session, row)
+    return row
+
+
+def member_state_row(session: Session, user_id: str) -> SqlTeamMember | None:
+    """Lock and return the account's current membership, if any."""
+    return _lock_current_member(session, user_id)
+
+
+def apply_member_state(session: Session, row: SqlTeamMember, state: MemberState) -> bool:
+    """Move a locked membership to *state*, keeping the lifecycle and an active owner.
+
+    Runs after :func:`lock_team`. Removal is final and drops the identity
+    bindings; any state change alters admission, so it bumps the revision.
+
+    :returns: Whether the state changed.
+    :raises OmnigentError: ``CONFLICT`` for a transition the lifecycle does
+        not allow; :class:`LastActiveOwnerError` when the last active owner
+        would stop being active.
+    """
+    current = decode_team_member_state(row.state)
+    if state == current:
+        return False
+    if state not in _STATE_TRANSITIONS[current]:
+        raise OmnigentError(f"a {current} member cannot become {state}", code=ErrorCode.CONFLICT)
+    encoded = encode_team_member_state(state)
+    _require_owner_remains(session, row, row.role, encoded)
+    if state == "removed":
+        _retire(session, row, _now())
+    else:
+        row.state, row.updated_at = encoded, _now()
+        session.flush()
+    _store_admin_flag(session, row)
+    bump_admission_revision(session)
+    return True
+
+
+def to_member(row: SqlTeamMember) -> TeamMember:
+    """The entity for a membership row."""
+    return _to_member(row)
 
 
 class SqlAlchemyTeamStore:
@@ -583,11 +856,19 @@ class SqlAlchemyTeamStore:
         operation: str,
         member_id: str,
         change: Callable[[SqlTeamMember], tuple[int, int]],
+        *,
+        actor_member_id: str | None = None,
     ) -> TeamMember:
-        """Apply a role/state change under the team lock and keep the invariants."""
+        """Apply a role/state change under the team lock and keep the invariants.
+
+        With *actor_member_id*, the actor must be an active owner, re-read under
+        the same lock.
+        """
 
         def write(session: Session) -> TeamMember:
             lock_team(session)
+            if actor_member_id is not None:
+                require_actor(session, actor_member_id, owner=True)
             account = session.execute(
                 select(SqlTeamMember.current_user_id).where(
                     SqlTeamMember.workspace_id == current_workspace_id(),
@@ -605,22 +886,30 @@ class SqlAlchemyTeamStore:
             if (role, state) == (row.role, row.state):
                 return _to_member(row)
             _require_owner_remains(session, row, role, state)
+            state_changed = state != row.state
             if state == _REMOVED:
                 _retire(session, row, _now())
             else:
                 row.role, row.state, row.updated_at = role, state, _now()
                 session.flush()
             _store_admin_flag(session, row)
+            if state_changed:
+                bump_admission_revision(session)
             return _to_member(row)
 
         return run_write_transaction(self._session_immediate, operation, write)
 
-    def change_role(self, member_id: str, role: MemberRole) -> TeamMember:
+    def change_role(
+        self, member_id: str, role: MemberRole, *, actor_member_id: str | None = None
+    ) -> TeamMember:
         """Change a current member's role, keeping an active owner.
 
+        :param actor_member_id: The owner making the change, authorized inside
+            the write; ``None`` for the system.
         :raises OmnigentError: ``NOT_FOUND`` for an unknown member,
             ``CONFLICT`` for a removed one, :class:`LastActiveOwnerError` when
-            the last active owner would lose the role.
+            the last active owner would lose the role, ``FORBIDDEN`` when the
+            actor is not an active owner.
         """
         if role not in _ROLES:
             raise OmnigentError(f"unknown role {role!r}", code=ErrorCode.INVALID_INPUT)
@@ -630,13 +919,18 @@ class SqlAlchemyTeamStore:
                 raise OmnigentError("a removed member has no role", code=ErrorCode.CONFLICT)
             return encode_team_member_role(role), row.state
 
-        return self._update_member("change_team_member_role", member_id, change)
+        return self._update_member(
+            "change_team_member_role", member_id, change, actor_member_id=actor_member_id
+        )
 
     def change_state(self, member_id: str, state: MemberState) -> TeamMember:
         """Move a membership through invited → active ⇄ suspended → removed.
 
         Removal is final and drops the member's identity bindings; the account
-        itself is not deleted. The same state again is a no-op.
+        itself is not deleted. The same state again is a no-op. This is the
+        bare state change: suspending a person through the team, which also
+        rotates their registration, is
+        :meth:`SqlAlchemyAccountStore.change_member_state`.
 
         :raises OmnigentError: ``NOT_FOUND`` for an unknown member,
             ``CONFLICT`` for a transition the lifecycle does not allow,
@@ -667,6 +961,7 @@ class SqlAlchemyTeamStore:
         audience: str,
         provenance: IdentityProvenance,
         bound_by_member_id: str | None = None,
+        email: str | None = None,
     ) -> ExternalIdentityBinding:
         """Bind a verified ``(issuer, subject)`` to a current member.
 
@@ -681,76 +976,97 @@ class SqlAlchemyTeamStore:
         :param audience: The audience its assertions must carry.
         :param provenance: How the identity was verified.
         :param bound_by_member_id: The member completing the binding, if any.
+        :param email: The address the identity was verified with, lowercase,
+            kept for the front proxy's admission list.
         :returns: The binding.
         :raises IdentityBindingConflictError: When bound differently.
         :raises OmnigentError: ``NOT_FOUND`` for an unknown or removed member,
             ``CONFLICT`` when the member already has the maximum bindings,
             ``INVALID_INPUT`` for malformed values.
         """
-        issuer, subject = _validated_identity(issuer, subject)
-        if not audience or len(audience) > _AUDIENCE_MAX_CHARS:
-            raise OmnigentError("audience must be 1-255 characters", code=ErrorCode.INVALID_INPUT)
-        provenance_code = encode_team_identity_provenance(provenance)
-        cksum = external_identity_cksum(issuer, subject)
-        existing_query = (
-            select(SqlTeamIdentityBinding)
-            .where(
-                SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
-                SqlTeamIdentityBinding.identity_cksum == cksum,
-            )
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-
-        def converge(existing: SqlTeamIdentityBinding) -> ExternalIdentityBinding:
-            if (existing.issuer, existing.subject, existing.member_id, existing.audience) != (
-                issuer,
-                subject,
-                member_id,
-                audience,
-            ):
-                raise IdentityBindingConflictError()
-            return _to_binding(existing)
 
         def write(session: Session) -> ExternalIdentityBinding:
-            member = _lock_member(session, member_id)
-            if member is None or member.state == _REMOVED:
-                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
-            existing = session.execute(existing_query).scalar_one_or_none()
-            if existing is not None:
-                return converge(existing)
-            bound = session.execute(
-                select(func.count())
-                .select_from(SqlTeamIdentityBinding)
-                .where(
-                    SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
-                    SqlTeamIdentityBinding.member_id == member_id,
-                )
-            ).scalar_one()
-            if bound >= MAX_IDENTITIES_PER_MEMBER:
-                raise OmnigentError(
-                    "this member already has the maximum number of external identities",
-                    code=ErrorCode.CONFLICT,
-                )
-            row = SqlTeamIdentityBinding(
-                identity_cksum=cksum,
+            return bind_identity_in_session(
+                session,
+                member_id,
                 issuer=issuer,
                 subject=subject,
                 audience=audience,
-                member_id=member_id,
-                provenance=provenance_code,
+                provenance=provenance,
                 bound_by_member_id=bound_by_member_id,
-                created_at=_now(),
+                email=email,
             )
-            session.add(row)
-            session.flush()
-            return _to_binding(row)
 
         try:
             return run_write_transaction(self._session_immediate, "bind_external_identity", write)
         except IntegrityError:
             # A concurrent bind committed the same identity first; the retry reads it.
             return run_write_transaction(self._session_immediate, "bind_external_identity", write)
+
+    def bind_installation_owner(
+        self, user_id: str, identity: ExternalIdentity
+    ) -> TeamMember | None:
+        """Bind the proxy's identity of the installation's owner to their own membership.
+
+        The single-owner upgrade, once: the proxy asserts the operator (its owner
+        pin matched) and the request carries that account's own sign-in, so both
+        the address and the account are proven. Only the team's designated
+        founding membership is bound, as an active owner without any binding
+        yet, with provenance ``migration``; the designation is then cleared in
+        the same transaction, so every later link goes through an invitation
+        proved by the account's password.
+
+        :param user_id: The account the request's own credential speaks for.
+        :param identity: The proxy-verified identity.
+        :returns: The member, or ``None`` when *user_id* is not the unbound
+            founding owner, or the identity is bound elsewhere.
+        """
+        if not identity.installation_owner:
+            return None
+
+        def write(session: Session) -> TeamMember | None:
+            team = lock_team(session)
+            row = _lock_current_member(session, user_id)
+            if (
+                row is None
+                or team.founding_member_id is None
+                or row.id != team.founding_member_id
+                or row.role != _OWNER
+                or row.state != _ACTIVE
+            ):
+                return None
+            bound = session.execute(
+                select(func.count())
+                .select_from(SqlTeamIdentityBinding)
+                .where(
+                    SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
+                    SqlTeamIdentityBinding.member_id == row.id,
+                )
+            ).scalar_one()
+            if bound:
+                return None
+            team.founding_member_id = None
+            session.flush()
+            bind_identity_in_session(
+                session,
+                row.id,
+                issuer=identity.issuer,
+                subject=identity.subject,
+                audience=identity.audience,
+                provenance="migration",
+                bound_by_member_id=None,
+                email=identity.email,
+            )
+            return _to_member(row)
+
+        try:
+            return run_write_transaction(self._session_immediate, "bind_installation_owner", write)
+        except (IdentityBindingConflictError, IntegrityError):
+            return None
+        except OmnigentError as exc:
+            if exc.code is ErrorCode.CONFLICT:
+                return None
+            raise
 
     def get_external_identity(self, issuer: str, subject: str) -> ExternalIdentityBinding | None:
         """Return the binding for ``(issuer, subject)``, or ``None``."""
@@ -845,6 +1161,261 @@ class SqlAlchemyTeamStore:
             return True
 
         return run_write_transaction(self._session_immediate, "unbind_external_identity", write)
+
+    # ── Invitations and admission ──────────────────────────────────
+
+    def create_invitation(
+        self,
+        email: str,
+        role: InvitationRole,
+        *,
+        created_by_member_id: str | None,
+        ttl_seconds: int,
+        target_user_id: str | None = None,
+    ) -> tuple[TeamInvitation, str]:
+        """Issue a single-use invitation for *email*; returns it and its token.
+
+        An earlier pending invitation for the same address is revoked, so one
+        address has at most one usable invitation. Only the token's digest is
+        stored: the token is returned once, for the administrator to hand over.
+
+        :param email: The invited address.
+        :param role: ``"admin"`` or ``"member"``.
+        :param created_by_member_id: The issuing member.
+        :param ttl_seconds: Lifetime, 60 seconds to 30 days.
+        :param target_user_id: Link this existing account instead of creating one.
+        :raises OmnigentError: ``INVALID_INPUT`` for a bad address, role, lifetime
+            or target; ``CONFLICT`` when the target already has a membership.
+        """
+        normalized = normalize_invitation_email(email)
+        if role not in _INVITATION_ROLES:
+            raise OmnigentError(
+                "an invitation offers admin or member", code=ErrorCode.INVALID_INPUT
+            )
+        if not 60 <= ttl_seconds <= 30 * 24 * 3600:
+            raise OmnigentError("invalid invitation lifetime", code=ErrorCode.INVALID_INPUT)
+        if target_user_id is not None and target_user_id in _RESERVED_USERS:
+            raise OmnigentError("that account cannot join a team", code=ErrorCode.INVALID_INPUT)
+        token = secrets.token_urlsafe(32)
+
+        def write(session: Session) -> TeamInvitation:
+            lock_team(session)
+            if created_by_member_id is not None:
+                actor = require_actor(session, created_by_member_id, owner=False)
+                if actor.role != _OWNER and (role != "member" or target_user_id is not None):
+                    raise OmnigentError(
+                        "only an owner invites admins or links existing accounts",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+            now = _now()
+            if target_user_id is not None:
+                live, _ = _live_generation(session, target_user_id)
+                if not live:
+                    raise OmnigentError("no such account", code=ErrorCode.INVALID_INPUT)
+                if _lock_current_member(session, target_user_id) is not None:
+                    raise OmnigentError(
+                        "that account already has a team membership", code=ErrorCode.CONFLICT
+                    )
+            session.execute(
+                update(SqlTeamInvitation)
+                .where(
+                    SqlTeamInvitation.workspace_id == current_workspace_id(),
+                    SqlTeamInvitation.email == normalized,
+                    SqlTeamInvitation.state == _PENDING,
+                )
+                .values(state=_REVOKED, closed_at=now)
+            )
+            row = SqlTeamInvitation(
+                id=uuid.uuid4().hex,
+                token_digest=_token_digest(token),
+                email=normalized,
+                role=encode_team_member_role(role),
+                target_user_id=target_user_id,
+                created_by_member_id=created_by_member_id,
+                created_at=now,
+                expires_at=now + ttl_seconds,
+                state=_PENDING,
+            )
+            session.add(row)
+            session.flush()
+            bump_admission_revision(session)
+            return _to_invitation(row, now)
+
+        return run_write_transaction(
+            self._session_immediate, "create_team_invitation", write
+        ), token
+
+    def invitation_for_token(self, token: str) -> TeamInvitation | None:
+        """Return the invitation a token names, without using it."""
+        if not token or len(token) > 128:
+            return None
+        with self._session("select_team_invitation_by_token") as session:
+            row = session.execute(
+                select(SqlTeamInvitation).where(
+                    SqlTeamInvitation.workspace_id == current_workspace_id(),
+                    SqlTeamInvitation.token_digest == _token_digest(token),
+                )
+            ).scalar_one_or_none()
+            return _to_invitation(row, _now()) if row is not None else None
+
+    def get_invitation(self, invitation_id: str) -> TeamInvitation | None:
+        """Return an invitation by id, in any state."""
+        with self._session("select_team_invitation") as session:
+            row = session.get(SqlTeamInvitation, (current_workspace_id(), invitation_id))
+            return _to_invitation(row, _now()) if row is not None else None
+
+    def list_invitations(self, *, limit: int = 100) -> list[TeamInvitation]:
+        """List pending invitations, newest first, expired ones included."""
+        if not 1 <= limit <= MAX_ADMITTED:
+            raise OmnigentError("limit must be 1-1000", code=ErrorCode.INVALID_INPUT)
+        with self._session("list_team_invitations") as session:
+            now = _now()
+            rows = (
+                session.execute(
+                    select(SqlTeamInvitation)
+                    .where(
+                        SqlTeamInvitation.workspace_id == current_workspace_id(),
+                        SqlTeamInvitation.state == _PENDING,
+                    )
+                    .order_by(SqlTeamInvitation.created_at.desc(), SqlTeamInvitation.id)
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return [_to_invitation(row, now) for row in rows]
+
+    def revoke_invitation(
+        self, invitation_id: str, *, actor_member_id: str | None = None
+    ) -> TeamInvitation:
+        """Revoke a pending invitation.
+
+        :param actor_member_id: The owner or admin revoking it, authorized
+            inside the write (an admin revokes member invitations only).
+        :raises OmnigentError: ``NOT_FOUND`` for an unknown one, ``CONFLICT``
+            for one already used or revoked, ``FORBIDDEN`` for an actor who may
+            not.
+        """
+
+        def write(session: Session) -> TeamInvitation:
+            lock_team(session)
+            actor = (
+                require_actor(session, actor_member_id, owner=False)
+                if actor_member_id is not None
+                else None
+            )
+            row = session.execute(
+                select(SqlTeamInvitation)
+                .where(
+                    SqlTeamInvitation.workspace_id == current_workspace_id(),
+                    SqlTeamInvitation.id == invitation_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            if row is None:
+                raise OmnigentError("no such invitation", code=ErrorCode.NOT_FOUND)
+            if actor is not None and actor.role != _OWNER and row.role != _MEMBER_ROLE:
+                raise OmnigentError(
+                    "only an owner revokes an admin's invitation", code=ErrorCode.FORBIDDEN
+                )
+            if row.state != _PENDING:
+                raise OmnigentError(
+                    "this invitation is no longer pending", code=ErrorCode.CONFLICT
+                )
+            now = _now()
+            row.state, row.closed_at = _REVOKED, now
+            session.flush()
+            bump_admission_revision(session)
+            return _to_invitation(row, now)
+
+        return run_write_transaction(self._session_immediate, "revoke_team_invitation", write)
+
+    def expire_invitations(self) -> int:
+        """Store ``expired`` on pending invitations past their expiry; bump admission once.
+
+        Time alone changes who a proxy should admit when an invitation expires;
+        this records it as a change, so the admission list's revision moves.
+
+        :returns: How many invitations expired.
+        """
+
+        def write(session: Session) -> int:
+            lock_team(session)
+            now = _now()
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlTeamInvitation)
+                    .where(
+                        SqlTeamInvitation.workspace_id == current_workspace_id(),
+                        SqlTeamInvitation.state == _PENDING,
+                        SqlTeamInvitation.expires_at <= now,
+                    )
+                    .values(state=_EXPIRED, closed_at=now)
+                ),
+            )
+            if result.rowcount:
+                bump_admission_revision(session)
+            return result.rowcount
+
+        return run_write_transaction(self._session_immediate, "expire_team_invitations", write)
+
+    def admission_snapshot(self) -> AdmissionSnapshot:
+        """Who a front proxy should admit now, and the revision it reflects.
+
+        Active members' verified addresses and pending, unexpired invitations.
+        Suspended and removed members are left out.
+        """
+        with self._session("select_team_admission") as session:
+            now = _now()
+            team = session.get(SqlTeam, current_workspace_id())
+            members = (
+                select(SqlTeamIdentityBinding.email)
+                .join(
+                    SqlTeamMember,
+                    (SqlTeamMember.workspace_id == SqlTeamIdentityBinding.workspace_id)
+                    & (SqlTeamMember.id == SqlTeamIdentityBinding.member_id),
+                )
+                .where(
+                    SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
+                    SqlTeamIdentityBinding.email.is_not(None),
+                    SqlTeamMember.state == _ACTIVE,
+                )
+            )
+            invited = select(SqlTeamInvitation.email).where(
+                SqlTeamInvitation.workspace_id == current_workspace_id(),
+                SqlTeamInvitation.state == _PENDING,
+                SqlTeamInvitation.expires_at > now,
+            )
+            emails: set[str] = set()
+            for statement in (members, invited):
+                emails.update(
+                    email
+                    for email in session.execute(statement.limit(MAX_ADMITTED)).scalars()
+                    if email
+                )
+            owners = {
+                email
+                for email in session.execute(
+                    members.where(SqlTeamMember.role == _OWNER).limit(MAX_ADMITTED)
+                ).scalars()
+                if email
+            }
+            next_expiry = session.execute(
+                select(func.min(SqlTeamInvitation.expires_at)).where(
+                    SqlTeamInvitation.workspace_id == current_workspace_id(),
+                    SqlTeamInvitation.state == _PENDING,
+                    SqlTeamInvitation.expires_at > now,
+                )
+            ).scalar_one_or_none()
+            listed = tuple(sorted(emails)[:MAX_ADMITTED])
+            return AdmissionSnapshot(
+                revision=team.admission_revision if team is not None else 0,
+                emails=listed,
+                owners=tuple(sorted(owners & set(listed))),
+                next_change_at=next_expiry,
+            )
 
     # ── Inventory ──────────────────────────────────────────────────
 

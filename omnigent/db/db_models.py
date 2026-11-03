@@ -453,6 +453,14 @@ class SqlTeam(OmnigentBase):
     id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Increases with every change to who a front proxy should admit, so a proxy
+    # can ignore an older admission list that arrives late.
+    admission_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    # The founding owner membership, until the proxy's sign-in of the
+    # installation's operator is bound to it once; then NULL for good.
+    founding_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
 
 class SqlTeamMember(OmnigentBase):
@@ -530,6 +538,9 @@ class SqlTeamIdentityBinding(OmnigentBase):
     :param bound_by_member_id: The member who completed the binding, or
         ``NULL`` when the system bound it.
     :param created_at: Unix epoch seconds when the binding was created.
+    :param email: The address the identity was verified with, lowercase, for
+        the front proxy's admission list; ``NULL`` when it carried none.
+        Never an authorization key.
     """
 
     __tablename__ = "team_identity_bindings"
@@ -545,6 +556,7 @@ class SqlTeamIdentityBinding(OmnigentBase):
     provenance: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     bound_by_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
     __table_args__ = (
         CheckConstraint("provenance IN (1, 2, 3)", name="ck_team_identity_bindings_provenance"),
@@ -554,6 +566,53 @@ class SqlTeamIdentityBinding(OmnigentBase):
             "member_id",
             "identity_cksum",
         ),
+    )
+
+
+class SqlTeamInvitation(OmnigentBase):
+    """
+    SQLAlchemy model for the ``team_invitations`` table.
+
+    A single-use invitation to join the team (or to link an existing account
+    to a membership). Only the token's digest is stored; the token itself is
+    shown once to the administrator who issued it.
+
+    :param id: Stable invitation id stored as 16 raw bytes.
+    :param token_digest: sha256 of the invitation token.
+    :param email: The invited address, lowercase.
+    :param role: Int code of the offered role (``TEAM_MEMBER_ROLE``: admin or member).
+    :param target_user_id: For a link invitation, the existing account.
+    :param created_by_member_id: The issuing member.
+    :param created_at: Unix epoch seconds when issued.
+    :param expires_at: Unix epoch seconds after which it cannot be redeemed.
+    :param state: Int code (see ``omnigent.db.enum_codecs.TEAM_INVITATION_STATE``).
+    :param closed_at: Unix epoch seconds when it was redeemed or revoked.
+    :param redeemed_member_id: The membership a redemption created or linked.
+    """
+
+    __tablename__ = "team_invitations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    token_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    role: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    target_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    closed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    redeemed_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("role IN (2, 3)", name="ck_team_invitations_role"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_team_invitations_state"),
+        UniqueConstraint("workspace_id", "token_digest", name="uq_team_invitations_token"),
+        Index("ix_team_invitations_state_expiry", "workspace_id", "state", "expires_at"),
+        Index("ix_team_invitations_email", "workspace_id", "email", "state"),
     )
 
 

@@ -1268,6 +1268,8 @@ def _build_accounts_app(
     *,
     init_admin_password: str | None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    cookie_secret: str | None = None,
+    **create_app_kwargs: object,
 ) -> Iterator[TestClient]:
     """Build a production-shaped accounts-mode app + TestClient.
 
@@ -1282,13 +1284,17 @@ def _build_accounts_app(
         with it (admin exists, no setup pending). When ``None``, no
         admin is created and ``/v1/info`` reports ``needs_setup``.
     :param sandbox_config: Managed sandbox providers, or ``None`` for none.
+    :param cookie_secret: The cookie secret's hex, for a test that keys something
+        to it (a machine client's secret hash); random when ``None``.
+    :param create_app_kwargs: Further ``create_app`` arguments, e.g. a team
+        admission adapter.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     # Accounts is the default provider now, but pin it explicitly
     # so this fixture doesn't depend on the global default.
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", secrets.token_hex(32))
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", cookie_secret or secrets.token_hex(32))
     monkeypatch.setenv("OMNIGENT_ACCOUNTS_BASE_URL", "http://localhost:8000")
     if init_admin_password is not None:
         monkeypatch.setenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD", init_admin_password)
@@ -1360,6 +1366,7 @@ def _build_accounts_app(
         auth_provider=auth_provider,
         account_store=account_store,
         sandbox_config=sandbox_config,
+        **create_app_kwargs,  # type: ignore[arg-type]
     )
     with TestClient(app) as client:
         yield client

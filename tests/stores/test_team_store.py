@@ -279,7 +279,8 @@ def test_concurrent_memberships_for_one_account_converge_to_one(stores) -> None:
     assert [member.user_id for member in members] == ["bob", "owner"]
 
 
-def test_admin_flag_writes_move_a_members_role_but_never_an_owners(stores) -> None:
+def test_team_roles_win_over_admin_flag_writes(stores) -> None:
+    """A login-time roster or a flag write never changes a member's role (WP8.3 F-5)."""
     _founder(stores)
     _account(stores, "bob")
     _account(stores, "carol")
@@ -287,19 +288,31 @@ def test_admin_flag_writes_move_a_members_role_but_never_an_owners(stores) -> No
     bob = teams.add_member("bob", role="member", state="active")
 
     accounts.set_admin("bob", True)
-    assert teams.get_member(bob.id).role == "admin" and accounts.is_admin("bob")
-    permissions.set_admin("bob", False)
     assert teams.get_member(bob.id).role == "member" and not accounts.is_admin("bob")
-    with pytest.raises(OmnigentError) as exc:
-        accounts.set_admin("owner", False)
-    assert exc.value.code == ErrorCode.CONFLICT
+    teams.change_role(bob.id, "admin")
+    permissions.set_admin("bob", False)
+    assert teams.get_member(bob.id).role == "admin" and accounts.is_admin("bob")
+    accounts.set_admin("owner", False)
     assert accounts.is_admin("owner")
     # A suspended member gains no admin flag, and an account outside the team keeps its flag.
     teams.change_state(bob.id, "suspended")
     accounts.set_admin("bob", True)
-    assert teams.get_member(bob.id).role == "admin" and not accounts.is_admin("bob")
+    assert not accounts.is_admin("bob")
     accounts.set_admin("carol", True)
     assert accounts.is_admin("carol") and teams.get_member_for_account("carol") is None
+
+
+def test_a_roster_promotion_cannot_reverse_an_owners_demotion(stores, tmp_path) -> None:
+    from omnigent.server.admin_list import AdminList, promote_if_listed
+
+    _founder(stores)
+    _account(stores, "bob")
+    teams, accounts = stores["teams"], stores["accounts"]
+    bob = teams.add_member("bob", role="admin", state="active")
+    teams.change_role(bob.id, "member")
+    roster = AdminList(tmp_path / "admins", extra=frozenset({"bob"}))
+    assert promote_if_listed(roster, accounts, "bob") is False
+    assert teams.get_member(bob.id).role == "member" and not accounts.is_admin("bob")
 
 
 # ── External identities ────────────────────────────────────────────
@@ -639,9 +652,11 @@ def test_admin_flag_writes_cannot_restore_a_removed_registration(stores, store) 
     assert not accounts.is_admin("bob")
     assert teams.get_member(bob.id).state == "removed"
 
-    again = teams.add_member("bob", role="member", state="active")
-    stores[store].set_admin("bob", True)
+    again = teams.add_member("bob", role="admin", state="active")
     assert accounts.is_admin("bob") and teams.get_member(again.id).role == "admin"
+    # The team's role decides from then on; a flag write changes nothing.
+    stores[store].set_admin("bob", False)
+    assert accounts.is_admin("bob")
 
 
 def test_a_later_registration_of_the_username_is_not_held_by_an_old_removal(stores) -> None:

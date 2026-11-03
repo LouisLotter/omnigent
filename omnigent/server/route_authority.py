@@ -336,6 +336,15 @@ _OTHER_ROUTES: tuple[tuple[str, str, RouteRule], ...] = (
     ("PUT", "/v1/mcp-registry/admin/services/{service_id}", HUMAN),
     ("DELETE", "/v1/mcp-registry/admin/services/{service_id}", HUMAN),
     ("POST", "/v1/mcp-registry/admin/services/{service_id}/discover", HUMAN),
+    # The team page: owners and admins, from a browser for every change.
+    ("GET", "/v1/team", HUMAN),
+    ("POST", "/v1/team/invitations", HUMAN),
+    ("DELETE", "/v1/team/invitations/{invitation_id}", HUMAN),
+    ("PUT", "/v1/team/members/{member_id}/role", HUMAN),
+    ("POST", "/v1/team/members/{member_id}/suspend", HUMAN),
+    ("POST", "/v1/team/members/{member_id}/reinstate", HUMAN),
+    # What an invitation offers, for the person holding its link.
+    ("GET", "/v1/team/invitations/preview", PUBLIC),
 )
 
 # Families whose paths are only known at run time. Sign-in and credential

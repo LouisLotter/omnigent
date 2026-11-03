@@ -184,6 +184,9 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
 
 def test_downgrade_drops_only_what_it_added(db_uri, engine) -> None:
     _use_both_columns(db_uri)
+    # Later revisions come down first; measure from this revision alone.
+    _migrate(engine, _REVISION, downgrade=True)
+    engine.dispose()
     tables = set(sa.inspect(engine).get_table_names()) - {"session_inputs", "session_turns"}
 
     _migrate(engine, _PREVIOUS, downgrade=True)

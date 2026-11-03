@@ -390,10 +390,11 @@ def test_login_unlisted_user_stays_member_end_to_end(
 def test_login_roster_does_not_restore_a_removed_members_admin(
     accounts_router_client: tuple[TestClient, SqlAlchemyAccountStore, Path], db_uri: str
 ) -> None:
-    """Removal survives roster logins and password rotation until the team re-admits.
+    """Removal survives roster logins and password rotation; a re-admission keeps its role.
 
-    A deleted and re-registered username is a new registration the roster
-    may promote as before.
+    The team role of a current membership is authoritative, so the roster
+    cannot promote a re-admitted member. A deleted and re-registered username
+    without a membership is a new registration the roster may promote as before.
     """
     from omnigent.stores.team_store import SqlAlchemyTeamStore
 
@@ -418,8 +419,8 @@ def test_login_roster_does_not_restore_a_removed_members_admin(
     assert login() is False
 
     teams.add_member("dave", role="member", state="active")
-    assert login() is True
-    assert teams.get_member_for_account("dave").role == "admin"
+    assert login() is False
+    assert teams.get_member_for_account("dave").role == "member"
 
     teams.change_state(teams.get_member_for_account("dave").id, "removed")
     assert account_store.delete_user("dave") is True

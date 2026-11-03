@@ -59,10 +59,9 @@ _MACHINE_SUB = "machine@example.com"
 class _FakeStore:
     """Duck-typed permission store: only what the grant actually calls.
 
-    The grant touches the store through ``is_admin`` — at mount and again
-    before every mint — and through ``list_users`` once at mount, for the
-    dedicated-identity warning. A minimal stand-in avoids implementing the
-    whole ABC.
+    The grant touches the store through ``is_admin`` and ``user_exists`` —
+    at mount and again before every mint — to refuse an admin or a person's
+    account. A minimal stand-in avoids implementing the whole ABC.
     """
 
     def __init__(self, *, admins: tuple[str, ...] = (), users: tuple[str, ...] = ()) -> None:
@@ -71,6 +70,9 @@ class _FakeStore:
 
     def is_admin(self, user_id: str) -> bool:
         return user_id in self.admins
+
+    def user_exists(self, user_id: str) -> bool:
+        return user_id in self.users or user_id in self.admins
 
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         return [
@@ -520,22 +522,37 @@ def test_factory_rejects_non_cookie_mode() -> None:
         create_client_credentials_handler(UnifiedAuthProvider(source="header"), None)
 
 
-def test_machine_sub_matching_a_real_account_warns(
+def test_machine_sub_matching_a_real_account_is_not_enabled(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Nothing forces the machine sub to be a DEDICATED identity.
+    """The machine sub must be a DEDICATED identity, never a person's.
 
-    Pointing it at a real person's address silently mints tokens acting as
-    that person, so the operator is told at mount. Advisory: the grant is
-    still enabled.
+    Tokens for a person's account would act as that person without the checks
+    a person's credentials get, such as a team suspension, so the grant stays
+    off and the operator is told why at mount.
     """
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("ERROR"):
         handler = _handler(monkeypatch, store=_FakeStore(users=(_MACHINE_SUB, "someone@x.com")))
-    assert handler is not None
+    assert handler is None
+    refusals = [r.message for r in caplog.records if "refusing to enable" in r.message]
+    assert any("is an existing account" in m for m in refusals)
+
+
+def test_machine_sub_matching_an_account_in_the_real_store_is_not_enabled(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same refusal against the real permission store, and a dedicated sub's success."""
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store = SqlAlchemyPermissionStore(db_uri)
+    assert _handler(monkeypatch, store=store) is not None  # type: ignore[arg-type]
+    store.ensure_user(_MACHINE_SUB)
+    with caplog.at_level("ERROR"):
+        assert _handler(monkeypatch, store=store) is None  # type: ignore[arg-type]
     assert any("is an existing account" in r.message for r in caplog.records)
 
 
-def test_dedicated_machine_sub_does_not_warn(
+def test_dedicated_machine_sub_is_enabled(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A sub that matches no account is the intended shape and stays quiet."""
@@ -543,6 +560,21 @@ def test_dedicated_machine_sub_does_not_warn(
         handler = _handler(monkeypatch, store=_FakeStore(users=("someone@x.com",)))
     assert handler is not None
     assert not any("is an existing account" in r.message for r in caplog.records)
+
+
+def test_an_account_taking_the_machine_sub_stops_minting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checked per mint too: a person who signs up as the machine sub gets no machine tokens."""
+    store = _FakeStore()
+    client = _client(monkeypatch, store=store)
+    credentials = {
+        "grant_type": "client_credentials",
+        "client_id": _CLIENT_ID,
+        "client_secret": _CLIENT_SECRET,
+    }
+    assert client.post("/oauth/token", data=credentials).status_code == 200
+    store.users.add(_MACHINE_SUB)
+    resp = client.post("/oauth/token", data=credentials)
+    assert resp.status_code == 400 and resp.json()["error"] == "unauthorized_client"
 
 
 # ── /oauth/token route: success + token shape ─────────────────────

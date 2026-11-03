@@ -47,6 +47,8 @@ import {
   resetUserPassword,
 } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { type TeamState, getTeam } from "@/lib/teamApi";
+import { TeamPanel } from "@/pages/settings/TeamPanel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
 import { isSingleUserMode } from "@/lib/capabilities";
@@ -64,6 +66,9 @@ export function MembersPage() {
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   const [users, setUsers] = useState<AccountListEntry[] | null>(null);
+  // The team (roles, states, invitations) when the server has one; the
+  // plain account list below remains for servers without it.
+  const [team, setTeam] = useState<TeamState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   // Modal state (only one open at a time — keeps the render simple).
@@ -76,6 +81,8 @@ export function MembersPage() {
   const [actionError, setActionError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    const teamState = await getTeam();
+    setTeam(teamState);
     const list = await listUsers();
     if (list === null) {
       setLoadError(
@@ -193,7 +200,7 @@ export function MembersPage() {
         {/* Invite mints a password-backed account — accounts mode only.
         Under OIDC, accounts are provisioned by the IdP on first login, so
         there's nothing to invite here. */}
-        {manageable && (
+        {manageable && team === null && (
           <Button onClick={() => setShowCreateInvite(true)}>
             <UserPlusIcon /> Invite member
           </Button>
@@ -216,7 +223,18 @@ export function MembersPage() {
         </div>
       )}
 
-      {users !== null && users.length > 0 && (
+      {team !== null && (
+        <TeamPanel
+          state={team}
+          accounts={(users ?? []).map((u) => u.id)}
+          onChanged={refresh}
+          onResetPassword={(userId) => void onResetPassword(userId)}
+          onRemove={(userId) => setDeleteCandidate(userId)}
+          rebaseUrl={rebaseUrl}
+        />
+      )}
+
+      {team === null && users !== null && users.length > 0 && (
         <div className="overflow-hidden rounded-md border border-border">
           <table className="w-full text-ui">
             <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
@@ -278,7 +296,7 @@ export function MembersPage() {
         </div>
       )}
 
-      {users !== null && users.length === 0 && (
+      {team === null && users !== null && users.length === 0 && (
         <p className="text-ui text-muted-foreground">No members yet.</p>
       )}
 

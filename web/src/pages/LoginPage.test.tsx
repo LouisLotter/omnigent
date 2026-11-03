@@ -250,3 +250,29 @@ describe("LoginPage forced re-auth (?reauth=1)", () => {
     expect(hrefWrites[0]).toBe("/oauth/device?user_code=ABCD");
   });
 });
+
+describe("LoginPage after an identity refusal", () => {
+  it.each([
+    ["external_identity_mismatch", "as someone else than the person signed in"],
+    ["member_suspended", "membership of this team is suspended"],
+    ["external_identity_unbound", "not linked to a member of this team"],
+  ])("explains %s", async (reason, text) => {
+    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+    render(
+      <MemoryRouter initialEntries={[`/login?reason=${reason}`]}>
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    expect((await screen.findByRole("alert")).textContent).toContain(text);
+  });
+
+  it("shows nothing for an unknown reason", async () => {
+    vi.mocked(accountsApi.getMe).mockResolvedValue(null);
+    render(
+      <MemoryRouter initialEntries={["/login?reason=whatever"]}>
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+});

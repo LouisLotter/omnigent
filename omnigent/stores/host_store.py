@@ -17,7 +17,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -33,7 +33,7 @@ from sqlalchemy import (
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
 
 from omnigent.db.account_authority import (
     AccountAuthority,
@@ -54,6 +54,7 @@ from omnigent.db.enum_codecs import (
     decode_host_status,
     encode_host_lifecycle,
     encode_host_status,
+    encode_team_member_state,
 )
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -390,6 +391,24 @@ def delete_host_in_session(session: Session, row: SqlHost) -> Host:
 # sandbox, so the runner must be bound again on the current one. Migration
 # ri1a2b3c4d5e writes the same literal.
 RETIRED_RUNNER_INCARNATION = "omnigent:retired-runner-binding"
+_SUSPENDED_MEMBER = encode_team_member_state("suspended")
+
+
+def owner_suspended_clause(user_column: InstrumentedAttribute[Any]) -> ColumnElement[bool]:
+    """Whether the account in *user_column* is a suspended team member (a correlated EXISTS).
+
+    A suspended member's machine credentials (launch tokens, runner bindings)
+    authenticate nothing until they are reinstated and issued fresh ones.
+    """
+    return (
+        select(SqlTeamMember.id)
+        .where(
+            SqlTeamMember.workspace_id == current_workspace_id(),
+            SqlTeamMember.current_user_id == user_column,
+            SqlTeamMember.state == _SUSPENDED_MEMBER,
+        )
+        .exists()
+    )
 
 
 def _owner_grants(session_id_column: SQLColumnExpression[str] | str) -> ColumnElement[bool]:
@@ -443,6 +462,7 @@ def resolve_runner_binding(
             SqlHost.deleted_at.label("host_deleted_at"),
             SqlHost.sandbox_id.label("host_sandbox_id"),
             SqlHost.sandbox_provider.label("host_sandbox_provider"),
+            owner_suspended_clause(SqlSessionPermission.user_id).label("owner_suspended"),
         )
         .select_from(SqlConversationMetadata)
         .join(SqlSessionPermission, _owner_grants(SqlConversationMetadata.id))
@@ -483,6 +503,8 @@ def resolve_runner_binding(
     for row in rows:
         if (
             row.owner_deleted_at is not None
+            # A suspended member's runners act for nobody.
+            or row.owner_suspended
             or row.host_id is None
             or row.host_owner is None
             or row.host_deleted_at is not None
@@ -531,6 +553,24 @@ def _held_by_an_earlier_registration() -> ColumnElement[bool]:
                     ),
                 ),
             ),
+        )
+        .exists()
+    )
+
+
+def _owner_registration_is(generation: str) -> ColumnElement[bool]:
+    """Whether a host row's owner is still on registration *generation*, undeleted.
+
+    Correlated with :class:`SqlHost`. A password reset or a team suspension
+    rotates the registration, and a reinstatement never restores an old one.
+    """
+    return (
+        select(SqlUser.id)
+        .where(
+            SqlUser.workspace_id == SqlHost.workspace_id,
+            SqlUser.id == SqlHost.user_id,
+            SqlUser.deleted_at.is_(None),
+            SqlUser.account_generation == generation,
         )
         .exists()
     )
@@ -1017,6 +1057,7 @@ class HostStore:
         by_bearer: bool = False,
         launch_token: str | None = None,
         owner: str | None = None,
+        generation: str | None = None,
     ) -> bool:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
@@ -1042,11 +1083,17 @@ class HostStore:
             ends once the host is removed, belongs to someone else, or is held
             by an earlier registration of its owner (as
             :meth:`get_actual_host_owner` decides). A password change carries the
-            host to the new registration, so it does not end the tunnel.
+            host to the new registration, so this alone does not end the tunnel.
+        :param generation: With *owner*, the registration the tunnel's own
+            credential was issued under, for a tunnel a person's sign-in opened.
+            Such a tunnel ends once the owner's registration changes (a password
+            reset or a team suspension rotates it), and a reinstatement never
+            makes it current again: an open socket is not lasting authority.
         :returns: ``False`` when the tunnel must end: *by_bearer* is set and
             the host has become launch-token-only, *launch_token* is no
-            longer the host's token, or the host no longer belongs to
-            *owner*'s current registration. ``True`` otherwise.
+            longer the host's token, the host no longer belongs to *owner*'s
+            current registration, or that registration is no longer
+            *generation*. ``True`` otherwise.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
@@ -1069,6 +1116,11 @@ class HostStore:
                 statement = statement.where(
                     SqlHost.user_id == owner, ~_held_by_an_earlier_registration()
                 )
+                if generation is not None:
+                    statement = statement.where(_owner_registration_is(generation))
+            if launch_token is not None or owner is not None:
+                # A suspended owner's host tunnel ends at its next heartbeat.
+                statement = statement.where(~owner_suspended_clause(SqlHost.user_id))
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(statement.values(updated_at=updated_at)),
@@ -1769,6 +1821,14 @@ class HostStore:
             if not hmac.compare_digest(row.token_hash, hash_host_launch_token(token)):
                 return None
             if row.token_expires_at < now_epoch():
+                return None
+            suspended = session.execute(
+                select(owner_suspended_clause(SqlHost.user_id)).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+            ).scalar_one()
+            if suspended:
                 return None
             return _row_to_host(row)
 

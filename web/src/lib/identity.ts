@@ -389,6 +389,24 @@ function isTransientIdentityStatus(status: number): boolean {
   return status >= 500 || status === 408 || status === 429;
 }
 
+const IDENTITY_REFUSAL_CODES = new Set([
+  "external_identity_mismatch",
+  "external_identity_unbound",
+  "member_suspended",
+  "external_identity_required",
+]);
+
+/** The identity refusal a 403 names, or ``null`` for any other 403. */
+async function identityRefusalCode(res: Response): Promise<string | null> {
+  try {
+    const data = (await res.json()) as { error?: { code?: string } };
+    const code = data.error?.code;
+    return code !== undefined && IDENTITY_REFUSAL_CODES.has(code) ? code : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Probe ``GET /v1/me`` once and record the identity it reports.
  *
@@ -426,6 +444,17 @@ async function probeIdentity(): Promise<boolean> {
       };
       currentUserId = data.user_id;
       currentIsAdmin = data.is_admin ?? false;
+      return true;
+    }
+    if (res.status === 403) {
+      // Behind an identity-aware proxy: the Omnigent session belongs to
+      // someone else, or the member is suspended. Sign this browser out and
+      // say why, rather than leaving a blank app.
+      const code = await identityRefusalCode(res);
+      if (code !== null && !isOnLoginPath()) {
+        await hostFetch("/auth/logout", { method: "POST" }).catch(() => undefined);
+        window.location.href = `${withBasePath("/login")}?reason=${encodeURIComponent(code)}`;
+      }
       return true;
     }
     return !isTransientIdentityStatus(res.status);

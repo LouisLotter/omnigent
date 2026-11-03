@@ -77,6 +77,8 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.authority_changes import authority_change_count, sleep_until_authority_change
+from omnigent.server.external_identity import machine_refusal_for_user
 from omnigent.server.host_registry import (
     ConcurrentRegistrationError,
     HostConnection,
@@ -280,6 +282,12 @@ def create_host_tunnel_router(
                 await ws.close(code=4004, reason="unauthenticated")
                 return
             tunnel_owner = managed.user_id
+            # Behind an identity-aware proxy (a personal host), the token's owner must
+            # be the person signed in there; a private route carries no sign-in.
+            refusal = machine_refusal_for_user(ws, tunnel_owner)
+            if refusal is not None:
+                await ws.close(code=4403, reason=refusal)
+                return
         elif auth_provider is not None:
             authenticated_owner = auth_provider.get_user_id(ws)
             if authenticated_owner is None:
@@ -497,8 +505,16 @@ def create_host_tunnel_router(
                         by_bearer=managed_token is None,
                         launch_token=managed_token,
                         owner=tunnel_owner,
+                        # A person's sign-in opened it: it lasts only as long as
+                        # the registration that sign-in was issued under.
+                        generation=conn.account_generation if managed_token is None else None,
                     ),
                     name=f"host-heartbeat:{host_id}",
+                )
+                # Someone's authority changed (a suspension, say): check now.
+                authority_task = asyncio.create_task(
+                    _heartbeat_on_authority_change(heartbeat_requested),
+                    name=f"host-authority:{host_id}",
                 )
                 ping_task = asyncio.create_task(
                     _ping_loop(ws, conn, host_id, heartbeat_requested),
@@ -538,7 +554,7 @@ def create_host_tunnel_router(
                             )
 
                     done, _pending = await asyncio.wait(
-                        {sender_task, ping_task, receive_task, heartbeat_task},
+                        {sender_task, ping_task, receive_task, heartbeat_task, authority_task},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
@@ -552,7 +568,13 @@ def create_host_tunnel_router(
                     # Shield teardown from ASGI cancellation, but do not let a
                     # stalled dependency hold shutdown indefinitely.
                     try:
-                        for task in (sender_task, ping_task, receive_task, heartbeat_task):
+                        for task in (
+                            sender_task,
+                            ping_task,
+                            receive_task,
+                            heartbeat_task,
+                            authority_task,
+                        ):
                             task.cancel()
                         with anyio.move_on_after(
                             _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
@@ -563,6 +585,7 @@ def create_host_tunnel_router(
                                     ping_task,
                                     receive_task,
                                     heartbeat_task,
+                                    authority_task,
                                     return_exceptions=True,
                                 )
                             finally:
@@ -1324,6 +1347,20 @@ async def _receive_loop(
         )
 
 
+async def _heartbeat_on_authority_change(requested: asyncio.Event) -> None:
+    """Run the heartbeat's checks at once whenever someone's authority changes.
+
+    The heartbeat re-checks what authorized the tunnel (its owner's current
+    registration and membership), so a suspension ends an open tunnel now
+    rather than at the next ping interval.
+    """
+    while True:
+        seen = authority_change_count()
+        await sleep_until_authority_change(PING_INTERVAL_S)
+        if authority_change_count() != seen:
+            requested.set()
+
+
 async def _heartbeat_loop(
     requested: asyncio.Event,
     *,
@@ -1333,6 +1370,7 @@ async def _heartbeat_loop(
     by_bearer: bool = False,
     launch_token: str | None = None,
     owner: str | None = None,
+    generation: str | None = None,
 ) -> None:
     """Serialize host-liveness writes independently of socket pings.
 
@@ -1340,7 +1378,9 @@ async def _heartbeat_loop(
         and the host has since become launch-token-only, registered with
         *launch_token* and that token has since been replaced or revoked, or
         registered for *owner* and the host was removed or no longer belongs
-        to that person's current registration.
+        to that person's current registration, or a person's sign-in opened it
+        under registration *generation* and the owner's registration has changed
+        since (a password reset or a team suspension; reinstatement does not undo it).
     """
     failure_count = 0
     last_failure_log_at = 0.0
@@ -1357,6 +1397,7 @@ async def _heartbeat_loop(
                 by_bearer=by_bearer,
                 launch_token=launch_token,
                 owner=owner,
+                generation=generation,
             )
         except asyncio.CancelledError:
             raise
