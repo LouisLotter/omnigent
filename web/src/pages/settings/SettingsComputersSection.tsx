@@ -27,8 +27,10 @@ import {
 export function SettingsComputersSection() {
   const info = useServerInfo();
   const providers = persistentHostProviders(info);
-  // Administrators see other people's computers on the provider's own page, when it has one.
-  const overviews = useIsAdmin() ? persistentHostOverviewUrls(info) : [];
+  // The provider's own computers page, when it declares one: everyone's way to their own
+  // computers' setup, and an administrator's to other people's.
+  const overviews = persistentHostOverviewUrls(info);
+  const isAdmin = useIsAdmin();
   const hosts = useHosts();
   const [addOpen, setAddOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Host | null>(null);
@@ -55,22 +57,17 @@ export function SettingsComputersSection() {
         send them work.
       </p>
       {overviews.map((url) => (
-        <p
-          key={url}
-          className="mt-1 text-ui text-muted-foreground"
-          data-testid="computers-overview"
-        >
-          Other people&apos;s computers are on the{" "}
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline underline-offset-2 hover:no-underline"
-          >
-            computers page
-          </a>
-          .
-        </p>
+        <div key={url} className="mt-1 text-ui text-muted-foreground">
+          <p data-testid="computers-overview-own">
+            Your computers&apos; setup, sign-ins and terminals are on the <OverviewLink url={url} />
+            .
+          </p>
+          {isAdmin && (
+            <p data-testid="computers-overview">
+              Other people&apos;s computers are on the <OverviewLink url={url} />.
+            </p>
+          )}
+        </div>
       ))}
       <div className="mt-6">
         {hosts.isError && !hosts.data ? (
@@ -97,6 +94,20 @@ export function SettingsComputersSection() {
       <AddComputerDialog open={addOpen} onOpenChange={setAddOpen} providers={providers} />
       <DeleteComputerDialog host={deleteTarget} onClose={() => setDeleteTarget(null)} />
     </section>
+  );
+}
+
+/** The provider's computers page, opened beside Omnigent as each computer's setup link is. */
+function OverviewLink({ url }: { url: string }) {
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="underline underline-offset-2 hover:no-underline"
+    >
+      computers page
+    </a>
   );
 }
 

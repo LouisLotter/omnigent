@@ -64,30 +64,41 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SettingsComputersSection", () => {
-  it("points administrators at the provider's page for other people's computers", async () => {
-    vi.mocked(useIsAdmin).mockReturnValue(true);
-    renderSection(["cloudflare"], { cloudflare: "/platform/computers" });
-    const line = await screen.findByTestId("computers-overview");
-    expect(line.textContent).toBe("Other people's computers are on the computers page.");
-    const link = within(line).getByRole("link", { name: "computers page" });
-    expect(link.getAttribute("href")).toBe(`${window.location.origin}/platform/computers`);
-    expect(link.getAttribute("target")).toBe("_blank");
-  });
-
-  it("shows no overview line to members, or for a provider without a page", async () => {
+  it("points everyone at the provider's computers page, and administrators at other people's", async () => {
+    const page = `${window.location.origin}/platform/computers`;
     vi.mocked(useIsAdmin).mockReturnValue(false);
     renderSection(["cloudflare"], { cloudflare: "/platform/computers" });
-    await screen.findByTestId("computers-empty");
+    const own = await screen.findByTestId("computers-overview-own");
+    expect(own.textContent).toBe(
+      "Your computers' setup, sign-ins and terminals are on the computers page.",
+    );
+    const link = within(own).getByRole("link", { name: "computers page" });
+    expect(link.getAttribute("href")).toBe(page);
+    expect(link.getAttribute("target")).toBe("_blank");
     expect(screen.queryByTestId("computers-overview")).toBeNull();
     cleanup();
     vi.mocked(useIsAdmin).mockReturnValue(true);
+    renderSection(["cloudflare"], { cloudflare: "/platform/computers" });
+    expect((await screen.findByTestId("computers-overview-own")).textContent).toContain(
+      "Your computers' setup",
+    );
+    const others = screen.getByTestId("computers-overview");
+    expect(others.textContent).toBe("Other people's computers are on the computers page.");
+    expect(within(others).getByRole("link").getAttribute("href")).toBe(page);
+    vi.mocked(useIsAdmin).mockReturnValue(false);
+  });
+
+  it("shows no computers-page line for a provider without a page, or another origin's", async () => {
+    vi.mocked(useIsAdmin).mockReturnValue(true);
     renderSection(["cloudflare"], { other: "/platform/computers" });
     await screen.findByTestId("computers-empty");
+    expect(screen.queryByTestId("computers-overview-own")).toBeNull();
     expect(screen.queryByTestId("computers-overview")).toBeNull();
     cleanup();
     // Another origin is never linked, even when it reaches the page unparsed.
     renderSection(["cloudflare"], { cloudflare: "https://elsewhere.example.test/" });
     await screen.findByTestId("computers-empty");
+    expect(screen.queryByTestId("computers-overview-own")).toBeNull();
     expect(screen.queryByTestId("computers-overview")).toBeNull();
     vi.mocked(useIsAdmin).mockReturnValue(false);
   });
