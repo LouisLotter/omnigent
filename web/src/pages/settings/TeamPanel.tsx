@@ -1,15 +1,25 @@
 /**
  * The team section of Settings → Members: members with their roles and
- * states, pending invitations, and the owner's and admins' actions.
+ * states, pending invitations, removed members, and the owner's and admins'
+ * actions.
  *
  * Who may do what mirrors the server, which enforces it: an owner invites
- * admins and members, changes roles and suspends or reinstates anyone but
- * themselves; an admin invites members and suspends or reinstates members.
- * Hiding a button is only convenience.
+ * admins and members, changes roles and suspends, reinstates or removes
+ * anyone but themselves and the installation's own owner; an admin invites
+ * members and suspends, reinstates or removes members. Hiding a button is
+ * only convenience.
  */
 
 import { useState } from "react";
-import { KeyRoundIcon, PauseIcon, PlayIcon, Trash2Icon, UserPlusIcon, XIcon } from "lucide-react";
+import {
+  KeyRoundIcon,
+  PauseIcon,
+  PlayIcon,
+  RefreshCwIcon,
+  Trash2Icon,
+  UserPlusIcon,
+  XIcon,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,14 +32,19 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
+  type RemovedThread,
   type TeamMemberEntry,
+  type TeamRemovalEntry,
   type TeamRole,
   type TeamState,
   changeMemberRole,
+  getRemoval,
   inviteToTeam,
+  removeMember,
   revokeInvitation,
   setMemberSuspended,
 } from "@/lib/teamApi";
+import { withBasePath } from "@/lib/basePath";
 
 /** The default account list: one stable reference, so renders compare equal. */
 const NO_ACCOUNTS: readonly string[] = [];
@@ -41,7 +56,6 @@ interface TeamPanelProps {
   /** Reload the team after a change. */
   onChanged: () => Promise<void>;
   onResetPassword: (userId: string) => void;
-  onRemove: (userId: string) => void;
   /** Renders an invite link for the current origin and base path. */
   rebaseUrl: (url: string) => string;
 }
@@ -53,12 +67,74 @@ function mayChangeState(me: TeamMemberEntry, target: TeamMemberEntry): boolean {
   return me.role === "owner" || target.role === "member";
 }
 
+function mayRemove(me: TeamMemberEntry, target: TeamMemberEntry): boolean {
+  return mayChangeState(me, target) && target.installation_owner !== true;
+}
+
+function hasPendingStep(removal: TeamRemovalEntry): boolean {
+  const { steps } = removal;
+  return (
+    steps.member_group === "pending" ||
+    steps.computers.state === "pending" ||
+    steps.devices.state === "pending"
+  );
+}
+
+/** One removal's steps, each saying what is done and what isn't. */
+function RemovalSteps({ removal }: { removal: TeamRemovalEntry }) {
+  const { steps } = removal;
+  const computers = steps.computers;
+  return (
+    <ul className="mt-1 space-y-0.5 text-sm text-muted-foreground" data-removal-steps>
+      <li data-step="access">
+        ✓ Access blocked: every sign-in, CLI login, laptop, runner and invitation of theirs stopped
+        working.
+      </li>
+      {steps.member_group !== "not_used" && (
+        <li data-step="member_group" data-state={steps.member_group}>
+          {steps.member_group === "done"
+            ? "✓ The installation's sign-in no longer lets them in."
+            : "… Telling the installation's sign-in to stop letting them in. This is retried until it is confirmed."}
+        </li>
+      )}
+      <li data-step="computers" data-state={computers.state}>
+        {computers.total === 0 ? (
+          "✓ No cloud computers."
+        ) : (
+          <>
+            {computers.state === "done" ? "✓" : "…"} Cloud computers handed over to stop and be
+            deleted: {computers.handed_over} of {computers.total}.
+            {computers.state === "pending" && " The rest are retried."}{" "}
+            {computers.fleet_url !== null ? (
+              <a className="underline" href={computers.fleet_url} data-link="fleet">
+                Delete them on the computers page
+              </a>
+            ) : (
+              "Delete them where your computers are managed."
+            )}
+          </>
+        )}
+      </li>
+      <li data-step="devices" data-state={steps.devices.state}>
+        {steps.devices.state === "not_used"
+          ? "Laptop device registrations: none to revoke; laptops are not registered per member yet."
+          : steps.devices.state === "done"
+            ? "✓ Laptop device registrations revoked."
+            : `… Laptop device registrations still to revoke: ${steps.devices.remaining}.`}
+      </li>
+      <li data-step="threads">
+        {removal.thread_count === 1 ? "1 thread" : `${removal.thread_count} threads`} kept, readable
+        by owners and admins. Nothing was moved to anyone else.
+      </li>
+    </ul>
+  );
+}
+
 export function TeamPanel({
   state,
   accounts = NO_ACCOUNTS,
   onChanged,
   onResetPassword,
-  onRemove,
   rebaseUrl,
 }: TeamPanelProps) {
   const { me } = state;
@@ -73,8 +149,24 @@ export function TeamPanel({
     member: TeamMemberEntry;
     suspend: boolean;
   } | null>(null);
+  const [removal, setRemoval] = useState<TeamMemberEntry | null>(null);
+  // The threads of the removal whose list is open, by its member id.
+  const [threads, setThreads] = useState<{ memberId: string; list: RemovedThread[] } | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  async function showThreads(memberId: string) {
+    if (threads?.memberId === memberId) {
+      setThreads(null);
+      return;
+    }
+    const result = await getRemoval(memberId);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setThreads({ memberId, list: result.threads });
+  }
 
   async function run(action: () => Promise<{ ok: boolean; error?: string }>): Promise<boolean> {
     setPending(true);
@@ -123,7 +215,7 @@ export function TeamPanel({
         </Button>
       </div>
 
-      {error !== null && !showInvite && stateChange === null && (
+      {error !== null && !showInvite && stateChange === null && removal === null && (
         <div
           role="alert"
           className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
@@ -218,13 +310,13 @@ export function TeamPanel({
                     >
                       <KeyRoundIcon /> Reset
                     </Button>
-                    {member.member_id !== me.member_id && (
+                    {mayRemove(me, member) && (
                       <Button
                         variant="ghost"
                         size="xs"
-                        title="Remove user"
+                        title="Remove from the team"
                         disabled={pending}
-                        onClick={() => onRemove(member.user_id)}
+                        onClick={() => setRemoval(member)}
                       >
                         <Trash2Icon /> Remove
                       </Button>
@@ -264,6 +356,65 @@ export function TeamPanel({
                   >
                     <XIcon /> Revoke
                   </Button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {(state.removals ?? []).length > 0 && (
+        <div className="mt-6" data-removals>
+          <h3 className="mb-2 text-ui font-semibold">Removed</h3>
+          <ul className="divide-y divide-border rounded-md border border-border">
+            {(state.removals ?? []).map((removed) => (
+              <li
+                key={removed.member_id}
+                className="px-3 py-2 text-ui"
+                data-removed={removed.user_id}
+              >
+                <div className="flex items-center justify-between">
+                  <span>
+                    <span className="font-medium">{removed.user_id}</span>{" "}
+                    <span className="text-muted-foreground">
+                      removed {new Date(removed.removed_at * 1000).toLocaleString()}
+                      {removed.removed_by !== null && ` by ${removed.removed_by}`}
+                    </span>
+                  </span>
+                  <span className="flex gap-1">
+                    {removed.thread_count > 0 && (
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        disabled={pending}
+                        onClick={() => void showThreads(removed.member_id)}
+                      >
+                        {threads?.memberId === removed.member_id ? "Hide threads" : "Threads"}
+                      </Button>
+                    )}
+                    {hasPendingStep(removed) && (
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        disabled={pending}
+                        onClick={() => void run(() => removeMember(removed.member_id))}
+                      >
+                        <RefreshCwIcon /> Retry now
+                      </Button>
+                    )}
+                  </span>
+                </div>
+                <RemovalSteps removal={removed} />
+                {threads?.memberId === removed.member_id && (
+                  <ul className="mt-1 list-disc pl-6 text-sm" data-removed-threads>
+                    {threads.list.map((thread) => (
+                      <li key={thread.session_id}>
+                        <a className="underline" href={withBasePath(`/c/${thread.session_id}`)}>
+                          {thread.title ?? "Untitled thread"}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
                 )}
               </li>
             ))}
@@ -432,6 +583,57 @@ export function TeamPanel({
               }}
             >
               {stateChange?.suspend ? "Suspend" : "Reinstate"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {/* ── Remove ─────────────────────────────────────────────── */}
+      <Dialog
+        open={removal !== null}
+        onOpenChange={(open) => {
+          if (pending) return;
+          if (!open) {
+            setRemoval(null);
+            setError(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove {removal?.user_id} from the team?</DialogTitle>
+            <DialogDescription>
+              This cannot be undone. Their account is deleted at once: every sign-in, CLI login,
+              laptop and runner of theirs stops working, their open pages close, their schedules
+              stop, and invitations to their address are revoked. The installation's sign-in stops
+              letting them in. Their cloud computers stop and are handed over to be deleted. Their
+              threads stay, readable by owners and admins; nothing moves to anyone else. Invitations
+              they sent to other people stay pending.
+            </DialogDescription>
+          </DialogHeader>
+          {error !== null && (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+            >
+              {error}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRemoval(null)} disabled={pending}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              loading={pending}
+              onClick={() => {
+                const target = removal;
+                if (target === null) return;
+                void run(() => removeMember(target.member_id)).then((done) => {
+                  if (done) setRemoval(null);
+                });
+              }}
+            >
+              Remove
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -5003,6 +5003,19 @@ def create_app(
                     auth_provider=auth_provider,
                 )
             app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
+            member_removals = None
+            if team_store is not None:
+                from omnigent.server.member_removal import MemberRemovals
+
+                # One path for every removal: the team page and the account list's Remove.
+                member_removals = MemberRemovals(
+                    account_store,
+                    team_store,
+                    auth_provider=auth_provider,
+                    admission_sync=app.state.team_admission_sync,
+                    scheduled_task_store=scheduled_task_store,
+                    conversation_store=conversation_store,
+                )
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -5013,6 +5026,7 @@ def create_app(
                     scheduled_task_store,
                     team_store=team_store,
                     admission_sync=app.state.team_admission_sync,
+                    member_removals=member_removals,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -5028,6 +5042,7 @@ def create_app(
                         base_url=auth_provider._accounts_config.base_url,
                         invite_ttl_seconds=auth_provider._accounts_config.invite_ttl_seconds,
                         admission_sync=app.state.team_admission_sync,
+                        removals=member_removals,
                     ),
                     prefix="/v1",
                     tags=["team"],

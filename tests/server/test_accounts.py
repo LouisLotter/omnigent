@@ -1844,10 +1844,10 @@ def test_admin_can_delete_former_admin_when_others_exist(
         json={"invite": invite_token, "username": "second", "password": "second-pw-1234"},
     )
 
-    # The bootstrap admin is the team's only owner, so another admin alone is not enough.
+    # An admin flag without a team membership removes no member: the team's rules decide.
     resp = second.delete("/auth/users/admin")
-    assert resp.status_code == 400, resp.text
-    assert "last active owner" in resp.json()["error"]
+    assert resp.status_code == 403, resp.text
+    assert "owners and admins" in resp.json()["error"]
 
     from omnigent.stores.team_store import SqlAlchemyTeamStore
 

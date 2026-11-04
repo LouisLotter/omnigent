@@ -834,6 +834,9 @@ class PersistentHostPolicy:
     :param overview_url: Provider page listing this provider's hosts, where an
         administrator also finds other people's, e.g.
         ``"https://computers.example.com/"``; ``None`` shows no link.
+    :param fleet_url: Provider page listing everyone's hosts, where an owner or
+        admin finishes removing a removed member's, e.g.
+        ``"https://computers.example.com/"``; ``None`` shows no link.
     """
 
     idle_sleep_s: float = 300.0
@@ -842,6 +845,7 @@ class PersistentHostPolicy:
     token_refresh_margin_s: float = 24 * 3600.0
     manage_url: str | None = None
     overview_url: str | None = None
+    fleet_url: str | None = None
 
 
 class NoReachableModels(Exception):

@@ -229,7 +229,6 @@ export function MembersPage() {
           accounts={(users ?? []).map((u) => u.id)}
           onChanged={refresh}
           onResetPassword={(userId) => void onResetPassword(userId)}
-          onRemove={(userId) => setDeleteCandidate(userId)}
           rebaseUrl={rebaseUrl}
         />
       )}

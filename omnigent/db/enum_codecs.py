@@ -186,6 +186,13 @@ TEAM_INVITATION_STATE: dict[str, int] = {
     "expired": 4,
 }
 
+# What a member's removal recorded: a thread they owned, or a cloud computer
+# (a persistent host) handed to its provider for removal.
+TEAM_REMOVAL_ITEM_KIND: dict[str, int] = {
+    "thread": 1,
+    "computer": 2,
+}
+
 
 def _assert_item_type_codes_cover_data_classes() -> None:
     """
@@ -493,3 +500,13 @@ def encode_team_invitation_state(name: str) -> int:
 def decode_team_invitation_state(code: int) -> str:
     """Decode a ``team_invitations.state`` int code to its name."""
     return _decode(TEAM_INVITATION_STATE, code, field="team_invitations.state")
+
+
+def encode_team_removal_item_kind(name: str) -> int:
+    """Encode a ``team_member_removal_items.kind`` name to its int code."""
+    return _encode(TEAM_REMOVAL_ITEM_KIND, name, field="team_member_removal_items.kind")
+
+
+def decode_team_removal_item_kind(code: int) -> str:
+    """Decode a ``team_member_removal_items.kind`` int code to its name."""
+    return _decode(TEAM_REMOVAL_ITEM_KIND, code, field="team_member_removal_items.kind")

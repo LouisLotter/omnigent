@@ -1,6 +1,6 @@
 /**
- * Client for the team API (``/v1/team``): members, roles, suspension and
- * invitations. Every helper resolves with a typed result instead of
+ * Client for the team API (``/v1/team``): members, roles, suspension,
+ * removal and invitations. Every helper resolves with a typed result instead of
  * throwing, like ``accountsApi``.
  */
 
@@ -17,6 +17,40 @@ export interface TeamMemberEntry {
   state: TeamMemberState;
   created_at: number;
   updated_at: number;
+  /** The installation's own owner, whom the team never removes. */
+  installation_owner?: boolean;
+}
+
+/** One step of a removal: done, still pending (it is retried), or not used here. */
+export type RemovalStepState = "done" | "pending" | "not_used";
+
+export interface TeamRemovalEntry {
+  member_id: string;
+  user_id: string;
+  removed_at: number;
+  /** The owner or admin who removed them, when known. */
+  removed_by: string | null;
+  /** Threads they owned; owners and admins can still open them. */
+  thread_count: number;
+  steps: {
+    /** Every sign-in, token, runner and invitation of theirs was refused at once. */
+    access: "done";
+    /** The installation's sign-in no longer admits them (read back by the proxy). */
+    member_group: RemovalStepState;
+    computers: {
+      state: RemovalStepState;
+      total: number;
+      handed_over: number;
+      /** Where the computers are shown stopping and can be deleted, if the provider has one. */
+      fleet_url: string | null;
+    };
+    devices: { state: RemovalStepState; remaining: number };
+  };
+}
+
+export interface RemovedThread {
+  session_id: string;
+  title: string | null;
 }
 
 export interface TeamInvitationEntry {
@@ -34,6 +68,8 @@ export interface TeamState {
   me: TeamMemberEntry;
   members: TeamMemberEntry[];
   invitations: TeamInvitationEntry[];
+  /** The latest removals, newest first; absent from servers before removals were recorded. */
+  removals?: TeamRemovalEntry[];
   /** How the server ties requests to a front proxy's sign-in: off, bind or required. */
   external_identity: "off" | "bind" | "required";
 }
@@ -134,6 +170,21 @@ export function setMemberSuspended(
     `/v1/team/members/${encodeURIComponent(memberId)}/${action}`,
     jsonInit("POST"),
   );
+}
+
+/**
+ * POST /v1/team/members/{id}/remove — removes a member for good. Repeated, it
+ * retries the steps not done yet and returns where the removal stands.
+ */
+export function removeMember(memberId: string): Promise<TeamResult<{ removal: TeamRemovalEntry }>> {
+  return teamRequest(`/v1/team/members/${encodeURIComponent(memberId)}/remove`, jsonInit("POST"));
+}
+
+/** GET /v1/team/members/{id}/removal — a removal's steps and the threads they owned. */
+export function getRemoval(
+  memberId: string,
+): Promise<TeamResult<{ removal: TeamRemovalEntry; threads: RemovedThread[] }>> {
+  return teamRequest(`/v1/team/members/${encodeURIComponent(memberId)}/removal`);
 }
 
 /** GET /v1/team/invitations/preview — what an invitation link offers; no sign-in needed. */

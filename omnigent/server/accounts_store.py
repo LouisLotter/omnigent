@@ -53,13 +53,14 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Account, AccountToken
-from omnigent.entities.team import InvitationRole, MemberState, TeamMember
+from omnigent.entities.team import InvitationRole, MemberRemoval, MemberState, TeamMember
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.principals import MachineBinding
 from omnigent.stores.approval_store import remove_account_approval_authority
 from omnigent.stores.host_store import RETIRED_RUNNER_INCARNATION, resolve_runner_binding
 from omnigent.stores.team_store import (
     InvitationEmailMismatchError,
+    LastActiveOwnerError,
     admin_flag_for_account,
     apply_member_state,
     bind_identity_in_session,
@@ -69,9 +70,15 @@ from omnigent.stores.team_store import (
     insert_active_membership,
     lock_pending_invitation,
     lock_team,
+    member_account,
+    member_identity_emails,
     member_state_row,
+    owned_before_removal,
+    record_member_removal,
+    removals_in_session,
     require_actor,
     retire_deleted_account_membership,
+    revoke_invitations_for,
     to_member,
 )
 
@@ -177,6 +184,49 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     )
     for host in hosts:
         delete_host_in_session(session, host)
+
+
+def _tombstone_account(session: Session, target: SqlUser, admin_ids: list[str]) -> bool:
+    """Tombstone the locked account *target* and revoke the authority it owns.
+
+    Runs after the team lock and the deletion's account lock set. Shares,
+    schedules, device and refresh grants, hosts, preferences, approval
+    authority and tokens go in the same transaction, and the current team
+    membership is retired with its identity bindings.
+
+    :returns: ``False``, changing nothing, when *target* is the last admin or
+        the team's last active owner; ``True`` once tombstoned.
+    """
+    user_id = target.id
+    if target.is_admin and not [uid for uid in admin_ids if uid != user_id]:
+        return False
+    if not retire_deleted_account_membership(session, user_id):
+        return False
+    # A username registered again must not inherit approval authority.
+    remove_account_approval_authority(session, user_id)
+    session.execute(
+        delete(SqlSessionPermission).where(
+            SqlSessionPermission.workspace_id == current_workspace_id(),
+            SqlSessionPermission.user_id == user_id,
+        )
+    )
+    _revoke_durable_authority(session, user_id, now=int(time.time()))
+    session.execute(
+        delete(SqlPreference).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == user_id,
+        )
+    )
+    target.deleted_at = int(time.time())
+    target.password_hash = None
+    target.is_admin = False
+    session.execute(
+        delete(SqlAccountToken).where(
+            SqlAccountToken.workspace_id == current_workspace_id(),
+            or_(SqlAccountToken.user_id == user_id, SqlAccountToken.created_by == user_id),
+        )
+    )
+    return True
 
 
 def _carry_registration_work(session: Session, user_id: str, *, old: str, new: str) -> None:
@@ -539,46 +589,104 @@ class SqlAlchemyAccountStore:
             # The team lock comes first, then the complete account lock set in
             # username order, before checking the last-admin and last-owner rules.
             lock_team(session)
-            actor = current_account_user()
-            include = (user_id, actor) if actor is not None else (user_id,)
-            admin_ids = self._locked_admin_ids(session, include=include)
-            require_active_account(session, None)
+            admin_ids = self._lock_for_deletion(session, user_id)
             target = lock_account(session, user_id)
             if target is None or target.deleted_at is not None:
                 return None
-            if target.is_admin:
-                other_admins = [uid for uid in admin_ids if uid != user_id]
-                if not other_admins:
-                    return False
-            if not retire_deleted_account_membership(session, user_id):
-                return False
-            # A username registered again must not inherit approval authority.
-            remove_account_approval_authority(session, user_id)
-            session.execute(
-                delete(SqlSessionPermission).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == user_id,
-                )
-            )
-            _revoke_durable_authority(session, user_id, now=int(time.time()))
-            session.execute(
-                delete(SqlPreference).where(
-                    SqlPreference.workspace_id == current_workspace_id(),
-                    SqlPreference.user_id == user_id,
-                )
-            )
-            target.deleted_at = int(time.time())
-            target.password_hash = None
-            target.is_admin = False
-            session.execute(
-                delete(SqlAccountToken).where(
-                    SqlAccountToken.workspace_id == current_workspace_id(),
-                    or_(SqlAccountToken.user_id == user_id, SqlAccountToken.created_by == user_id),
-                )
-            )
-            return True
+            return _tombstone_account(session, target, admin_ids)
 
         return run_write_transaction(self._session_immediate, "delete_user", write)
+
+    def _lock_for_deletion(self, session: Session, user_id: str) -> list[str]:
+        """Lock the admins, the actor and *user_id* in username order; return the admins."""
+        actor = current_account_user()
+        include = (user_id, actor) if actor is not None else (user_id,)
+        admin_ids = self._locked_admin_ids(session, include=include)
+        require_active_account(session, None)
+        return admin_ids
+
+    def remove_member(
+        self,
+        member_id: str,
+        *,
+        actor_member_id: str | None,
+        protected_user_id: str | None = None,
+    ) -> MemberRemoval:
+        """Remove a team member: their account, everything it can still use, and their access.
+
+        One transaction tombstones the account as :meth:`delete_user` does and
+        retires the membership with its identity bindings. It also revokes the
+        pending invitations they could still use and records the removal: who
+        removed them, the admission revision it committed, the threads they
+        owned (still readable by owners and admins) and the cloud computers
+        their provider must remove. A crash before the commit changes nothing;
+        after it every credential of theirs is refused.
+
+        Removing an already removed member changes nothing and returns its
+        record, so the steps outside the database can be repeated.
+
+        :param actor_member_id: The owner or admin removing them, authorized
+            under the team lock: nobody removes themselves, and an admin
+            removes members only. ``None`` for the system.
+        :param protected_user_id: The installation's own owner account, which
+            is never removed, e.g. the operator-named first admin.
+        :raises OmnigentError: ``NOT_FOUND``, ``FORBIDDEN``, or
+            :class:`LastActiveOwnerError`.
+        """
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        def write(session: Session) -> MemberRemoval:
+            lock_team(session)
+            found = member_account(session, member_id)
+            if found is None:
+                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            user_id, state = found
+            if state == "removed":
+                existing = removals_in_session(session, [member_id])
+                if not existing:
+                    raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+                return existing[0]
+            admin_ids = self._lock_for_deletion(session, user_id)
+            target = lock_account(session, user_id)
+            row = member_state_row(session, user_id)
+            if (
+                target is None
+                or target.deleted_at is not None
+                or row is None
+                or row.id != member_id
+            ):
+                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            if actor_member_id is not None:
+                actor = require_actor(session, actor_member_id, owner=False)
+                if actor.id == row.id:
+                    raise OmnigentError("you cannot remove yourself", code=ErrorCode.FORBIDDEN)
+                if actor.role != encode_team_member_role("owner") and row.role != (
+                    encode_team_member_role("member")
+                ):
+                    raise OmnigentError(
+                        "only an owner removes owners and admins", code=ErrorCode.FORBIDDEN
+                    )
+            if protected_user_id is not None and user_id == protected_user_id:
+                raise OmnigentError(
+                    "the installation's owner cannot be removed", code=ErrorCode.FORBIDDEN
+                )
+            threads, computers = owned_before_removal(session, user_id)
+            emails = member_identity_emails(session, member_id)
+            if not _tombstone_account(session, target, admin_ids):
+                raise LastActiveOwnerError()
+            now = int(time.time())
+            revoke_invitations_for(session, emails=emails, user_id=user_id, now=now)
+            return record_member_removal(
+                session,
+                member_id=member_id,
+                user_id=user_id,
+                removed_by_member_id=actor_member_id,
+                threads=threads,
+                computers=computers,
+                now=now,
+            )
+
+        return run_write_transaction(self._session_immediate, "remove_team_member", write)
 
     def login_snapshot(self, user_id: str) -> tuple[str | None, str | None]:
         """Read the password and generation together before password verification."""

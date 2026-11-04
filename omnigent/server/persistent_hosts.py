@@ -251,6 +251,16 @@ def forget(host_id: str) -> None:
         state.removed = True
 
 
+def fleet_url() -> str | None:
+    """The first persistent provider's page listing everyone's hosts, if it has one."""
+    if _deployment is None:
+        return None
+    for config in _deployment.offered():
+        if config.persistent is not None and config.persistent.fleet_url is not None:
+            return config.persistent.fleet_url
+    return None
+
+
 def manage_url(host: Host) -> str | None:
     """The provider's setup page for *host*, from the policy's ``manage_url`` template."""
     policy = policy_for(host)

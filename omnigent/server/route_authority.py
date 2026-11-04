@@ -343,6 +343,8 @@ _OTHER_ROUTES: tuple[tuple[str, str, RouteRule], ...] = (
     ("PUT", "/v1/team/members/{member_id}/role", HUMAN),
     ("POST", "/v1/team/members/{member_id}/suspend", HUMAN),
     ("POST", "/v1/team/members/{member_id}/reinstate", HUMAN),
+    ("POST", "/v1/team/members/{member_id}/remove", HUMAN),
+    ("GET", "/v1/team/members/{member_id}/removal", HUMAN),
     # What an invitation offers, for the person holding its link.
     ("GET", "/v1/team/invitations/preview", PUBLIC),
 )

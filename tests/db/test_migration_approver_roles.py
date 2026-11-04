@@ -33,7 +33,13 @@ _PREVIOUS = "ri1a2b3c4d5e"
 _REVISION = "ap1a2b3c4d5e"
 _TABLES = ("approval_resources", "approver_grants", "protected_policies", "approval_verdicts")
 # Tables later revisions add; a downgrade below this revision drops them too.
-_LATER_TABLES = ("team_invitations", "session_inputs", "session_turns")
+_LATER_TABLES = (
+    "team_invitations",
+    "session_inputs",
+    "session_turns",
+    "team_member_removals",
+    "team_member_removal_items",
+)
 
 
 def _migrate(engine: sa.Engine, revision: str, *, downgrade: bool = False) -> None:
