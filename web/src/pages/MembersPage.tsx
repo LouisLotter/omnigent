@@ -51,7 +51,7 @@ import { type TeamState, getTeam } from "@/lib/teamApi";
 import { TeamPanel } from "@/pages/settings/TeamPanel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { isSingleUserMode, persistentHostOverviewUrls } from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
@@ -229,6 +229,7 @@ export function MembersPage() {
           accounts={(users ?? []).map((u) => u.id)}
           onChanged={refresh}
           onResetPassword={(userId) => void onResetPassword(userId)}
+          computersPage={persistentHostOverviewUrls(info)[0] ?? null}
           rebaseUrl={rebaseUrl}
         />
       )}

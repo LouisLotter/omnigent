@@ -56,6 +56,11 @@ interface TeamPanelProps {
   /** Reload the team after a change. */
   onChanged: () => Promise<void>;
   onResetPassword: (userId: string) => void;
+  /**
+   * The computers' overview page, where a removed member's computers are deleted: same-origin
+   * only (`persistentHostOverviewUrls`), or null without one.
+   */
+  computersPage?: string | null;
   /** Renders an invite link for the current origin and base path. */
   rebaseUrl: (url: string) => string;
 }
@@ -80,8 +85,17 @@ function hasPendingStep(removal: TeamRemovalEntry): boolean {
   );
 }
 
-/** One removal's steps, each saying what is done and what isn't. */
-function RemovalSteps({ removal }: { removal: TeamRemovalEntry }) {
+/**
+ * One removal's steps, each saying what is done and what isn't. *computersPage*: the computers'
+ * overview on this installation's own origin, where they are deleted, or null.
+ */
+function RemovalSteps({
+  removal,
+  computersPage,
+}: {
+  removal: TeamRemovalEntry;
+  computersPage: string | null;
+}) {
   const { steps } = removal;
   const computers = steps.computers;
   return (
@@ -105,8 +119,8 @@ function RemovalSteps({ removal }: { removal: TeamRemovalEntry }) {
             {computers.state === "done" ? "✓" : "…"} Cloud computers handed over to stop and be
             deleted: {computers.handed_over} of {computers.total}.
             {computers.state === "pending" && " The rest are retried."}{" "}
-            {computers.fleet_url !== null ? (
-              <a className="underline" href={computers.fleet_url} data-link="fleet">
+            {computersPage !== null ? (
+              <a className="underline" href={computersPage} data-link="computers-page">
                 Delete them on the computers page
               </a>
             ) : (
@@ -135,6 +149,7 @@ export function TeamPanel({
   accounts = NO_ACCOUNTS,
   onChanged,
   onResetPassword,
+  computersPage = null,
   rebaseUrl,
 }: TeamPanelProps) {
   const { me } = state;
@@ -404,7 +419,7 @@ export function TeamPanel({
                     )}
                   </span>
                 </div>
-                <RemovalSteps removal={removed} />
+                <RemovalSteps removal={removed} computersPage={computersPage} />
                 {threads?.memberId === removed.member_id && (
                   <ul className="mt-1 list-disc pl-6 text-sm" data-removed-threads>
                     {threads.list.map((thread) => (

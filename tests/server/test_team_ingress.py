@@ -996,14 +996,9 @@ def test_a_link_invitation_binds_an_existing_account_proved_by_its_password(
 # ── 8.9: removing a member ─────────────────────────────────────────
 
 
-@pytest.fixture(params=["https://computers.example.test/"])
-def computer_world(
-    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[World]:
-    """The team behind the proxy, with persistent cloud computers from a fake provider.
-
-    The parameter is the provider's fleet page, or ``None`` for one without it.
-    """
+@pytest.fixture
+def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    """The team behind the proxy, with persistent cloud computers from a fake provider."""
     from omnigent.server import persistent_hosts
     from omnigent.server.managed_hosts import (
         ManagedSandboxConfig,
@@ -1021,7 +1016,7 @@ def computer_world(
             launcher_factory=lambda: computer,
             token_ttl_s=3600,
             provider=computer.provider,
-            persistent=PersistentHostPolicy(fleet_url=request.param),
+            persistent=PersistentHostPolicy(),
         )
     )
     admission = RecordingAdmission()
@@ -1114,12 +1109,7 @@ def test_removal_ends_every_credential_closes_streams_and_tells_the_proxy(
 
     steps = removed.json()["removal"]["steps"]
     assert steps["access"] == "done"
-    assert steps["computers"] == {
-        "state": "done",
-        "total": 1,
-        "handed_over": 1,
-        "fleet_url": "https://computers.example.test/",
-    }
+    assert steps["computers"] == {"state": "done", "total": 1, "handed_over": 1}
     assert steps["devices"] == {"state": "not_used", "remaining": 0}
     assert world.app.state.fake_computer.terminated == ["sb-bob"]  # type: ignore[attr-defined]
     assert _stores(world)["hosts"].get_host(computer_id) is None
@@ -1239,7 +1229,6 @@ def test_the_installation_owner_is_never_removed_and_another_owner_is(
     assert owner.post(f"/v1/team/members/{carol_id}/remove").status_code == 200
 
 
-@pytest.mark.parametrize("computer_world", [None], indirect=True)
 def test_removal_is_safe_to_repeat_and_finishes_what_failed(computer_world: World) -> None:
     """A provider that does not answer leaves the computer pending; repeating finishes it."""
     world = computer_world
@@ -1254,7 +1243,6 @@ def test_removal_is_safe_to_repeat_and_finishes_what_failed(computer_world: Worl
         "state": "pending",
         "total": 1,
         "handed_over": 0,
-        "fleet_url": None,
     }
     # Access is already blocked whatever the provider does.
     assert world.people["bob"].get("/v1/me").status_code == 401

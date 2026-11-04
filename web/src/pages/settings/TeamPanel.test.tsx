@@ -52,7 +52,6 @@ function removed(
         state: "done",
         total: 1,
         handed_over: 1,
-        fleet_url: "https://team.example/platform/computers",
       },
       devices: { state: "not_used", remaining: 0 },
       ...steps,
@@ -83,10 +82,16 @@ function teamAs(me: TeamMemberEntry, removals: TeamRemovalEntry[] = []): TeamSta
 
 const onChanged = vi.fn(async () => undefined);
 
-function renderAs(me: TeamMemberEntry, accounts: string[] = [], removals: TeamRemovalEntry[] = []) {
+function renderAs(
+  me: TeamMemberEntry,
+  accounts: string[] = [],
+  removals: TeamRemovalEntry[] = [],
+  computersPage: string | null = "https://team.example/platform/computers",
+) {
   return render(
     <TeamPanel
       state={teamAs(me, removals)}
+      computersPage={computersPage}
       accounts={accounts}
       onChanged={onChanged}
       onResetPassword={vi.fn()}
@@ -284,9 +289,17 @@ describe("TeamPanel", () => {
     expect(entry.textContent).toContain("1 of 1");
     expect(entry.textContent).toContain("none to revoke");
     expect(entry.textContent).toContain("2 threads kept");
-    const fleet = within(entry).getByRole("link", { name: /computers page/ });
-    expect(fleet.getAttribute("href")).toBe("https://team.example/platform/computers");
+    const page = within(entry).getByRole("link", { name: /computers page/ });
+    expect(page.getAttribute("href")).toBe("https://team.example/platform/computers");
     expect(within(entry).queryByRole("button", { name: /Retry/ })).toBeNull();
+  });
+
+  it("names no link without a computers page on this installation's origin", () => {
+    renderAs(owner, [], [removed("dave")], null);
+    const entry = document.querySelector<HTMLElement>('[data-removed="dave"]');
+    if (entry === null) throw new Error("no removal entry");
+    expect(within(entry).queryByRole("link", { name: /computers page/ })).toBeNull();
+    expect(entry.textContent).toContain("Delete them where your computers are managed.");
   });
 
   it("keeps an unfinished step visible and retries it on request", async () => {
@@ -297,7 +310,7 @@ describe("TeamPanel", () => {
       [
         removed("dave", {
           member_group: "pending",
-          computers: { state: "pending", total: 1, handed_over: 0, fleet_url: null },
+          computers: { state: "pending", total: 1, handed_over: 0 },
         }),
       ],
     );

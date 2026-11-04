@@ -184,8 +184,6 @@ class MemberRemovals:
         if self._devices is not None:
             devices_remaining = self._devices.remaining(removal.member_id)
             devices_state = "pending" if devices_remaining else "done"
-        from omnigent.server import persistent_hosts
-
         return {
             "member_id": removal.member_id,
             "user_id": removal.user_id,
@@ -200,8 +198,6 @@ class MemberRemovals:
                     "state": computers_state,
                     "total": removal.computers,
                     "handed_over": removal.computers - removal.computers_pending,
-                    # Where the provider shows them stopping and lets an admin delete them.
-                    "fleet_url": persistent_hosts.fleet_url() if removal.computers else None,
                 },
                 "devices": {"state": devices_state, "remaining": devices_remaining},
             },

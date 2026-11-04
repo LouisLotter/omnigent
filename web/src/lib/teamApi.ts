@@ -41,8 +41,6 @@ export interface TeamRemovalEntry {
       state: RemovalStepState;
       total: number;
       handed_over: number;
-      /** Where the computers are shown stopping and can be deleted, if the provider has one. */
-      fleet_url: string | null;
     };
     devices: { state: RemovalStepState; remaining: number };
   };
