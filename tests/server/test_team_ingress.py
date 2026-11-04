@@ -1063,6 +1063,24 @@ def _remove(world: World, name: str, by: str = "owner"):
     return world.people[by].post(f"/v1/team/members/{world.member_id(name)}/remove")
 
 
+def test_a_member_deletes_her_own_computer_in_omnigent_and_nobody_elses(
+    computer_world: World,
+) -> None:
+    """Settings, Computers, Delete: the way a member removes her own computer, asleep or not."""
+    world = computer_world
+    computer = world.app.state.fake_computer  # type: ignore[attr-defined]
+    bobs = _cloud_computer(world, "bob")
+    # Alice may not delete Bob's computer; nothing reaches the provider.
+    assert world.people["alice"].delete(f"/v1/hosts/{bobs}").status_code == 403
+    assert computer.terminated == []
+    deleted = world.people["bob"].delete(f"/v1/hosts/{bobs}")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"host_id": bobs, "deleted": True}
+    # Omnigent's own terminate: the platform records the removal and stops the computer.
+    assert computer.terminated == ["sb-bob"]
+    assert _stores(world)["hosts"].get_host(bobs) is None
+
+
 def test_removal_ends_every_credential_closes_streams_and_tells_the_proxy(
     computer_world: World,
 ) -> None:
