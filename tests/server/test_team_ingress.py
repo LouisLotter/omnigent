@@ -991,3 +991,319 @@ def test_a_link_invitation_binds_an_existing_account_proved_by_its_password(
         "https://team.example.cloudflareaccess.com", "legacy-sub"
     )
     assert binding is not None and binding.provenance == "account_proof"
+
+
+# ── 8.9: removing a member ─────────────────────────────────────────
+
+
+@pytest.fixture
+def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    """The team behind the proxy, with persistent cloud computers from a fake provider."""
+    from omnigent.server import persistent_hosts
+    from omnigent.server.managed_hosts import (
+        ManagedSandboxConfig,
+        ManagedSandboxDeployment,
+        PersistentHostPolicy,
+    )
+    from tests.server.persistent_host_fakes import FakeComputer
+
+    monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_MODE", "required")
+    monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_KEY", _KEY)
+    computer = FakeComputer()
+    deployment = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://localhost:8000",
+            launcher_factory=lambda: computer,
+            token_ttl_s=3600,
+            provider=computer.provider,
+            persistent=PersistentHostPolicy(),
+        )
+    )
+    admission = RecordingAdmission()
+    try:
+        for base in _build_accounts_app(
+            tmp_path,
+            monkeypatch,
+            init_admin_password=_OWNER_PASSWORD,
+            sandbox_config=deployment,
+            team_admission=admission,
+        ):
+            world = World(base.app, admission, {}, {})
+            owner = world.as_("owner-sub", "owner@example.test", owner=True)
+            login = owner.post(
+                "/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD}
+            )
+            assert login.status_code == 200, login.text
+            world.people["owner"] = owner
+            _join(world, "carol", "admin")
+            _join(world, "alice")
+            _join(world, "bob")
+            world.app.state.fake_computer = computer  # type: ignore[attr-defined]
+            yield world
+    finally:
+        persistent_hosts.configure(None, None, None)
+
+
+def _cloud_computer(world: World, owner: str) -> str:
+    """Give *owner* a persistent cloud computer with a running sandbox; return its host id."""
+    hosts = _stores(world)["hosts"]
+    host = hosts.create_persistent_host(
+        host_id=uuid.uuid4().hex, name="Work computer", user_id=owner, provider="fakepersist"
+    )
+    hosts.attach_persistent_sandbox(host.host_id, provider="fakepersist", sandbox_id=f"sb-{owner}")
+    return host.host_id
+
+
+def _remove(world: World, name: str, by: str = "owner"):
+    return world.people[by].post(f"/v1/team/members/{world.member_id(name)}/remove")
+
+
+def test_a_member_deletes_her_own_computer_in_omnigent_and_nobody_elses(
+    computer_world: World,
+) -> None:
+    """Settings, Computers, Delete: the way a member removes her own computer, asleep or not."""
+    world = computer_world
+    computer = world.app.state.fake_computer  # type: ignore[attr-defined]
+    bobs = _cloud_computer(world, "bob")
+    # Alice may not delete Bob's computer; nothing reaches the provider.
+    assert world.people["alice"].delete(f"/v1/hosts/{bobs}").status_code == 403
+    assert computer.terminated == []
+    deleted = world.people["bob"].delete(f"/v1/hosts/{bobs}")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"host_id": bobs, "deleted": True}
+    # Omnigent's own terminate: the platform records the removal and stops the computer.
+    assert computer.terminated == ["sb-bob"]
+    assert _stores(world)["hosts"].get_host(bobs) is None
+
+
+def test_removal_ends_every_credential_closes_streams_and_tells_the_proxy(
+    computer_world: World,
+) -> None:
+    """Bob's browser, CLI, refresh grant, runner, computer and invitation all stop at once."""
+    world = computer_world
+    bob = world.people["bob"]
+    login = bob.post(
+        "/auth/login", json={"username": "bob", "password": "bob-pw-1234", "issue_refresh": True}
+    )
+    refresh = {"grant_type": "refresh_token", "refresh_token": login.json()["refresh_token"]}
+    binding = _bound_runner(world, "bob")
+    mint = f"/v1/runners/{token_bound_runner_id(binding)}/token"
+    runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: binding}
+    private = TestClient(world.app)  # type: ignore[arg-type]
+    assert private.post(mint, headers=runner_headers).status_code == 200
+    computer_id = _cloud_computer(world, "bob")
+    cli = world.as_("bob-sub", "bob@example.test")
+    bearer = {"Authorization": f"Bearer {world.tokens['bob']}"}
+    assert cli.get("/v1/me", headers=bearer).status_code == 200
+    # A second invitation to his address, and one linking his account, are still pending.
+    again = _invite(world, "bob@example.test")
+    bob_id = world.member_id("bob")
+    assert _wait_for(lambda: "bob@example.test" in world.admission.applied[-1].emails)
+
+    with bob.websocket_connect("/v1/sessions/updates") as stream:
+        removed = _remove(world, "bob")
+        assert removed.status_code == 200, removed.text
+        with pytest.raises(WebSocketDisconnect):
+            for _ in range(50):
+                stream.receive_text()
+
+    steps = removed.json()["removal"]["steps"]
+    assert steps["access"] == "done"
+    assert steps["computers"] == {"state": "done", "total": 1, "handed_over": 1}
+    assert steps["devices"] == {"state": "not_used", "remaining": 0}
+    assert world.app.state.fake_computer.terminated == ["sb-bob"]  # type: ignore[attr-defined]
+    assert _stores(world)["hosts"].get_host(computer_id) is None
+    # Every credential of his is refused; nobody else is touched.
+    assert bob.get("/v1/me").status_code == 401
+    assert cli.get("/v1/me", headers=bearer).status_code == 401
+    assert bob.post("/oauth/token", data=refresh).status_code == 400
+    assert private.post(mint, headers=runner_headers).status_code == 401
+    login_again = bob.post("/auth/login", json={"username": "bob", "password": "bob-pw-1234"})
+    assert login_again.status_code == 403 and _code(login_again) == "external_identity_unbound"
+    assert (
+        world.people["owner"].get(f"/v1/team/invitations/preview?token={again}").status_code == 404
+    )
+    assert world.people["alice"].get("/v1/me").status_code == 200
+    # The proxy hears at once, and its list no longer has his address.
+    assert _wait_for(lambda: "bob@example.test" not in world.admission.applied[-1].emails)
+    team = world.people["owner"].get("/v1/team").json()
+    assert bob_id not in {m["member_id"] for m in team["members"]}
+    assert not [i for i in team["invitations"] if i["email"] == "bob@example.test"]
+    listed = next(r for r in team["removals"] if r["member_id"] == bob_id)
+    assert listed["removed_by"] == "admin"
+    assert listed["steps"]["member_group"] == "done"
+
+
+def test_removal_ends_a_running_threads_open_runner_tunnel(world: World) -> None:
+    """Bob's runner, connected for his thread, is cut off at once when he is removed."""
+    from omnigent.server.routes.runner_tunnel import RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+    from tests.server.test_runner_surfaces import _hello
+
+    binding = _bound_runner(world, "bob")
+    runner_id = token_bound_runner_id(binding)
+    registry = world.app.state.tunnel_registry  # type: ignore[attr-defined]
+    private = TestClient(world.app)  # type: ignore[arg-type]
+    tunnel = f"/v1/runners/{runner_id}/tunnel"
+    with private.websocket_connect(tunnel, headers={RUNNER_TUNNEL_TOKEN_HEADER: binding}) as open_:
+        open_.send_text(_hello())
+        assert _wait_for(lambda: registry.get(runner_id) is not None)
+        started = time.monotonic()
+        assert _remove(world, "bob").status_code == 200
+        with pytest.raises(WebSocketDisconnect) as closed:
+            for _ in range(50):
+                open_.receive_text()
+        assert closed.value.code == RUNNER_AUTHORITY_REVOKED_CLOSE_CODE
+        # Woken by the removal, not by the next 30-second check.
+        assert time.monotonic() - started < 10
+    assert not _opens(private, tunnel, {RUNNER_TUNNEL_TOKEN_HEADER: binding})
+
+
+def test_a_removed_identitys_valid_sign_in_reaches_nothing(world: World) -> None:
+    """In required mode a still-valid proxy sign-in for Bob is unbound once he is removed."""
+    bob = world.people["bob"]
+    cookie = bob.cookies[_COOKIE]
+    assert _remove(world, "bob").status_code == 200
+    teams = _stores(world)["teams"]
+    assert teams.member_for_external_identity(_ISSUER, "bob-sub", audience=_AUDIENCE) is None
+    for client in (bob, world.as_("bob-sub", "bob@example.test")):
+        client.cookies.set(_COOKIE, cookie)
+        assert client.get("/v1/me").status_code == 401
+        assert client.get("/v1/sessions").status_code == 401
+    # Signing in again under that proxy sign-in finds no member.
+    signed_in = world.as_("bob-sub", "bob@example.test")
+    refused = signed_in.post("/auth/login", json={"username": "bob", "password": "bob-pw-1234"})
+    assert refused.status_code == 403 and _code(refused) == "external_identity_unbound"
+    assert signed_in.get("/v1/sessions").status_code == 401
+    # His old CLI sign-in under his proxy sign-in: refused too.
+    bearer = {"Authorization": f"Bearer {world.tokens['bob']}"}
+    assert signed_in.get("/v1/me", headers=bearer).status_code == 401
+
+
+def test_without_a_named_installation_owner_only_the_last_owner_is_kept(world: World) -> None:
+    owner = world.people["owner"]
+    assert owner.get("/v1/team").json()["me"]["installation_owner"] is False
+    carol_id = world.member_id("carol")
+    assert (
+        owner.put(f"/v1/team/members/{carol_id}/role", json={"role": "owner"}).status_code == 200
+    )
+    assert (
+        world.people["carol"]
+        .post(f"/v1/team/members/{world.member_id('admin')}/remove")
+        .status_code
+        == 200
+    )
+
+
+def test_an_admin_removes_members_but_not_owners_admins_or_herself(world: World) -> None:
+    carol = world.people["carol"]
+    assert _remove(world, "admin", by="carol").status_code == 403
+    assert _remove(world, "carol", by="carol").status_code == 403
+    assert _remove(world, "alice", by="carol").status_code == 200
+    # A member cannot remove anyone.
+    assert (
+        world.people["bob"].post(f"/v1/team/members/{world.member_id('carol')}/remove").status_code
+        == 403
+    )
+    # Nor can the admin's CLI sign-in, though her browser can.
+    cli = world.as_("carol-sub", "carol@example.test")
+    bearer = {"Authorization": f"Bearer {world.tokens['carol']}"}
+    bob_id = world.member_id("bob")
+    assert cli.post(f"/v1/team/members/{bob_id}/remove", headers=bearer).status_code == 403
+    assert carol.post(f"/v1/team/members/{bob_id}/remove").status_code == 200
+
+
+def test_the_installation_owner_is_never_removed_and_another_owner_is(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deployment's named owner is kept; a second owner may be removed by an owner."""
+    monkeypatch.setenv("OMNIGENT_INSTALLATION_OWNER", "admin")
+    owner = world.people["owner"]
+    carol_id = world.member_id("carol")
+    promoted = owner.put(f"/v1/team/members/{carol_id}/role", json={"role": "owner"})
+    assert promoted.status_code == 200
+    # Carol is an owner now; she still cannot remove the installation's owner.
+    refused = world.people["carol"].post(f"/v1/team/members/{world.member_id('admin')}/remove")
+    assert refused.status_code == 403 and "installation" in refused.text
+    assert owner.get("/v1/team").json()["me"]["installation_owner"] is True
+    # An owner removes another owner.
+    assert owner.post(f"/v1/team/members/{carol_id}/remove").status_code == 200
+
+
+def test_removal_is_safe_to_repeat_and_finishes_what_failed(computer_world: World) -> None:
+    """A provider that does not answer leaves the computer pending; repeating finishes it."""
+    world = computer_world
+    computer = world.app.state.fake_computer  # type: ignore[attr-defined]
+    computer_id = _cloud_computer(world, "bob")
+    bob_id = world.member_id("bob")
+    computer.terminate_error = "the platform did not answer"
+
+    first = _remove(world, "bob")
+    assert first.status_code == 200, first.text
+    assert first.json()["removal"]["steps"]["computers"] == {
+        "state": "pending",
+        "total": 1,
+        "handed_over": 0,
+    }
+    # Access is already blocked whatever the provider does.
+    assert world.people["bob"].get("/v1/me").status_code == 401
+    assert _stores(world)["hosts"].get_host(computer_id) is None
+
+    computer.terminate_error = None
+    owner = world.people["owner"]
+    again = owner.post(f"/v1/team/members/{bob_id}/remove")
+    assert again.status_code == 200
+    assert again.json()["removal"]["steps"]["computers"]["state"] == "done"
+    assert computer.terminated == ["sb-bob"]
+    # A third time changes nothing and terminates nothing more.
+    assert owner.post(f"/v1/team/members/{bob_id}/remove").json() == again.json()
+    assert computer.terminated == ["sb-bob"]
+    removals = [r for r in owner.get("/v1/team").json()["removals"] if r["member_id"] == bob_id]
+    assert len(removals) == 1
+
+
+def test_a_removed_members_threads_stay_readable_by_owners_and_admins(world: World) -> None:
+    from tests.server.test_account_revocation import create_session
+
+    created = create_session(world.people["bob"])
+    assert created.status_code == 201, created.text
+    thread_id = created.json()["session_id"]
+    bob_id = world.member_id("bob")
+    assert _remove(world, "bob").status_code == 200
+
+    detail = world.people["owner"].get(f"/v1/team/members/{bob_id}/removal")
+    assert detail.status_code == 200
+    assert [t["session_id"] for t in detail.json()["threads"]] == [thread_id]
+    assert detail.json()["removal"]["thread_count"] == 1
+    assert world.people["owner"].get(f"/v1/sessions/{thread_id}").status_code == 200
+    assert world.people["carol"].get(f"/v1/sessions/{thread_id}").status_code == 200
+    assert world.people["alice"].get(f"/v1/sessions/{thread_id}").status_code in (403, 404)
+    # The removal's page is the owners' and admins'.
+    assert world.people["alice"].get(f"/v1/team/members/{bob_id}/removal").status_code == 403
+
+
+def test_the_account_list_remove_follows_the_team_rules(world: World) -> None:
+    """``DELETE /auth/users/{id}`` removes a member exactly as the team page does."""
+    carol = world.people["carol"]
+    assert carol.delete("/auth/users/admin").status_code == 403
+    cli = world.as_("carol-sub", "carol@example.test")
+    bearer = {"Authorization": f"Bearer {world.tokens['carol']}"}
+    assert cli.delete("/auth/users/bob", headers=bearer).status_code == 403
+    bob_id = world.member_id("bob")
+    assert carol.delete("/auth/users/bob").status_code == 204
+    assert world.people["bob"].get("/v1/me").status_code == 401
+    removals = world.people["owner"].get("/v1/team").json()["removals"]
+    assert [r["member_id"] for r in removals] == [bob_id]
+    assert carol.delete("/auth/users/bob").status_code == 404
+
+
+def test_runners_never_reach_the_removal_routes() -> None:
+    runner = Principal(PrincipalKind.RUNNER, "carol", scopes=frozenset({"session"}))
+    host = Principal(PrincipalKind.HOST, "carol")
+    for method, path in (
+        ("POST", "/v1/team/members/{member_id}/remove"),
+        ("GET", "/v1/team/members/{member_id}/removal"),
+    ):
+        rule = rule_for(method, path)
+        assert rule is not None
+        assert not rule.admits(runner) and not rule.admits(host)
+        assert rule.admits(Principal(PrincipalKind.HUMAN, "carol"))

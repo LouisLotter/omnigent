@@ -7,6 +7,10 @@
 - ``DELETE /v1/team/invitations/{invitation_id}``: revoke a pending invitation.
 - ``PUT /v1/team/members/{member_id}/role``: change a role (owners only).
 - ``POST /v1/team/members/{member_id}/suspend`` and ``/reinstate``.
+- ``POST /v1/team/members/{member_id}/remove``: remove a member for good, or
+  repeat an earlier removal's remaining steps; returns where it stands.
+- ``GET /v1/team/members/{member_id}/removal``: a removal's steps and the
+  threads the member owned.
 - ``GET /v1/team/invitations/preview``: what an invitation offers, for the
   person holding its link; no sign-in needed.
 
@@ -22,6 +26,12 @@ Suspension blocks the member's new work at once: their credentials stop
 authenticating, their open streams close, their schedules skip, and their
 registration rotates so every token issued before stays dead after
 reinstatement.
+
+Removal does the same at once and for good (:mod:`omnigent.server.member_removal`):
+the account is removed, their cloud computers are handed to their provider,
+and their threads stay readable by owners and admins. Who may remove whom
+follows suspension; the last active owner and the installation's own owner
+(``OMNIGENT_INSTALLATION_OWNER``) are kept.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ from omnigent.server.external_identity import (
     external_identity_mode,
     resolved_external_identity,
 )
+from omnigent.server.member_removal import MemberRemovals, installation_owner
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.team_admission import AdmissionSync
 from omnigent.stores.team_store import SqlAlchemyTeamStore
@@ -81,6 +92,8 @@ def _member_json(member: TeamMember) -> dict[str, object]:
         "state": member.state,
         "created_at": member.created_at,
         "updated_at": member.updated_at,
+        # The deployment's own owner is never removed; the page hides Remove for them.
+        "installation_owner": member.user_id == installation_owner(),
     }
 
 
@@ -104,6 +117,7 @@ def create_team_router(
     base_url: str,
     invite_ttl_seconds: int,
     admission_sync: AdmissionSync | None = None,
+    removals: MemberRemovals | None = None,
 ) -> APIRouter:
     """Build the ``/v1/team`` router.
 
@@ -113,8 +127,12 @@ def create_team_router(
     :param base_url: The installation's public address, for invitation links.
     :param invite_ttl_seconds: How long an invitation stays usable.
     :param admission_sync: Pushes the change to a front proxy, when one is wired.
+    :param removals: Removes members; one is built from the stores when omitted.
     """
     router = APIRouter()
+    member_removals = removals or MemberRemovals(
+        account_store, team_store, auth_provider=auth_provider, admission_sync=admission_sync
+    )
 
     def _caller(request: Request, action: str | None) -> TeamMember:
         """The calling owner or admin; *action* names a change that needs a browser."""
@@ -174,13 +192,18 @@ def create_team_router(
         team = await asyncio.to_thread(team_store.get_team)
         members, _ = await asyncio.to_thread(team_store.list_members, limit=1000)
         invitations = await asyncio.to_thread(team_store.list_invitations)
+        removed = await asyncio.to_thread(_removal_list)
         return {
             "team": {"team_id": team.id, "name": team.name} if team is not None else None,
             "me": _member_json(caller),
             "members": [_member_json(member) for member in members if member.is_current],
             "invitations": [_invitation_json(invitation) for invitation in invitations],
+            "removals": removed,
             "external_identity": external_identity_mode(request).value,
         }
+
+    def _removal_list() -> list[dict[str, object]]:
+        return [member_removals.status(removal) for removal in team_store.list_removals()]
 
     @router.post("/team/invitations")
     async def invite(request: Request, body: InvitationRequest) -> dict[str, object]:
@@ -264,6 +287,24 @@ def create_team_router(
         """Reinstate a suspended member; they sign in again on every device."""
         changed = await _set_state(request, member_id, "active", "reinstate members")
         return {"member": _member_json(changed)}
+
+    @router.post("/team/members/{member_id}/remove")
+    async def remove(request: Request, member_id: str) -> dict[str, object]:
+        """Remove a member for good; repeated, it retries the steps not yet done."""
+        caller = await asyncio.to_thread(_caller, request, "remove members")
+        removal = await member_removals.remove(request, member_id, actor_member_id=caller.id)
+        return {"removal": await asyncio.to_thread(member_removals.status, removal)}
+
+    @router.get("/team/members/{member_id}/removal")
+    async def removal_detail(request: Request, member_id: str) -> dict[str, object]:
+        """A removal's steps and the threads the member owned."""
+        await asyncio.to_thread(_caller, request, None)
+        removal = await asyncio.to_thread(team_store.get_removal, member_id)
+        if removal is None:
+            raise OmnigentError("no such removal", code=ErrorCode.NOT_FOUND)
+        status = await asyncio.to_thread(member_removals.status, removal)
+        threads = await asyncio.to_thread(member_removals.threads, member_id)
+        return {"removal": status, "threads": threads}
 
     @router.get("/team/invitations/preview")
     async def preview(token: str = "") -> dict[str, object]:

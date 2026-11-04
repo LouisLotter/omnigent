@@ -1,18 +1,21 @@
 // The team section of Settings → Members: what an owner and an admin may do,
-// the invitation link shown once, and the suspend confirmation. The server
+// the invitation link shown once, the suspend and remove confirmations, and
+// what a removal says is done and what isn't. The server
 // enforces every rule; these pin the page to the same rules.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TeamPanel } from "./TeamPanel";
 import * as teamApi from "@/lib/teamApi";
-import type { TeamMemberEntry, TeamState } from "@/lib/teamApi";
+import type { TeamMemberEntry, TeamRemovalEntry, TeamState } from "@/lib/teamApi";
 
 vi.mock("@/lib/teamApi", () => ({
   inviteToTeam: vi.fn(),
   revokeInvitation: vi.fn(),
   changeMemberRole: vi.fn(),
   setMemberSuspended: vi.fn(),
+  removeMember: vi.fn(),
+  getRemoval: vi.fn(),
 }));
 
 function member(user_id: string, role: TeamMemberEntry["role"], state = "active"): TeamMemberEntry {
@@ -26,12 +29,37 @@ function member(user_id: string, role: TeamMemberEntry["role"], state = "active"
   };
 }
 
-const owner = member("owner", "owner");
+const owner = { ...member("owner", "owner"), installation_owner: true };
 const carol = member("carol", "admin");
 const alice = member("alice", "member");
 const bob = member("bob", "member", "suspended");
 
-function teamAs(me: TeamMemberEntry): TeamState {
+function removed(
+  user_id: string,
+  steps: Partial<TeamRemovalEntry["steps"]> = {},
+  thread_count = 2,
+): TeamRemovalEntry {
+  return {
+    member_id: `${user_id}-id`,
+    user_id,
+    removed_at: 1_700_000_000,
+    removed_by: "owner",
+    thread_count,
+    steps: {
+      access: "done",
+      member_group: "done",
+      computers: {
+        state: "done",
+        total: 1,
+        handed_over: 1,
+      },
+      devices: { state: "not_used", remaining: 0 },
+      ...steps,
+    },
+  };
+}
+
+function teamAs(me: TeamMemberEntry, removals: TeamRemovalEntry[] = []): TeamState {
   return {
     team: { team_id: "t", name: null },
     me,
@@ -48,19 +76,25 @@ function teamAs(me: TeamMemberEntry): TeamState {
       },
     ],
     external_identity: "required",
+    removals,
   };
 }
 
 const onChanged = vi.fn(async () => undefined);
 
-function renderAs(me: TeamMemberEntry, accounts: string[] = []) {
+function renderAs(
+  me: TeamMemberEntry,
+  accounts: string[] = [],
+  removals: TeamRemovalEntry[] = [],
+  computersPage: string | null = "https://team.example/platform/computers",
+) {
   return render(
     <TeamPanel
-      state={teamAs(me)}
+      state={teamAs(me, removals)}
+      computersPage={computersPage}
       accounts={accounts}
       onChanged={onChanged}
       onResetPassword={vi.fn()}
-      onRemove={vi.fn()}
       rebaseUrl={(url) => url.replace("http://server", "https://team.example")}
     />,
   );
@@ -80,6 +114,7 @@ beforeEach(() => {
     ok: true,
     invitation: teamAs(owner).invitations[0],
   });
+  vi.mocked(teamApi.removeMember).mockResolvedValue({ ok: true, removal: removed("alice") });
 });
 
 afterEach(() => {
@@ -195,5 +230,115 @@ describe("TeamPanel", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Create invitation" }));
     expect((await within(dialog).findByRole("alert")).textContent).toContain("valid email");
     expect(teamApi.inviteToTeam).toHaveBeenCalledWith("nope", "member");
+  });
+  it("lets an owner remove anyone but themselves and the installation's owner", () => {
+    const second = member("sam", "owner");
+    render(
+      <TeamPanel
+        state={{ ...teamAs(second), members: [owner, second, carol, alice] }}
+        onChanged={onChanged}
+        onResetPassword={vi.fn()}
+        rebaseUrl={(url) => url}
+      />,
+    );
+    expect(within(row("carol")).getByRole("button", { name: /Remove/ })).toBeTruthy();
+    expect(within(row("alice")).getByRole("button", { name: /Remove/ })).toBeTruthy();
+    expect(within(row("sam")).queryByRole("button", { name: /Remove/ })).toBeNull();
+    expect(within(row("owner")).queryByRole("button", { name: /Remove/ })).toBeNull();
+  });
+
+  it("lets an admin remove members only", () => {
+    renderAs(carol);
+    expect(within(row("alice")).getByRole("button", { name: /Remove/ })).toBeTruthy();
+    expect(within(row("owner")).queryByRole("button", { name: /Remove/ })).toBeNull();
+    expect(within(row("carol")).queryByRole("button", { name: /Remove/ })).toBeNull();
+  });
+
+  it("removes only after the confirmation that says what happens and what stays", async () => {
+    renderAs(owner);
+    fireEvent.click(within(row("alice")).getByRole("button", { name: /Remove/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toContain("cannot be undone");
+    expect(dialog.textContent).toContain("readable by owners and admins");
+    expect(dialog.textContent).toContain("Invitations they sent to other people stay pending");
+    expect(teamApi.removeMember).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(teamApi.removeMember).toHaveBeenCalledWith("alice-id"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("shows the server's refusal in the remove confirmation", async () => {
+    vi.mocked(teamApi.removeMember).mockResolvedValue({
+      ok: false,
+      error: "the installation's owner cannot be removed",
+      status: 403,
+    });
+    renderAs(owner);
+    fireEvent.click(within(row("carol")).getByRole("button", { name: /Remove/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
+    expect((await within(dialog).findByRole("alert")).textContent).toContain("cannot be removed");
+  });
+
+  it("says what a finished removal did, with no retry", () => {
+    renderAs(owner, [], [removed("dave")]);
+    const entry = document.querySelector<HTMLElement>('[data-removed="dave"]');
+    if (entry === null) throw new Error("no removal entry");
+    expect(entry.textContent).toContain("Access blocked");
+    expect(entry.textContent).toContain("no longer lets them in");
+    expect(entry.textContent).toContain("1 of 1");
+    expect(entry.textContent).toContain("none to revoke");
+    expect(entry.textContent).toContain("2 threads kept");
+    const page = within(entry).getByRole("link", { name: /computers page/ });
+    expect(page.getAttribute("href")).toBe("https://team.example/platform/computers");
+    expect(within(entry).queryByRole("button", { name: /Retry/ })).toBeNull();
+  });
+
+  it("names no link without a computers page on this installation's origin", () => {
+    renderAs(owner, [], [removed("dave")], null);
+    const entry = document.querySelector<HTMLElement>('[data-removed="dave"]');
+    if (entry === null) throw new Error("no removal entry");
+    expect(within(entry).queryByRole("link", { name: /computers page/ })).toBeNull();
+    expect(entry.textContent).toContain("Delete them where your computers are managed.");
+  });
+
+  it("keeps an unfinished step visible and retries it on request", async () => {
+    vi.mocked(teamApi.removeMember).mockResolvedValue({ ok: true, removal: removed("dave") });
+    renderAs(
+      owner,
+      [],
+      [
+        removed("dave", {
+          member_group: "pending",
+          computers: { state: "pending", total: 1, handed_over: 0 },
+        }),
+      ],
+    );
+    const entry = document.querySelector<HTMLElement>('[data-removed="dave"]');
+    if (entry === null) throw new Error("no removal entry");
+    expect(entry.textContent).toContain("0 of 1");
+    expect(entry.textContent).toContain("retried until it is confirmed");
+    fireEvent.click(within(entry).getByRole("button", { name: /Retry now/ }));
+    await waitFor(() => expect(teamApi.removeMember).toHaveBeenCalledWith("dave-id"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("lists a removed member's threads as links", async () => {
+    vi.mocked(teamApi.getRemoval).mockResolvedValue({
+      ok: true,
+      removal: removed("dave"),
+      threads: [
+        { session_id: "t1", title: "Quarterly report" },
+        { session_id: "t2", title: null },
+      ],
+    });
+    renderAs(owner, [], [removed("dave")]);
+    const entry = document.querySelector<HTMLElement>('[data-removed="dave"]');
+    if (entry === null) throw new Error("no removal entry");
+    fireEvent.click(within(entry).getByRole("button", { name: "Threads" }));
+    const report = await within(entry).findByRole("link", { name: "Quarterly report" });
+    expect(report.getAttribute("href")).toMatch(/\/c\/t1$/);
+    expect(within(entry).getByRole("link", { name: "Untitled thread" })).toBeTruthy();
+    expect(teamApi.getRemoval).toHaveBeenCalledWith("dave-id");
   });
 });

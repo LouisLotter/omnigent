@@ -24,6 +24,7 @@ password hash, not an IdP authorization code exchange.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -36,7 +37,7 @@ from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from omnigent.db.account_authority import bind_account_authority, target_account_scope
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.approval_authority import answer_credential_problem
@@ -62,9 +63,11 @@ from omnigent.server.passwords import (
 )
 from omnigent.server.principals import CredentialKind
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.team_store import LastActiveOwnerError
 
 if TYPE_CHECKING:
     from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.member_removal import MemberRemovals
     from omnigent.server.team_admission import AdmissionSync
     from omnigent.stores.scheduled_task_store import ScheduledTaskStore
     from omnigent.stores.team_store import SqlAlchemyTeamStore
@@ -252,6 +255,7 @@ def create_accounts_auth_router(
     scheduled_task_store: ScheduledTaskStore | None = None,
     team_store: SqlAlchemyTeamStore | None = None,
     admission_sync: AdmissionSync | None = None,
+    member_removals: MemberRemovals | None = None,
 ) -> APIRouter:
     """Build the ``/auth/*`` router for the accounts provider.
 
@@ -287,6 +291,8 @@ def create_accounts_auth_router(
         redeems team invitations, and a suspended member cannot sign in.
     :param admission_sync: Told when a redemption changes who a front proxy
         should admit.
+    :param member_removals: When set, ``DELETE /auth/users/{id}`` removes a
+        team member the way the team page does, with the team's rules.
     :returns: APIRouter to mount at ``/auth``.
     """
     if auth_provider._source != "accounts":
@@ -976,6 +982,32 @@ def create_accounts_auth_router(
             },
         )
 
+    async def _remove_team_member(request: Request, admin_id: str, member_id: str) -> Response:
+        """A team member's account is removed as the team page removes it."""
+        assert member_removals is not None and team_store is not None
+        actor = await asyncio.to_thread(team_store.get_member_for_account, admin_id)
+        if actor is None:
+            # An admin flag without a membership administers no team.
+            return JSONResponse(
+                status_code=403,
+                content={"error": "only the team's owners and admins remove its members"},
+            )
+        try:
+            await member_removals.remove(request, member_id, actor_member_id=actor.id)
+        except LastActiveOwnerError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "cannot delete the last admin or the team's last active "
+                    "owner — promote another user first or the deploy would have no "
+                    "recovery path"
+                },
+            )
+        except OmnigentError as exc:
+            status = 404 if exc.code == ErrorCode.NOT_FOUND else 403
+            return JSONResponse(status_code=status, content={"error": exc.message})
+        return Response(status_code=204)
+
     @router.delete("/users/{user_id}")
     async def delete_user(request: Request, user_id: str) -> Response:
         """Remove a user (admin only).
@@ -998,8 +1030,15 @@ def create_accounts_auth_router(
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
             return JSONResponse(status_code=403, content={"error": "admin only"})
+        problem = answer_credential_problem(request, auth_provider, "remove people")
+        if problem is not None:
+            return JSONResponse(status_code=403, content={"error": problem})
         if user_id == admin_id:
             return JSONResponse(status_code=400, content={"error": "cannot delete self"})
+        if member_removals is not None and team_store is not None:
+            target = await asyncio.to_thread(team_store.get_member_for_account, user_id)
+            if target is not None:
+                return await _remove_team_member(request, admin_id, target.id)
 
         scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
         persistent = getattr(request.app.state, "scheduled_task_dispatch_enabled", False)

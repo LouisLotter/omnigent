@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   loginUrl: null as string | null,
   serverVersion: "0.3.0.dev0" as string | null,
   singleUser: false,
+  overviewUrls: {} as Record<string, string>,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -29,6 +30,8 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     login_url: mocks.loginUrl,
     server_version: mocks.serverVersion,
     single_user: mocks.singleUser,
+    persistent_host_providers: ["cloud"],
+    persistent_host_overview_urls: mocks.overviewUrls,
   }),
 }));
 vi.mock("@/lib/identity", () => ({
@@ -73,6 +76,7 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.serverVersion = "0.3.0.dev0";
   mocks.singleUser = false;
+  mocks.overviewUrls = {};
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
@@ -298,4 +302,52 @@ describe("MembersPage with a team", () => {
     expect(screen.getByRole("button", { name: /Invite someone/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Invite member/ })).toBeNull();
   });
+
+  it.each([
+    ["on this installation's origin", "/platform/computers", true],
+    ["on another origin", "https://elsewhere.example/platform/computers", false],
+  ] as const)(
+    "links a removal to a computers page %s only if same-origin",
+    async (_where, path, linked) => {
+      const page = path.startsWith("/") ? `${window.location.origin}${path}` : path;
+      mocks.overviewUrls = { cloud: page };
+      vi.mocked(teamApi.getTeam).mockResolvedValue({
+        team: { team_id: "t", name: null },
+        me: {
+          member_id: "o",
+          user_id: "admin",
+          role: "owner",
+          state: "active",
+          created_at: 1,
+          updated_at: 1,
+        },
+        members: [],
+        invitations: [],
+        external_identity: "required",
+        removals: [
+          {
+            member_id: "d",
+            user_id: "dave",
+            removed_at: 1_700_000_000,
+            removed_by: "admin",
+            thread_count: 0,
+            steps: {
+              access: "done",
+              member_group: "done",
+              computers: { state: "done", total: 1, handed_over: 1 },
+              devices: { state: "not_used", remaining: 0 },
+            },
+          },
+        ],
+      });
+      renderPage();
+      const entry = await waitFor(() => {
+        const found = document.querySelector<HTMLElement>('[data-removed="dave"]');
+        if (found === null) throw new Error("no removal entry");
+        return found;
+      });
+      const link = within(entry).queryByRole("link", { name: /computers page/ });
+      expect(link?.getAttribute("href") ?? null).toBe(linked ? page : null);
+    },
+  );
 });

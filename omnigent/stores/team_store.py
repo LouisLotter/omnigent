@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from sqlalchemy import ColumnElement, Insert, delete, func, select, update
+from sqlalchemy import ColumnElement, Insert, delete, func, insert, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -42,6 +42,8 @@ from omnigent.db.db_models import (
     SqlTeamIdentityBinding,
     SqlTeamInvitation,
     SqlTeamMember,
+    SqlTeamMemberRemoval,
+    SqlTeamMemberRemovalItem,
     SqlUser,
     current_workspace_id,
     external_identity_cksum,
@@ -52,11 +54,13 @@ from omnigent.db.enum_codecs import (
     decode_team_member_role,
     decode_team_member_state,
     encode_conversation_kind,
+    encode_host_lifecycle,
     encode_scheduled_task_state,
     encode_team_identity_provenance,
     encode_team_invitation_state,
     encode_team_member_role,
     encode_team_member_state,
+    encode_team_removal_item_kind,
 )
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -70,6 +74,7 @@ from omnigent.entities.team import (
     InventoryAccount,
     InvitationRole,
     InvitationState,
+    MemberRemoval,
     MemberRole,
     MemberState,
     OwnershipFinding,
@@ -110,6 +115,11 @@ _REVOKED = encode_team_invitation_state("revoked")
 _EXPIRED = encode_team_invitation_state("expired")
 _ADMIN = encode_team_member_role("admin")
 _MEMBER_ROLE = encode_team_member_role("member")
+_THREAD_ITEM = encode_team_removal_item_kind("thread")
+_COMPUTER_ITEM = encode_team_removal_item_kind("computer")
+_PERSISTENT_HOST = encode_host_lifecycle("persistent")
+# Rows per insert when a removal records what the member owned.
+_REMOVAL_ITEM_BATCH = 500
 # Bounds one admission list and one page of invitations.
 MAX_ADMITTED = 1000
 _INVENTORY_PAGE_SIZE = 500
@@ -386,7 +396,231 @@ def retire_deleted_account_membership(session: Session, user_id: str) -> bool:
     except LastActiveOwnerError:
         return False
     _retire(session, row, _now())
+    # Their address leaves the admission list, so a front proxy must hear of it now.
+    bump_admission_revision(session)
     return True
+
+
+# ── A member's removal, inside the account deletion's transaction ──────
+
+
+def member_account(session: Session, member_id: str) -> tuple[str, MemberState] | None:
+    """The account a membership names and its state, read under the team lock.
+
+    The row is not locked here: the caller locks the account first, then the
+    membership, as every account writer does.
+    """
+    row = session.execute(
+        select(SqlTeamMember.user_id, SqlTeamMember.state).where(
+            SqlTeamMember.workspace_id == current_workspace_id(),
+            SqlTeamMember.id == member_id,
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    return row.user_id, cast(MemberState, decode_team_member_state(row.state))
+
+
+def owned_before_removal(session: Session, user_id: str) -> tuple[list[str], list[str]]:
+    """The threads *user_id* owns and their cloud computers, before the deletion drops them.
+
+    Cloud computers are persistent hosts that are live or still have a
+    sandbox for their provider to remove.
+
+    :returns: ``(thread_ids, host_ids)``, each sorted.
+    """
+    workspace_id = current_workspace_id()
+    threads = session.execute(
+        select(SqlSessionPermission.conversation_id)
+        .where(
+            SqlSessionPermission.workspace_id == workspace_id,
+            SqlSessionPermission.user_id == user_id,
+            SqlSessionPermission.level >= LEVEL_OWNER,
+        )
+        .order_by(SqlSessionPermission.conversation_id)
+    ).scalars()
+    computers = session.execute(
+        select(SqlHost.host_id)
+        .where(
+            SqlHost.workspace_id == workspace_id,
+            SqlHost.user_id == user_id,
+            SqlHost.lifecycle == _PERSISTENT_HOST,
+            or_(
+                SqlHost.deleted_at.is_(None),
+                SqlHost.sandbox_id.is_not(None),
+                SqlHost.terminating_sandbox_id.is_not(None),
+            ),
+        )
+        .order_by(SqlHost.host_id)
+    ).scalars()
+    return list(threads), list(computers)
+
+
+def member_addresses(session: Session, member_id: str) -> list[str]:
+    """The addresses a removed membership could be invited at again, before its bindings go.
+
+    Those its identities were verified with, and those of the invitations this
+    membership redeemed: a registration without a front proxy binds no
+    identity, and its invitation's address is the only one on record.
+    """
+    workspace_id = current_workspace_id()
+    bound = session.execute(
+        select(SqlTeamIdentityBinding.email)
+        .where(
+            SqlTeamIdentityBinding.workspace_id == workspace_id,
+            SqlTeamIdentityBinding.member_id == member_id,
+            SqlTeamIdentityBinding.email.is_not(None),
+        )
+        .limit(MAX_IDENTITIES_PER_MEMBER)
+    ).scalars()
+    redeemed = session.execute(
+        select(SqlTeamInvitation.email)
+        .where(
+            SqlTeamInvitation.workspace_id == workspace_id,
+            SqlTeamInvitation.redeemed_member_id == member_id,
+        )
+        .limit(MAX_ADMITTED)
+    ).scalars()
+    # Invitations store addresses lowercased; a proxy may report one in any case.
+    return sorted({email.strip().lower() for email in (*bound, *redeemed) if email})
+
+
+def revoke_invitations_for(session: Session, *, emails: list[str], user_id: str, now: int) -> int:
+    """Revoke the pending invitations a removed person could still use.
+
+    Those to one of their addresses, and those linking their account. An
+    invitation they issued to someone else is that person's and stays.
+
+    :returns: How many were revoked.
+    """
+    for_them = [SqlTeamInvitation.target_user_id == user_id]
+    if emails:
+        for_them.append(SqlTeamInvitation.email.in_(emails))
+    result = session.execute(
+        update(SqlTeamInvitation)
+        .where(
+            SqlTeamInvitation.workspace_id == current_workspace_id(),
+            SqlTeamInvitation.state == _PENDING,
+            or_(*for_them),
+        )
+        .values(state=_REVOKED, closed_at=now)
+    )
+    revoked = cast(CursorResult, result).rowcount or 0
+    if revoked:
+        bump_admission_revision(session)
+    return revoked
+
+
+def record_member_removal(
+    session: Session,
+    *,
+    member_id: str,
+    user_id: str,
+    removed_by_member_id: str | None,
+    threads: list[str],
+    computers: list[str],
+    now: int,
+) -> MemberRemoval:
+    """Write the removal's record, after every change it makes, in the same transaction."""
+    team = lock_team(session)
+    session.add(
+        SqlTeamMemberRemoval(
+            member_id=member_id,
+            user_id=user_id,
+            removed_by_member_id=removed_by_member_id,
+            removed_at=now,
+            admission_revision=team.admission_revision or 0,
+        )
+    )
+    session.flush()
+    items = [(_THREAD_ITEM, thread_id) for thread_id in threads]
+    items += [(_COMPUTER_ITEM, host_id) for host_id in computers]
+    workspace_id = current_workspace_id()
+    for start in range(0, len(items), _REMOVAL_ITEM_BATCH):
+        session.execute(
+            insert(SqlTeamMemberRemovalItem),
+            [
+                {
+                    "workspace_id": workspace_id,
+                    "member_id": member_id,
+                    "kind": kind,
+                    "item_id": item,
+                }
+                for kind, item in items[start : start + _REMOVAL_ITEM_BATCH]
+            ],
+        )
+    removal = removals_in_session(session, [member_id])
+    return removal[0]
+
+
+def removals_in_session(session: Session, member_ids: list[str]) -> list[MemberRemoval]:
+    """The removal records for *member_ids*, newest first, with their counts.
+
+    A computer is pending while its host's tombstone still records a sandbox:
+    its provider has not confirmed the removal, and the reaper retries it.
+    """
+    if not member_ids:
+        return []
+    workspace_id = current_workspace_id()
+    rows = (
+        session.execute(
+            select(SqlTeamMemberRemoval)
+            .where(
+                SqlTeamMemberRemoval.workspace_id == workspace_id,
+                SqlTeamMemberRemoval.member_id.in_(member_ids),
+            )
+            .order_by(SqlTeamMemberRemoval.removed_at.desc(), SqlTeamMemberRemoval.member_id)
+        )
+        .scalars()
+        .all()
+    )
+    counts: Counter[tuple[str, int]] = Counter()
+    for member_id, kind, count in session.execute(
+        select(
+            SqlTeamMemberRemovalItem.member_id,
+            SqlTeamMemberRemovalItem.kind,
+            func.count(),
+        )
+        .where(
+            SqlTeamMemberRemovalItem.workspace_id == workspace_id,
+            SqlTeamMemberRemovalItem.member_id.in_(member_ids),
+        )
+        .group_by(SqlTeamMemberRemovalItem.member_id, SqlTeamMemberRemovalItem.kind)
+    ).all():
+        counts[(member_id, kind)] = count
+    pending: dict[str, int] = dict(
+        session.execute(
+            select(SqlTeamMemberRemovalItem.member_id, func.count())
+            .join(
+                SqlHost,
+                (SqlHost.workspace_id == SqlTeamMemberRemovalItem.workspace_id)
+                & (SqlHost.host_id == SqlTeamMemberRemovalItem.item_id),
+            )
+            .where(
+                SqlTeamMemberRemovalItem.workspace_id == workspace_id,
+                SqlTeamMemberRemovalItem.member_id.in_(member_ids),
+                SqlTeamMemberRemovalItem.kind == _COMPUTER_ITEM,
+                SqlHost.deleted_at.is_not(None),
+                or_(SqlHost.sandbox_id.is_not(None), SqlHost.terminating_sandbox_id.is_not(None)),
+            )
+            .group_by(SqlTeamMemberRemovalItem.member_id)
+        )
+        .tuples()
+        .all()
+    )
+    return [
+        MemberRemoval(
+            member_id=row.member_id,
+            user_id=row.user_id,
+            removed_by_member_id=row.removed_by_member_id,
+            removed_at=row.removed_at,
+            admission_revision=row.admission_revision,
+            thread_count=counts[(row.member_id, _THREAD_ITEM)],
+            computers=counts[(row.member_id, _COMPUTER_ITEM)],
+            computers_pending=pending.get(row.member_id, 0),
+        )
+        for row in rows
+    ]
 
 
 def admin_flag_for_account(session: Session, user_id: str, is_admin: bool) -> bool:
@@ -1415,6 +1649,49 @@ class SqlAlchemyTeamStore:
                 emails=listed,
                 owners=tuple(sorted(owners & set(listed))),
                 next_change_at=next_expiry,
+            )
+
+    # ── Removals ───────────────────────────────────────────────────
+
+    def get_removal(self, member_id: str) -> MemberRemoval | None:
+        """Return a removed member's removal record, or ``None``."""
+        with self._session("select_team_member_removal") as session:
+            found = removals_in_session(session, [member_id])
+            return found[0] if found else None
+
+    def list_removals(self, *, limit: int = 50) -> list[MemberRemoval]:
+        """Return the latest removals, newest first."""
+        if not 1 <= limit <= MAX_ADMITTED:
+            raise OmnigentError("limit must be 1-1000", code=ErrorCode.INVALID_INPUT)
+        with self._session("list_team_member_removals") as session:
+            member_ids = list(
+                session.execute(
+                    select(SqlTeamMemberRemoval.member_id)
+                    .where(SqlTeamMemberRemoval.workspace_id == current_workspace_id())
+                    .order_by(
+                        SqlTeamMemberRemoval.removed_at.desc(), SqlTeamMemberRemoval.member_id
+                    )
+                    .limit(limit)
+                ).scalars()
+            )
+            return removals_in_session(session, member_ids)
+
+    def removal_threads(self, member_id: str, *, limit: int = 500) -> list[str]:
+        """Return the ids of the threads a removed member owned, in id order."""
+        if not 1 <= limit <= MAX_ADMITTED:
+            raise OmnigentError("limit must be 1-1000", code=ErrorCode.INVALID_INPUT)
+        with self._session("list_team_member_removal_threads") as session:
+            return list(
+                session.execute(
+                    select(SqlTeamMemberRemovalItem.item_id)
+                    .where(
+                        SqlTeamMemberRemovalItem.workspace_id == current_workspace_id(),
+                        SqlTeamMemberRemovalItem.member_id == member_id,
+                        SqlTeamMemberRemovalItem.kind == _THREAD_ITEM,
+                    )
+                    .order_by(SqlTeamMemberRemovalItem.item_id)
+                    .limit(limit)
+                ).scalars()
             )
 
     # ── Inventory ──────────────────────────────────────────────────

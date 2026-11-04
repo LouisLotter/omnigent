@@ -134,6 +134,32 @@ class TeamInvitation:
 
 
 @dataclasses.dataclass(frozen=True)
+class MemberRemoval:
+    """The record of one member's removal, from its own transaction.
+
+    :param member_id: The removed membership.
+    :param user_id: Their username, kept for display (e.g. ``"alice"``).
+    :param removed_by_member_id: The owner or admin who removed them, or
+        ``None`` for the system.
+    :param removed_at: Unix epoch seconds of the removal.
+    :param admission_revision: The admission revision the removal committed.
+    :param thread_count: Threads they owned; owners and admins can still open them.
+    :param computers: Cloud computers handed to their provider for removal.
+    :param computers_pending: Of those, the ones whose provider has not yet
+        confirmed the removal; they are retried.
+    """
+
+    member_id: str
+    user_id: str
+    removed_by_member_id: str | None
+    removed_at: int
+    admission_revision: int
+    thread_count: int
+    computers: int
+    computers_pending: int
+
+
+@dataclasses.dataclass(frozen=True)
 class AdmissionSnapshot:
     """Who a front proxy should admit, for one membership revision.
 

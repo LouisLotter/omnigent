@@ -64,6 +64,11 @@ _CODECS = [
         ec.encode_team_invitation_state,
         ec.decode_team_invitation_state,
     ),
+    (
+        ec.TEAM_REMOVAL_ITEM_KIND,
+        ec.encode_team_removal_item_kind,
+        ec.decode_team_removal_item_kind,
+    ),
 ]
 
 
@@ -164,3 +169,4 @@ def test_shipped_codes_are_stable() -> None:
     assert ec.TEAM_MEMBER_STATE == {"invited": 1, "active": 2, "suspended": 3, "removed": 4}
     assert ec.TEAM_IDENTITY_PROVENANCE == {"invitation": 1, "account_proof": 2, "migration": 3}
     assert ec.TEAM_INVITATION_STATE == {"pending": 1, "redeemed": 2, "revoked": 3, "expired": 4}
+    assert ec.TEAM_REMOVAL_ITEM_KIND == {"thread": 1, "computer": 2}

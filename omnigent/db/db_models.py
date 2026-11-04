@@ -616,6 +616,62 @@ class SqlTeamInvitation(OmnigentBase):
     )
 
 
+class SqlTeamMemberRemoval(OmnigentBase):
+    """
+    SQLAlchemy model for the ``team_member_removals`` table.
+
+    One row per removed member, written in the removal's own transaction, so
+    the team page can say which steps are done and retry the rest.
+
+    :param member_id: The removed membership (``team_members.id``).
+    :param user_id: The removed account's username, kept for display.
+    :param removed_by_member_id: The owner or admin who removed them; ``NULL``
+        for the system.
+    :param removed_at: Unix epoch seconds of the removal.
+    :param admission_revision: The team's admission revision the removal
+        committed; a front proxy that applied it no longer admits them.
+    """
+
+    __tablename__ = "team_member_removals"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    member_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    removed_by_member_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    removed_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    admission_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_team_member_removals_removed_at", "workspace_id", "removed_at", "member_id"),
+    )
+
+
+class SqlTeamMemberRemovalItem(OmnigentBase):
+    """
+    SQLAlchemy model for the ``team_member_removal_items`` table.
+
+    What a removal recorded: the threads the member owned, which owners and
+    admins can still open, and the cloud computers handed to their provider.
+
+    :param member_id: The removal (``team_member_removals.member_id``).
+    :param kind: Int code (see ``omnigent.db.enum_codecs.TEAM_REMOVAL_ITEM_KIND``).
+    :param item_id: The thread id or host id, stored as 16 raw bytes.
+    """
+
+    __tablename__ = "team_member_removal_items"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    member_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    kind: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    item_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+
+    __table_args__ = (CheckConstraint("kind IN (1, 2)", name="ck_team_member_removal_items_kind"),)
+
+
 class SqlApprovalResource(OmnigentBase):
     """
     SQLAlchemy model for the ``approval_resources`` table.
