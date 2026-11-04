@@ -144,6 +144,11 @@ export interface ServerInfo {
    */
   persistent_host_providers?: string[];
   /**
+   * Each persistent provider's overview page, by provider: where an
+   * administrator finds other people's computers. Absent on older servers.
+   */
+  persistent_host_overview_urls?: Record<string, string>;
+  /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
@@ -315,6 +320,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
   persistent_host_providers: [],
+  persistent_host_overview_urls: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -424,6 +430,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           persistent_host_providers: Array.isArray(data.persistent_host_providers)
             ? data.persistent_host_providers.filter((p): p is string => typeof p === "string")
             : [],
+          persistent_host_overview_urls: overviewUrls(data.persistent_host_overview_urls),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -539,6 +546,27 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
 /** Providers that create computers; empty hides the add-computer action. */
 export function persistentHostProviders(info: ServerInfo | "loading"): string[] {
   return info === "loading" ? [] : (info.persistent_host_providers ?? []);
+}
+
+/** The computers' overview pages providers declare, by provider: http(s) or same-origin paths. */
+function overviewUrls(raw: unknown): Record<string, string> {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(
+    Object.entries(raw).filter(
+      (entry): entry is [string, string] =>
+        typeof entry[1] === "string" && /^(https?:\/\/|\/(?!\/))/i.test(entry[1]),
+    ),
+  );
+}
+
+/** Overview pages of the providers that create computers, in their order. */
+export function persistentHostOverviewUrls(info: ServerInfo | "loading"): string[] {
+  if (info === "loading") return [];
+  const urls = info.persistent_host_overview_urls ?? {};
+  return persistentHostProviders(info).flatMap((provider) => {
+    const url = urls[provider];
+    return url ? [url] : [];
+  });
 }
 
 /** Whether "New sandbox" can be offered: the server launches per-session sandboxes. */

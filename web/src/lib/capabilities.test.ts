@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // test starts from a fresh module cache; only the pure helpers are static.
 import {
   canLaunchManagedSandbox,
+  persistentHostOverviewUrls,
   persistentHostProviders,
   sandboxOptionLabel,
   sandboxProviderOptions,
@@ -129,6 +130,20 @@ describe("canLaunchManagedSandbox", () => {
   });
 });
 
+describe("persistentHostOverviewUrls", () => {
+  it("lists the overview pages of the providers that create computers, in their order", () => {
+    expect(persistentHostOverviewUrls("loading")).toEqual([]);
+    expect(
+      persistentHostOverviewUrls(
+        info({
+          persistent_host_providers: ["b", "a", "c"],
+          persistent_host_overview_urls: { a: "https://a.test/", b: "https://b.test/", z: "/z" },
+        }),
+      ),
+    ).toEqual(["https://b.test/", "https://a.test/"]);
+  });
+});
+
 describe("persistentHostProviders", () => {
   it("lists the providers that create computers, empty while loading or absent", () => {
     expect(persistentHostProviders("loading")).toEqual([]);
@@ -192,6 +207,31 @@ describe("resolveServerInfo sandbox_providers", () => {
 
   it("defaults the persistent host providers to empty on an older server", async () => {
     expect((await probe({})).persistent_host_providers).toEqual([]);
+  });
+
+  it("keeps http(s) and same-origin overview pages, dropping anything else", async () => {
+    const resolved = await probe({
+      persistent_host_overview_urls: {
+        cloudflare: "https://computers.example.test/all",
+        local: "/computers",
+        script: "javascript:alert(1)",
+        relative: "//elsewhere.example.test/",
+        number: 3,
+      },
+    });
+    expect(resolved.persistent_host_overview_urls).toEqual({
+      cloudflare: "https://computers.example.test/all",
+      local: "/computers",
+    });
+  });
+
+  it("defaults the overview pages to none on an older server", async () => {
+    expect((await probe({})).persistent_host_overview_urls).toEqual({});
+  });
+
+  it("drops an overview list that is not an object", async () => {
+    const resolved = await probe({ persistent_host_overview_urls: ["https://x.test/"] });
+    expect(resolved.persistent_host_overview_urls).toEqual({});
   });
 
   it("drops non-string entries from the provider list", async () => {

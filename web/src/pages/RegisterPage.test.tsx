@@ -11,6 +11,8 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RegisterPage } from "./RegisterPage";
 import * as accountsApi from "@/lib/accountsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as teamApi from "@/lib/teamApi";
 
 vi.mock("@/lib/accountsApi", () => ({ register: vi.fn(), login: vi.fn() }));
@@ -198,6 +200,34 @@ describe("RegisterPage with a team invitation", () => {
       await screen.findByText("You were invited to join Acme as an admin, with erin@example.test."),
     ).toBeTruthy();
     expect(teamApi.previewInvitation).toHaveBeenCalledWith("tok");
+  });
+
+  it("says where a new member adds a computer, when the server creates computers", async () => {
+    const preview = {
+      team_name: "Acme",
+      email: "erin@example.test",
+      role: "member" as const,
+      links_account: false,
+      expires_at: 9_999_999_999,
+    };
+    vi.mocked(teamApi.previewInvitation).mockResolvedValue(preview);
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, persistent_host_providers: ["cloudflare"] }}
+      >
+        <MemoryRouter initialEntries={["/register?invite=tok"]}>
+          <RegisterPage />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect((await screen.findByTestId("register-next-computer")).textContent).toBe(
+      "Once you have joined, add your own computer in Settings → Computers.",
+    );
+    cleanup();
+    // No computers on this server: nothing to point at.
+    renderRegisterAt("?invite=tok");
+    await screen.findByText("You were invited to join Acme as a member, with erin@example.test.");
+    expect(screen.queryByTestId("register-next-computer")).toBeNull();
   });
 
   it("shows the server's refusal for another address", async () => {

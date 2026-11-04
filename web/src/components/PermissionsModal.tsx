@@ -204,10 +204,15 @@ export function PermissionsModal({
                   ? "This server allows read-only sharing — invite others to view this session."
                   : "Invite others to view or collaborate on this session."}
               </p>
-              {sharingReadOnly && (
+              {sharingReadOnly ? (
                 <p>
                   Please be careful when sharing. Read access will allow for reading of all session
                   outputs.
+                </p>
+              ) : (
+                <p data-testid="share-edit-runs-on-owner">
+                  Someone with Edit can run turns on this session&apos;s computer, with its
+                  owner&apos;s subscription.
                 </p>
               )}
             </div>

@@ -831,6 +831,9 @@ class PersistentHostPolicy:
     :param manage_url: Provider page where the person sets up or manages one
         host, e.g. ``"https://computers.example.com/c/{sandbox_id}"``.
         ``{host_id}`` and ``{sandbox_id}`` are substituted; ``None`` shows no link.
+    :param overview_url: Provider page listing this provider's hosts, where an
+        administrator also finds other people's, e.g.
+        ``"https://computers.example.com/"``; ``None`` shows no link.
     """
 
     idle_sleep_s: float = 300.0
@@ -838,6 +841,7 @@ class PersistentHostPolicy:
     sweep_interval_s: float = 30.0
     token_refresh_margin_s: float = 24 * 3600.0
     manage_url: str | None = None
+    overview_url: str | None = None
 
 
 class NoReachableModels(Exception):
@@ -993,6 +997,16 @@ class ManagedSandboxDeployment:
             and config.managed_launch_supported
             and config.provider is not None
         )
+
+    def persistent_overview_urls(self) -> dict[str, str]:
+        """Each persistent provider's overview page, for those that declare one."""
+        persistent = set(self.persistent_providers())
+        urls: dict[str, str] = {}
+        for config in self.configs:
+            policy = config.persistent
+            if config.provider in persistent and policy is not None and policy.overview_url:
+                urls[str(config.provider)] = policy.overview_url
+        return urls
 
     def offered(self) -> tuple[ManagedSandboxConfig, ...]:
         """Every provider config this deployment offers, in configured order."""

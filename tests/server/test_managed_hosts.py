@@ -4908,7 +4908,9 @@ async def test_info_lists_every_offered_provider(db_uri: str, tmp_path: Path) ->
     assert body["sandbox_providers"] == ["modal", "e2b"]
 
 
-def _persistent_entry(provider: str = "cloud") -> ManagedSandboxConfig:
+def _persistent_entry(
+    provider: str = "cloud", overview_url: str | None = None
+) -> ManagedSandboxConfig:
     from omnigent.server.managed_hosts import PersistentHostPolicy
 
     return ManagedSandboxConfig(
@@ -4916,7 +4918,7 @@ def _persistent_entry(provider: str = "cloud") -> ManagedSandboxConfig:
         launcher_factory=lambda: _ProvisionRecordingLauncher(),
         token_ttl_s=3600,
         provider=provider,
-        persistent=PersistentHostPolicy(),
+        persistent=PersistentHostPolicy(overview_url=overview_url),
     )
 
 
@@ -4960,9 +4962,30 @@ async def test_info_never_offers_persistent_providers_for_new_sessions(
     finally:
         persistent_hosts.configure(None, None, None)
     assert body["persistent_host_providers"] == ["cloud"]
+    assert body["persistent_host_overview_urls"] == {}
     assert body["managed_sandboxes_enabled"] is with_session_provider
     assert body["sandbox_providers"] == (["modal"] if with_session_provider else [])
     assert "cloud" not in body["sandbox_provider_capabilities"]
+
+
+async def test_info_lists_the_overview_pages_persistent_providers_declare(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """A persistent provider's overview page is listed by provider; one without is absent."""
+    from omnigent.server import persistent_hosts
+
+    configs = (
+        _persistent_entry("cloud", overview_url="https://computers.test/all"),
+        _persistent_entry("other"),
+    )
+    app = _capability_probe_app(db_uri, tmp_path, ManagedSandboxDeployment(configs=configs))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body = (await client.get("/v1/info")).json()
+    finally:
+        persistent_hosts.configure(None, None, None)
+    assert body["persistent_host_providers"] == ["cloud", "other"]
+    assert body["persistent_host_overview_urls"] == {"cloud": "https://computers.test/all"}
 
 
 async def test_persistent_provider_refuses_one_session_launches(db_uri: str) -> None:

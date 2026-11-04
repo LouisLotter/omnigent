@@ -6,9 +6,10 @@ import { ManageComputerLink } from "@/components/computers/ComputerStatus";
 import { DeleteComputerDialog } from "@/components/computers/DeleteComputerDialog";
 import { Button } from "@/components/ui/button";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useStartPersistentHost } from "@/hooks/usePersistentHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { persistentHostProviders } from "@/lib/capabilities";
+import { persistentHostOverviewUrls, persistentHostProviders } from "@/lib/capabilities";
 import {
   describePersistentHostState,
   isPersistentHost,
@@ -24,7 +25,10 @@ import {
  * when the server has a provider that creates computers.
  */
 export function SettingsComputersSection() {
-  const providers = persistentHostProviders(useServerInfo());
+  const info = useServerInfo();
+  const providers = persistentHostProviders(info);
+  // Administrators see other people's computers on the provider's own page, when it has one.
+  const overviews = useIsAdmin() ? persistentHostOverviewUrls(info) : [];
   const hosts = useHosts();
   const [addOpen, setAddOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Host | null>(null);
@@ -50,6 +54,24 @@ export function SettingsComputersSection() {
         Cloud computers keep their files between sessions. They sleep when idle and wake when you
         send them work.
       </p>
+      {overviews.map((url) => (
+        <p
+          key={url}
+          className="mt-1 text-ui text-muted-foreground"
+          data-testid="computers-overview"
+        >
+          Other people&apos;s computers are on the{" "}
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline underline-offset-2 hover:no-underline"
+          >
+            computers page
+          </a>
+          .
+        </p>
+      ))}
       <div className="mt-6">
         {hosts.isError && !hosts.data ? (
           <p role="alert" className="text-ui">

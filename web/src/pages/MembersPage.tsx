@@ -389,7 +389,8 @@ export function MembersPage() {
           <DialogHeader>
             <DialogTitle>New password for {resetResult?.id}</DialogTitle>
             <DialogDescription>
-              Send this password to the user out-of-band (e.g. Slack DM). It is shown only once.
+              Give this password to them yourself, for example in a message from your own email. It
+              is shown only once; they can change it in Settings → Account.
             </DialogDescription>
           </DialogHeader>
           {resetResult !== null && <CopyableValue value={resetResult.new_password} />}

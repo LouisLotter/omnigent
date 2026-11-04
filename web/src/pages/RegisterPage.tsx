@@ -28,12 +28,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { login as loginRequest, register as registerRequest } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { persistentHostProviders } from "@/lib/capabilities";
 import { type InvitationPreview, previewInvitation } from "@/lib/teamApi";
 
 const MIN_PASSWORD_LENGTH = 8;
 
 export function RegisterPage() {
   const loginV2 = useLoginV2();
+  // Where a new member goes next, when this server creates computers.
+  const computersOffered = persistentHostProviders(useServerInfo()).length > 0;
   const [params] = useSearchParams();
   const invite = params.get("invite") ?? "";
 
@@ -120,6 +124,11 @@ export function RegisterPage() {
         {linksAccount && (
           <p className="text-ui text-muted-foreground">
             The invitation is for your existing account. Enter its password to accept.
+          </p>
+        )}
+        {preview !== null && !linksAccount && computersOffered && (
+          <p className="text-ui text-muted-foreground" data-testid="register-next-computer">
+            Once you have joined, add your own computer in Settings → Computers.
           </p>
         )}
       </div>

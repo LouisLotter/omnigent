@@ -1628,9 +1628,11 @@ def test_invite_is_single_use(accounts_app: TestClient) -> None:
         json={"invite": token, "username": "bob", "password": "bob-pw-12345"},
     )
     assert second.status_code == 400
-    assert (
-        "invalid" in second.json()["error"].lower() or "expired" in second.json()["error"].lower()
-    )
+    from omnigent.server.routes.accounts_auth import INVITE_UNAVAILABLE
+
+    # One plain answer for every unusable invitation, saying what to do.
+    assert second.json()["error"] == INVITE_UNAVAILABLE
+    assert "Ask whoever invited you for a new one" in INVITE_UNAVAILABLE
 
 
 def test_register_rejects_reserved_username(accounts_app: TestClient) -> None:

@@ -226,6 +226,10 @@ class ServerInfoResponse(BaseModel):
     # Providers whose hosts are persistent computers created through
     # ``POST /v1/hosts``; never offered for a new session's sandbox.
     persistent_host_providers: list[str] = []
+    # Each persistent provider's overview page, where administrators find other
+    # people's computers, e.g. ``{"example": "https://computers.example.com/"}``.
+    # Providers without one are absent.
+    persistent_host_overview_urls: dict[str, str] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -3399,6 +3403,9 @@ def create_app(
         persistent_host_providers = (
             list(sandbox_config.persistent_providers()) if sandbox_config is not None else []
         )
+        persistent_host_overview_urls = (
+            sandbox_config.persistent_overview_urls() if sandbox_config is not None else {}
+        )
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3479,6 +3486,7 @@ def create_app(
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "persistent_host_providers": persistent_host_providers,
+                "persistent_host_overview_urls": persistent_host_overview_urls,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,

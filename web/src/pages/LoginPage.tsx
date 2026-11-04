@@ -58,7 +58,7 @@ function rememberUsername(value: string): void {
 /** Why the app signed this browser out, from an identity refusal (``?reason=``). */
 const IDENTITY_REFUSALS: Record<string, string> = {
   external_identity_mismatch:
-    "You were signed in to Omnigent as someone else than the person signed in to this installation. Sign in with your own account.",
+    "You were signed in to Omnigent as someone other than the person signed in to this installation. Sign in with your own account.",
   external_identity_unbound:
     "Your sign-in to this installation is not linked to a member of this team. Ask a team administrator for an invitation.",
   member_suspended: "Your membership of this team is suspended. Ask a team administrator.",

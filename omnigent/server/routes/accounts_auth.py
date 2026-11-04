@@ -235,6 +235,14 @@ def _redact_for_log(user_id: str) -> str:
     return f"{user_id[:3]}***(len={len(user_id)})"
 
 
+#: The answer for an invitation that cannot be redeemed, whatever the reason: missing, expired,
+#: already used or withdrawn are not told apart, so a guessed token learns nothing.
+INVITE_UNAVAILABLE = (
+    "This invitation is invalid: it has expired, was already used or was withdrawn. "
+    "Ask whoever invited you for a new one."
+)
+
+
 def create_accounts_auth_router(
     auth_provider: UnifiedAuthProvider,
     account_store: SqlAlchemyAccountStore,
@@ -397,9 +405,7 @@ def create_accounts_auth_router(
             try:
                 account_store.link_team_invitation(invite, user_id=username, identity=identity)
             except InvitationUnavailableError:
-                return JSONResponse(
-                    status_code=400, content={"error": "invite invalid or expired"}
-                )
+                return JSONResponse(status_code=400, content={"error": INVITE_UNAVAILABLE})
             except InvitationEmailMismatchError as exc:
                 return JSONResponse(
                     status_code=403,
@@ -441,7 +447,7 @@ def create_accounts_auth_router(
                 identity=identity,
             )
         except InvitationUnavailableError:
-            return JSONResponse(status_code=400, content={"error": "invite invalid or expired"})
+            return JSONResponse(status_code=400, content={"error": INVITE_UNAVAILABLE})
         except InvitationEmailMismatchError as exc:
             return JSONResponse(
                 status_code=403,
@@ -703,14 +709,14 @@ def create_accounts_auth_router(
             or resolved_external_identity(request) is not None
         ):
             # Behind a proxy, a new account always comes from a team invitation.
-            return JSONResponse(status_code=400, content={"error": "invite invalid or expired"})
+            return JSONResponse(status_code=400, content={"error": INVITE_UNAVAILABLE})
 
         now = int(time.time())
         token = account_store.redeem_token(body.invite, kind="invite", now_epoch_seconds=now)
         if token is None:
             # Don't distinguish missing / expired / already-redeemed
             # — keeps the route opaque to brute-force token guessing.
-            return JSONResponse(status_code=400, content={"error": "invite invalid or expired"})
+            return JSONResponse(status_code=400, content={"error": INVITE_UNAVAILABLE})
 
         try:
             user = account_store.create_user_with_password(

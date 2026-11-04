@@ -8,9 +8,11 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { SIGN_IN_NEEDED_MESSAGE } from "@/lib/persistentHosts";
 import { computerHost } from "@/test/hostFixtures";
+import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { SettingsComputersSection } from "./SettingsComputersSection";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: vi.fn(() => false) }));
 
 const fetchMock = vi.mocked(authenticatedFetch);
 const response = (body: unknown, status = 200) =>
@@ -29,12 +31,16 @@ function requests(method: string, path: string) {
   );
 }
 
-function renderSection(providers = ["cloudflare"]) {
+function renderSection(providers = ["cloudflare"], overviews: Record<string, string> = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, persistent_host_providers: providers }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          persistent_host_providers: providers,
+          persistent_host_overview_urls: overviews,
+        }}
       >
         <SettingsComputersSection />
       </CapabilitiesProvider>
@@ -58,6 +64,29 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SettingsComputersSection", () => {
+  it("points administrators at the provider's page for other people's computers", async () => {
+    vi.mocked(useIsAdmin).mockReturnValue(true);
+    renderSection(["cloudflare"], { cloudflare: "https://computers.example.test/all" });
+    const line = await screen.findByTestId("computers-overview");
+    expect(line.textContent).toBe("Other people's computers are on the computers page.");
+    const link = within(line).getByRole("link", { name: "computers page" });
+    expect(link.getAttribute("href")).toBe("https://computers.example.test/all");
+    expect(link.getAttribute("target")).toBe("_blank");
+  });
+
+  it("shows no overview line to members, or for a provider without a page", async () => {
+    vi.mocked(useIsAdmin).mockReturnValue(false);
+    renderSection(["cloudflare"], { cloudflare: "https://computers.example.test/all" });
+    await screen.findByTestId("computers-empty");
+    expect(screen.queryByTestId("computers-overview")).toBeNull();
+    cleanup();
+    vi.mocked(useIsAdmin).mockReturnValue(true);
+    renderSection(["cloudflare"], { other: "https://elsewhere.example.test/" });
+    await screen.findByTestId("computers-empty");
+    expect(screen.queryByTestId("computers-overview")).toBeNull();
+    vi.mocked(useIsAdmin).mockReturnValue(false);
+  });
+
   it("lists only computers, each with its state and wake progress", async () => {
     hosts = [
       laptop,
