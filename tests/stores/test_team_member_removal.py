@@ -121,6 +121,26 @@ def test_removal_is_one_transaction_that_records_what_the_member_had(stores) -> 
     assert [r.member_id for r in teams.list_removals()] == [alice_id]
 
 
+def test_an_invitation_to_their_address_is_revoked_whatever_its_case(stores) -> None:
+    owner_id = _member(stores, "owner")
+    teams, accounts = stores["teams"], stores["accounts"]
+    accounts.create_user_with_password("carol", "hash")
+    carol = teams.add_member("carol", role="member", state="active")
+    teams.bind_external_identity(
+        carol.id,
+        issuer=_ISSUER,
+        subject="carol-sub",
+        audience=_AUDIENCE,
+        provenance="invitation",
+        email="Carol@Example.test",
+    )
+    teams.create_invitation(
+        "carol@example.test", "member", created_by_member_id=owner_id, ttl_seconds=3600
+    )
+    accounts.remove_member(carol.id, actor_member_id=owner_id)
+    assert teams.list_invitations() == []
+
+
 def test_a_removal_that_fails_changes_nothing(stores, monkeypatch: pytest.MonkeyPatch) -> None:
     owner_id = _member(stores, "owner")
     bob_id = _member(stores, "bob")

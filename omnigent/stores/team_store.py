@@ -467,7 +467,8 @@ def member_identity_emails(session: Session, member_id: str) -> list[str]:
         )
         .limit(MAX_IDENTITIES_PER_MEMBER)
     ).scalars()
-    return sorted({email for email in rows if email})
+    # Invitations store addresses lowercased; a proxy may report one in any case.
+    return sorted({email.strip().lower() for email in rows if email})
 
 
 def revoke_invitations_for(session: Session, *, emails: list[str], user_id: str, now: int) -> int:
