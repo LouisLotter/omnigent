@@ -79,6 +79,7 @@ import {
   UserRoundIcon,
   UsersIcon,
   WalletIcon,
+  MonitorCloudIcon,
   XIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -180,7 +181,7 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, persistentHostOverviewUrls } from "@/lib/capabilities";
 import { hostDisplayLabel } from "@/lib/persistentHosts";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
@@ -695,6 +696,8 @@ function SidebarImpl({
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  // The computers page a provider declares (same origin only): everyone's own computers there.
+  const computersPage = persistentHostOverviewUrls(serverInfo)[0] ?? null;
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -1298,6 +1301,24 @@ function SidebarImpl({
                 activePageId={activeExtensionPageId}
                 onNavigate={onNavClick}
               />
+              {computersPage !== null && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                  )}
+                  data-testid="computers-page-nav"
+                >
+                  {/* The provider's own page, beside Omnigent, as Settings → Computers opens it. */}
+                  <a href={computersPage} target="_blank" rel="noopener noreferrer">
+                    <MonitorCloudIcon className="ui-icon text-muted-foreground" />
+                    Computers page
+                  </a>
+                </Button>
+              )}
               {usagePageEnabled && (
                 <Button
                   asChild

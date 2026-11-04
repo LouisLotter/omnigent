@@ -1056,6 +1056,35 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("links everyone to the computers page a provider declares, opened beside Omnigent", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      persistent_host_providers: ["cloudflare"],
+      persistent_host_overview_urls: { cloudflare: "/platform/computers" },
+    });
+
+    const row = screen.getByTestId("computers-page-nav");
+    expect(row).toHaveTextContent("Computers page");
+    expect(row).toHaveAttribute("href", `${window.location.origin}/platform/computers`);
+    expect(row).toHaveAttribute("target", "_blank");
+    expect(row).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it.each([
+    ["no provider declares one", {}],
+    ["the declared page is on another origin", { cloudflare: "https://elsewhere.example.test/" }],
+  ])("shows no computers-page row when %s", (_case, overviews) => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      persistent_host_providers: ["cloudflare"],
+      persistent_host_overview_urls: overviews,
+    });
+
+    expect(screen.queryByTestId("computers-page-nav")).toBeNull();
+  });
+
   it("hides Usage navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
