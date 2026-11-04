@@ -6363,6 +6363,14 @@
             "title": "Needs Setup",
             "type": "boolean"
           },
+          "persistent_host_overview_urls": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Persistent Host Overview Urls",
+            "type": "object"
+          },
           "persistent_host_providers": {
             "default": [],
             "items": {
