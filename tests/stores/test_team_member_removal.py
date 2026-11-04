@@ -18,7 +18,11 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from omnigent.stores.team_store import LastActiveOwnerError, SqlAlchemyTeamStore
+from omnigent.stores.team_store import (
+    InvitationUnavailableError,
+    LastActiveOwnerError,
+    SqlAlchemyTeamStore,
+)
 from tests.stores.test_team_store import _race
 
 _ISSUER = "https://team.example.cloudflareaccess.com"
@@ -139,6 +143,37 @@ def test_an_invitation_to_their_address_is_revoked_whatever_its_case(stores) -> 
     )
     accounts.remove_member(carol.id, actor_member_id=owner_id)
     assert teams.list_invitations() == []
+
+
+def test_a_member_registered_without_a_proxy_cannot_rejoin_with_an_earlier_invitation(
+    stores,
+) -> None:
+    """Without a front proxy no identity is bound; the redeemed invitation's address counts."""
+    owner_id = _member(stores, "owner")
+    teams, accounts = stores["teams"], stores["accounts"]
+    _, first = teams.create_invitation(
+        "member@example.test", "member", created_by_member_id=owner_id, ttl_seconds=3600
+    )
+    _, member = accounts.redeem_team_invitation(
+        first, username="member", password_hash="hash", identity=None
+    )
+    assert teams.list_external_identities(member.id) == []
+    # A second invitation to the same address, issued while they are a member.
+    _, spare = teams.create_invitation(
+        "Member@Example.test", "member", created_by_member_id=owner_id, ttl_seconds=3600
+    )
+    current = {m.id for m in teams.list_members(limit=100)[0]}
+
+    accounts.remove_member(member.id, actor_member_id=owner_id)
+
+    assert teams.invitation_for_token(spare).state == "revoked"
+    for username in ("member", "someone-else"):
+        with pytest.raises(InvitationUnavailableError):
+            accounts.redeem_team_invitation(
+                spare, username=username, password_hash="hash", identity=None
+            )
+    assert teams.get_member_for_account("member") is None
+    assert {m.id for m in teams.list_members(limit=100)[0]} == current - {member.id}
 
 
 def test_a_removal_that_fails_changes_nothing(stores, monkeypatch: pytest.MonkeyPatch) -> None:

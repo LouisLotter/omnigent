@@ -71,7 +71,7 @@ from omnigent.stores.team_store import (
     lock_pending_invitation,
     lock_team,
     member_account,
-    member_identity_emails,
+    member_addresses,
     member_state_row,
     owned_before_removal,
     record_member_removal,
@@ -671,7 +671,7 @@ class SqlAlchemyAccountStore:
                     "the installation's owner cannot be removed", code=ErrorCode.FORBIDDEN
                 )
             threads, computers = owned_before_removal(session, user_id)
-            emails = member_identity_emails(session, member_id)
+            emails = member_addresses(session, member_id)
             if not _tombstone_account(session, target, admin_ids):
                 raise LastActiveOwnerError()
             now = int(time.time())

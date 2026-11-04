@@ -456,19 +456,33 @@ def owned_before_removal(session: Session, user_id: str) -> tuple[list[str], lis
     return list(threads), list(computers)
 
 
-def member_identity_emails(session: Session, member_id: str) -> list[str]:
-    """The addresses *member_id*'s identities were verified with, before they are dropped."""
-    rows = session.execute(
+def member_addresses(session: Session, member_id: str) -> list[str]:
+    """The addresses a removed membership could be invited at again, before its bindings go.
+
+    Those its identities were verified with, and those of the invitations this
+    membership redeemed: a registration without a front proxy binds no
+    identity, and its invitation's address is the only one on record.
+    """
+    workspace_id = current_workspace_id()
+    bound = session.execute(
         select(SqlTeamIdentityBinding.email)
         .where(
-            SqlTeamIdentityBinding.workspace_id == current_workspace_id(),
+            SqlTeamIdentityBinding.workspace_id == workspace_id,
             SqlTeamIdentityBinding.member_id == member_id,
             SqlTeamIdentityBinding.email.is_not(None),
         )
         .limit(MAX_IDENTITIES_PER_MEMBER)
     ).scalars()
+    redeemed = session.execute(
+        select(SqlTeamInvitation.email)
+        .where(
+            SqlTeamInvitation.workspace_id == workspace_id,
+            SqlTeamInvitation.redeemed_member_id == member_id,
+        )
+        .limit(MAX_ADMITTED)
+    ).scalars()
     # Invitations store addresses lowercased; a proxy may report one in any case.
-    return sorted({email.strip().lower() for email in rows if email})
+    return sorted({email.strip().lower() for email in (*bound, *redeemed) if email})
 
 
 def revoke_invitations_for(session: Session, *, emails: list[str], user_id: str, now: int) -> int:
