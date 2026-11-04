@@ -172,6 +172,11 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.resetUserPassword).toHaveBeenCalledWith("bob"));
     // The new password renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue("fresh-pw-123")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Give this password to them yourself, for example in a message from your own email. It is shown only once; they can change it in Settings → Account.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("deletes a user through the confirmation dialog and refreshes the list", async () => {

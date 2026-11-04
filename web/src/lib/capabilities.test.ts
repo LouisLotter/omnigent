@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // test starts from a fresh module cache; only the pure helpers are static.
 import {
   canLaunchManagedSandbox,
+  persistentHostOverviewUrls,
+  sameOriginPage,
   persistentHostProviders,
   sandboxOptionLabel,
   sandboxProviderOptions,
@@ -129,6 +131,58 @@ describe("canLaunchManagedSandbox", () => {
   });
 });
 
+describe("persistentHostOverviewUrls", () => {
+  it("lists the same-origin overview pages of the providers that create computers, in their order", () => {
+    const origin = window.location.origin;
+    expect(persistentHostOverviewUrls("loading")).toEqual([]);
+    expect(
+      persistentHostOverviewUrls(
+        info({
+          persistent_host_providers: ["b", "a", "c", "d"],
+          persistent_host_overview_urls: {
+            a: "/a",
+            b: `${origin}/b`,
+            d: "https://elsewhere.example.test/",
+            z: "/z",
+          },
+        }),
+      ),
+    ).toEqual([`${origin}/b`, `${origin}/a`]);
+  });
+});
+
+describe("sameOriginPage", () => {
+  const origin = "https://omnigent.example.test";
+
+  it("keeps a relative or same-origin http(s) page, normalized", () => {
+    expect(sameOriginPage("/platform/computers", origin)).toBe(`${origin}/platform/computers`);
+    expect(sameOriginPage(`${origin}/x?y=1#z`, origin)).toBe(`${origin}/x?y=1#z`);
+    expect(sameOriginPage("computers", `${origin}/`)).toBe(`${origin}/computers`);
+  });
+
+  it.each([
+    ["another origin", "https://computers.example.test/all"],
+    ["another scheme of the same host", "http://omnigent.example.test/x"],
+    ["another port", "https://omnigent.example.test:8443/x"],
+    ["a protocol-relative URL", "//computers.example.test/"],
+    ["a backslash", "/\\computers.example.test/"],
+    ["a tab", "/\t/computers.example.test/"],
+    ["a newline", "/platform\n/computers"],
+    ["a NUL", "/platform\u0000"],
+    ["userinfo", "https://someone@omnigent.example.test/x"],
+    ["a password", "https://a:b@omnigent.example.test/x"],
+    ["javascript:", "javascript:alert(1)"],
+    ["data:", "data:text/html,hi"],
+    ["a malformed URL", "https://["],
+  ])("refuses %s", (_case, value) => {
+    expect(sameOriginPage(value, origin)).toBeNull();
+  });
+
+  it("refuses everything against a malformed origin", () => {
+    expect(sameOriginPage("/x", "not an origin")).toBeNull();
+  });
+});
+
 describe("persistentHostProviders", () => {
   it("lists the providers that create computers, empty while loading or absent", () => {
     expect(persistentHostProviders("loading")).toEqual([]);
@@ -192,6 +246,32 @@ describe("resolveServerInfo sandbox_providers", () => {
 
   it("defaults the persistent host providers to empty on an older server", async () => {
     expect((await probe({})).persistent_host_providers).toEqual([]);
+  });
+
+  it("keeps only overview pages on this installation's origin", async () => {
+    const origin = window.location.origin;
+    const resolved = await probe({
+      persistent_host_overview_urls: {
+        relative: "/platform/computers",
+        absolute: `${origin}/all`,
+        other: "https://computers.example.test/all",
+        script: "javascript:alert(1)",
+        number: 3,
+      },
+    });
+    expect(resolved.persistent_host_overview_urls).toEqual({
+      relative: `${origin}/platform/computers`,
+      absolute: `${origin}/all`,
+    });
+  });
+
+  it("defaults the overview pages to none on an older server", async () => {
+    expect((await probe({})).persistent_host_overview_urls).toEqual({});
+  });
+
+  it("drops an overview list that is not an object", async () => {
+    const resolved = await probe({ persistent_host_overview_urls: ["https://x.test/"] });
+    expect(resolved.persistent_host_overview_urls).toEqual({});
   });
 
   it("drops non-string entries from the provider list", async () => {

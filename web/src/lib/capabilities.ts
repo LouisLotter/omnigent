@@ -144,6 +144,11 @@ export interface ServerInfo {
    */
   persistent_host_providers?: string[];
   /**
+   * Each persistent provider's overview page, by provider: where an
+   * administrator finds other people's computers. Absent on older servers.
+   */
+  persistent_host_overview_urls?: Record<string, string>;
+  /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
    * Sandbox Integrations nav; the SPA renders one panel per provider via
@@ -315,6 +320,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
   persistent_host_providers: [],
+  persistent_host_overview_urls: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -424,6 +430,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           persistent_host_providers: Array.isArray(data.persistent_host_providers)
             ? data.persistent_host_providers.filter((p): p is string => typeof p === "string")
             : [],
+          persistent_host_overview_urls: overviewUrls(data.persistent_host_overview_urls),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -539,6 +546,52 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
 /** Providers that create computers; empty hides the add-computer action. */
 export function persistentHostProviders(info: ServerInfo | "loading"): string[] {
   return info === "loading" ? [] : (info.persistent_host_providers ?? []);
+}
+
+/**
+ * An overview page on this installation's own origin, normalized; null for anything else:
+ * another origin, a scheme other than http(s), userinfo, a backslash or a control character
+ * (which URL parsing would quietly normalize into another origin).
+ */
+export function sameOriginPage(value: string, origin: string): string | null {
+  // eslint-disable-next-line no-control-regex -- control characters are refused
+  if (/[\u0000-\u001f\u007f\\]/.test(value)) return null;
+  let url: URL;
+  let base: URL;
+  try {
+    base = new URL(origin);
+    url = new URL(value, base);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username !== "" || url.password !== "") return null;
+  if (url.origin !== base.origin) return null;
+  return url.href;
+}
+
+/** The computers' overview pages providers declare, by provider: same-origin pages only. */
+function overviewUrls(raw: unknown): Record<string, string> {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const origin = typeof window === "undefined" ? null : window.location.origin;
+  if (origin === null) return {};
+  const pages: Record<string, string> = {};
+  for (const [provider, value] of Object.entries(raw)) {
+    const page = typeof value === "string" ? sameOriginPage(value, origin) : null;
+    if (page !== null) pages[provider] = page;
+  }
+  return pages;
+}
+
+/** Overview pages of the providers that create computers, in their order. */
+export function persistentHostOverviewUrls(info: ServerInfo | "loading"): string[] {
+  if (info === "loading" || typeof window === "undefined") return [];
+  const urls = info.persistent_host_overview_urls ?? {};
+  return persistentHostProviders(info).flatMap((provider) => {
+    const url = urls[provider];
+    const page = url ? sameOriginPage(url, window.location.origin) : null;
+    return page === null ? [] : [page];
+  });
 }
 
 /** Whether "New sandbox" can be offered: the server launches per-session sandboxes. */

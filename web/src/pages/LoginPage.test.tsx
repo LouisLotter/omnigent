@@ -253,7 +253,7 @@ describe("LoginPage forced re-auth (?reauth=1)", () => {
 
 describe("LoginPage after an identity refusal", () => {
   it.each([
-    ["external_identity_mismatch", "as someone else than the person signed in"],
+    ["external_identity_mismatch", "as someone other than the person signed in"],
     ["member_suspended", "membership of this team is suspended"],
     ["external_identity_unbound", "not linked to a member of this team"],
   ])("explains %s", async (reason, text) => {

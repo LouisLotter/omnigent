@@ -719,6 +719,10 @@ describe("PermissionsModal", () => {
         screen.getByText("Invite others to view or collaborate on this session."),
       ).toBeInTheDocument();
       expect(screen.queryByText(/Please be careful when sharing/)).not.toBeInTheDocument();
+      // Edit is offered, so the dialog says where an editor's turns run.
+      expect(screen.getByTestId("share-edit-runs-on-owner").textContent).toBe(
+        "Someone with Edit can run turns on this session's computer, with its owner's subscription.",
+      );
       expect(
         screen.queryByText("Sharing has been disabled for this Omnigent server."),
       ).not.toBeInTheDocument();
@@ -742,6 +746,8 @@ describe("PermissionsModal", () => {
           "Please be careful when sharing. Read access will allow for reading of all session outputs.",
         ),
       ).toBeInTheDocument();
+      // Edit is not offered, so nothing is said about an editor's turns.
+      expect(screen.queryByTestId("share-edit-runs-on-owner")).not.toBeInTheDocument();
       // Read grants are still allowed, so the Grant control stays.
       expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
       // The add-form level select must offer only Read (Edit is hidden). With no

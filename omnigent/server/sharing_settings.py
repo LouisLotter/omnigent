@@ -90,33 +90,60 @@ class PublicSharingMaxLevel(str, Enum):
 _public_sharing_max_level: ContextVar[Callable[[], PublicSharingMaxLevel]] = ContextVar(
     "public_sharing_max_level", default=lambda: PublicSharingMaxLevel.READ
 )
+_public_grants_honoured: ContextVar[Callable[[], bool]] = ContextVar(
+    "public_grants_honoured", default=lambda: True
+)
+
+
+def _honoured() -> bool:
+    return True
 
 
 def effective_public_level(level: int | None) -> int | None:
-    """Apply the live ceiling outside the raw grant cache, including on open streams."""
-    if level is None:
+    """Apply the live policy outside the raw grant cache, including on open streams.
+
+    A stored public grant counts only while the policy honours public grants, and
+    never above the live ceiling.
+    """
+    if level is None or not _public_grants_honoured.get()():
         return None
     return min(level, _public_sharing_max_level.get()().level)
 
 
 @contextlib.contextmanager
-def public_sharing_policy_scope(max_level: Callable[[], PublicSharingMaxLevel]) -> Iterator[None]:
-    token = _public_sharing_max_level.set(max_level)
+def public_sharing_policy_scope(
+    max_level: Callable[[], PublicSharingMaxLevel],
+    grants_honoured: Callable[[], bool] = _honoured,
+) -> Iterator[None]:
+    ceiling = _public_sharing_max_level.set(max_level)
+    honoured = _public_grants_honoured.set(grants_honoured)
     try:
         yield
     finally:
-        _public_sharing_max_level.reset(token)
+        _public_grants_honoured.reset(honoured)
+        _public_sharing_max_level.reset(ceiling)
 
 
 class PublicSharingPolicyMiddleware:
-    """Keep each application's live public policy in its request/task context."""
+    """Keep each application's live public policy in its request/task context.
 
-    def __init__(self, app: ASGIApp, max_level: Callable[[], PublicSharingMaxLevel]) -> None:
+    :param max_level: The live ceiling on a stored public grant.
+    :param grants_honoured: Whether stored public grants count now; see
+        ``create_app(public_grants_when_disabled=...)``.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        max_level: Callable[[], PublicSharingMaxLevel],
+        grants_honoured: Callable[[], bool] = _honoured,
+    ) -> None:
         self._app = app
         self._max_level = max_level
+        self._grants_honoured = grants_honoured
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        with public_sharing_policy_scope(self._max_level):
+        with public_sharing_policy_scope(self._max_level, self._grants_honoured):
             await self._app(scope, receive, send)
 
 

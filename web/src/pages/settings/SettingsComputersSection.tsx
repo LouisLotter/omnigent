@@ -6,9 +6,10 @@ import { ManageComputerLink } from "@/components/computers/ComputerStatus";
 import { DeleteComputerDialog } from "@/components/computers/DeleteComputerDialog";
 import { Button } from "@/components/ui/button";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useStartPersistentHost } from "@/hooks/usePersistentHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { persistentHostProviders } from "@/lib/capabilities";
+import { persistentHostOverviewUrls, persistentHostProviders } from "@/lib/capabilities";
 import {
   describePersistentHostState,
   isPersistentHost,
@@ -24,7 +25,12 @@ import {
  * when the server has a provider that creates computers.
  */
 export function SettingsComputersSection() {
-  const providers = persistentHostProviders(useServerInfo());
+  const info = useServerInfo();
+  const providers = persistentHostProviders(info);
+  // The provider's own computers page, when it declares one: everyone's way to their own
+  // computers' setup, and an administrator's to other people's.
+  const overviews = persistentHostOverviewUrls(info);
+  const isAdmin = useIsAdmin();
   const hosts = useHosts();
   const [addOpen, setAddOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Host | null>(null);
@@ -50,6 +56,19 @@ export function SettingsComputersSection() {
         Cloud computers keep their files between sessions. They sleep when idle and wake when you
         send them work.
       </p>
+      {overviews.map((url) => (
+        <div key={url} className="mt-1 text-ui text-muted-foreground">
+          <p data-testid="computers-overview-own">
+            Your computers&apos; setup, sign-ins and terminals are on the <OverviewLink url={url} />
+            .
+          </p>
+          {isAdmin && (
+            <p data-testid="computers-overview">
+              Other people&apos;s computers are on the <OverviewLink url={url} />.
+            </p>
+          )}
+        </div>
+      ))}
       <div className="mt-6">
         {hosts.isError && !hosts.data ? (
           <p role="alert" className="text-ui">
@@ -75,6 +94,20 @@ export function SettingsComputersSection() {
       <AddComputerDialog open={addOpen} onOpenChange={setAddOpen} providers={providers} />
       <DeleteComputerDialog host={deleteTarget} onClose={() => setDeleteTarget(null)} />
     </section>
+  );
+}
+
+/** The provider's computers page, opened beside Omnigent as each computer's setup link is. */
+function OverviewLink({ url }: { url: string }) {
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="underline underline-offset-2 hover:no-underline"
+    >
+      computers page
+    </a>
   );
 }
 

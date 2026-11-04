@@ -226,6 +226,10 @@ class ServerInfoResponse(BaseModel):
     # Providers whose hosts are persistent computers created through
     # ``POST /v1/hosts``; never offered for a new session's sandbox.
     persistent_host_providers: list[str] = []
+    # Each persistent provider's overview page, where administrators find other
+    # people's computers, e.g. ``{"example": "https://computers.example.com/"}``.
+    # Providers without one are absent.
+    persistent_host_overview_urls: dict[str, str] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -1407,6 +1411,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
+    public_grants_when_disabled: Literal["honoured", "ignored"] = "honoured",
     default_public_sessions: str | Callable[[], str] | None = None,
     filesystem_attachment_allowed_extensions: (
         str | list[str] | Callable[[], str | list[str] | None] | None
@@ -1566,6 +1571,12 @@ def create_app(
         ``None`` uses ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` with a file-backed
         admin override. A static value or callable is deployment-managed.
         The live ceiling also limits stored grants, without upgrading Read.
+    :param public_grants_when_disabled: What a stored ``__public__`` grant gives
+        while ``public_sharing`` is off. ``"honoured"`` (the default): existing
+        public grants stay accessible and can be revoked. ``"ignored"``: they
+        give nobody access on any path (direct reads, lists, snapshots,
+        streams); the rows are kept, so turning public sharing on again
+        restores them.
     :param default_public_sessions: Which new sessions start with a public
         read grant: ``"off"`` (all private), ``"sandbox"`` (managed cloud
         sandbox sessions only) or ``"all"``. Same shape as ``public_sharing``:
@@ -3399,6 +3410,9 @@ def create_app(
         persistent_host_providers = (
             list(sandbox_config.persistent_providers()) if sandbox_config is not None else []
         )
+        persistent_host_overview_urls = (
+            sandbox_config.persistent_overview_urls() if sandbox_config is not None else {}
+        )
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3479,6 +3493,7 @@ def create_app(
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
                 "persistent_host_providers": persistent_host_providers,
+                "persistent_host_overview_urls": persistent_host_overview_urls,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -5219,7 +5234,19 @@ def create_app(
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
-    app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
+    if public_grants_when_disabled not in ("honoured", "ignored"):
+        raise ValueError("public_grants_when_disabled must be 'honoured' or 'ignored'")
+    _ignore_when_disabled = public_grants_when_disabled == "ignored"
+
+    def _public_grants_honoured() -> bool:
+        return not _ignore_when_disabled or bool(app.state.public_sharing())
+
+    app.state.public_grants_honoured = _public_grants_honoured
+    app.add_middleware(
+        PublicSharingPolicyMiddleware,
+        max_level=app.state.public_sharing_max_level,
+        grants_honoured=_public_grants_honoured,
+    )
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.

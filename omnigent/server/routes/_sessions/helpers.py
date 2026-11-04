@@ -308,6 +308,7 @@ from omnigent.server.schemas import (
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
+from omnigent.server.sharing_settings import effective_public_level
 from omnigent.server.startup_inputs import ManagedStartupInputs, StartupInputContext
 from omnigent.server.turn_attribution import (
     TurnInitiator,
@@ -1346,7 +1347,7 @@ def _permission_level_from_grants(
         return user_grant.level
     public_grant = next((g for g in grants if g.user_id == RESERVED_USER_PUBLIC), None)
     if public_grant is not None:
-        return public_grant.level
+        return effective_public_level(public_grant.level)
     return None
 
 
