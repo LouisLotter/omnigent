@@ -548,24 +548,49 @@ export function persistentHostProviders(info: ServerInfo | "loading"): string[] 
   return info === "loading" ? [] : (info.persistent_host_providers ?? []);
 }
 
-/** The computers' overview pages providers declare, by provider: http(s) or same-origin paths. */
+/**
+ * An overview page on this installation's own origin, normalized; null for anything else:
+ * another origin, a scheme other than http(s), userinfo, a backslash or a control character
+ * (which URL parsing would quietly normalize into another origin).
+ */
+export function sameOriginPage(value: string, origin: string): string | null {
+  // eslint-disable-next-line no-control-regex -- control characters are refused
+  if (/[\u0000-\u001f\u007f\\]/.test(value)) return null;
+  let url: URL;
+  let base: URL;
+  try {
+    base = new URL(origin);
+    url = new URL(value, base);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username !== "" || url.password !== "") return null;
+  if (url.origin !== base.origin) return null;
+  return url.href;
+}
+
+/** The computers' overview pages providers declare, by provider: same-origin pages only. */
 function overviewUrls(raw: unknown): Record<string, string> {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
-  return Object.fromEntries(
-    Object.entries(raw).filter(
-      (entry): entry is [string, string] =>
-        typeof entry[1] === "string" && /^(https?:\/\/|\/(?!\/))/i.test(entry[1]),
-    ),
-  );
+  const origin = typeof window === "undefined" ? null : window.location.origin;
+  if (origin === null) return {};
+  const pages: Record<string, string> = {};
+  for (const [provider, value] of Object.entries(raw)) {
+    const page = typeof value === "string" ? sameOriginPage(value, origin) : null;
+    if (page !== null) pages[provider] = page;
+  }
+  return pages;
 }
 
 /** Overview pages of the providers that create computers, in their order. */
 export function persistentHostOverviewUrls(info: ServerInfo | "loading"): string[] {
-  if (info === "loading") return [];
+  if (info === "loading" || typeof window === "undefined") return [];
   const urls = info.persistent_host_overview_urls ?? {};
   return persistentHostProviders(info).flatMap((provider) => {
     const url = urls[provider];
-    return url ? [url] : [];
+    const page = url ? sameOriginPage(url, window.location.origin) : null;
+    return page === null ? [] : [page];
   });
 }
 

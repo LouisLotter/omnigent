@@ -21,6 +21,7 @@ lifespan) since none of these paths need the runtime.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -80,6 +81,7 @@ def _build_app(
     sharing_mode: SharingMode | object | None = None,
     public_sharing: bool | object | None = None,
     public_sharing_max_level: str | None = None,
+    public_grants_when_disabled: str = "honoured",
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
 ) -> FastAPI:
@@ -96,6 +98,7 @@ def _build_app(
         sharing_mode=sharing_mode,
         public_sharing=public_sharing,
         public_sharing_max_level=public_sharing_max_level,
+        public_grants_when_disabled=public_grants_when_disabled,  # type: ignore[arg-type]
     )
 
 
@@ -142,6 +145,82 @@ def _seed_owned_session(
         auth_provider=UnifiedAuthProvider(source="header"),
     )
     return app, conv.id
+
+
+_STRANGER = "carol@sharing.test"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("public_sharing", "when_disabled", "reachable"),
+    [
+        # The default keeps upstream's behaviour: a disable stops new public links only.
+        (False, "honoured", True),
+        # Strict: a stored public grant gives nobody access while public sharing is off.
+        (False, "ignored", False),
+        # Turning public sharing on again restores the kept grant.
+        (True, "ignored", True),
+    ],
+)
+async def test_stored_public_grant_follows_the_disabled_policy_on_every_path(
+    db_uri: str,
+    tmp_path: Path,
+    runtime_init: None,
+    public_sharing: bool,
+    when_disabled: str,
+    reachable: bool,
+) -> None:
+    """An upgraded database holds a public read grant made while public sharing was on."""
+    from tests.server.helpers import create_test_agent
+
+    store = SqlAlchemyPermissionStore(db_uri)
+    seeding = _build_app(
+        db_uri,
+        tmp_path,
+        permission_store=store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+    async with _client(seeding, _OWNER) as owner:
+        session_id = (await create_test_agent(owner, user=_OWNER))["_session_id"]
+    store.ensure_user(RESERVED_USER_PUBLIC)
+    store.grant(RESERVED_USER_PUBLIC, session_id, LEVEL_READ)
+    store.ensure_user(_STRANGER)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        public_sharing=public_sharing,
+        public_grants_when_disabled=when_disabled,
+        permission_store=store,
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+    async with _client(app, _STRANGER) as stranger:
+        direct = await stranger.get(f"/v1/sessions/{session_id}")
+        items = await stranger.get(f"/v1/sessions/{session_id}/items")
+        listed = await stranger.get("/v1/sessions")
+        # An allowed stream stays open, which the in-process transport cannot return; a
+        # refused one answers at once.
+        stream = (
+            None
+            if reachable
+            else await asyncio.wait_for(
+                stranger.get(f"/v1/sessions/{session_id}/stream"), timeout=30
+            )
+        )
+    if reachable:
+        assert direct.status_code == 200
+        assert direct.json()["permission_level"] == LEVEL_READ
+        assert items.status_code == 200
+    else:
+        assert stream is not None
+        for response in (direct, items, stream):
+            assert response.status_code in (403, 404), response.text
+    # A public-only session is never in a person's own list, whatever the policy.
+    assert listed.status_code == 200
+    assert session_id not in {s["id"] for s in listed.json()["data"]}
+    # The stored grant is never removed.
+    assert store.get(RESERVED_USER_PUBLIC, session_id).level == LEVEL_READ
+    async with _client(app, _OWNER) as owner:
+        assert (await owner.get(f"/v1/sessions/{session_id}")).status_code == 200
 
 
 @pytest.mark.asyncio

@@ -66,22 +66,27 @@ afterEach(cleanup);
 describe("SettingsComputersSection", () => {
   it("points administrators at the provider's page for other people's computers", async () => {
     vi.mocked(useIsAdmin).mockReturnValue(true);
-    renderSection(["cloudflare"], { cloudflare: "https://computers.example.test/all" });
+    renderSection(["cloudflare"], { cloudflare: "/platform/computers" });
     const line = await screen.findByTestId("computers-overview");
     expect(line.textContent).toBe("Other people's computers are on the computers page.");
     const link = within(line).getByRole("link", { name: "computers page" });
-    expect(link.getAttribute("href")).toBe("https://computers.example.test/all");
+    expect(link.getAttribute("href")).toBe(`${window.location.origin}/platform/computers`);
     expect(link.getAttribute("target")).toBe("_blank");
   });
 
   it("shows no overview line to members, or for a provider without a page", async () => {
     vi.mocked(useIsAdmin).mockReturnValue(false);
-    renderSection(["cloudflare"], { cloudflare: "https://computers.example.test/all" });
+    renderSection(["cloudflare"], { cloudflare: "/platform/computers" });
     await screen.findByTestId("computers-empty");
     expect(screen.queryByTestId("computers-overview")).toBeNull();
     cleanup();
     vi.mocked(useIsAdmin).mockReturnValue(true);
-    renderSection(["cloudflare"], { other: "https://elsewhere.example.test/" });
+    renderSection(["cloudflare"], { other: "/platform/computers" });
+    await screen.findByTestId("computers-empty");
+    expect(screen.queryByTestId("computers-overview")).toBeNull();
+    cleanup();
+    // Another origin is never linked, even when it reaches the page unparsed.
+    renderSection(["cloudflare"], { cloudflare: "https://elsewhere.example.test/" });
     await screen.findByTestId("computers-empty");
     expect(screen.queryByTestId("computers-overview")).toBeNull();
     vi.mocked(useIsAdmin).mockReturnValue(false);

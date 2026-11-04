@@ -49,3 +49,26 @@ async def test_concurrent_applications_keep_independent_public_ceilings() -> Non
         read({"type": "http", "expected": 1}, None, None),
         edit({"type": "http", "expected": 2}, None, None),
     )
+
+
+@pytest.mark.asyncio
+async def test_a_policy_that_ignores_public_grants_applies_on_open_connections() -> None:
+    honoured = True
+    raw = ResolvedAccess(is_admin=False, user_grant_level=None, public_grant_level=1)
+
+    async def connection(scope, receive, send):
+        nonlocal honoured
+        assert resolved_level(raw) == 1 and resolved_allows(raw, 1)
+        honoured = False
+        assert resolved_level(raw) is None
+        assert not resolved_allows(raw, 1)
+        assert await asyncio.to_thread(effective_public_level, 1) is None
+        # A direct grant is unaffected.
+        assert resolved_allows(ResolvedAccess(False, 1, 1), 1)
+
+    middleware = PublicSharingPolicyMiddleware(
+        connection, max_level=lambda: PublicSharingMaxLevel.READ, grants_honoured=lambda: honoured
+    )
+    await middleware({"type": "http"}, None, None)
+    # Outside an application's scope, stored grants count as before.
+    assert effective_public_level(1) == 1

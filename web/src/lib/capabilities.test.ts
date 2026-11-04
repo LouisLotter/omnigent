@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   canLaunchManagedSandbox,
   persistentHostOverviewUrls,
+  sameOriginPage,
   persistentHostProviders,
   sandboxOptionLabel,
   sandboxProviderOptions,
@@ -131,16 +132,54 @@ describe("canLaunchManagedSandbox", () => {
 });
 
 describe("persistentHostOverviewUrls", () => {
-  it("lists the overview pages of the providers that create computers, in their order", () => {
+  it("lists the same-origin overview pages of the providers that create computers, in their order", () => {
+    const origin = window.location.origin;
     expect(persistentHostOverviewUrls("loading")).toEqual([]);
     expect(
       persistentHostOverviewUrls(
         info({
-          persistent_host_providers: ["b", "a", "c"],
-          persistent_host_overview_urls: { a: "https://a.test/", b: "https://b.test/", z: "/z" },
+          persistent_host_providers: ["b", "a", "c", "d"],
+          persistent_host_overview_urls: {
+            a: "/a",
+            b: `${origin}/b`,
+            d: "https://elsewhere.example.test/",
+            z: "/z",
+          },
         }),
       ),
-    ).toEqual(["https://b.test/", "https://a.test/"]);
+    ).toEqual([`${origin}/b`, `${origin}/a`]);
+  });
+});
+
+describe("sameOriginPage", () => {
+  const origin = "https://omnigent.example.test";
+
+  it("keeps a relative or same-origin http(s) page, normalized", () => {
+    expect(sameOriginPage("/platform/computers", origin)).toBe(`${origin}/platform/computers`);
+    expect(sameOriginPage(`${origin}/x?y=1#z`, origin)).toBe(`${origin}/x?y=1#z`);
+    expect(sameOriginPage("computers", `${origin}/`)).toBe(`${origin}/computers`);
+  });
+
+  it.each([
+    ["another origin", "https://computers.example.test/all"],
+    ["another scheme of the same host", "http://omnigent.example.test/x"],
+    ["another port", "https://omnigent.example.test:8443/x"],
+    ["a protocol-relative URL", "//computers.example.test/"],
+    ["a backslash", "/\\computers.example.test/"],
+    ["a tab", "/\t/computers.example.test/"],
+    ["a newline", "/platform\n/computers"],
+    ["a NUL", "/platform\u0000"],
+    ["userinfo", "https://someone@omnigent.example.test/x"],
+    ["a password", "https://a:b@omnigent.example.test/x"],
+    ["javascript:", "javascript:alert(1)"],
+    ["data:", "data:text/html,hi"],
+    ["a malformed URL", "https://["],
+  ])("refuses %s", (_case, value) => {
+    expect(sameOriginPage(value, origin)).toBeNull();
+  });
+
+  it("refuses everything against a malformed origin", () => {
+    expect(sameOriginPage("/x", "not an origin")).toBeNull();
   });
 });
 
@@ -209,19 +248,20 @@ describe("resolveServerInfo sandbox_providers", () => {
     expect((await probe({})).persistent_host_providers).toEqual([]);
   });
 
-  it("keeps http(s) and same-origin overview pages, dropping anything else", async () => {
+  it("keeps only overview pages on this installation's origin", async () => {
+    const origin = window.location.origin;
     const resolved = await probe({
       persistent_host_overview_urls: {
-        cloudflare: "https://computers.example.test/all",
-        local: "/computers",
+        relative: "/platform/computers",
+        absolute: `${origin}/all`,
+        other: "https://computers.example.test/all",
         script: "javascript:alert(1)",
-        relative: "//elsewhere.example.test/",
         number: 3,
       },
     });
     expect(resolved.persistent_host_overview_urls).toEqual({
-      cloudflare: "https://computers.example.test/all",
-      local: "/computers",
+      relative: `${origin}/platform/computers`,
+      absolute: `${origin}/all`,
     });
   });
 
