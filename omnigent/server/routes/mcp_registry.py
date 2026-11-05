@@ -211,6 +211,45 @@ def _admin_view(service: McpService, *, source: str, has_client_secret: bool) ->
     return view
 
 
+async def service_connection(
+    registry: McpRegistry, entry: McpService, user_id: str, app_state: Any
+) -> tuple[bool, bool]:
+    """Whether *user_id* is connected to *entry*, and whether their login needs reconnecting.
+
+    Never reads or returns the login itself beyond what the status needs.
+
+    :param app_state: The app's state, for the GitHub and Databricks connection stores.
+    :returns: ``(connected, needs_reconnect)``.
+    """
+    if entry.auth in {"github", "databricks"}:
+        store = getattr(app_state, f"{entry.auth}_store", None)
+        connected = store is not None and await asyncio.to_thread(store.get, user_id) is not None
+        return connected, False
+    if entry.auth in {"oauth", "bearer"}:
+        if registry.store is None:
+            return False, False
+        connection = await asyncio.to_thread(registry.store.get, user_id, f"mcp:{entry.id}")
+        connected = login_matches(entry, connection)
+        return connected, connected and needs_reconnect(connection)
+    return entry.auth == "none", False
+
+
+def holds_own_login(entry: McpService) -> bool:
+    """Whether each person keeps their own login to *entry* in the registry's store."""
+    return entry.auth in {"oauth", "bearer"}
+
+
+def forget_login(registry: McpRegistry, entry: McpService, user_id: str) -> None:
+    """Remove *user_id*'s login to *entry*, and any sign-in they had started.
+
+    The route names whose: the caller's own, or the member a team owner or
+    admin acts for. Reads and writes the store: call it from a worker thread.
+    """
+    assert registry.store is not None
+    registry.store.delete(user_id, f"mcp:{entry.id}")
+    registry.store.delete(user_id, f"mcp-pending:{entry.id}")
+
+
 def create_mcp_registry_router(
     registry: McpRegistry,
     auth_provider: AuthProvider | None,
@@ -245,19 +284,9 @@ def create_mcp_registry_router(
         page = ids[start : start + limit]
         for service_id in page:
             entry = entries[service_id]
-            connected = entry.auth == "none"
-            rejected = False
-            if entry.auth in {"github", "databricks"}:
-                store = getattr(request.app.state, f"{entry.auth}_store", None)
-                connected = (
-                    store is not None and await asyncio.to_thread(store.get, user_id) is not None
-                )
-            elif entry.auth in {"oauth", "bearer"} and registry.store is not None:
-                connection = await asyncio.to_thread(
-                    registry.store.get, user_id, f"mcp:{entry.id}"
-                )
-                connected = login_matches(entry, connection)
-                rejected = connected and needs_reconnect(connection)
+            connected, rejected = await service_connection(
+                registry, entry, user_id, request.app.state
+            )
             data.append(
                 {
                     "id": entry.id,
@@ -302,13 +331,11 @@ def create_mcp_registry_router(
     @router.delete("/mcp-registry/services/{service_id}/connection")
     async def disconnect(request: Request, service_id: str) -> dict[str, bool]:
         entry = await service(request, service_id)
-        if entry.auth not in {"oauth", "bearer"} or registry.store is None:
+        if not holds_own_login(entry) or registry.store is None:
             raise HTTPException(
                 400, "Manage the shared provider connection in Sandbox Integrations"
             )
-        user_id = user(request)
-        await asyncio.to_thread(registry.store.delete, user_id, f"mcp:{entry.id}")
-        await asyncio.to_thread(registry.store.delete, user_id, f"mcp-pending:{entry.id}")
+        await asyncio.to_thread(forget_login, registry, entry, user(request))
         return {"disconnected": True}
 
     @router.post("/mcp-registry/services/{service_id}/test")

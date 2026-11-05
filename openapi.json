@@ -4999,6 +4999,20 @@
             "title": "Name",
             "type": "string"
           },
+          "owner_user_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whose computer it is, when a team owner or admin creates one for an active member, e.g. `\"alice\"`; `None` for the caller.",
+            "title": "Owner User Id"
+          },
           "provider": {
             "anyOf": [
               {
@@ -12134,7 +12148,7 @@
         ]
       },
       "post": {
-        "description": "Create a persistent host for the caller; its first start runs in the background.\n\n**Returns:** The new host, `waking` while it starts.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when no such persistent provider is configured; 409 when the caller already has a host with the name.",
+        "description": "Create a persistent host; its first start runs in the background.\n\nThe host is the caller's, or with `owner_user_id` and support access,\nthe named active member's: a team owner or admin adds it for them.\n\n**Returns:** The new host, `waking` while it starts.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when no such persistent provider is configured; 409 when the owner already has a host with the name.\n- `HTTPException` \u2014 403 when the caller may not add a computer for someone else; 404 when `owner_user_id` names no active member.",
         "operationId": "create_persistent_host_v1_hosts_post",
         "requestBody": {
           "content": {
@@ -12267,7 +12281,7 @@
     },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
-        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline or the host daemon is too old to detect credentials, 502/504 on host failure/timeout.",
+        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Flag-gated like the credential-write\nroute (404 when disabled). The host owner may read it, or a team owner or\nadmin giving support access, to see whether the member is signed in\n(`may_manage_host`); writing a credential stays the owner's. Never\nreturns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline or the host daemon is too old to detect credentials, 502/504 on host failure/timeout.",
         "operationId": "detect_host_credentials_v1_hosts__host_id__credentials_detected_get",
         "parameters": [
           {
@@ -12746,7 +12760,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"version\": str | None, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Only the host owner may install onto it, or a team owner or\nadmin giving support access (`may_manage_host`). Scoped to the\nUI-installable allowlist (claude, codex, pi, opencode, qwen) \u2014\ncurl/brew and interactive-auth harnesses are refused. The whole route\nis gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"version\": str | None, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {

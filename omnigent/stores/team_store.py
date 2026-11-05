@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator
 from enum import Enum
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from sqlalchemy import ColumnElement, Insert, delete, func, insert, or_, select, update
+from sqlalchemy import ColumnElement, Insert, Select, delete, func, insert, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -421,6 +421,19 @@ def member_account(session: Session, member_id: str) -> tuple[str, MemberState] 
     return row.user_id, cast(MemberState, decode_team_member_state(row.state))
 
 
+def owned_threads_query(user_id: str) -> Select[tuple[str]]:
+    """The ids of the threads *user_id* holds an owner grant on, in id order."""
+    return (
+        select(SqlSessionPermission.conversation_id)
+        .where(
+            SqlSessionPermission.workspace_id == current_workspace_id(),
+            SqlSessionPermission.user_id == user_id,
+            SqlSessionPermission.level >= LEVEL_OWNER,
+        )
+        .order_by(SqlSessionPermission.conversation_id)
+    )
+
+
 def owned_before_removal(session: Session, user_id: str) -> tuple[list[str], list[str]]:
     """The threads *user_id* owns and their cloud computers, before the deletion drops them.
 
@@ -430,15 +443,7 @@ def owned_before_removal(session: Session, user_id: str) -> tuple[list[str], lis
     :returns: ``(thread_ids, host_ids)``, each sorted.
     """
     workspace_id = current_workspace_id()
-    threads = session.execute(
-        select(SqlSessionPermission.conversation_id)
-        .where(
-            SqlSessionPermission.workspace_id == workspace_id,
-            SqlSessionPermission.user_id == user_id,
-            SqlSessionPermission.level >= LEVEL_OWNER,
-        )
-        .order_by(SqlSessionPermission.conversation_id)
-    ).scalars()
+    threads = session.execute(owned_threads_query(user_id)).scalars()
     computers = session.execute(
         select(SqlHost.host_id)
         .where(
@@ -1693,6 +1698,16 @@ class SqlAlchemyTeamStore:
                     .limit(limit)
                 ).scalars()
             )
+
+    def owned_threads(self, user_id: str, *, limit: int = 500) -> list[str]:
+        """Return the ids of the threads a current member owns, in id order.
+
+        The same threads a removal would record for them.
+        """
+        if not 1 <= limit <= MAX_ADMITTED:
+            raise OmnigentError("limit must be 1-1000", code=ErrorCode.INVALID_INPUT)
+        with self._session("list_team_member_owned_threads") as session:
+            return list(session.execute(owned_threads_query(user_id).limit(limit)).scalars())
 
     # ── Inventory ──────────────────────────────────────────────────
 

@@ -68,6 +68,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
+    managed_host,
     ready_host_connection,
     resolve_host_launch,
     resolve_host_owner,
@@ -79,6 +80,7 @@ from omnigent.server.routes._workspace_validation import (
     restore_host_filesystem_url_path,
 )
 from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.support_access import SupportAccess
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -736,6 +738,7 @@ def create_hosts_router(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     feature_flags: FeatureFlags | None = None,
+    support: SupportAccess | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -758,10 +761,23 @@ def create_hosts_router(
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
     :param feature_flags: Immutable deployment release-feature snapshot.
         When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
+    :param support: Support access, letting a team's owners and admins read a
+        member's host, install harnesses, check readiness and list model
+        options and detected sign-ins on it; ``None`` keeps hosts their owner's.
     :returns: A FastAPI router with host endpoints.
     """
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
+
+    async def _managed(request: Request, host_id: str, action: str) -> Host:
+        return await managed_host(
+            request,
+            host_id,
+            action=action,
+            host_store=host_store,
+            auth_provider=auth_provider,
+            support=support,
+        )
 
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
@@ -813,17 +829,9 @@ def create_hosts_router(
             ``gateway_inference``, ``None`` when unreported) plus ``runners``.
         :raises HTTPException: 404 if the host does not exist.
         """
-        # require_user: with an auth provider configured, an
-        # unauthenticated caller must get 401 here — get_user_id would
-        # return None and the ownership check below would be skipped,
-        # exposing another user's host. user_id is None only when auth
-        # is disabled entirely (single-user server).
-        user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        # Unauthenticated callers 401 inside: with an auth provider configured,
+        # a missing identity must never skip the ownership check.
+        host = await _managed(request, host_id, "read_host")
 
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
@@ -846,12 +854,7 @@ def create_hosts_router(
             owner, 409 when offline or the host daemon is too old to list model
             options, 502 on host-side failure, 504 on timeout.
         """
-        user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await _managed(request, host_id, "list_model_options")
         conn = await ready_host_connection(
             host.host_id, host, host_registry, operation="model_options", renews_idle=False
         )
@@ -1555,12 +1558,7 @@ def create_hosts_router(
         if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
-        user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await _managed(request, host_id, "refresh_harnesses")
 
         conn = await ready_host_connection(
             host.host_id, host, host_registry, operation="refresh_harnesses"
@@ -1604,10 +1602,11 @@ def create_hosts_router(
 
         Backs the Web UI's New Chat dialog "Install" action so a user can
         install a harness the connected host is missing without dropping to a
-        terminal. Owner-scoped like the other host actions: only the host owner
-        may install onto it. Scoped to the UI-installable allowlist (claude,
-        codex, pi, opencode, qwen) — curl/brew and interactive-auth harnesses
-        are refused. The whole route is gated behind
+        terminal. Only the host owner may install onto it, or a team owner or
+        admin giving support access (:func:`may_manage_host`). Scoped to the
+        UI-installable allowlist (claude, codex, pi, opencode, qwen) —
+        curl/brew and interactive-auth harnesses are refused. The whole route
+        is gated behind
         ``harness_install`` in ``OMNIGENT_FEATURES`` (default off): when
         disabled it returns 404 so the feature is invisible until opted in.
 
@@ -1643,15 +1642,7 @@ def create_hosts_router(
                 detail=f"harness {harness!r} is not installable from the UI",
             )
 
-        # require_user: unauthenticated callers 401 instead of slipping past
-        # the owner check below as None.
-        user_id = require_user(request, auth_provider)
-
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await _managed(request, host_id, "install_harness")
 
         conn = await ready_host_connection(
             host.host_id, host, host_registry, operation="install_harness"
@@ -1832,8 +1823,11 @@ def create_hosts_router(
         Backs the setup dialog's "adopt an existing credential" affordance: the
         host reports which UI-auth-family credentials it already has as
         NON-secret descriptors (family + source label + env var name), so the UI
-        can offer a one-click "Use it". Owner-scoped and flag-gated like the
-        credential-write route (404 when disabled). Never returns a secret value.
+        can offer a one-click "Use it". Flag-gated like the credential-write
+        route (404 when disabled). The host owner may read it, or a team owner or
+        admin giving support access, to see whether the member is signed in
+        (:func:`may_manage_host`); writing a credential stays the owner's. Never
+        returns a secret value.
 
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier.
@@ -1845,13 +1839,7 @@ def create_hosts_router(
         if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
-        user_id = require_user(request, auth_provider)
-
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        host = await _managed(request, host_id, "detect_credentials")
 
         conn = await ready_host_connection(
             host.host_id, host, host_registry, operation="detect_credentials", renews_idle=False

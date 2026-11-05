@@ -6,6 +6,9 @@ provider implements (see ``SandboxLifecycle.claim_start``). Its methods record
 what Omnigent asked for, and its knobs inject the faults the lifecycle must
 survive: lost replies, unanswered status reports, slow or refused stops.
 
+:class:`OwnedComputer` is the same computer declaring ``owner_context``: it records
+the owner Omnigent names on each call.
+
 :class:`FakeHost` is the host process on that computer: it connects to the
 registry only with a launch token the store accepts, answers ``host.quiesce``
 from its runner and operation lists (and directory listings and plugin
@@ -38,6 +41,7 @@ from omnigent.onboarding.sandboxes.types import (
     AdmissionReport,
     HostSandboxStatus,
     RepoWorkspace,
+    SandboxOwner,
     StartClaim,
     SuspendResult,
 )
@@ -248,6 +252,76 @@ class FakeComputer(SandboxHostLauncher):
         if self.terminate_error is not None:
             raise LostReplyError(self.terminate_error)
         self.terminated.append(sandbox_id)
+
+
+@dataclass
+class OwnedComputer(FakeComputer):
+    """:class:`FakeComputer` declaring ``owner_context``: records each call's owner."""
+
+    provider: ClassVar[str] = "fakepersist"
+    supports_owner_context: ClassVar[bool] = True
+    owners: list[tuple[str, SandboxOwner | None]] = field(default_factory=list)
+
+    def provision(self, name: str, *, owner: SandboxOwner | None = None) -> str:
+        self.owners.append(("provision", owner))
+        return super().provision(name)
+
+    def admission(
+        self, sandbox_id: str, *, owner: SandboxOwner | None = None
+    ) -> AdmissionReport | None:
+        self.owners.append(("admission", owner))
+        return super().admission(sandbox_id)
+
+    def resume(self, sandbox_id: str, *, owner: SandboxOwner | None = None) -> None:
+        self.owners.append(("resume", owner))
+        super().resume(sandbox_id)
+
+    def claim_start(
+        self, sandbox_id: str, *, operation_id: str, owner: SandboxOwner | None = None
+    ) -> StartClaim:
+        self.owners.append(("claim_start", owner))
+        return super().claim_start(sandbox_id, operation_id=operation_id)
+
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repos: Sequence[RepoWorkspace] = (),
+        host_config: dict[str, object] | None = None,
+        on_stage: Any = None,
+        start_attempt: int | None = None,
+        owner: SandboxOwner | None = None,
+    ) -> str:
+        self.owners.append(("start_host", owner))
+        return super().start_host(
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repos=repos,
+            host_config=host_config,
+            on_stage=on_stage,
+            start_attempt=start_attempt,
+        )
+
+    def is_running(self, sandbox_id: str, *, owner: SandboxOwner | None = None) -> bool | None:
+        self.owners.append(("is_running", owner))
+        return super().is_running(sandbox_id)
+
+    def suspend(
+        self, sandbox_id: str, *, operation_id: str, owner: SandboxOwner | None = None
+    ) -> SuspendResult:
+        self.owners.append(("suspend", owner))
+        return super().suspend(sandbox_id, operation_id=operation_id)
+
+    def terminate(self, sandbox_id: str, *, owner: SandboxOwner | None = None) -> None:
+        self.owners.append(("terminate", owner))
+        super().terminate(sandbox_id)
 
 
 @dataclass

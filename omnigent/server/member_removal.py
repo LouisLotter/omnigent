@@ -32,7 +32,7 @@ from omnigent.server.authority_changes import authority_changed
 if TYPE_CHECKING:
     from starlette.requests import HTTPConnection
 
-    from omnigent.entities.team import MemberRemoval
+    from omnigent.entities.team import MemberRemoval, TeamMember
     from omnigent.server.accounts_store import SqlAlchemyAccountStore
     from omnigent.server.auth import AuthProvider
     from omnigent.server.team_admission import AdmissionSync
@@ -205,8 +205,17 @@ class MemberRemovals:
 
     def threads(self, member_id: str) -> list[dict[str, object]]:
         """The threads a removed member owned, with titles where they can be read."""
+        return self._titled(self._team.removal_threads(member_id, limit=MAX_LISTED_THREADS))
+
+    def member_threads(self, member: TeamMember) -> list[dict[str, object]]:
+        """The threads *member* owns now, or owned when they were removed, with titles."""
+        if member.state == "removed":
+            return self.threads(member.id)
+        return self._titled(self._team.owned_threads(member.user_id, limit=MAX_LISTED_THREADS))
+
+    def _titled(self, thread_ids: list[str]) -> list[dict[str, object]]:
         listed = []
-        for thread_id in self._team.removal_threads(member_id, limit=MAX_LISTED_THREADS):
+        for thread_id in thread_ids:
             title = None
             if self._conversations is not None:
                 try:

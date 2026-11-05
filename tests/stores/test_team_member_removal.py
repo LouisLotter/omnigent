@@ -96,6 +96,8 @@ def test_removal_is_one_transaction_that_records_what_the_member_had(stores) -> 
     )
     before = teams.admission_snapshot()
     assert "alice@example.test" in before.emails
+    # A current member's own threads: what the removal records below.
+    assert teams.owned_threads("alice") == [own_thread]
 
     removal = accounts.remove_member(alice_id, actor_member_id=owner_id)
 

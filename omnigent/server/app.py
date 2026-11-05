@@ -1431,6 +1431,7 @@ def create_app(
     approval_store: SqlAlchemyApprovalStore | None = None,
     team_admission: MembershipAdmission | None = None,
     external_identity: ExternalIdentityConfig | None = None,
+    admin_support_access: bool = False,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1470,6 +1471,14 @@ def create_app(
     :param external_identity: The front proxy's signed-identity settings
         (:mod:`omnigent.server.external_identity`); ``None`` reads them from
         the environment, where they default to off.
+    :param admin_support_access: Whether a team's owners and admins, signed in
+        through a browser, act on other members' computers and connections
+        (:mod:`omnigent.server.support_access`): read, start and delete a
+        member's computers and create one for them, install harnesses and read
+        model options and sign-in state on them, and see or remove the member's
+        connections and list their threads. Logins stay the person's own.
+        ``False`` (the default) keeps every host and connection its owner's
+        alone. Needs accounts mode, which has the team.
     :param scheduled_task_store: Store backing the recurring-task
         scheduler. When provided, the FastAPI lifespan
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
@@ -2121,6 +2130,14 @@ def create_app(
         SqlAlchemyTeamStore(account_store.storage_location) if account_store is not None else None
     )
     app.state.team_store = team_store
+    from omnigent.server.support_access import SupportAccess
+
+    support_access = (
+        SupportAccess(team_store, account_store)
+        if admin_support_access and team_store is not None and account_store is not None
+        else None
+    )
+    app.state.support_access = support_access
     external_identity_config = (
         external_identity if external_identity is not None else ExternalIdentityConfig.from_env()
     )
@@ -4850,6 +4867,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                support=support_access,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -4857,7 +4875,9 @@ def create_app(
         from omnigent.server.routes.persistent_hosts import create_persistent_hosts_router
 
         app.include_router(
-            create_persistent_hosts_router(host_store, host_registry, auth_provider=auth_provider),
+            create_persistent_hosts_router(
+                host_store, host_registry, auth_provider=auth_provider, support=support_access
+            ),
             prefix="/v1",
             tags=["hosts"],
         )
@@ -5043,10 +5063,32 @@ def create_app(
                         invite_ttl_seconds=auth_provider._accounts_config.invite_ttl_seconds,
                         admission_sync=app.state.team_admission_sync,
                         removals=member_removals,
+                        support_access=support_access is not None and host_store is not None,
                     ),
                     prefix="/v1",
                     tags=["team"],
                 )
+                if (
+                    support_access is not None
+                    and host_store is not None
+                    and member_removals is not None
+                ):
+                    from omnigent.server.routes.member_support import (
+                        create_member_support_router,
+                    )
+
+                    app.include_router(
+                        create_member_support_router(
+                            support_access,
+                            host_store,
+                            host_registry,
+                            auth_provider=auth_provider,
+                            removals=member_removals,
+                            mcp_registry=mcp_registry,
+                        ),
+                        prefix="/v1",
+                        tags=["team"],
+                    )
         elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 

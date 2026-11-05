@@ -4,6 +4,7 @@
  * throwing, like ``accountsApi``.
  */
 
+import type { Host } from "@/hooks/useHosts";
 import { hostFetch } from "./host";
 
 export type TeamRole = "owner" | "admin" | "member";
@@ -70,6 +71,34 @@ export interface TeamState {
   removals?: TeamRemovalEntry[];
   /** How the server ties requests to a front proxy's sign-in: off, bind or required. */
   external_identity: "off" | "bind" | "required";
+  /**
+   * Whether owners and admins manage other members' computers and connections, on each
+   * member's page; absent from servers without support access.
+   */
+  support_access?: boolean;
+}
+
+/** A member's connection to a provider such as GitHub; never the login itself. */
+export interface MemberProviderConnection {
+  provider: string;
+  connected: boolean;
+  connected_at: number | null;
+}
+
+/** Whether a member is connected to one MCP service. */
+export interface MemberServiceConnection {
+  id: string;
+  title: string;
+  auth: string;
+  connected: boolean;
+  needs_reconnect: boolean;
+  /** The member keeps their own login to it, which an owner or admin may remove. */
+  disconnectable: boolean;
+}
+
+export interface MemberConnections {
+  services: MemberServiceConnection[];
+  providers: MemberProviderConnection[];
 }
 
 export interface InvitationPreview {
@@ -183,6 +212,49 @@ export function getRemoval(
   memberId: string,
 ): Promise<TeamResult<{ removal: TeamRemovalEntry; threads: RemovedThread[] }>> {
   return teamRequest(`/v1/team/members/${encodeURIComponent(memberId)}/removal`);
+}
+
+function memberPath(memberId: string, suffix: string): string {
+  return `/v1/team/members/${encodeURIComponent(memberId)}${suffix}`;
+}
+
+/** GET /v1/team/members/{id}/hosts — a member's hosts, for owners and admins. */
+export function getMemberHosts(memberId: string): Promise<TeamResult<{ hosts: Host[] }>> {
+  return teamRequest(memberPath(memberId, "/hosts"));
+}
+
+/** GET /v1/team/members/{id}/connections — whether the member is connected to each service. */
+export function getMemberConnections(memberId: string): Promise<TeamResult<MemberConnections>> {
+  return teamRequest(memberPath(memberId, "/connections"));
+}
+
+/** DELETE /v1/team/members/{id}/connections/{provider} — remove the member's connection. */
+export function disconnectMemberProvider(
+  memberId: string,
+  provider: string,
+): Promise<TeamResult<{ disconnected: boolean }>> {
+  return teamRequest(
+    memberPath(memberId, `/connections/${encodeURIComponent(provider)}`),
+    jsonInit("DELETE"),
+  );
+}
+
+/** DELETE /v1/team/members/{id}/mcp-services/{service}/connection — remove their login. */
+export function disconnectMemberService(
+  memberId: string,
+  serviceId: string,
+): Promise<TeamResult<{ disconnected: boolean }>> {
+  return teamRequest(
+    memberPath(memberId, `/mcp-services/${encodeURIComponent(serviceId)}/connection`),
+    jsonInit("DELETE"),
+  );
+}
+
+/** GET /v1/team/members/{id}/threads — the threads the member owns, or owned. */
+export function getMemberThreads(
+  memberId: string,
+): Promise<TeamResult<{ threads: RemovedThread[] }>> {
+  return teamRequest(memberPath(memberId, "/threads"));
 }
 
 /** GET /v1/team/invitations/preview — what an invitation link offers; no sign-in needed. */

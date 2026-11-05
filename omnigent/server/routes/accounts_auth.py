@@ -1074,6 +1074,22 @@ def create_accounts_auth_router(
             _logger.exception("Removing deleted account %s's persistent hosts failed", user_id)
         return Response(status_code=204)
 
+    def _team_reset_refusal(admin_id: str, user_id: str) -> str | None:
+        """Why the team's roles keep *admin_id* from resetting *user_id*'s password, if they do.
+
+        Reset follows suspension: an owner resets anyone's password, an admin a
+        member's and their own. An account without a membership is as before.
+        """
+        if team_store is None or user_id == admin_id:
+            return None
+        target = team_store.get_member_for_account(user_id)
+        if target is None or target.role == "member":
+            return None
+        actor = team_store.get_member_for_account(admin_id)
+        if actor is not None and actor.state == "active" and actor.role == "owner":
+            return None
+        return "only an owner resets an owner's or admin's password"
+
     @router.post("/users/{user_id}/reset")
     async def reset_user_password(request: Request, user_id: str) -> Response:
         """Admin-initiated password reset.
@@ -1084,7 +1100,8 @@ def create_accounts_auth_router(
         Also revokes the user's existing sessions and CLI logins.
 
         Only from a browser sign-in: the new password signs anyone in through
-        the browser, so a CLI or host credential cannot obtain one.
+        the browser, so a CLI or host credential cannot obtain one. In a team,
+        only an owner resets an owner's or another admin's password.
         """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
@@ -1092,6 +1109,9 @@ def create_accounts_auth_router(
         problem = answer_credential_problem(request, auth_provider, "reset passwords")
         if problem is not None:
             return JSONResponse(status_code=403, content={"error": problem})
+        refusal = await asyncio.to_thread(_team_reset_refusal, admin_id, user_id)
+        if refusal is not None:
+            return JSONResponse(status_code=403, content={"error": refusal})
 
         user = account_store.get_user(user_id)
         if user is None:

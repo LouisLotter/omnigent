@@ -24,6 +24,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { useNavigate, useParams } from "@/lib/routing";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -48,13 +49,21 @@ import {
 } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { type TeamState, getTeam } from "@/lib/teamApi";
+import { MemberPage } from "@/pages/settings/MemberPage";
 import { TeamPanel } from "@/pages/settings/TeamPanel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
-import { isSingleUserMode, persistentHostOverviewUrls } from "@/lib/capabilities";
+import {
+  isSingleUserMode,
+  persistentHostOverviewUrls,
+  persistentHostProviders,
+} from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
+  // ``/settings/members/<member id>``: that member's page, for owners and admins.
+  const { subSection } = useParams<{ subSection?: string }>();
+  const navigate = useNavigate();
   // Password-based management (invite / reset / remove) only exists in
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).
@@ -193,6 +202,60 @@ export function MembersPage() {
     setResetResult(result);
   }
 
+  // The reset password, shown once, here and on a member's page.
+  const resetDialog = (
+    <Dialog
+      open={resetResult !== null}
+      onOpenChange={(open) => {
+        if (!open) setResetResult(null);
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>New password for {resetResult?.id}</DialogTitle>
+          <DialogDescription>
+            Give this password to them yourself, for example in a message from your own email. It is
+            shown only once; they can change it in Settings → Account.
+          </DialogDescription>
+        </DialogHeader>
+        {resetResult !== null && <CopyableValue value={resetResult.new_password} />}
+        <DialogFooter>
+          <Button onClick={() => setResetResult(null)}>Done</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+
+  const computersPage = persistentHostOverviewUrls(info)[0] ?? null;
+  const memberId = team?.support_access === true && subSection ? subSection : null;
+  const actionNotice = actionError !== null && !showCreateInvite && deleteCandidate === null && (
+    <div
+      role="alert"
+      className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+    >
+      {actionError}
+    </div>
+  );
+
+  if (team !== null && memberId !== null) {
+    return (
+      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+        <h1 className="settings-page-title mb-4 text-2xl font-semibold">Members</h1>
+        {actionNotice}
+        <MemberPage
+          memberId={memberId}
+          state={team}
+          providers={persistentHostProviders(info)}
+          computersPage={computersPage}
+          onChanged={refresh}
+          onResetPassword={(userId) => void onResetPassword(userId)}
+          onBack={() => navigate("/settings/members")}
+        />
+        {resetDialog}
+      </PageScroll>
+    );
+  }
+
   return (
     <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
@@ -222,6 +285,7 @@ export function MembersPage() {
           {loadError}
         </div>
       )}
+      {actionNotice}
 
       {team !== null && (
         <TeamPanel
@@ -229,8 +293,11 @@ export function MembersPage() {
           accounts={(users ?? []).map((u) => u.id)}
           onChanged={refresh}
           onResetPassword={(userId) => void onResetPassword(userId)}
-          computersPage={persistentHostOverviewUrls(info)[0] ?? null}
+          computersPage={computersPage}
           rebaseUrl={rebaseUrl}
+          onManage={(member) =>
+            navigate(`/settings/members/${encodeURIComponent(member.member_id)}`)
+          }
         />
       )}
 
@@ -378,27 +445,7 @@ export function MembersPage() {
         </DialogContent>
       </Dialog>
 
-      {/* ── Reset password modal (shows the new password once) ───── */}
-      <Dialog
-        open={resetResult !== null}
-        onOpenChange={(open) => {
-          if (!open) setResetResult(null);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New password for {resetResult?.id}</DialogTitle>
-            <DialogDescription>
-              Give this password to them yourself, for example in a message from your own email. It
-              is shown only once; they can change it in Settings → Account.
-            </DialogDescription>
-          </DialogHeader>
-          {resetResult !== null && <CopyableValue value={resetResult.new_password} />}
-          <DialogFooter>
-            <Button onClick={() => setResetResult(null)}>Done</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {resetDialog}
 
       {/* ── Delete confirmation ────────────────────────────────── */}
       <Dialog
