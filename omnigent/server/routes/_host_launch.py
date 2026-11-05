@@ -35,7 +35,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerEx
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 from omnigent.server.persistent_hosts import ensure_host_ready
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.support_access import log_support_action
+from omnigent.server.support_access import SUPPORTED_STATES, log_support_action
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -43,11 +43,11 @@ from omnigent.stores.permission_store import PermissionStore
 if TYPE_CHECKING:
     from starlette.requests import Request
 
-    from omnigent.entities.team import TeamMember
+    from omnigent.entities.team import MemberState, SupportAction, TeamMember
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
     from omnigent.server.auth import AuthProvider
     from omnigent.server.principals import Principal
-    from omnigent.server.support_access import SupportAccess
+    from omnigent.server.support_access import SupportAccess, SupportedMember
 
 _logger = logging.getLogger(__name__)
 
@@ -169,11 +169,17 @@ class ManageGrant:
 
     :param actor: The team owner or admin acting for the host's owner; ``None``
         when the caller owns the host (or auth is off).
-    :param member: The host owner's membership, set with *actor*.
+    :param member: The host owner's membership and registration, set with *actor*.
     """
 
     actor: TeamMember | None = None
-    member: TeamMember | None = None
+    member: SupportedMember | None = None
+
+    def action(self, states: frozenset[MemberState] = SUPPORTED_STATES) -> SupportAction | None:
+        """The support action, for a write to check again; ``None`` for the host's owner."""
+        if self.actor is None or self.member is None:
+            return None
+        return self.member.action(self.actor, states)
 
 
 def may_manage_host(
@@ -208,7 +214,7 @@ def may_manage_host(
     if actor is None:
         return None
     member = support.member_for_host(host)
-    if member is None or member.id == actor.id:
+    if member is None or member.member.id == actor.id:
         return None
     return ManageGrant(actor=actor, member=member)
 
@@ -221,11 +227,14 @@ async def managed_host(
     host_store: HostStore,
     auth_provider: AuthProvider | None,
     support: SupportAccess | None,
-) -> Host:
+) -> tuple[Host, ManageGrant]:
     """
     Load a host the caller may manage (:func:`may_manage_host`), logging support.
 
     :param action: What the caller does, for the support log, e.g. ``"start_host"``.
+    :returns: The host and the grant, which the operation keeps: a write checks
+        :meth:`ManageGrant.action` again, and a command sent after a wait calls
+        :func:`confirm_manage_grant` first.
     :raises OmnigentError: 401 when unauthenticated.
     :raises HTTPException: 404 if the host is unknown; 403 when the caller may
         not manage it.
@@ -238,7 +247,7 @@ async def managed_host(
         else None
     )
 
-    def resolve() -> Host:
+    def resolve() -> tuple[Host, ManageGrant]:
         host = host_store.get_host(host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
@@ -246,10 +255,26 @@ async def managed_host(
         if grant is None:
             raise HTTPException(status_code=403, detail="not your host")
         if grant.actor is not None and grant.member is not None:
-            log_support_action(grant.actor, action, grant.member, subject=host.host_id)
-        return host
+            log_support_action(grant.actor, action, grant.member.member, subject=host.host_id)
+        return host, grant
 
     return await asyncio.to_thread(resolve)
+
+
+async def confirm_manage_grant(
+    grant: ManageGrant, host: Host, support: SupportAccess | None
+) -> None:
+    """Check a support grant again before a command goes to the host, e.g. after it woke.
+
+    A no-op for the host's owner.
+
+    :raises HTTPException: 403 when the owner or admin may no longer act on it.
+    """
+    if grant.actor is None or grant.member is None or support is None:
+        return
+    actor, member = grant.actor, grant.member.member
+    if not await asyncio.to_thread(support.still_supports, actor, member, host):
+        raise HTTPException(status_code=403, detail="not your host")
 
 
 # Set by ``create_app(host_sharded=...)``. Process-wide because

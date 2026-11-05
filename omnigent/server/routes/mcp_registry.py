@@ -239,17 +239,6 @@ def holds_own_login(entry: McpService) -> bool:
     return entry.auth in {"oauth", "bearer"}
 
 
-def forget_login(registry: McpRegistry, entry: McpService, user_id: str) -> None:
-    """Remove *user_id*'s login to *entry*, and any sign-in they had started.
-
-    The route names whose: the caller's own, or the member a team owner or
-    admin acts for. Reads and writes the store: call it from a worker thread.
-    """
-    assert registry.store is not None
-    registry.store.delete(user_id, f"mcp:{entry.id}")
-    registry.store.delete(user_id, f"mcp-pending:{entry.id}")
-
-
 def create_mcp_registry_router(
     registry: McpRegistry,
     auth_provider: AuthProvider | None,
@@ -335,7 +324,9 @@ def create_mcp_registry_router(
             raise HTTPException(
                 400, "Manage the shared provider connection in Sandbox Integrations"
             )
-        await asyncio.to_thread(forget_login, registry, entry, user(request))
+        user_id = user(request)
+        await asyncio.to_thread(registry.store.delete, user_id, f"mcp:{entry.id}")
+        await asyncio.to_thread(registry.store.delete, user_id, f"mcp-pending:{entry.id}")
         return {"disconnected": True}
 
     @router.post("/mcp-registry/services/{service_id}/test")

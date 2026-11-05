@@ -12192,7 +12192,7 @@
     },
     "/v1/hosts/{host_id}": {
       "delete": {
-        "description": "Delete a persistent host and ask its provider to remove the sandbox.\n\nThe host is removed from Omnigent first; a provider removal that fails\nis retried by the managed-sandbox reaper.",
+        "description": "Delete a persistent host and ask its provider to remove the sandbox.\n\nThe host is removed from Omnigent first; a provider removal that fails\nis retried by the managed-sandbox reaper. An owner's or admin's delete\nis checked again in the removal's own write.",
         "operationId": "delete_persistent_host_v1_hosts__host_id__delete",
         "parameters": [
           {

@@ -8,21 +8,24 @@ the computer is the member's, and its provider is called for the member.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from omnigent.db.account_authority import target_account_scope
 from omnigent.entities.team import TeamMember
 from omnigent.server import persistent_hosts
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import managed_host
+from omnigent.server.routes._host_launch import ManageGrant, managed_host
 from omnigent.server.routes.hosts import host_payload
-from omnigent.server.support_access import SupportAccess, log_support_action
+from omnigent.server.support_access import (
+    ACTIVE_ONLY,
+    SupportAccess,
+    SupportedMember,
+    log_support_action,
+)
 from omnigent.stores.host_store import Host, HostStore
 
 
@@ -61,8 +64,10 @@ def create_persistent_hosts_router(
     """
     router = APIRouter()
 
-    async def _managed_persistent_host(request: Request, host_id: str, action: str) -> Host:
-        host = await managed_host(
+    async def _managed_persistent_host(
+        request: Request, host_id: str, action: str
+    ) -> tuple[Host, ManageGrant]:
+        host, grant = await managed_host(
             request,
             host_id,
             action=action,
@@ -72,12 +77,12 @@ def create_persistent_hosts_router(
         )
         if not persistent_hosts.is_persistent_host(host):
             raise HTTPException(status_code=400, detail="not a persistent host")
-        return host
+        return host, grant
 
     def _member_to_create_for(
         request: Request, user_id: str | None, owner_user_id: str
-    ) -> tuple[TeamMember, TeamMember, str | None]:
-        """The supporting caller, the active member the computer is for, and their registration."""
+    ) -> tuple[TeamMember, SupportedMember]:
+        """The supporting caller and the active member the computer is for."""
         actor = None
         if support is not None and auth_provider is not None:
             actor = support.supporter(auth_provider.principal(request), user_id)
@@ -86,14 +91,10 @@ def create_persistent_hosts_router(
                 status_code=403,
                 detail="only a team owner or admin, in the browser, adds a computer for someone",
             )
-        member = support.team_store.get_member_for_account(owner_user_id)
-        if member is None or member.state != "active":
+        member = support.member(user_id=owner_user_id, states=ACTIVE_ONLY)
+        if member is None:
             raise HTTPException(status_code=404, detail="no such active team member")
-        try:
-            generation = support.registration(member)
-        except LookupError:
-            raise HTTPException(status_code=404, detail="no such active team member") from None
-        return actor, member, generation
+        return actor, member
 
     @router.post("/hosts", status_code=201)
     async def create_persistent_host(
@@ -117,19 +118,17 @@ def create_persistent_hosts_router(
                 owner=owner, name=body.name, provider=body.provider
             )
             return host_payload(host, host_registry)
-        actor, member, generation = await asyncio.to_thread(
+        actor, member = await asyncio.to_thread(
             _member_to_create_for, request, user_id, body.owner_user_id
         )
-        # Pinned so the row is written for the registration that was checked.
-        with (
-            target_account_scope(member.user_id, generation)
-            if generation is not None
-            else contextlib.nullcontext()
-        ):
-            host = await persistent_hosts.create_host(
-                owner=member.user_id, name=body.name, provider=body.provider
-            )
-        log_support_action(actor, "create_host", member, subject=host.host_id)
+        # The row's write checks the actor and the member again (support=).
+        host = await persistent_hosts.create_host(
+            owner=member.member.user_id,
+            name=body.name,
+            provider=body.provider,
+            support=member.action(actor, ACTIVE_ONLY),
+        )
+        log_support_action(actor, "create_host", member.member, subject=host.host_id)
         return host_payload(host, host_registry)
 
     @router.post("/hosts/{host_id}/start", status_code=202)
@@ -138,7 +137,7 @@ def create_persistent_hosts_router(
 
         :returns: The host, ``waking`` while it starts.
         """
-        host = await _managed_persistent_host(request, host_id, "start_host")
+        host, _grant = await _managed_persistent_host(request, host_id, "start_host")
         persistent_hosts.start_host_now(host.host_id)
         return host_payload(host, host_registry)
 
@@ -147,10 +146,11 @@ def create_persistent_hosts_router(
         """Delete a persistent host and ask its provider to remove the sandbox.
 
         The host is removed from Omnigent first; a provider removal that fails
-        is retried by the managed-sandbox reaper.
+        is retried by the managed-sandbox reaper. An owner's or admin's delete
+        is checked again in the removal's own write.
         """
-        host = await _managed_persistent_host(request, host_id, "delete_host")
-        await persistent_hosts.delete_host(host)
+        host, grant = await _managed_persistent_host(request, host_id, "delete_host")
+        await persistent_hosts.delete_host(host, support=grant.action())
         return {"host_id": host.host_id, "deleted": True}
 
     return router

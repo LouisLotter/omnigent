@@ -97,17 +97,6 @@ def sanitize_return_to(raw: str | None) -> str:
     return raw
 
 
-async def remove_connection(store: Any, user_id: str) -> bool:
-    """Remove *user_id*'s connection from a provider's connection *store*.
-
-    The route names whose: the caller's own, or the member a team owner or
-    admin acts for (:mod:`omnigent.server.routes.member_support`).
-
-    :returns: Whether there was one.
-    """
-    return bool(await asyncio.to_thread(store.delete, user_id))
-
-
 def redirect_with_status(provider: str, return_to: str, status: str) -> RedirectResponse:
     """Redirect back to *return_to* with a ``?<provider>=<status>`` marker."""
     sep = "&" if "?" in return_to else "?"
@@ -256,6 +245,7 @@ def _connection_routes(
         """Remove the caller's connection."""
         user_id = _current_user(request)
         hooks = await resolve_hooks(request)
-        return {"disconnected": await remove_connection(hooks.store, user_id)}
+        removed = await asyncio.to_thread(hooks.store.delete, user_id)
+        return {"disconnected": removed}
 
     return router

@@ -17,7 +17,9 @@ Mounted beside ``/v1/team`` by ``create_app(admin_support_access=True)``:
 There is no connect: logins stay the person's own (:mod:`omnigent.server.support_access`).
 Every route needs an active owner or admin signed in through a browser. The
 member comes from the path alone, never from anything a runner or host sends,
-and each route logs the acting member and the member by member id.
+and each route logs the acting member and the member by member id. A disconnect
+is one write that checks the actor and the member again, so it acts only for
+the membership and registration the request checked.
 """
 
 from __future__ import annotations
@@ -30,15 +32,14 @@ from fastapi import APIRouter, Request
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.connections_registry import connection_providers
-from omnigent.server.routes.connections_base import remove_connection
 from omnigent.server.routes.hosts import host_payload
-from omnigent.server.routes.mcp_registry import (
-    forget_login,
-    holds_own_login,
-    service_connection,
-)
+from omnigent.server.routes.mcp_registry import holds_own_login, service_connection
 from omnigent.server.routes.team import team_administrator
-from omnigent.server.support_access import SUPPORTED_STATES, SupportAccess, log_support_action
+from omnigent.server.support_access import (
+    SupportAccess,
+    SupportedMember,
+    log_support_action,
+)
 
 if TYPE_CHECKING:
     from omnigent.entities.team import TeamMember
@@ -73,25 +74,22 @@ def create_member_support_router(
     router = APIRouter()
     team_store = support.team_store
 
-    def _actor_and_member(
-        request: Request, member_id: str, *, removed: bool = False
-    ) -> tuple[TeamMember, TeamMember]:
-        actor = team_administrator(request, team_store, auth_provider, _ACTION)
-        member = team_store.get_member(member_id)
-        states = (SUPPORTED_STATES | {"removed"}) if removed else SUPPORTED_STATES
-        if member is None or member.state not in states:
+    def _actor(request: Request) -> TeamMember:
+        return team_administrator(request, team_store, auth_provider, _ACTION)
+
+    def _actor_and_member(request: Request, member_id: str) -> tuple[TeamMember, SupportedMember]:
+        """The acting owner or admin, and the current member with their registration."""
+        actor = _actor(request)
+        member = support.member(member_id=member_id)
+        if member is None:
             raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
         return actor, member
 
-    def _member_hosts(member: TeamMember) -> list[Host]:
-        try:
-            generation = support.registration(member)
-        except LookupError:
-            raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND) from None
+    def _member_hosts(member: SupportedMember) -> list[Host]:
         return [
             host
-            for host in host_store.list_hosts(member.user_id)
-            if host.account_generation in (None, generation)
+            for host in host_store.list_hosts(member.member.user_id)
+            if host.account_generation in (None, member.generation)
         ]
 
     @router.get("/team/members/{member_id}/hosts")
@@ -99,14 +97,15 @@ def create_member_support_router(
         """The member's hosts, with the fields ``GET /v1/hosts`` gives their owner."""
         actor, member = await asyncio.to_thread(_actor_and_member, request, member_id)
         hosts = await asyncio.to_thread(_member_hosts, member)
-        log_support_action(actor, "list_hosts", member)
+        log_support_action(actor, "list_hosts", member.member)
         now = now_epoch()
         return {"hosts": [host_payload(host, host_registry, now=now) for host in hosts]}
 
     @router.get("/team/members/{member_id}/connections")
     async def member_connections(request: Request, member_id: str) -> dict[str, Any]:
         """Whether the member is connected to each MCP service and connection provider."""
-        actor, member = await asyncio.to_thread(_actor_and_member, request, member_id)
+        actor, supported = await asyncio.to_thread(_actor_and_member, request, member_id)
+        member = supported.member
         services: list[dict[str, Any]] = []
         if mcp_registry is not None:
             await mcp_registry.refresh()
@@ -158,8 +157,12 @@ def create_member_support_router(
         )
         if store is None:
             raise OmnigentError("no such connection", code=ErrorCode.NOT_FOUND)
-        removed = await remove_connection(store, member.user_id)
-        log_support_action(actor, "disconnect", member, subject=provider)
+        removed = await asyncio.to_thread(
+            support.account_store.remove_member_connections,
+            member.action(actor),
+            [store.provider_key],
+        )
+        log_support_action(actor, "disconnect", member.member, subject=provider)
         return {"disconnected": removed}
 
     @router.delete("/team/members/{member_id}/mcp-services/{service_id}/connection")
@@ -179,16 +182,30 @@ def create_member_support_router(
                 "this service uses a connection provider; remove that connection instead",
                 code=ErrorCode.INVALID_INPUT,
             )
-        await asyncio.to_thread(forget_login, mcp_registry, entry, member.user_id)
-        log_support_action(actor, "disconnect", member, subject=f"mcp:{entry.id}")
+        # The login and the sign-in they had started go in the same write.
+        await asyncio.to_thread(
+            support.account_store.remove_member_connections,
+            member.action(actor),
+            [f"mcp:{entry.id}", f"mcp-pending:{entry.id}"],
+        )
+        log_support_action(actor, "disconnect", member.member, subject=f"mcp:{entry.id}")
         return {"disconnected": True}
 
     @router.get("/team/members/{member_id}/threads")
     async def member_threads(request: Request, member_id: str) -> dict[str, Any]:
         """The threads the member owns, or owned when they were removed, with titles."""
-        actor, member = await asyncio.to_thread(
-            _actor_and_member, request, member_id, removed=True
-        )
+
+        def actor_and_member() -> tuple[TeamMember, TeamMember]:
+            actor = _actor(request)
+            current = support.member(member_id=member_id)
+            if current is not None:
+                return actor, current.member
+            removed = team_store.get_member(member_id)
+            if removed is None or removed.state != "removed":
+                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            return actor, removed
+
+        actor, member = await asyncio.to_thread(actor_and_member)
         threads = await asyncio.to_thread(removals.member_threads, member)
         log_support_action(actor, "list_threads", member)
         return {"threads": threads}

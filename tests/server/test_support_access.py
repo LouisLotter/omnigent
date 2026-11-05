@@ -31,8 +31,10 @@ from omnigent.server import persistent_hosts
 from omnigent.server.github_app import GitHubTokenSet
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.principals import CredentialKind, Principal, PrincipalKind
+from omnigent.server.routes import accounts_auth
 from omnigent.server.routes import hosts as hosts_routes
 from omnigent.server.routes._host_launch import ManageGrant, may_manage_host
+from omnigent.server.support_access import SupportedMember
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 from omnigent.stores.host_store import Host
 from tests.server.persistent_host_fakes import OwnedComputer
@@ -568,15 +570,17 @@ def test_support_access_needs_a_browser_sign_in_of_an_active_owner_or_admin(
 def test_may_manage_host_allows_the_owner_or_support_for_someone_else() -> None:
     carol = TeamMember("m-carol", "carol", "admin", "active", 0, 0)
     alice = TeamMember("m-alice", "alice", "member", "active", 0, 0)
+    as_carol = SupportedMember(carol, "gen-carol")
+    as_alice = SupportedMember(alice, "gen-alice")
 
     class Support:
-        def __init__(self, actor: TeamMember | None, member: TeamMember | None) -> None:
+        def __init__(self, actor: TeamMember | None, member: SupportedMember | None) -> None:
             self.actor, self.member = actor, member
 
         def supporter(self, principal: object, user_id: str | None) -> TeamMember | None:
             return self.actor
 
-        def member_for_host(self, host: Host) -> TeamMember | None:
+        def member_for_host(self, host: Host) -> SupportedMember | None:
             return self.member
 
     host = Host("h1", "laptop", "alice", "online", 0, 0)
@@ -589,10 +593,20 @@ def test_may_manage_host_allows_the_owner_or_support_for_someone_else() -> None:
     assert decide("alice", None) == ManageGrant()
     assert decide("alice", Support(None, None)) == ManageGrant()
     assert decide("carol", None) is None
-    assert decide("carol", Support(None, alice)) is None
+    assert decide("carol", Support(None, as_alice)) is None
     assert decide("carol", Support(carol, None)) is None
-    assert decide("carol", Support(carol, carol)) is None
-    assert decide("carol", Support(carol, alice)) == ManageGrant(actor=carol, member=alice)
+    assert decide("carol", Support(carol, as_carol)) is None
+    grant = decide("carol", Support(carol, as_alice))
+    assert grant == ManageGrant(actor=carol, member=as_alice)
+    # The grant carries what a write checks again: who, for whom, which registration.
+    action = grant.action()
+    assert action is not None
+    assert (action.actor_member_id, action.member_id, action.member_generation) == (
+        "m-carol",
+        "m-alice",
+        "gen-alice",
+    )
+    assert ManageGrant().action() is None
 
 
 # ── Reset, the option off, and the log ───────────────────────────
@@ -660,3 +674,191 @@ def test_support_actions_are_logged_with_member_ids_only(
     ]
     for line in lines:
         assert "alice" not in line and "carol" not in line and "@" not in line
+
+
+# ── A change between the check and the write is seen by the write ─
+
+
+def _demote(world: World, name: str) -> None:
+    _stores(world)["teams"].change_role(_member(world, name).id, "member")
+
+
+def _suspend(world: World, name: str) -> None:
+    _stores(world)["accounts"].change_member_state(_member(world, name).id, "suspended")
+
+
+@pytest.mark.parametrize("change", ["target_to_admin", "target_to_owner", "actor_demoted"])
+def test_a_role_change_before_a_resets_write_is_seen_by_it(
+    plain_world: World, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    world, carol = plain_world, plain_world.people["carol"]
+    teams, accounts = _stores(world)["teams"], _stores(world)["accounts"]
+    alice_id = _member(world, "alice").id
+    before = accounts.get_password_hash("alice")
+    original = accounts_auth.hash_password
+
+    def changed_meanwhile(password: str) -> str:
+        # After the route's checks, before the reset's write.
+        if change == "actor_demoted":
+            _demote(world, "carol")
+        else:
+            teams.change_role(alice_id, "admin" if change == "target_to_admin" else "owner")
+        return original(password)
+
+    monkeypatch.setattr(accounts_auth, "hash_password", changed_meanwhile)
+    refused = carol.post("/auth/users/alice/reset")
+    assert refused.status_code == 403, refused.text
+    assert "new_password" not in refused.text
+    assert accounts.get_password_hash("alice") == before
+
+
+def _support_store(world: World) -> Any:
+    return world.app.state.support_access.account_store  # type: ignore[attr-defined]
+
+
+def _pending_mcp_login(world: World, name: str) -> None:
+    registry: McpRegistry = world.app.state.mcp_registry  # type: ignore[attr-defined]
+    entry = registry.services[_SERVICE]
+    registry.save_login(entry, name, f"mcp-pending:{_SERVICE}", {"state": "s"}, {})
+
+
+def _mcp_rows(world: World, name: str) -> tuple[bool, bool]:
+    registry: McpRegistry = world.app.state.mcp_registry  # type: ignore[attr-defined]
+    assert registry.store is not None
+    return (
+        registry.store.get(name, f"mcp:{_SERVICE}") is not None,
+        registry.store.get(name, f"mcp-pending:{_SERVICE}") is not None,
+    )
+
+
+def test_a_disconnect_removes_the_login_and_its_pending_sign_in_and_nothing_else(
+    support_world: World,
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    for name in ("alice", "bob"):
+        _connect(world, name)
+        _pending_mcp_login(world, name)
+    alice_id = _member(world, "alice").id
+    removed = carol.delete(f"/v1/team/members/{alice_id}/mcp-services/{_SERVICE}/connection")
+    assert removed.status_code == 200, removed.text
+    assert _mcp_rows(world, "alice") == (False, False)
+    # Her GitHub connection, and Bob's login and sign-in, are untouched.
+    assert _connected(world, "alice") == (True, False)
+    assert _mcp_rows(world, "bob") == (True, True)
+
+
+@pytest.mark.parametrize("change", ["actor_demoted", "actor_suspended"])
+@pytest.mark.parametrize("connection", ["github", "mcp"])
+def test_a_disconnect_checks_its_actor_again_in_its_write(
+    support_world: World, monkeypatch: pytest.MonkeyPatch, change: str, connection: str
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    _connect(world, "alice")
+    store = _support_store(world)
+    original = store.remove_member_connections
+
+    def changed_meanwhile(*args: Any, **kwargs: Any) -> bool:
+        (_demote if change == "actor_demoted" else _suspend)(world, "carol")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "remove_member_connections", changed_meanwhile)
+    alice_id = _member(world, "alice").id
+    path = (
+        f"/v1/team/members/{alice_id}/connections/github"
+        if connection == "github"
+        else f"/v1/team/members/{alice_id}/mcp-services/{_SERVICE}/connection"
+    )
+    refused = carol.delete(path)
+    # A demoted admin is refused; a suspended one's own sign-in has ended.
+    assert refused.status_code == (403 if change == "actor_demoted" else 401), refused.text
+    assert _connected(world, "alice") == (True, True)
+
+
+def test_a_disconnect_never_reaches_a_new_account_with_the_members_old_username(
+    support_world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    accounts = _stores(world)["accounts"]
+    _connect(world, "alice")
+    alice_id, owner_id = _member(world, "alice").id, _member(world, "admin").id
+    store = _support_store(world)
+    original = store.remove_member_connections
+
+    def replaced_meanwhile(*args: Any, **kwargs: Any) -> bool:
+        # Alice is removed and someone else registers her username, with connections.
+        accounts.remove_member(alice_id, actor_member_id=owner_id)
+        accounts.create_user_with_password("alice", "another-persons-hash")
+        _connect(world, "alice")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "remove_member_connections", replaced_meanwhile)
+    with caplog.at_level(logging.INFO, logger="omnigent.server.support_access"):
+        refused = carol.delete(f"/v1/team/members/{alice_id}/connections/github")
+    assert refused.status_code in (404, 409), refused.text
+    # The new account's connections survive, and no support action is logged for it.
+    assert _connected(world, "alice") == (True, True)
+    assert not [r for r in caplog.records if "action=disconnect" in r.getMessage()]
+
+
+@pytest.mark.parametrize("change", ["actor_demoted", "target_suspended"])
+def test_adding_a_computer_for_someone_is_checked_again_in_its_write(
+    support_world: World, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    computer, hosts = _computer(world), _stores(world)["hosts"]
+    original = hosts.create_persistent_host
+
+    def changed_meanwhile(**kwargs: Any) -> Host:
+        # After the route's checks, before the row's write.
+        if change == "actor_demoted":
+            _demote(world, "carol")
+        else:
+            _suspend(world, "alice")
+        return original(**kwargs)
+
+    monkeypatch.setattr(hosts, "create_persistent_host", changed_meanwhile)
+    refused = carol.post("/v1/hosts", json={"name": "For alice", "owner_user_id": "alice"})
+    assert refused.status_code in (401, 403, 404, 409), refused.text
+    assert [h.name for h in hosts.list_hosts("alice")] == []
+    assert computer.owners == []
+
+
+@pytest.mark.parametrize("change", ["actor_demoted", "actor_suspended"])
+def test_a_command_after_a_wait_checks_the_admin_again_before_it_is_sent(
+    support_world: World,
+    answered: list[tuple[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    host_id = _laptop(world, "alice")
+    original = hosts_routes.ready_host_connection
+
+    async def waited(*args: Any, **kwargs: Any) -> Any:
+        # The host was woken; meanwhile Carol lost her role.
+        (_demote if change == "actor_demoted" else _suspend)(world, "carol")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(hosts_routes, "ready_host_connection", waited)
+    refused = carol.post(f"/v1/hosts/{host_id}/harnesses/claude/install")
+    assert refused.status_code == 403, refused.text
+    assert answered == []
+
+
+def test_deleting_a_members_computer_is_checked_again_in_its_write(
+    support_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    computer, hosts = _computer(world), _stores(world)["hosts"]
+    host_id = _cloud_computer(world, "alice")
+    original = hosts.delete_host
+
+    def demoted_meanwhile(*args: Any, **kwargs: Any) -> Host | None:
+        _demote(world, "carol")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hosts, "delete_host", demoted_meanwhile)
+    refused = carol.delete(f"/v1/hosts/{host_id}")
+    assert refused.status_code == 403, refused.text
+    assert hosts.get_host(host_id) is not None
+    assert computer.terminated == []

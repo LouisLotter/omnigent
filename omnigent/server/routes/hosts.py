@@ -68,6 +68,8 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
+    ManageGrant,
+    confirm_manage_grant,
     managed_host,
     ready_host_connection,
     resolve_host_launch,
@@ -769,7 +771,7 @@ def create_hosts_router(
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
-    async def _managed(request: Request, host_id: str, action: str) -> Host:
+    async def _managed(request: Request, host_id: str, action: str) -> tuple[Host, ManageGrant]:
         return await managed_host(
             request,
             host_id,
@@ -778,6 +780,16 @@ def create_hosts_router(
             auth_provider=auth_provider,
             support=support,
         )
+
+    async def _ready_for(
+        host: Host, grant: ManageGrant, *, operation: str, renews_idle: bool = True
+    ) -> HostConnection:
+        """The host's connection once ready, its support grant checked again after any wait."""
+        conn = await ready_host_connection(
+            host.host_id, host, host_registry, operation=operation, renews_idle=renews_idle
+        )
+        await confirm_manage_grant(grant, host, support)
+        return conn
 
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
@@ -831,7 +843,7 @@ def create_hosts_router(
         """
         # Unauthenticated callers 401 inside: with an auth provider configured,
         # a missing identity must never skip the ownership check.
-        host = await _managed(request, host_id, "read_host")
+        host, _grant = await _managed(request, host_id, "read_host")
 
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
@@ -854,10 +866,8 @@ def create_hosts_router(
             owner, 409 when offline or the host daemon is too old to list model
             options, 502 on host-side failure, 504 on timeout.
         """
-        host = await _managed(request, host_id, "list_model_options")
-        conn = await ready_host_connection(
-            host.host_id, host, host_registry, operation="model_options", renews_idle=False
-        )
+        host, grant = await _managed(request, host_id, "list_model_options")
+        conn = await _ready_for(host, grant, operation="model_options", renews_idle=False)
         _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
@@ -1558,11 +1568,9 @@ def create_hosts_router(
         if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
-        host = await _managed(request, host_id, "refresh_harnesses")
+        host, grant = await _managed(request, host_id, "refresh_harnesses")
 
-        conn = await ready_host_connection(
-            host.host_id, host, host_registry, operation="refresh_harnesses"
-        )
+        conn = await _ready_for(host, grant, operation="refresh_harnesses")
         _require_harness_setup_support(conn, "refreshing harness readiness")
         if CAP_REFRESH_HARNESSES not in conn.hello.capabilities:
             raise OmnigentError(
@@ -1642,11 +1650,9 @@ def create_hosts_router(
                 detail=f"harness {harness!r} is not installable from the UI",
             )
 
-        host = await _managed(request, host_id, "install_harness")
+        host, grant = await _managed(request, host_id, "install_harness")
 
-        conn = await ready_host_connection(
-            host.host_id, host, host_registry, operation="install_harness"
-        )
+        conn = await _ready_for(host, grant, operation="install_harness")
         _require_harness_setup_support(conn, "UI-driven harness installs")
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
@@ -1839,11 +1845,9 @@ def create_hosts_router(
         if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
-        host = await _managed(request, host_id, "detect_credentials")
+        host, grant = await _managed(request, host_id, "detect_credentials")
 
-        conn = await ready_host_connection(
-            host.host_id, host, host_registry, operation="detect_credentials", renews_idle=False
-        )
+        conn = await _ready_for(host, grant, operation="detect_credentials", renews_idle=False)
         _require_harness_setup_support(conn, "detecting existing credentials")
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)

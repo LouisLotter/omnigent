@@ -4740,6 +4740,21 @@ async def terminate_managed_host(
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
         return
+    await terminate_deleted_host(tombstone, host_store, config)
+
+
+async def terminate_deleted_host(
+    tombstone: Host,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+) -> None:
+    """
+    Terminate the sandboxes of a host row already deleted (:meth:`HostStore.delete_host`).
+
+    :param tombstone: The deleted host, as the deletion returned it.
+    :param host_store: Store holding the tombstone.
+    :param config: The deployment's current sandbox config, or ``None``.
+    """
     launcher = _launcher_for_teardown(tombstone, config)
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:

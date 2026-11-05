@@ -57,6 +57,11 @@ class ConnectionStore(ABC, Generic[EntityT]):
     def _to_entity(conn: ProviderConnection) -> EntityT:
         """Map a generic connection row into this provider's typed entity."""
 
+    @property
+    def provider_key(self) -> str:
+        """The credential store's provider key for these connections, e.g. ``"github"``."""
+        return self._PROVIDER
+
     def get(self, user_id: str, *, with_tokens: bool = False) -> EntityT | None:
         """Return the user's connection for this provider, or ``None``.
 

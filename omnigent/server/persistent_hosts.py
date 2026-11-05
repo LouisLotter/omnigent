@@ -67,12 +67,14 @@ from omnigent.server.managed_hosts import (
     _resume_locks,
     _start_sandbox_host,
     _terminate_sandbox_best_effort,
+    terminate_deleted_host,
     terminate_managed_host,
 )
 from omnigent.server.sandbox_owners import launcher_call, owner_for
 from omnigent.stores.host_store import SandboxInUseError
 
 if TYPE_CHECKING:
+    from omnigent.entities.team import SupportAction
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
     from omnigent.server.host_registry import HostConnection, HostRegistry
     from omnigent.server.managed_hosts import (
@@ -1286,19 +1288,25 @@ async def recover_pending_sleeps() -> list[str]:
     return recovered
 
 
-async def create_host(*, owner: str, name: str, provider: str | None) -> Host:
+async def create_host(
+    *, owner: str, name: str, provider: str | None, support: SupportAction | None = None
+) -> Host:
     """Create a persistent host and start it in the background.
 
     The pending row is written before the provider provisions anything; the
     first start then provisions, arms and starts the host. A failure leaves
     the host ``failed`` with its reason, never deleted.
 
-    :param owner: The caller, e.g. ``"alice@example.com"``.
+    :param owner: The host's owner, e.g. ``"alice@example.com"``: the caller,
+        or the member a team owner or admin adds it for.
     :param name: Caller-chosen display name, e.g. ``"Work computer"``.
     :param provider: A persistent provider, or ``None`` for the first one.
+    :param support: An owner's or admin's action for *owner*, checked again in
+        the row's write; ``None`` for the caller's own.
     :returns: The pending host.
     :raises OmnigentError: ``INVALID_INPUT`` when no such provider exists;
-        ``CONFLICT`` when the name is taken.
+        ``CONFLICT`` when the name is taken; as
+        :func:`~omnigent.stores.team_store.authorize_support_action` for *support*.
     """
     assert _host_store is not None
     offered = _deployment.persistent_providers() if _deployment is not None else ()
@@ -1316,6 +1324,7 @@ async def create_host(*, owner: str, name: str, provider: str | None) -> Host:
             name=name,
             user_id=owner,
             provider=provider or offered[0],
+            support=support,
         )
     except ValueError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
@@ -1323,15 +1332,25 @@ async def create_host(*, owner: str, name: str, provider: str | None) -> Host:
     return host
 
 
-async def delete_host(host: Host) -> None:
+async def delete_host(host: Host, *, support: SupportAction | None = None) -> None:
     """Delete a persistent host: tombstone it, then ask the provider to remove it.
 
     ``terminate`` means removal for a persistent host and is called only here,
     after account deletion, and by the reaper's retry of a tombstone.
+
+    :param support: An owner's or admin's action on the host's owner. Its
+        tombstone's write checks it again, and the host's lifecycle state is
+        dropped only once that write succeeded.
     """
     assert _host_store is not None
+    if support is None:
+        forget(host.host_id)
+        await terminate_managed_host(host, _host_store, _deployment)
+        return
+    tombstone = await asyncio.to_thread(_host_store.delete_host, host.host_id, support=support)
     forget(host.host_id)
-    await terminate_managed_host(host, _host_store, _deployment)
+    if tombstone is not None:
+        await terminate_deleted_host(tombstone, _host_store, _deployment)
 
 
 async def remove_deleted_account_hosts(user_id: str) -> None:

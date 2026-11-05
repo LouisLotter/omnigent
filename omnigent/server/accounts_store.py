@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
@@ -53,7 +53,13 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Account, AccountToken
-from omnigent.entities.team import InvitationRole, MemberRemoval, MemberState, TeamMember
+from omnigent.entities.team import (
+    InvitationRole,
+    MemberRemoval,
+    MemberState,
+    SupportAction,
+    TeamMember,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.principals import MachineBinding
 from omnigent.stores.approval_store import remove_account_approval_authority
@@ -63,6 +69,7 @@ from omnigent.stores.team_store import (
     LastActiveOwnerError,
     admin_flag_for_account,
     apply_member_state,
+    authorize_support_action,
     bind_identity_in_session,
     carry_membership_registration,
     claim_founding_owner,
@@ -184,6 +191,38 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     )
     for host in hosts:
         delete_host_in_session(session, host)
+
+
+def _write_password(
+    session: Session, user_id: str, password_hash: str, *, revoke_sessions: bool
+) -> str | None:
+    """Replace *user_id*'s password hash in *session*, rotating the registration if asked.
+
+    :returns: The account generation after the write, or ``None`` when the
+        user does not exist.
+    """
+    generation = require_active_account(session, user_id)
+    new_generation = generation
+    if generation is None or revoke_sessions:
+        new_generation = uuid.uuid4().hex
+        if generation is not None:
+            _carry_registration_work(session, user_id, old=generation, new=new_generation)
+        else:
+            # A passwordless identity first receiving credentials stays the same
+            # registration for its team membership.
+            carry_membership_registration(session, user_id, old=None, new=new_generation)
+    result = cast(
+        CursorResult[tuple[object]],
+        session.execute(
+            update(SqlUser)
+            .where(
+                SqlUser.workspace_id == current_workspace_id(),
+                SqlUser.id == user_id,
+            )
+            .values(password_hash=password_hash, account_generation=new_generation)
+        ),
+    )
+    return new_generation if result.rowcount == 1 else None
 
 
 def _tombstone_account(session: Session, target: SqlUser, admin_ids: list[str]) -> bool:
@@ -907,6 +946,40 @@ class SqlAlchemyAccountStore:
 
         return run_write_transaction(self._session_immediate, "change_team_member_state", write)
 
+    def remove_member_connections(self, action: SupportAction, providers: Sequence[str]) -> bool:
+        """An owner or admin removes a member's connections to *providers* (support access).
+
+        One write: *action* is authorized inside it, against the team and the
+        registrations as they are then
+        (:func:`~omnigent.stores.team_store.authorize_support_action`), and the
+        member's rows go together, e.g. an MCP login and the sign-in they had
+        started. Nothing else of theirs, or of anyone else, changes.
+
+        :param providers: Connection keys, e.g. ``["github"]`` or
+            ``["mcp:tracker", "mcp-pending:tracker"]``.
+        :returns: Whether a row went.
+        :raises OmnigentError: As :func:`authorize_support_action`.
+        """
+
+        def write(session: Session) -> bool:
+            member = authorize_support_action(session, action)
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlConnection).where(
+                        SqlConnection.workspace_id == current_workspace_id(),
+                        SqlConnection.user_id == member.current_user_id,
+                        SqlConnection.provider.in_(list(providers)),
+                        SqlConnection.account_id == "",
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(
+            self._session_immediate, "remove_team_member_connections", write
+        )
+
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.
 
@@ -940,30 +1013,46 @@ class SqlAlchemyAccountStore:
         """
 
         def write(session: Session) -> str | None:
-            generation = require_active_account(session, user_id)
-            new_generation = generation
-            if generation is None or revoke_sessions:
-                new_generation = uuid.uuid4().hex
-                if generation is not None:
-                    _carry_registration_work(session, user_id, old=generation, new=new_generation)
-                else:
-                    # A passwordless identity first receiving credentials stays the same
-                    # registration for its team membership.
-                    carry_membership_registration(session, user_id, old=None, new=new_generation)
-            result = cast(
-                CursorResult[tuple[object]],
-                session.execute(
-                    update(SqlUser)
-                    .where(
-                        SqlUser.workspace_id == current_workspace_id(),
-                        SqlUser.id == user_id,
-                    )
-                    .values(password_hash=password_hash, account_generation=new_generation)
-                ),
+            return _write_password(
+                session, user_id, password_hash, revoke_sessions=revoke_sessions
             )
-            return new_generation if result.rowcount == 1 else None
 
         return run_write_transaction(self._session_immediate, "update_password", write)
+
+    def reset_password(
+        self, user_id: str, password_hash: str, *, actor_member_id: str | None
+    ) -> str | None:
+        """An administrator's reset of *user_id*'s password, revoking every session.
+
+        In a team the reset follows suspension, authorized inside the write
+        against the roles and states as they are then: an active owner resets
+        anyone's password, an active admin a member's; anyone resets their own.
+        An account without a membership is reset as before.
+
+        :param actor_member_id: The resetting administrator's membership, or
+            ``None`` when they have none.
+        :returns: The account generation after the write, or ``None`` when the
+            user does not exist.
+        :raises OmnigentError: ``FORBIDDEN`` for an actor who may not.
+        """
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        def write(session: Session) -> str | None:
+            lock_team(session)
+            require_active_account(session, user_id)
+            target = member_state_row(session, user_id)
+            if target is not None and target.id != actor_member_id:
+                owner_only = target.role != encode_team_member_role("member")
+                if actor_member_id is not None:
+                    require_actor(session, actor_member_id, owner=owner_only)
+                elif owner_only:
+                    raise OmnigentError(
+                        "only an owner resets an owner's or admin's password",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+            return _write_password(session, user_id, password_hash, revoke_sessions=True)
+
+        return run_write_transaction(self._session_immediate, "reset_user_password", write)
 
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
         """Bump ``last_login_at`` on every successful login.

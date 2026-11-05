@@ -14,6 +14,12 @@ An owner or admin acts *on* a member's things, never *as* the member:
 
 Every support action logs one line naming the acting member and the member acted
 for by member id, never by username or address.
+
+A request checks the actor and the member when it starts. Each write it makes
+checks them again under the team lock
+(:func:`omnigent.stores.team_store.authorize_support_action`), and a host
+command sent after a wait checks them again first, so a role change, suspension
+or removal that lands in between is seen.
 """
 
 from __future__ import annotations
@@ -22,9 +28,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from omnigent.db.account_authority import AccountAuthority
-from omnigent.db.db_models import current_workspace_id
-from omnigent.entities.team import ADMIN_ROLES, TeamMember
+from omnigent.entities.team import ADMIN_ROLES, MemberState, SupportAction, TeamMember
 
 if TYPE_CHECKING:
     from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -36,7 +40,28 @@ _logger = logging.getLogger(__name__)
 
 # Members whose things an owner or admin may act on: a suspended member's
 # computers can still be looked after or deleted.
-SUPPORTED_STATES = frozenset({"active", "suspended"})
+SUPPORTED_STATES: frozenset[MemberState] = frozenset({"active", "suspended"})
+# A computer is added only for an active member.
+ACTIVE_ONLY: frozenset[MemberState] = frozenset({"active"})
+
+
+@dataclass(frozen=True)
+class SupportedMember:
+    """A member an owner or admin acts for, with the registration read with the membership."""
+
+    member: TeamMember
+    generation: str | None
+
+    def action(
+        self, actor: TeamMember, states: frozenset[MemberState] = SUPPORTED_STATES
+    ) -> SupportAction:
+        """The action *actor* takes for this member, for its write to check again."""
+        return SupportAction(
+            actor_member_id=actor.id,
+            member_id=self.member.id,
+            member_generation=self.generation,
+            states=states,
+        )
 
 
 @dataclass(frozen=True)
@@ -46,7 +71,7 @@ class SupportAccess:
     The methods read the stores: call them from a worker thread in async code.
 
     :param team_store: The team's memberships.
-    :param account_store: The accounts, for a member's current registration.
+    :param account_store: The accounts, whose writes apply support actions.
     """
 
     team_store: SqlAlchemyTeamStore
@@ -67,26 +92,42 @@ class SupportAccess:
             return None
         return member
 
-    def member_for_host(self, host: Host) -> TeamMember | None:
+    def member(
+        self,
+        *,
+        member_id: str | None = None,
+        user_id: str | None = None,
+        states: frozenset[MemberState] = SUPPORTED_STATES,
+    ) -> SupportedMember | None:
+        """The current member *member_id* (or *user_id*'s), when in one of *states*."""
+        found = self.team_store.member_registration(member_id=member_id, user_id=user_id)
+        if found is None or found[0].state not in states:
+            return None
+        return SupportedMember(*found)
+
+    def member_for_host(self, host: Host) -> SupportedMember | None:
         """The membership of *host*'s owner, when it is active or suspended.
 
         ``None`` for a host of an earlier registration of the same username.
         """
-        member = self.team_store.member_for_owner(
-            AccountAuthority(host.user_id, host.account_generation, current_workspace_id())
-        )
-        return member if member is not None and member.state in SUPPORTED_STATES else None
+        found = self.member(user_id=host.user_id)
+        if found is None:
+            return None
+        if host.account_generation is not None and host.account_generation != found.generation:
+            return None
+        return found
 
-    def registration(self, member: TeamMember) -> str | None:
-        """The member's current account registration, to pin a write made for them.
+    def still_supports(self, actor: TeamMember, member: TeamMember, host: Host) -> bool:
+        """Whether *actor* may still act on *member*'s *host*, read again now.
 
-        :returns: The account generation, or ``None`` when the account has none.
-        :raises LookupError: When the member's account is gone.
+        For a command sent to the host after a wait: the actor is still an
+        active owner or admin, and the host still belongs to that membership.
         """
-        account = self.account_store.get_user(member.user_id)
-        if account is None:
-            raise LookupError(member.id)
-        return account.account_generation
+        current = self.team_store.get_member(actor.id)
+        if current is None or current.state != "active" or current.role not in ADMIN_ROLES:
+            return False
+        owner = self.member_for_host(host)
+        return owner is not None and owner.member.id == member.id
 
 
 def log_support_action(
