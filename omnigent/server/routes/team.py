@@ -109,6 +109,33 @@ def _invitation_json(invitation: TeamInvitation) -> dict[str, object]:
     }
 
 
+def team_administrator(
+    request: Request,
+    team_store: SqlAlchemyTeamStore,
+    auth_provider: AuthProvider | None,
+    action: str | None,
+) -> TeamMember:
+    """The calling active owner or admin; reads the store (call from a worker thread).
+
+    :param action: A change or support action that needs a browser sign-in,
+        completing "cannot ..."; ``None`` for a read any of their sign-ins may make.
+    :raises OmnigentError: ``FORBIDDEN`` for anyone else, or another credential.
+    """
+    user_id = require_user(request, auth_provider)
+    if user_id is None:
+        raise OmnigentError("team administration needs accounts", code=ErrorCode.FORBIDDEN)
+    if action is not None:
+        problem = answer_credential_problem(request, auth_provider, action)
+        if problem is not None:
+            raise OmnigentError(problem, code=ErrorCode.FORBIDDEN)
+    member = team_store.get_member_for_account(user_id)
+    if member is None or member.state != "active" or member.role not in ("owner", "admin"):
+        raise OmnigentError(
+            "only the team's owners and admins manage it", code=ErrorCode.FORBIDDEN
+        )
+    return member
+
+
 def create_team_router(
     team_store: SqlAlchemyTeamStore,
     account_store: SqlAlchemyAccountStore,
@@ -118,6 +145,7 @@ def create_team_router(
     invite_ttl_seconds: int,
     admission_sync: AdmissionSync | None = None,
     removals: MemberRemovals | None = None,
+    support_access: bool = False,
 ) -> APIRouter:
     """Build the ``/v1/team`` router.
 
@@ -128,6 +156,8 @@ def create_team_router(
     :param invite_ttl_seconds: How long an invitation stays usable.
     :param admission_sync: Pushes the change to a front proxy, when one is wired.
     :param removals: Removes members; one is built from the stores when omitted.
+    :param support_access: Whether owners and admins manage members' computers and
+        connections (:mod:`omnigent.server.routes.member_support`); reported to the page.
     """
     router = APIRouter()
     member_removals = removals or MemberRemovals(
@@ -136,19 +166,7 @@ def create_team_router(
 
     def _caller(request: Request, action: str | None) -> TeamMember:
         """The calling owner or admin; *action* names a change that needs a browser."""
-        user_id = require_user(request, auth_provider)
-        if user_id is None:
-            raise OmnigentError("team administration needs accounts", code=ErrorCode.FORBIDDEN)
-        if action is not None:
-            problem = answer_credential_problem(request, auth_provider, action)
-            if problem is not None:
-                raise OmnigentError(problem, code=ErrorCode.FORBIDDEN)
-        member = team_store.get_member_for_account(user_id)
-        if member is None or member.state != "active" or member.role not in ("owner", "admin"):
-            raise OmnigentError(
-                "only the team's owners and admins manage it", code=ErrorCode.FORBIDDEN
-            )
-        return member
+        return team_administrator(request, team_store, auth_provider, action)
 
     def _require_bound(request: Request, caller: TeamMember) -> None:
         """Behind a proxy, people are invited only once the caller's sign-in is bound."""
@@ -200,6 +218,7 @@ def create_team_router(
             "invitations": [_invitation_json(invitation) for invitation in invitations],
             "removals": removed,
             "external_identity": external_identity_mode(request).value,
+            "support_access": support_access,
         }
 
     def _removal_list() -> list[dict[str, object]]:

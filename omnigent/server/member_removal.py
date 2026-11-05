@@ -205,8 +205,25 @@ class MemberRemovals:
 
     def threads(self, member_id: str) -> list[dict[str, object]]:
         """The threads a removed member owned, with titles where they can be read."""
+        return self._titled(self._team.removal_threads(member_id, limit=MAX_LISTED_THREADS))
+
+    def member_threads(
+        self, member_id: str, generation: str | None
+    ) -> list[dict[str, object]] | None:
+        """The threads a current member owns, with titles, read bound to their membership.
+
+        :param generation: The member's registration, read with the membership.
+        :returns: The threads, or ``None`` when *member_id* no longer names that
+            registration.
+        """
+        thread_ids = self._team.member_owned_threads(
+            member_id, generation, limit=MAX_LISTED_THREADS
+        )
+        return None if thread_ids is None else self._titled(thread_ids)
+
+    def _titled(self, thread_ids: list[str]) -> list[dict[str, object]]:
         listed = []
-        for thread_id in self._team.removal_threads(member_id, limit=MAX_LISTED_THREADS):
+        for thread_id in thread_ids:
             title = None
             if self._conversations is not None:
                 try:

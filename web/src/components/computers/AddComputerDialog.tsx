@@ -27,19 +27,23 @@ export const COMPUTER_NAME_MAX_LENGTH = 64;
 
 /**
  * Names a new computer and creates it on a persistent-host provider. The
- * provider field appears only when the server offers more than one.
+ * provider field appears only when the server offers more than one. With
+ * *ownerUserId*, an owner or admin adds the computer for that team member.
  */
 export function AddComputerDialog({
   open,
   onOpenChange,
   providers,
   onCreated,
+  ownerUserId,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Providers that create computers, from `/v1/info`; the first is the default. */
   providers: string[];
   onCreated?: (host: Host) => void;
+  /** The team member the computer is for; the caller's own when omitted. */
+  ownerUserId?: string;
 }) {
   const nameId = useId();
   const providerId = useId();
@@ -67,7 +71,9 @@ export function AddComputerDialog({
     event.preventDefault();
     if (!canSubmit) return;
     create.mutate(
-      { name: trimmedName, provider: selectedProvider },
+      ownerUserId === undefined
+        ? { name: trimmedName, provider: selectedProvider }
+        : { name: trimmedName, provider: selectedProvider, owner_user_id: ownerUserId },
       {
         onSuccess: (host) => {
           resetForm();
@@ -83,10 +89,13 @@ export function AddComputerDialog({
       <DialogContent showCloseButton={!create.isPending} data-testid="add-computer-dialog">
         <form onSubmit={submit} className="flex flex-col gap-4">
           <DialogHeader>
-            <DialogTitle>Add computer</DialogTitle>
+            <DialogTitle>
+              {ownerUserId === undefined ? "Add computer" : `Add a computer for ${ownerUserId}`}
+            </DialogTitle>
             <DialogDescription>
-              A cloud computer keeps its files between sessions. It sleeps when idle and wakes when
-              you send it work.
+              {ownerUserId === undefined
+                ? "A cloud computer keeps its files between sessions. It sleeps when idle and wakes when you send it work."
+                : `The computer is ${ownerUserId}'s. It keeps its files between sessions, and ${ownerUserId} signs in on it themselves.`}
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-1.5">

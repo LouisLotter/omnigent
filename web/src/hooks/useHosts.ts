@@ -92,7 +92,8 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
 }
 
 /** Poll quickly while a computer wakes or sleeps so its progress moves. */
-const CHANGING_HOSTS_REFRESH_MS = 2_000;
+/** How often a host list refreshes while a computer is waking, sleeping or starting. */
+export const CHANGING_HOSTS_REFRESH_MS = 2_000;
 const HOSTS_REFRESH_MS = 60_000;
 
 interface UseHostsOptions {

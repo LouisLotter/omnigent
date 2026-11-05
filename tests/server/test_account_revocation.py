@@ -1508,7 +1508,8 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
     session_id = created.json()["session_id"]
     reached, resume = Event(), Event()
     if operation == "reset":
-        store, method = stores["account_store"], "update_password"
+        # A team's reset is one write that also checks the roles (reset_password).
+        store, method = stores["account_store"], "reset_password"
     else:
         store = stores["permission_store"]
         method = {"share_lookup": "get", "share_ensure": "ensure_user", "share_grant": "grant"}[

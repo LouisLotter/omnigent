@@ -18,6 +18,7 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import os
@@ -33,12 +34,20 @@ from omnigent.host.frames import CAP_OPERATION_RECORDS, OPERATION_RECORD_RETENTI
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 from omnigent.server.persistent_hosts import ensure_host_ready
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.support_access import SUPPORTED_STATES, log_support_action
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
+    from starlette.requests import Request
+
+    from omnigent.entities.team import MemberState, SupportAction, TeamMember
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server.auth import AuthProvider
+    from omnigent.server.principals import Principal
+    from omnigent.server.support_access import SupportAccess, SupportedMember
 
 _logger = logging.getLogger(__name__)
 
@@ -152,6 +161,125 @@ def resolve_host_owner(
     if user_id is not None and host.user_id != user_id:
         raise HTTPException(status_code=403, detail="not your host")
     return host
+
+
+@dataclass(frozen=True)
+class ManageGrant:
+    """Why a caller may manage a host: they own it, or they give support access.
+
+    :param actor: The team owner or admin acting for the host's owner; ``None``
+        when the caller owns the host (or auth is off).
+    :param member: The host owner's membership and registration, set with *actor*.
+    """
+
+    actor: TeamMember | None = None
+    member: SupportedMember | None = None
+
+    def action(self, states: frozenset[MemberState] = SUPPORTED_STATES) -> SupportAction | None:
+        """The support action, for a write to check again; ``None`` for the host's owner."""
+        if self.actor is None or self.member is None:
+            return None
+        return self.member.action(self.actor, states)
+
+
+def may_manage_host(
+    principal: Principal | None,
+    host: Host,
+    *,
+    user_id: str | None,
+    support: SupportAccess | None,
+) -> ManageGrant | None:
+    """
+    Decide whether the caller may manage *host*: its read, start and delete,
+    harness install and readiness, model options and detected sign-ins.
+
+    The host's owner may. With support access on, so may a team owner or admin
+    signed in through a browser, on a host whose owner is an active or
+    suspended member. Logins, files, worktrees, runners and new threads on the
+    host stay its owner's, through :func:`resolve_host_owner`.
+
+    Reads the stores: call it from a worker thread in async code.
+
+    :param principal: The request's principal, or ``None`` when auth is off.
+    :param host: The host.
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param support: Support access, or ``None`` when the deployment leaves it off.
+    :returns: The grant, or ``None`` when the caller may not.
+    """
+    if user_id is None or host.user_id == user_id:
+        return ManageGrant()
+    if support is None:
+        return None
+    actor = support.supporter(principal, user_id)
+    if actor is None:
+        return None
+    member = support.member_for_host(host)
+    if member is None or member.member.id == actor.id:
+        return None
+    return ManageGrant(actor=actor, member=member)
+
+
+async def managed_host(
+    request: Request,
+    host_id: str,
+    *,
+    action: str,
+    host_store: HostStore,
+    auth_provider: AuthProvider | None,
+    support: SupportAccess | None,
+) -> tuple[Host, ManageGrant]:
+    """
+    Load a host the caller may manage (:func:`may_manage_host`), logging support.
+
+    :param action: What the caller does, for the support log, e.g. ``"start_host"``.
+    :returns: The host and the grant, which the operation keeps: a write checks
+        :meth:`ManageGrant.action` again, and a command sent after a wait calls
+        :func:`confirm_manage_grant` first.
+    :raises OmnigentError: 401 when unauthenticated.
+    :raises HTTPException: 404 if the host is unknown; 403 when the caller may
+        not manage it.
+    """
+    user_id = require_user(request, auth_provider)
+    # Read only for support access: an owner's own requests need no principal.
+    principal = (
+        auth_provider.principal(request)
+        if auth_provider is not None and support is not None
+        else None
+    )
+
+    def resolve() -> tuple[Host, ManageGrant]:
+        host = host_store.get_host(host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        grant = may_manage_host(principal, host, user_id=user_id, support=support)
+        if grant is None:
+            raise HTTPException(status_code=403, detail="not your host")
+        if grant.actor is not None and grant.member is not None:
+            log_support_action(grant.actor, action, grant.member.member, subject=host.host_id)
+        return host, grant
+
+    return await asyncio.to_thread(resolve)
+
+
+async def confirm_manage_grant(
+    grant: ManageGrant, host: Host, support: SupportAccess | None
+) -> None:
+    """Check a support grant again before a command goes to the host, e.g. after it woke.
+
+    The check a support write makes, changing nothing: the request's own
+    registration as it authenticated, the actor still an active owner or admin,
+    and the host's member still the one checked. A no-op for the host's owner.
+
+    :raises OmnigentError: As
+        :func:`~omnigent.stores.team_store.authorize_support_action`.
+    :raises HTTPException: 403 when the host is no longer the member's.
+    """
+    action = grant.action()
+    if action is None or support is None:
+        return
+    member_user_id = await asyncio.to_thread(support.account_store.confirm_support_action, action)
+    if member_user_id != host.user_id:
+        raise HTTPException(status_code=403, detail="not your host")
 
 
 # Set by ``create_app(host_sharded=...)``. Process-wide because

@@ -7,19 +7,12 @@
  * admins and members, changes roles and suspends, reinstates or removes
  * anyone but themselves and the installation's own owner; an admin invites
  * members and suspends, reinstates or removes members. Hiding a button is
- * only convenience.
+ * only convenience. With support access, each other member's row also has
+ * Manage, which opens their page.
  */
 
 import { useState } from "react";
-import {
-  KeyRoundIcon,
-  PauseIcon,
-  PlayIcon,
-  RefreshCwIcon,
-  Trash2Icon,
-  UserPlusIcon,
-  XIcon,
-} from "lucide-react";
+import { RefreshCwIcon, SlidersHorizontalIcon, UserPlusIcon, XIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,9 +35,9 @@ import {
   inviteToTeam,
   removeMember,
   revokeInvitation,
-  setMemberSuspended,
 } from "@/lib/teamApi";
 import { withBasePath } from "@/lib/basePath";
+import { MemberAccountActions } from "@/pages/settings/MemberAccountActions";
 
 /** The default account list: one stable reference, so renders compare equal. */
 const NO_ACCOUNTS: readonly string[] = [];
@@ -63,18 +56,15 @@ interface TeamPanelProps {
   computersPage?: string | null;
   /** Renders an invite link for the current origin and base path. */
   rebaseUrl: (url: string) => string;
+  /** Opens a member's page; Manage is offered only with it and the server's support access. */
+  onManage?: (member: TeamMemberEntry) => void;
 }
 
-const ROLE_LABELS: Record<TeamRole, string> = { owner: "Owner", admin: "Admin", member: "Member" };
-
-function mayChangeState(me: TeamMemberEntry, target: TeamMemberEntry): boolean {
-  if (target.member_id === me.member_id) return false;
-  return me.role === "owner" || target.role === "member";
-}
-
-function mayRemove(me: TeamMemberEntry, target: TeamMemberEntry): boolean {
-  return mayChangeState(me, target) && target.installation_owner !== true;
-}
+export const ROLE_LABELS: Record<TeamRole, string> = {
+  owner: "Owner",
+  admin: "Admin",
+  member: "Member",
+};
 
 function hasPendingStep(removal: TeamRemovalEntry): boolean {
   const { steps } = removal;
@@ -151,20 +141,17 @@ export function TeamPanel({
   onResetPassword,
   computersPage = null,
   rebaseUrl,
+  onManage,
 }: TeamPanelProps) {
   const { me } = state;
   const isOwner = me.role === "owner";
+  const manage = state.support_access === true ? onManage : undefined;
   const [showInvite, setShowInvite] = useState(false);
   const [email, setEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"admin" | "member">("member");
   // An existing account to link instead of creating one (owners only).
   const [linkAccount, setLinkAccount] = useState("");
   const [inviteLink, setInviteLink] = useState<{ url: string; email: string } | null>(null);
-  const [stateChange, setStateChange] = useState<{
-    member: TeamMemberEntry;
-    suspend: boolean;
-  } | null>(null);
-  const [removal, setRemoval] = useState<TeamMemberEntry | null>(null);
   // The threads of the removal whose list is open, by its member id.
   const [threads, setThreads] = useState<{ memberId: string; list: RemovedThread[] } | null>(null);
   const [pending, setPending] = useState(false);
@@ -230,7 +217,7 @@ export function TeamPanel({
         </Button>
       </div>
 
-      {error !== null && !showInvite && stateChange === null && removal === null && (
+      {error !== null && !showInvite && (
         <div
           role="alert"
           className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
@@ -296,46 +283,22 @@ export function TeamPanel({
                 </td>
                 <td className="px-3 py-2 text-right">
                   <div className="flex justify-end gap-1">
-                    {mayChangeState(me, member) && (
+                    {manage !== undefined && member.member_id !== me.member_id && (
                       <Button
                         variant="ghost"
                         size="xs"
-                        disabled={pending}
-                        onClick={() =>
-                          setStateChange({ member, suspend: member.state !== "suspended" })
-                        }
+                        title={`Manage ${member.user_id}'s computers and connections`}
+                        onClick={() => manage(member)}
                       >
-                        {member.state === "suspended" ? (
-                          <>
-                            <PlayIcon /> Reinstate
-                          </>
-                        ) : (
-                          <>
-                            <PauseIcon /> Suspend
-                          </>
-                        )}
+                        <SlidersHorizontalIcon /> Manage
                       </Button>
                     )}
-                    <Button
-                      variant="ghost"
-                      size="xs"
-                      title="Reset password"
-                      disabled={pending}
-                      onClick={() => onResetPassword(member.user_id)}
-                    >
-                      <KeyRoundIcon /> Reset
-                    </Button>
-                    {mayRemove(me, member) && (
-                      <Button
-                        variant="ghost"
-                        size="xs"
-                        title="Remove from the team"
-                        disabled={pending}
-                        onClick={() => setRemoval(member)}
-                      >
-                        <Trash2Icon /> Remove
-                      </Button>
-                    )}
+                    <MemberAccountActions
+                      me={me}
+                      member={member}
+                      onChanged={onChanged}
+                      onResetPassword={onResetPassword}
+                    />
                   </div>
                 </td>
               </tr>
@@ -546,110 +509,6 @@ export function TeamPanel({
           )}
           <DialogFooter>
             <Button onClick={() => setInviteLink(null)}>Done</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* ── Suspend or reinstate ───────────────────────────────── */}
-      <Dialog
-        open={stateChange !== null}
-        onOpenChange={(open) => {
-          if (pending) return;
-          if (!open) {
-            setStateChange(null);
-            setError(null);
-          }
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {stateChange?.suspend ? "Suspend" : "Reinstate"} {stateChange?.member.user_id}?
-            </DialogTitle>
-            <DialogDescription>
-              {stateChange?.suspend
-                ? "They are signed out everywhere at once: their sessions, laptops and running work lose access to Omnigent, open pages close, and their schedules pause. Their threads and computers are kept."
-                : "They can sign in again. Every sign-in and machine credential from before the suspension stays ended, so they sign in again in the browser and on each of their laptops, and each cloud computer is kept but must be started again before it reconnects. Their schedules resume."}
-            </DialogDescription>
-          </DialogHeader>
-          {error !== null && (
-            <div
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-            >
-              {error}
-            </div>
-          )}
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setStateChange(null)} disabled={pending}>
-              Cancel
-            </Button>
-            <Button
-              variant={stateChange?.suspend ? "destructive" : "default"}
-              loading={pending}
-              onClick={() => {
-                const change = stateChange;
-                if (change === null) return;
-                void run(() => setMemberSuspended(change.member.member_id, change.suspend)).then(
-                  (done) => {
-                    if (done) setStateChange(null);
-                  },
-                );
-              }}
-            >
-              {stateChange?.suspend ? "Suspend" : "Reinstate"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      {/* ── Remove ─────────────────────────────────────────────── */}
-      <Dialog
-        open={removal !== null}
-        onOpenChange={(open) => {
-          if (pending) return;
-          if (!open) {
-            setRemoval(null);
-            setError(null);
-          }
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Remove {removal?.user_id} from the team?</DialogTitle>
-            <DialogDescription>
-              This cannot be undone. Their account is deleted at once: every sign-in, CLI login,
-              laptop and runner of theirs stops working, their open pages close, their schedules
-              stop, and invitations to their address are revoked. The installation's sign-in stops
-              letting them in. Their cloud computers stop and are handed over to be deleted. Their
-              threads stay, readable by owners and admins; nothing moves to anyone else. Invitations
-              they sent to other people stay pending.
-            </DialogDescription>
-          </DialogHeader>
-          {error !== null && (
-            <div
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-            >
-              {error}
-            </div>
-          )}
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setRemoval(null)} disabled={pending}>
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              loading={pending}
-              onClick={() => {
-                const target = removal;
-                if (target === null) return;
-                void run(() => removeMember(target.member_id)).then((done) => {
-                  if (done) setRemoval(null);
-                });
-              }}
-            >
-              Remove
-            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

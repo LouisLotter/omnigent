@@ -31,7 +31,12 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
-from omnigent.db.account_authority import AccountAuthority, lock_account, require_active_account
+from omnigent.db.account_authority import (
+    AccountAuthority,
+    lock_account,
+    require_active_account,
+    target_account_scope,
+)
 from omnigent.db.db_models import (
     SqlConnection,
     SqlConversationMetadata,
@@ -78,6 +83,7 @@ from omnigent.entities.team import (
     MemberRole,
     MemberState,
     OwnershipFinding,
+    SupportAction,
     Team,
     TeamInventory,
     TeamInvitation,
@@ -86,6 +92,7 @@ from omnigent.entities.team import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 if TYPE_CHECKING:
     from omnigent.server.external_identity import ExternalIdentity
@@ -710,6 +717,39 @@ def require_actor(session: Session, actor_member_id: str, *, owner: bool) -> Sql
     return actor
 
 
+def authorize_support_action(session: Session, action: SupportAction) -> SqlTeamMember:
+    """Authorize an owner's or admin's *action* on a member inside the write that applies it.
+
+    Takes the team's lock order: the team, then the accounts (the request's own
+    and the member's, whose registration must still be the one the request
+    read), then the member's membership and the actor's. A role change,
+    suspension or removal that commits first is seen.
+
+    :returns: The member's locked membership.
+    :raises OmnigentError: ``NOT_FOUND`` when the member ID no longer names that
+        registration in an allowed state; ``CONFLICT`` or ``UNAUTHORIZED`` when
+        the member's or the actor's registration changed; ``FORBIDDEN`` when the
+        actor is no longer an active owner or admin.
+    """
+    lock_team(session)
+    found = member_account(session, action.member_id)
+    if found is None:
+        raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+    user_id, _state = found
+    # A changed member registration is the target's (409); a revoked actor stays 401.
+    with target_account_scope(user_id, action.member_generation):
+        require_active_account(session, user_id)
+    row = member_state_row(session, user_id)
+    if (
+        row is None
+        or row.id != action.member_id
+        or decode_team_member_state(row.state) not in action.states
+    ):
+        raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+    require_actor(session, action.actor_member_id, owner=False)
+    return row
+
+
 def _validated_identity(issuer: str, subject: str) -> tuple[str, str]:
     if not issuer or len(issuer) > _ISSUER_MAX_CHARS:
         raise OmnigentError("issuer must be 1-512 characters", code=ErrorCode.INVALID_INPUT)
@@ -1056,6 +1096,51 @@ class SqlAlchemyTeamStore:
             ):
                 return None
             return _to_member(member)
+
+    def member_registration(
+        self, *, member_id: str | None = None, user_id: str | None = None
+    ) -> tuple[TeamMember, str | None] | None:
+        """A current membership and its account's registration, read together.
+
+        Give *member_id* or *user_id*. A support action checks the pair again
+        when it writes (:func:`authorize_support_action`).
+
+        :returns: ``(member, account_generation)``, or ``None`` when there is no
+            such current membership, its account is gone, or the membership is
+            not carried to the account's current registration.
+        """
+        if (member_id is None) == (user_id is None):
+            raise ValueError("give member_id or user_id")
+        if member_id is not None:
+            try:
+                uuid_to_bytes(member_id)
+            except InvalidUuidError:
+                return None  # a member ID from a URL that names nobody
+        match = (
+            SqlTeamMember.id == member_id
+            if member_id is not None
+            else SqlTeamMember.current_user_id == user_id
+        )
+        with self._session("select_team_member_registration") as session:
+            row = session.execute(
+                select(SqlTeamMember, SqlUser.account_generation)
+                .join(
+                    SqlUser,
+                    (SqlUser.workspace_id == SqlTeamMember.workspace_id)
+                    & (SqlUser.id == SqlTeamMember.current_user_id),
+                )
+                .where(
+                    SqlTeamMember.workspace_id == current_workspace_id(),
+                    match,
+                    SqlUser.deleted_at.is_(None),
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            member, generation = row
+            if member.account_generation != generation:
+                return None
+            return _to_member(member), generation
 
     def list_members(
         self, *, limit: int = 100, after_user_id: str | None = None
@@ -1693,6 +1778,49 @@ class SqlAlchemyTeamStore:
                     .limit(limit)
                 ).scalars()
             )
+
+    def member_owned_threads(
+        self, member_id: str, generation: str | None, *, limit: int = 500
+    ) -> list[str] | None:
+        """Return the threads a current member owns, read bound to their membership.
+
+        One query: the owner grants come only through the membership
+        *member_id* and its account at *generation*, the registration read with
+        it. They are the threads a removal would record for the member.
+
+        :returns: Thread ids in id order, or ``None`` when *member_id* no longer
+            names that registration.
+        """
+        if not 1 <= limit <= MAX_ADMITTED:
+            raise OmnigentError("limit must be 1-1000", code=ErrorCode.INVALID_INPUT)
+        with self._session("list_team_member_owned_threads") as session:
+            rows = session.execute(
+                select(SqlTeamMember.id, SqlSessionPermission.conversation_id)
+                .join(
+                    SqlUser,
+                    (SqlUser.workspace_id == SqlTeamMember.workspace_id)
+                    & (SqlUser.id == SqlTeamMember.current_user_id),
+                )
+                .outerjoin(
+                    SqlSessionPermission,
+                    (SqlSessionPermission.workspace_id == SqlTeamMember.workspace_id)
+                    & (SqlSessionPermission.user_id == SqlTeamMember.current_user_id)
+                    & (SqlSessionPermission.level >= LEVEL_OWNER),
+                )
+                .where(
+                    SqlTeamMember.workspace_id == current_workspace_id(),
+                    SqlTeamMember.id == member_id,
+                    SqlTeamMember.state != _REMOVED,
+                    SqlUser.deleted_at.is_(None),
+                    _same_registration(SqlUser.account_generation, generation),
+                    _same_registration(SqlTeamMember.account_generation, generation),
+                )
+                .order_by(SqlSessionPermission.conversation_id)
+                .limit(limit)
+            ).all()
+        if not rows:
+            return None
+        return [thread_id for _member, thread_id in rows if thread_id is not None]
 
     # ── Inventory ──────────────────────────────────────────────────
 

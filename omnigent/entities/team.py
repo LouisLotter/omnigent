@@ -78,6 +78,27 @@ class TeamMember:
 
 
 @dataclasses.dataclass(frozen=True)
+class SupportAction:
+    """An owner's or admin's action on a member's things, as the request checked it.
+
+    The write that applies it checks it again under the team lock
+    (:func:`omnigent.stores.team_store.authorize_support_action`), so a role,
+    suspension or removal that commits in between is seen.
+
+    :param actor_member_id: The acting owner or admin.
+    :param member_id: The member acted for.
+    :param member_generation: The member's account registration, read together
+        with the membership; ``None`` for an identity without one.
+    :param states: The member states the action allows, e.g. ``{"active"}``.
+    """
+
+    actor_member_id: str
+    member_id: str
+    member_generation: str | None
+    states: frozenset[MemberState]
+
+
+@dataclasses.dataclass(frozen=True)
 class ExternalIdentityBinding:
     """A verified external identity tied to one member.
 

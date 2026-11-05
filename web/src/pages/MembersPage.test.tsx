@@ -8,7 +8,8 @@
 // manage-vs-read-only surface — the latter is the OIDC case).
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
@@ -44,6 +45,9 @@ vi.mock("@/lib/teamApi", () => ({
   revokeInvitation: vi.fn(),
   changeMemberRole: vi.fn(),
   setMemberSuspended: vi.fn(),
+  getMemberHosts: vi.fn(async () => ({ ok: true, hosts: [] })),
+  getMemberConnections: vi.fn(async () => ({ ok: true, services: [], providers: [] })),
+  getMemberThreads: vi.fn(async () => ({ ok: true, threads: [] })),
 }));
 vi.mock("@/lib/accountsApi", () => ({
   listUsers: vi.fn(),
@@ -350,4 +354,79 @@ describe("MembersPage with a team", () => {
       expect(link?.getAttribute("href") ?? null).toBe(linked ? page : null);
     },
   );
+});
+
+describe("MembersPage with support access", () => {
+  const entry = (member_id: string, user_id: string, role: "owner" | "admin" | "member") => ({
+    member_id,
+    user_id,
+    role,
+    state: "active" as const,
+    created_at: 1,
+    updated_at: 1,
+  });
+  const owner = entry("o", "admin", "owner");
+  const alice = entry("a", "alice", "member");
+
+  function teamState(support: boolean) {
+    return {
+      team: { team_id: "t", name: null },
+      me: owner,
+      members: [owner, alice],
+      invitations: [],
+      external_identity: "required" as const,
+      support_access: support,
+    };
+  }
+
+  function renderAt(path: string) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[path]}>
+          <Routes>
+            <Route path="/settings/:section/:subSection?" element={<MembersPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("opens a member's page from their row's Manage", async () => {
+    vi.mocked(teamApi.getTeam).mockResolvedValue(teamState(true));
+    renderAt("/settings/members");
+    const row = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>('[data-member="alice"]');
+      if (found === null) throw new Error("no row");
+      return found;
+    });
+    fireEvent.click(within(row).getByRole("button", { name: /Manage/ }));
+    expect(await screen.findByRole("heading", { name: "alice" })).toBeTruthy();
+    expect(document.querySelector('[data-member-page="a"]')).not.toBeNull();
+    expect(teamApi.getMemberHosts).toHaveBeenCalledWith("a");
+    fireEvent.click(screen.getByRole("button", { name: /Members/ }));
+    expect(await screen.findByRole("heading", { name: "Team" })).toBeTruthy();
+  });
+
+  it("shows a member neither Manage nor anyone's page", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    vi.mocked(teamApi.getTeam).mockResolvedValue(teamState(true));
+    renderAt("/settings/members/a");
+    expect(
+      await screen.findByText("You don't have permission to manage members."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Manage/ })).toBeNull();
+    expect(document.querySelector("[data-member-page]")).toBeNull();
+    expect(teamApi.getTeam).not.toHaveBeenCalled();
+    expect(teamApi.getMemberHosts).not.toHaveBeenCalled();
+  });
+
+  it("keeps the list, with no Manage, on a server without support access", async () => {
+    vi.mocked(teamApi.getTeam).mockResolvedValue(teamState(false));
+    renderAt("/settings/members/a");
+    expect(await screen.findByRole("heading", { name: "Team" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Manage/ })).toBeNull();
+    expect(document.querySelector("[data-member-page]")).toBeNull();
+  });
 });

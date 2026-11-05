@@ -1084,7 +1084,9 @@ def create_accounts_auth_router(
         Also revokes the user's existing sessions and CLI logins.
 
         Only from a browser sign-in: the new password signs anyone in through
-        the browser, so a CLI or host credential cannot obtain one.
+        the browser, so a CLI or host credential cannot obtain one. In a team,
+        only an owner resets an owner's or another admin's password, decided
+        inside the write against the roles as they are then.
         """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
@@ -1092,16 +1094,28 @@ def create_accounts_auth_router(
         problem = answer_credential_problem(request, auth_provider, "reset passwords")
         if problem is not None:
             return JSONResponse(status_code=403, content={"error": problem})
-
         user = account_store.get_user(user_id)
         if user is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
 
         new_password = secrets.token_urlsafe(16)
         with target_account_scope(user_id, user.account_generation):
-            generation = account_store.update_password(
-                user_id, hash_password(new_password), revoke_sessions=True
-            )
+            if team_store is None:
+                generation = account_store.update_password(
+                    user_id, hash_password(new_password), revoke_sessions=True
+                )
+            else:
+                actor = team_store.get_member_for_account(admin_id)
+                try:
+                    generation = account_store.reset_password(
+                        user_id,
+                        hash_password(new_password),
+                        actor_member_id=actor.id if actor is not None else None,
+                    )
+                except OmnigentError as exc:
+                    if exc.code != ErrorCode.FORBIDDEN:
+                        raise
+                    return JSONResponse(status_code=403, content={"error": exc.message})
         auth_provider.revoke_user_sessions(user_id)
         _logger.info(
             "auth/users/reset: %s reset by %s",

@@ -107,6 +107,26 @@ def _holds(secret: dict[str, Any], expected: dict[str, str]) -> bool:
     )
 
 
+def connection_entity(
+    row: SqlConnection, secret: dict[str, Any] | None = None
+) -> ProviderConnection:
+    """A connection row as an entity, with *secret* already resolved (``None``: metadata only).
+
+    Metadata is parsed soft-fail (a corrupt column reads as ``{}`` rather than
+    500-ing the caller).
+    """
+    return ProviderConnection(
+        user_id=row.user_id,
+        provider=row.provider,
+        account_id=row.account_id,
+        secret=secret,
+        metadata=_safe_json_obj(row.metadata_json) or {},
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        login_id=row.login_id,
+    )
+
+
 class CredentialStore:
     """SQLAlchemy-backed persistence for per-user integration credentials.
 
@@ -131,21 +151,8 @@ class CredentialStore:
     def _build_entity(
         self, row: SqlConnection, secret: dict[str, Any] | None
     ) -> ProviderConnection:
-        """Build an entity from a row and an already-resolved *secret*.
-
-        Metadata is parsed soft-fail (a corrupt column reads as ``{}`` rather
-        than 500-ing the caller).
-        """
-        return ProviderConnection(
-            user_id=row.user_id,
-            provider=row.provider,
-            account_id=row.account_id,
-            secret=secret,
-            metadata=_safe_json_obj(row.metadata_json) or {},
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            login_id=row.login_id,
-        )
+        """Build an entity from a row and an already-resolved *secret*."""
+        return connection_entity(row, secret)
 
     def _to_entity(self, row: SqlConnection, *, with_secret: bool) -> ProviderConnection:
         """Convert an ORM row to an entity, optionally decrypting the secret."""

@@ -15,14 +15,19 @@ import { ManageComputerLink } from "./ComputerStatus";
 /**
  * Confirms deleting a computer. Deletion also removes its files, so the
  * dialog first points the person to sign out on the computer's setup page.
+ * With *ownerName*, an owner or admin deletes a team member's computer, and
+ * the sign-out is the member's to do.
  */
 export function DeleteComputerDialog({
   host,
   onClose,
+  ownerName,
 }: {
   /** The computer to delete; null keeps the dialog closed. */
   host: Host | null;
   onClose: () => void;
+  /** The team member whose computer it is; the caller's own when omitted. */
+  ownerName?: string;
 }) {
   const remove = useDeletePersistentHost();
   const manageUrl = host ? persistentHostManageUrl(host) : null;
@@ -53,7 +58,9 @@ export function DeleteComputerDialog({
           </DialogDescription>
         </DialogHeader>
         <p className="text-ui" data-testid="delete-computer-sign-out">
-          {manageUrl ? (
+          {ownerName !== undefined ? (
+            `The sign-ins on it are ${ownerName}'s. Ask ${ownerName} to sign out of them first.`
+          ) : manageUrl ? (
             <>
               Before deleting, sign out of the accounts you use on this computer: open{" "}
               <ManageComputerLink url={manageUrl} />.

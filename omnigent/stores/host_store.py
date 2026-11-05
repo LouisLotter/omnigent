@@ -62,6 +62,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.entities.team import SupportAction
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.server.principals import MachineBinding, PrincipalKind
@@ -574,6 +575,24 @@ def _owner_registration_is(generation: str) -> ColumnElement[bool]:
         )
         .exists()
     )
+
+
+def _authorize_support_for(session: Session, action: SupportAction, user_id: str | None) -> str:
+    """Authorize a team owner's or admin's *action* in this write; return the member's account.
+
+    :param user_id: The account the write is for, which must be the member's;
+        ``None`` to take the member's.
+    :raises OmnigentError: As ``authorize_support_action``, and ``NOT_FOUND``
+        when *user_id* is not the member's account.
+    """
+    from omnigent.stores.team_store import authorize_support_action
+
+    member = authorize_support_action(session, action)
+    if member.current_user_id is None or (
+        user_id is not None and member.current_user_id != user_id
+    ):
+        raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+    return member.current_user_id
 
 
 class HostStore:
@@ -1949,7 +1968,7 @@ class HostStore:
 
         run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
 
-    def delete_host(self, host_id: str) -> Host | None:
+    def delete_host(self, host_id: str, *, support: SupportAction | None = None) -> Host | None:
         """
         Logically delete a host and retain pending sandbox cleanup.
 
@@ -1960,10 +1979,20 @@ class HostStore:
         deletion with managed-host generation replacement.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param support: A team owner's or admin's action on the host's owner,
+            authorized inside this write; the host must still be that member's.
         :returns: The latest host snapshot, or ``None`` when already absent.
+        :raises OmnigentError: As ``authorize_support_action`` for *support*,
+            and ``NOT_FOUND`` when the host is no longer the member's.
         """
 
         def write(session: Session) -> Host | None:
+            member: tuple[str, str | None] | None = None
+            if support is not None:
+                member = (
+                    _authorize_support_for(session, support, None),
+                    support.member_generation,
+                )
             row = session.execute(
                 select(SqlHost)
                 .where(
@@ -1974,6 +2003,12 @@ class HostStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
+            if member is not None and (
+                row.user_id != member[0]
+                or row.deleted_at is not None
+                or (row.account_generation is not None and row.account_generation != member[1])
+            ):
+                raise OmnigentError("not this member's host", code=ErrorCode.NOT_FOUND)
             return delete_host_in_session(session, row)
 
         return run_write_transaction(self._lifecycle_session, "delete_host", write)
@@ -2093,7 +2128,13 @@ class HostStore:
             return True
 
     def create_persistent_host(
-        self, *, host_id: str, name: str, user_id: str, provider: str
+        self,
+        *,
+        host_id: str,
+        name: str,
+        user_id: str,
+        provider: str,
+        support: SupportAction | None = None,
     ) -> Host:
         """
         Write a persistent managed host's pending row, before its sandbox exists.
@@ -2107,13 +2148,19 @@ class HostStore:
         :param name: Caller-chosen display name, e.g. ``"Work computer"``.
         :param user_id: Owner, e.g. ``"alice@example.com"``.
         :param provider: Persistent sandbox provider name, e.g. ``"cloudflare"``.
+        :param support: A team owner's or admin's action adding the host for
+            *user_id*, authorized inside this write
+            (:func:`~omnigent.stores.team_store.authorize_support_action`).
         :returns: The pending :class:`Host`.
         :raises ValueError: When the owner already has a host with *name*,
             including a deleted one awaiting cleanup.
+        :raises OmnigentError: As ``authorize_support_action`` for *support*.
         """
         now = now_epoch()
 
         def write(session: Session) -> Host:
+            if support is not None:
+                _authorize_support_for(session, support, user_id)
             generation = require_active_account(session, user_id)
             taken = session.execute(
                 select(SqlHost.host_id).where(

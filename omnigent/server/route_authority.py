@@ -345,6 +345,12 @@ _OTHER_ROUTES: tuple[tuple[str, str, RouteRule], ...] = (
     ("POST", "/v1/team/members/{member_id}/reinstate", HUMAN),
     ("POST", "/v1/team/members/{member_id}/remove", HUMAN),
     ("GET", "/v1/team/members/{member_id}/removal", HUMAN),
+    # Support access to a member's things: owners and admins, from a browser only.
+    ("GET", "/v1/team/members/{member_id}/hosts", HUMAN),
+    ("GET", "/v1/team/members/{member_id}/connections", HUMAN),
+    ("DELETE", "/v1/team/members/{member_id}/connections/{provider}", HUMAN),
+    ("DELETE", "/v1/team/members/{member_id}/mcp-services/{service_id}/connection", HUMAN),
+    ("GET", "/v1/team/members/{member_id}/threads", HUMAN),
     # What an invitation offers, for the person holding its link.
     ("GET", "/v1/team/invitations/preview", PUBLIC),
 )

@@ -88,6 +88,14 @@ class World:
     admission: RecordingAdmission
     people: dict[str, TestClient]
     tokens: dict[str, str]
+    # The app's own event loop. A client not entered as a context runs each
+    # request on a loop of its own, so background work it starts ends with it.
+    portal: Any = None
+
+    def on_app_loop(self, client: TestClient) -> TestClient:
+        """*client*, sending its requests on the app's loop, as a server does."""
+        client.portal = self.portal
+        return client
 
     def as_(self, subject: str, email: str | None, *, owner: bool = False) -> TestClient:
         """A browser whose proxy sign-in is *subject*, with no Omnigent cookie yet."""
@@ -996,9 +1004,21 @@ def test_a_link_invitation_binds_an_existing_account_proved_by_its_password(
 # ── 8.9: removing a member ─────────────────────────────────────────
 
 
-@pytest.fixture
-def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
-    """The team behind the proxy, with persistent cloud computers from a fake provider."""
+def computer_team(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    computer: Any = None,
+    *,
+    online_timeout_s: float | None = None,
+    **create_app_kwargs: object,
+) -> Iterator[World]:
+    """The team behind the proxy, with persistent cloud computers from a fake provider.
+
+    :param computer: The provider's computer, a ``FakeComputer`` by default; the
+        app keeps it as ``app.state.fake_computer``.
+    :param online_timeout_s: How long a wake waits for the host to come online.
+    :param create_app_kwargs: Further ``create_app`` arguments.
+    """
     from omnigent.server import persistent_hosts
     from omnigent.server.managed_hosts import (
         ManagedSandboxConfig,
@@ -1009,7 +1029,7 @@ def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
 
     monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_MODE", "required")
     monkeypatch.setenv("OMNIGENT_EXTERNAL_IDENTITY_KEY", _KEY)
-    computer = FakeComputer()
+    computer = computer if computer is not None else FakeComputer()
     deployment = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="http://localhost:8000",
@@ -1017,6 +1037,7 @@ def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
             token_ttl_s=3600,
             provider=computer.provider,
             persistent=PersistentHostPolicy(),
+            online_timeout_s=online_timeout_s,
         )
     )
     admission = RecordingAdmission()
@@ -1027,8 +1048,9 @@ def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
             init_admin_password=_OWNER_PASSWORD,
             sandbox_config=deployment,
             team_admission=admission,
+            **create_app_kwargs,
         ):
-            world = World(base.app, admission, {}, {})
+            world = World(base.app, admission, {}, {}, portal=base.portal)
             owner = world.as_("owner-sub", "owner@example.test", owner=True)
             login = owner.post(
                 "/auth/login", json={"username": "admin", "password": _OWNER_PASSWORD}
@@ -1042,6 +1064,12 @@ def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
             yield world
     finally:
         persistent_hosts.configure(None, None, None)
+
+
+@pytest.fixture
+def computer_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
+    """The team behind the proxy, with persistent cloud computers from a fake provider."""
+    yield from computer_team(tmp_path, monkeypatch)
 
 
 def _cloud_computer(world: World, owner: str) -> str:

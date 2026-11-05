@@ -341,4 +341,36 @@ describe("TeamPanel", () => {
     expect(within(entry).getByRole("link", { name: "Untitled thread" })).toBeTruthy();
     expect(teamApi.getRemoval).toHaveBeenCalledWith("dave-id");
   });
+
+  it("offers Reset as suspension is offered: an admin resets members and herself", () => {
+    renderAs(carol);
+    const reset = (name: string) => within(row(name)).queryByRole("button", { name: /Reset/ });
+    expect(reset("alice")).toBeTruthy();
+    expect(reset("bob")).toBeTruthy();
+    expect(reset("carol")).toBeTruthy();
+    expect(reset("owner")).toBeNull();
+    cleanup();
+    renderAs(owner);
+    for (const name of ["owner", "carol", "alice", "bob"]) expect(reset(name)).toBeTruthy();
+  });
+
+  it("offers Manage on other people's rows only when the server has support access", () => {
+    const onManage = vi.fn();
+    const props = {
+      computersPage: null,
+      onChanged,
+      onResetPassword: vi.fn(),
+      rebaseUrl: (url: string) => url,
+      onManage,
+    };
+    render(<TeamPanel state={{ ...teamAs(carol), support_access: true }} {...props} />);
+    const manage = (name: string) => within(row(name)).queryByRole("button", { name: /Manage/ });
+    expect(manage("carol")).toBeNull();
+    for (const name of ["owner", "alice", "bob"]) expect(manage(name)).toBeTruthy();
+    fireEvent.click(manage("alice") as HTMLElement);
+    expect(onManage).toHaveBeenCalledWith(alice);
+    cleanup();
+    render(<TeamPanel state={teamAs(carol)} {...props} />);
+    expect(screen.queryByRole("button", { name: /Manage/ })).toBeNull();
+  });
 });
