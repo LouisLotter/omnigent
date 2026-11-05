@@ -32,7 +32,7 @@ from omnigent.server.authority_changes import authority_changed
 if TYPE_CHECKING:
     from starlette.requests import HTTPConnection
 
-    from omnigent.entities.team import MemberRemoval, TeamMember
+    from omnigent.entities.team import MemberRemoval
     from omnigent.server.accounts_store import SqlAlchemyAccountStore
     from omnigent.server.auth import AuthProvider
     from omnigent.server.team_admission import AdmissionSync
@@ -207,11 +207,19 @@ class MemberRemovals:
         """The threads a removed member owned, with titles where they can be read."""
         return self._titled(self._team.removal_threads(member_id, limit=MAX_LISTED_THREADS))
 
-    def member_threads(self, member: TeamMember) -> list[dict[str, object]]:
-        """The threads *member* owns now, or owned when they were removed, with titles."""
-        if member.state == "removed":
-            return self.threads(member.id)
-        return self._titled(self._team.owned_threads(member.user_id, limit=MAX_LISTED_THREADS))
+    def member_threads(
+        self, member_id: str, generation: str | None
+    ) -> list[dict[str, object]] | None:
+        """The threads a current member owns, with titles, read bound to their membership.
+
+        :param generation: The member's registration, read with the membership.
+        :returns: The threads, or ``None`` when *member_id* no longer names that
+            registration.
+        """
+        thread_ids = self._team.member_owned_threads(
+            member_id, generation, limit=MAX_LISTED_THREADS
+        )
+        return None if thread_ids is None else self._titled(thread_ids)
 
     def _titled(self, thread_ids: list[str]) -> list[dict[str, object]]:
         listed = []

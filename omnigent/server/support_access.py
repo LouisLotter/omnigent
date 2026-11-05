@@ -15,11 +15,10 @@ An owner or admin acts *on* a member's things, never *as* the member:
 Every support action logs one line naming the acting member and the member acted
 for by member id, never by username or address.
 
-A request checks the actor and the member when it starts. Each write it makes
-checks them again under the team lock
-(:func:`omnigent.stores.team_store.authorize_support_action`), and a host
-command sent after a wait checks them again first, so a role change, suspension
-or removal that lands in between is seen.
+A request checks the actor and the member when it starts. Each write it makes,
+and each host command it sends after a wait, checks them again under the team
+lock (:func:`omnigent.stores.team_store.authorize_support_action`), so a role
+change, suspension, password reset or removal that lands in between is seen.
 """
 
 from __future__ import annotations
@@ -116,18 +115,6 @@ class SupportAccess:
         if host.account_generation is not None and host.account_generation != found.generation:
             return None
         return found
-
-    def still_supports(self, actor: TeamMember, member: TeamMember, host: Host) -> bool:
-        """Whether *actor* may still act on *member*'s *host*, read again now.
-
-        For a command sent to the host after a wait: the actor is still an
-        active owner or admin, and the host still belongs to that membership.
-        """
-        current = self.team_store.get_member(actor.id)
-        if current is None or current.state != "active" or current.role not in ADMIN_ROLES:
-            return False
-        owner = self.member_for_host(host)
-        return owner is not None and owner.member.id == member.id
 
 
 def log_support_action(

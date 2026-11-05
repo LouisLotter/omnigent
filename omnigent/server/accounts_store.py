@@ -10,12 +10,12 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from omnigent.db.account_authority import (
     account_authority_scope,
@@ -52,7 +52,7 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
-from omnigent.entities import Account, AccountToken
+from omnigent.entities import Account, AccountToken, ProviderConnection
 from omnigent.entities.team import (
     InvitationRole,
     MemberRemoval,
@@ -63,6 +63,7 @@ from omnigent.entities.team import (
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.principals import MachineBinding
 from omnigent.stores.approval_store import remove_account_approval_authority
+from omnigent.stores.credential_store.sqlalchemy_store import connection_entity
 from omnigent.stores.host_store import RETIRED_RUNNER_INCARNATION, resolve_runner_binding
 from omnigent.stores.team_store import (
     InvitationEmailMismatchError,
@@ -191,6 +192,11 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     )
     for host in hosts:
         delete_host_in_session(session, host)
+
+
+def _registration_is(column: InstrumentedAttribute[str | None], generation: str | None) -> Any:
+    """Match *column* to *generation*, treating ``NULL`` as a value."""
+    return column.is_(None) if generation is None else column == generation
 
 
 def _write_password(
@@ -979,6 +985,68 @@ class SqlAlchemyAccountStore:
         return run_write_transaction(
             self._session_immediate, "remove_team_member_connections", write
         )
+
+    def member_connections(
+        self, member_id: str, generation: str | None, states: frozenset[MemberState]
+    ) -> list[ProviderConnection] | None:
+        """A team member's connections (metadata only), read bound to their membership.
+
+        One query: the rows come only through the membership *member_id* in one
+        of *states* and its account at *generation*, the registration read with
+        it. A username that now names another registration yields ``None``,
+        never that account's rows.
+
+        :returns: The connections, or ``None`` when *member_id* no longer names
+            that registration.
+        """
+        with self._session("select_team_member_connections") as session:
+            rows = session.execute(
+                select(SqlTeamMember.id, SqlConnection)
+                .join(
+                    SqlUser,
+                    (SqlUser.workspace_id == SqlTeamMember.workspace_id)
+                    & (SqlUser.id == SqlTeamMember.current_user_id),
+                )
+                .outerjoin(
+                    SqlConnection,
+                    (SqlConnection.workspace_id == SqlTeamMember.workspace_id)
+                    & (SqlConnection.user_id == SqlTeamMember.current_user_id),
+                )
+                .where(
+                    SqlTeamMember.workspace_id == current_workspace_id(),
+                    SqlTeamMember.id == member_id,
+                    SqlTeamMember.state.in_([encode_team_member_state(st) for st in states]),
+                    SqlUser.deleted_at.is_(None),
+                    _registration_is(SqlUser.account_generation, generation),
+                    _registration_is(SqlTeamMember.account_generation, generation),
+                )
+            ).all()
+            if not rows:
+                return None
+            return [connection_entity(row) for _member, row in rows if row is not None]
+
+    def confirm_support_action(self, action: SupportAction) -> str:
+        """Check an owner's or admin's *action* again, changing nothing.
+
+        For a command sent to a member's host after a wait: the same check a
+        support write makes
+        (:func:`~omnigent.stores.team_store.authorize_support_action`),
+        including the request's own registration as it authenticated, so a
+        password reset or a suspension in the meantime is seen even once the
+        actor is active again.
+
+        :returns: The member's account.
+        :raises OmnigentError: As ``authorize_support_action``.
+        """
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        def check(session: Session) -> str:
+            member = authorize_support_action(session, action)
+            if member.current_user_id is None:
+                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
+            return member.current_user_id
+
+        return run_write_transaction(self._session_immediate, "confirm_support_action", check)
 
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.

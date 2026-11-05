@@ -33,9 +33,15 @@ from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.connections_registry import connection_providers
 from omnigent.server.routes.hosts import host_payload
-from omnigent.server.routes.mcp_registry import holds_own_login, service_connection
+from omnigent.server.routes.mcp_registry import (
+    connection_key,
+    connection_state,
+    connection_store_configured,
+    holds_own_login,
+)
 from omnigent.server.routes.team import team_administrator
 from omnigent.server.support_access import (
+    SUPPORTED_STATES,
     SupportAccess,
     SupportedMember,
     log_support_action,
@@ -51,6 +57,8 @@ if TYPE_CHECKING:
 
 # Completes "cannot ...", for a CLI, device, runner or host credential.
 _ACTION = "manage team members' computers and connections"
+# The member ID now names another registration, e.g. a new account took the username.
+_CHANGED = "this member's account changed since the page loaded; reload it"
 
 
 def create_member_support_router(
@@ -106,6 +114,16 @@ def create_member_support_router(
         """Whether the member is connected to each MCP service and connection provider."""
         actor, supported = await asyncio.to_thread(_actor_and_member, request, member_id)
         member = supported.member
+        # Read bound to the member ID and its registration: never a new account's rows.
+        rows = await asyncio.to_thread(
+            support.account_store.member_connections,
+            member.id,
+            supported.generation,
+            SUPPORTED_STATES,
+        )
+        if rows is None:
+            raise OmnigentError(_CHANGED, code=ErrorCode.CONFLICT)
+        by_key = {row.provider: row for row in rows if row.account_id == ""}
         services: list[dict[str, Any]] = []
         if mcp_registry is not None:
             await mcp_registry.refresh()
@@ -114,8 +132,13 @@ def create_member_support_router(
                 entry = catalog[service_id]
                 if not entry.permits(member.user_id):
                     continue
-                connected, rejected = await service_connection(
-                    mcp_registry, entry, member.user_id, request.app.state
+                key = connection_key(entry)
+                connected, rejected = connection_state(
+                    entry,
+                    by_key.get(key) if key is not None else None,
+                    store_configured=connection_store_configured(
+                        mcp_registry, entry, request.app.state
+                    ),
                 )
                 services.append(
                     {
@@ -134,7 +157,7 @@ def create_member_support_router(
             store = getattr(request.app.state, f"{provider.name}_store", None)
             if store is None:
                 continue
-            connection = await asyncio.to_thread(store.get, member.user_id)
+            connection = by_key.get(store.provider_key)
             providers.append(
                 {
                     "provider": provider.name,
@@ -195,18 +218,23 @@ def create_member_support_router(
     async def member_threads(request: Request, member_id: str) -> dict[str, Any]:
         """The threads the member owns, or owned when they were removed, with titles."""
 
-        def actor_and_member() -> tuple[TeamMember, TeamMember]:
+        def actor_member_and_threads() -> tuple[TeamMember, TeamMember, list[dict[str, object]]]:
             actor = _actor(request)
             current = support.member(member_id=member_id)
             if current is not None:
-                return actor, current.member
+                # Read bound to the member ID and its registration.
+                threads = removals.member_threads(current.member.id, current.generation)
+                if threads is not None:
+                    return actor, current.member, threads
+            # A removed member's threads are their removal's record, whoever has the name now.
             removed = team_store.get_member(member_id)
-            if removed is None or removed.state != "removed":
-                raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
-            return actor, removed
+            if removed is not None and removed.state == "removed":
+                return actor, removed, removals.threads(member_id)
+            if current is not None:
+                raise OmnigentError(_CHANGED, code=ErrorCode.CONFLICT)
+            raise OmnigentError("no such team member", code=ErrorCode.NOT_FOUND)
 
-        actor, member = await asyncio.to_thread(actor_and_member)
-        threads = await asyncio.to_thread(removals.member_threads, member)
+        actor, member, threads = await asyncio.to_thread(actor_member_and_threads)
         log_support_action(actor, "list_threads", member)
         return {"threads": threads}
 

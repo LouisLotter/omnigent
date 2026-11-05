@@ -11,6 +11,8 @@ host credential, gets none of it, and with the option off nothing changes.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
 import time
 import uuid
@@ -31,6 +33,7 @@ from omnigent.server import persistent_hosts
 from omnigent.server.github_app import GitHubTokenSet
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
 from omnigent.server.principals import CredentialKind, Principal, PrincipalKind
+from omnigent.server.routes import _host_launch as host_launch
 from omnigent.server.routes import accounts_auth
 from omnigent.server.routes import hosts as hosts_routes
 from omnigent.server.routes._host_launch import ManageGrant, may_manage_host
@@ -823,26 +826,51 @@ def test_adding_a_computer_for_someone_is_checked_again_in_its_write(
     assert computer.owners == []
 
 
-@pytest.mark.parametrize("change", ["actor_demoted", "actor_suspended"])
+def _outside_the_request(change: Callable[[], None]) -> None:
+    """Run a store change as another request would, not under this one's sign-in."""
+    contextvars.Context().run(change)
+
+
+@pytest.mark.parametrize(
+    ("change", "status"),
+    [
+        ("actor_demoted", 403),
+        ("actor_suspended", 401),
+        ("password_reset", 401),
+        ("suspended_then_reinstated", 401),
+    ],
+)
 def test_a_command_after_a_wait_checks_the_admin_again_before_it_is_sent(
-    support_world: World,
-    answered: list[tuple[str, str]],
-    monkeypatch: pytest.MonkeyPatch,
-    change: str,
+    support_world: World, monkeypatch: pytest.MonkeyPatch, change: str, status: int
 ) -> None:
     world, carol = support_world, support_world.people["carol"]
+    accounts = _stores(world)["accounts"]
+    carol_id, owner_id = _member(world, "carol").id, _member(world, "admin").id
     host_id = _laptop(world, "alice")
-    original = hosts_routes.ready_host_connection
+    conn = world.app.state.host_registry.get(host_id)  # type: ignore[attr-defined]
+    # A refused command never reaches the host; one sent would only time out here.
+    monkeypatch.setattr(hosts_routes, "_INSTALL_HARNESS_TIMEOUT_S", 2.0)
 
-    async def waited(*args: Any, **kwargs: Any) -> Any:
-        # The host was woken; meanwhile Carol lost her role.
-        (_demote if change == "actor_demoted" else _suspend)(world, "carol")
-        return await original(*args, **kwargs)
+    def apply() -> None:
+        if change == "actor_demoted":
+            _demote(world, "carol")
+        elif change == "password_reset":
+            accounts.reset_password("carol", "reset-by-owner", actor_member_id=owner_id)
+        else:
+            accounts.change_member_state(carol_id, "suspended", actor_member_id=owner_id)
+            if change == "suspended_then_reinstated":
+                accounts.change_member_state(carol_id, "active", actor_member_id=owner_id)
 
-    monkeypatch.setattr(hosts_routes, "ready_host_connection", waited)
+    async def wait_for_the_host(*args: Any, **kwargs: Any) -> None:
+        # The readiness step waits for the host; Carol's authority changes meanwhile.
+        await asyncio.sleep(0)
+        _outside_the_request(apply)
+
+    monkeypatch.setattr(host_launch, "ensure_host_ready", wait_for_the_host)
     refused = carol.post(f"/v1/hosts/{host_id}/harnesses/claude/install")
-    assert refused.status_code == 403, refused.text
-    assert answered == []
+    assert refused.status_code == status, refused.text
+    assert conn.outbound_queue.empty()
+    assert conn.pending_installs == {}
 
 
 def test_deleting_a_members_computer_is_checked_again_in_its_write(
@@ -862,3 +890,64 @@ def test_deleting_a_members_computer_is_checked_again_in_its_write(
     assert refused.status_code == 403, refused.text
     assert hosts.get_host(host_id) is not None
     assert computer.terminated == []
+
+
+def _replace(world: World, member_id: str) -> str:
+    """Remove the member; someone else registers the username, with a connection and a thread."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    stores = _stores(world)
+    member = stores["teams"].get_member(member_id)
+    stores["accounts"].remove_member(member_id, actor_member_id=_member(world, "admin").id)
+    stores["accounts"].create_user_with_password(member.user_id, "another-persons-hash")
+    _connect(world, member.user_id)
+    thread = stores["conversations"].create_conversation(agent_id=None)
+    permissions = SqlAlchemyPermissionStore(world.app.state.team_store.storage_location)  # type: ignore[attr-defined]
+    permissions.grant(member.user_id, thread.id, LEVEL_OWNER)
+    return thread.id
+
+
+def test_a_members_connections_are_never_read_from_a_new_account_with_their_name(
+    support_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    _connect(world, "alice")
+    alice_id = _member(world, "alice").id
+    store = _support_store(world)
+    original = store.member_connections
+
+    def replaced_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        # After the route read Alice's membership, before it reads her connections.
+        _outside_the_request(lambda: _replace(world, alice_id))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "member_connections", replaced_meanwhile)
+    refused = carol.get(f"/v1/team/members/{alice_id}/connections")
+    assert refused.status_code == 409, refused.text
+    assert "providers" not in refused.text and "connected_at" not in refused.text
+
+
+def test_a_members_threads_are_never_read_from_a_new_account_with_their_name(
+    support_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, carol = support_world, support_world.people["carol"]
+    created = create_session(world.people["alice"])
+    assert created.status_code == 201, created.text
+    own = created.json()["session_id"]
+    alice_id = _member(world, "alice").id
+    teams = world.app.state.team_store  # type: ignore[attr-defined]
+    original = teams.member_owned_threads
+    theirs: list[str] = []
+
+    def replaced_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        _outside_the_request(lambda: theirs.append(_replace(world, alice_id)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(teams, "member_owned_threads", replaced_meanwhile)
+    listed = carol.get(f"/v1/team/members/{alice_id}/threads")
+    assert listed.status_code == 200, listed.text
+    ids = [thread["session_id"] for thread in listed.json()["threads"]]
+    # Her removal's record, never the new account's thread.
+    assert ids == [own]
+    assert theirs and theirs[0] not in ids

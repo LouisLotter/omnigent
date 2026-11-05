@@ -266,14 +266,19 @@ async def confirm_manage_grant(
 ) -> None:
     """Check a support grant again before a command goes to the host, e.g. after it woke.
 
-    A no-op for the host's owner.
+    The check a support write makes, changing nothing: the request's own
+    registration as it authenticated, the actor still an active owner or admin,
+    and the host's member still the one checked. A no-op for the host's owner.
 
-    :raises HTTPException: 403 when the owner or admin may no longer act on it.
+    :raises OmnigentError: As
+        :func:`~omnigent.stores.team_store.authorize_support_action`.
+    :raises HTTPException: 403 when the host is no longer the member's.
     """
-    if grant.actor is None or grant.member is None or support is None:
+    action = grant.action()
+    if action is None or support is None:
         return
-    actor, member = grant.actor, grant.member.member
-    if not await asyncio.to_thread(support.still_supports, actor, member, host):
+    member_user_id = await asyncio.to_thread(support.account_store.confirm_support_action, action)
+    if member_user_id != host.user_id:
         raise HTTPException(status_code=403, detail="not your host")
 
 

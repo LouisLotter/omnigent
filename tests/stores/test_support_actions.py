@@ -206,3 +206,44 @@ def test_deleting_a_members_computer_checks_the_action_and_the_owner(stores) -> 
     teams.change_role(carol_id, "admin")
     assert hosts.delete_host(alices.host_id, support=action) is not None
     assert hosts.get_host(alices.host_id) is None
+
+
+def test_a_members_connections_and_threads_are_read_bound_to_the_membership(
+    stores, db_uri: str
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    owner_id = _member(stores, "owner")
+    alice_id = _member(stores, "alice")
+    bob_id = _member(stores, "bob")
+    teams, accounts = stores["teams"], stores["accounts"]
+    credentials = CredentialStore(db_uri, _FakeCipher())
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+
+    def owned_thread(user_id: str) -> str:
+        thread = conversations.create_conversation(agent_id=None)
+        permissions.grant(user_id, thread.id, LEVEL_OWNER)
+        return thread.id
+
+    _connect(credentials, "alice", "github", "mcp:tracker")
+    alices_thread = owned_thread("alice")
+    _member_row, generation = teams.member_registration(member_id=alice_id)
+    _bob, bob_generation = teams.member_registration(member_id=bob_id)
+
+    rows = accounts.member_connections(alice_id, generation, _ANY)
+    assert sorted(row.provider for row in rows) == ["github", "mcp:tracker"]
+    assert all(row.secret is None for row in rows)
+    assert accounts.member_connections(bob_id, bob_generation, _ANY) == []
+    assert teams.member_owned_threads(alice_id, generation) == [alices_thread]
+    assert teams.member_owned_threads(bob_id, bob_generation) == []
+
+    # Removed, and the username registered again by someone else with their own rows.
+    accounts.remove_member(alice_id, actor_member_id=owner_id)
+    accounts.create_user_with_password("alice", "another-persons-hash")
+    _connect(credentials, "alice", "github")
+    owned_thread("alice")
+    assert accounts.member_connections(alice_id, generation, _ANY) is None
+    assert teams.member_owned_threads(alice_id, generation) is None
