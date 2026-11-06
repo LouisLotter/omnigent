@@ -721,7 +721,7 @@ describe("PermissionsModal", () => {
       expect(screen.queryByText(/Please be careful when sharing/)).not.toBeInTheDocument();
       // Edit is offered, so the dialog says where an editor's turns run.
       expect(screen.getByTestId("share-edit-runs-on-owner").textContent).toBe(
-        "Someone with Edit can run turns on this session's computer, with its owner's subscription.",
+        "Someone with Edit can run turns on this session's computer, with its owner's subscription. They can also comment on, review and merge its pull requests, and GitHub shows those as the computer's GitHub account.",
       );
       expect(
         screen.queryByText("Sharing has been disabled for this Omnigent server."),

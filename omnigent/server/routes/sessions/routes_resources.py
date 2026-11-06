@@ -1244,10 +1244,43 @@ def register_resources_routes(
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             raise HTTPException(status_code=502, detail=exc.message) from exc
 
+    async def _log_github_action(request: Request, session_id: str, host_op: str) -> None:
+        """Record who acted through the host's GitHub account, before it acts.
+
+        GitHub names the host's account, which may belong to someone else than
+        the person with Edit who pressed the button. Best effort (D59), and by
+        member id only: a username can be an address.
+
+        :param request: The incoming request, for the acting person.
+        :param session_id: Session/conversation identifier.
+        :param host_op: The write op, e.g. ``"github_comment_create"``.
+        """
+        team_store = getattr(request.app.state, "team_store", None)
+        member_id: str | None = None
+        if team_store is not None:
+            try:
+                user_id = _get_user_id(request, auth_provider)
+                member = (
+                    await asyncio.to_thread(team_store.get_member_for_account, user_id)
+                    if user_id is not None
+                    else None
+                )
+                member_id = member.id if member is not None else None
+            except Exception:  # noqa: BLE001 — the record never stops the action
+                _logger.debug("Could not read the acting member", exc_info=True)
+        _logger.info(
+            "github action op=%s session=%s actor_member=%s",
+            host_op,
+            session_id,
+            member_id,
+            extra={"session_id": session_id},
+        )
+
     async def _post_pr_edit(
         session_id: str,
         conv: Conversation,
         *,
+        request: Request,
         runner_path: str,
         host_op: str,
         params: dict[str, Any],
@@ -1256,6 +1289,7 @@ def register_resources_routes(
     ) -> dict[str, Any]:
         """POST a PR edit to the runner, or to the host tunnel when the runner is offline.
 
+        :param request: The incoming request, for the record of who acted.
         :param host_op: Host-side write op, e.g. ``"github_merge"``.
         :param failure_detail: Error detail when the runner's refusal carries none.
         :param non_idempotent: Preserve uncertainty when the host loses a write result.
@@ -1263,6 +1297,7 @@ def register_resources_routes(
         :raises HTTPException: With the runner's status and ``detail`` when it refuses.
         """
         params = await _github_params(session_id, params)
+        await _log_github_action(request, session_id, host_op)
         try:
             status, result = await _proxy_post_to_runner(
                 session_id, runner_path, params, conv, timeout=_PR_EDIT_PROXY_TIMEOUT_S
@@ -3924,6 +3959,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
             host_op="github_labels_update",
             params={
@@ -3990,6 +4026,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/merge",
             host_op="github_merge",
             params={
@@ -4024,6 +4061,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/disable-auto-merge",
             host_op="github_disable_auto_merge",
             params={"pr_url": body["pr_url"]},
@@ -4086,6 +4124,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
             host_op="github_reviewers_update",
             params={
@@ -4165,6 +4204,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
             host_op="github_review_thread_create",
             non_idempotent=True,
@@ -4194,6 +4234,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=(
                 f"/v1/sessions/{session_id}/resources/github/review-threads/"
                 f"{urllib.parse.quote(thread_id, safe='')}/replies"
@@ -4218,6 +4259,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/comments",
             host_op="github_comment_create",
             non_idempotent=True,
@@ -4249,6 +4291,7 @@ def register_resources_routes(
         return await _post_pr_edit(
             session_id,
             conv,
+            request=request,
             runner_path=f"/v1/sessions/{session_id}/resources/github/details",
             host_op="github_details_update",
             params={
@@ -4289,6 +4332,7 @@ def register_resources_routes(
         content = await _read_upload_capped(file, _MAX_PR_ATTACHMENT_BYTES)
         name = file.filename or ""
         tracking = await _github_params(session_id, {"pr_url": pr_url})
+        await _log_github_action(request, session_id, "github_attachment_upload")
         try:
             resp = await _post_attachment_to_runner(session_id, conv, name, content, tracking)
         except OmnigentError as exc:

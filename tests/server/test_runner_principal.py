@@ -267,6 +267,26 @@ def test_runner_is_refused_on_human_only_routes(people: Any) -> None:
         runner.client.post(
             f"/v1/sessions/{thread}/elicitations/elicit_1/resolve", json={"action": "accept"}
         ),
+        # Publishing under the host's GitHub account, and taking a PR off the thread.
+        runner.client.post(
+            f"/v1/sessions/{thread}/resources/github/review-threads",
+            json={"pr_url": "https://github.com/o/r/pull/1", "body": "from the agent"},
+        ),
+        runner.client.post(
+            f"/v1/sessions/{thread}/resources/github/review-threads/thread_1/replies",
+            json={"pr_url": "https://github.com/o/r/pull/1", "body": "from the agent"},
+        ),
+        runner.client.delete(
+            f"/v1/sessions/{thread}/pull-requests",
+            params={"url": "https://github.com/o/r/pull/1"},
+        ),
+        # A computer's sign-ins are its owner's, in person.
+        runner.client.post(f"/v1/hosts/{runner.host_id}/harnesses/accounts/refresh"),
+        runner.client.post(f"/v1/hosts/{runner.host_id}/harnesses/codex/login"),
+        runner.client.get(f"/v1/hosts/{runner.host_id}/harnesses/codex/login/login_1"),
+        runner.client.delete(f"/v1/hosts/{runner.host_id}/harnesses/codex/login/login_1"),
+        runner.client.post(f"/v1/hosts/{runner.host_id}/harnesses/codex/logout"),
+        runner.client.get("/v1/sandbox-profiles"),
     ]
     for response in refused:
         assert response.status_code == 403, response.text
@@ -275,6 +295,25 @@ def test_runner_is_refused_on_human_only_routes(people: Any) -> None:
     assert runner.client.get("/auth/me").status_code == 401
     assert runner.client.post("/auth/invite", json={}).status_code in (401, 403)
     assert admin.get("/v1/usage").status_code == 200
+
+
+def test_a_runner_reads_the_pull_requests_of_its_persons_threads_only(people: Any) -> None:
+    """The read routes take the session scope, and the owner grant still decides."""
+    _admin, alice, bob, stores = people
+    thread = _session(alice)
+    others = _session(bob)
+    runner = _runner(stores, alice, thread, "alice")
+
+    for suffix in ("pull-requests", "resources/repository-branches"):
+        assert runner.client.get(f"/v1/sessions/{thread}/{suffix}").status_code == 200
+        foreign = runner.client.get(f"/v1/sessions/{others}/{suffix}")
+        assert foreign.status_code in (403, 404), foreign.text
+    review_threads = f"/v1/sessions/{others}/resources/github/review-threads"
+    params = {"pr_url": "https://github.com/o/r/pull/1"}
+    assert runner.client.get(review_threads, params=params).status_code in (403, 404)
+    assert runner.client.get(
+        f"{review_threads}/thread_1/comments", params={**params, "after": "cursor"}
+    ).status_code in (403, 404)
 
 
 def test_runner_token_cannot_open_a_host_tunnel_or_another_runners_tunnel(people: Any) -> None:

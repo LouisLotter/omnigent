@@ -212,7 +212,8 @@ export function PermissionsModal({
               ) : (
                 <p data-testid="share-edit-runs-on-owner">
                   Someone with Edit can run turns on this session&apos;s computer, with its
-                  owner&apos;s subscription.
+                  owner&apos;s subscription. They can also comment on, review and merge its pull
+                  requests, and GitHub shows those as the computer&apos;s GitHub account.
                 </p>
               )}
             </div>

@@ -26,7 +26,12 @@ from fastapi.testclient import TestClient
 
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.entities.team import TeamMember
-from omnigent.host.frames import CAP_REFRESH_HARNESSES, HostHelloFrame
+from omnigent.host.frames import (
+    CAP_HARNESS_ACCOUNTS,
+    CAP_HARNESS_LOGIN,
+    CAP_REFRESH_HARNESSES,
+    HostHelloFrame,
+)
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server import persistent_hosts
@@ -63,8 +68,14 @@ def _db_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path}/test.db"
 
 
-def _team(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, support: bool) -> Iterator[World]:
-    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
+def _team(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    support: bool,
+    features: str = "harness_install",
+) -> Iterator[World]:
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
     monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
     # A wake's status polls shortened, as the sandbox owner tests shorten them.
     monkeypatch.setattr(persistent_hosts, "_STATUS_POLL_S", 0.05)
@@ -165,6 +176,178 @@ def answered(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
         answer("models", {"status": "ok", "models": [{"id": "m"}], "routable_models": ["m"]}),
     )
     return sent
+
+
+# ── Sign-ins stay the person's own on the harness-install routes ──
+
+_ADDRESS = "alice@corp.example"
+_ACCOUNTS = {"codex": {"kind": "chatgpt", "email": _ADDRESS, "org": "Alice Ltd", "plan": "pro"}}
+_ACCOUNT_FIELDS = {"harness_accounts", "harness_accounts_supported", "harness_login_supported"}
+
+
+def _signed_in_laptop(world: World, owner: str) -> str:
+    """A connected host of *owner* whose hello reported a signed-in Codex."""
+    host_id = uuid.uuid4().hex
+    _stores(world)["hosts"].upsert_on_connect(host_id, f"laptop-{host_id[:8]}", owner)
+    world.app.state.host_registry.register(  # type: ignore[attr-defined]
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="laptop",
+            capabilities=[CAP_REFRESH_HARNESSES, CAP_HARNESS_ACCOUNTS, CAP_HARNESS_LOGIN],
+            harness_accounts=_ACCOUNTS,
+        ),
+        owner=owner,
+    )
+    return host_id
+
+
+def _sign_in_routes(host_id: str) -> list[tuple[str, str]]:
+    """Every route that starts, reads, ends or refreshes a sign-in on a host."""
+    base = f"/v1/hosts/{host_id}/harnesses"
+    return [
+        ("POST", f"{base}/accounts/refresh"),
+        ("POST", f"{base}/codex/login"),
+        ("GET", f"{base}/codex/login/login_1"),
+        ("DELETE", f"{base}/codex/login/login_1"),
+        ("POST", f"{base}/codex/logout"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "features", ["harness_install", ""], ids=["harness-install-on", "harness-install-off"]
+)
+def test_an_admins_read_of_a_members_host_never_carries_account_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, features: str
+) -> None:
+    """Account fields answer only the host's owner, and only under the gate."""
+    for world in _team(tmp_path, monkeypatch, support=True, features=features):
+        carol, alice = world.people["carol"], world.people["alice"]
+        host_id = _signed_in_laptop(world, "alice")
+
+        read = carol.get(f"/v1/hosts/{host_id}")
+        assert read.status_code == 200, read.text
+        assert not _ACCOUNT_FIELDS & read.json().keys()
+        assert _ADDRESS not in read.text
+        listed = carol.get(f"/v1/team/members/{_member(world, 'alice').id}/hosts")
+        assert listed.status_code == 200, listed.text
+        assert _ADDRESS not in listed.text
+        assert not _ACCOUNT_FIELDS & listed.json()["hosts"][0].keys()
+
+        own_read = alice.get(f"/v1/hosts/{host_id}").json()
+        own_list = next(
+            host for host in alice.get("/v1/hosts").json()["hosts"] if host["host_id"] == host_id
+        )
+        for own in (own_read, own_list):
+            if features:
+                assert own["harness_accounts"] == _ACCOUNTS
+                assert own["harness_accounts_supported"] is True
+                assert own["harness_login_supported"] is True
+            else:
+                assert not _ACCOUNT_FIELDS & own.keys()
+
+
+@pytest.mark.parametrize(
+    ("features", "status"),
+    [("harness_install", 403), ("", 404)],
+    ids=["harness-install-on", "harness-install-off"],
+)
+def test_an_admin_is_refused_every_sign_in_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, features: str, status: int
+) -> None:
+    """``may_manage_host`` reaches none of them, and nothing goes to the host."""
+    sent: list[object] = []
+
+    async def record(**kwargs: Any) -> dict[str, Any]:
+        sent.append(kwargs["frame"])
+        return {"status": "ok"}
+
+    monkeypatch.setattr(hosts_routes, "_proxy_rpc", record)
+    for world in _team(tmp_path, monkeypatch, support=True, features=features):
+        carol = world.people["carol"]
+        host_id = _signed_in_laptop(world, "alice")
+        probe = AsyncMock(return_value={"status": "ok"})
+        monkeypatch.setattr(
+            world.app.state.host_registry,  # type: ignore[attr-defined]
+            "request_harness_accounts",
+            probe,
+        )
+        for method, path in _sign_in_routes(host_id):
+            refused = carol.request(method, path)
+            assert refused.status_code == status, (path, refused.text)
+        probe.assert_not_called()
+    assert sent == []
+
+
+def test_the_owner_refreshes_their_own_accounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusals above are about the caller: the route answers the host's owner."""
+    for world in _team(tmp_path, monkeypatch, support=True):
+        alice = world.people["alice"]
+        host_id = _signed_in_laptop(world, "alice")
+        monkeypatch.setattr(
+            world.app.state.host_registry,  # type: ignore[attr-defined]
+            "request_harness_accounts",
+            AsyncMock(return_value={"status": "ok"}),
+        )
+        refreshed = alice.post(f"/v1/hosts/{host_id}/harnesses/accounts/refresh")
+        assert refreshed.status_code == 200, refreshed.text
+        assert refreshed.json() == {"harness_accounts": _ACCOUNTS}
+
+
+def test_setup_answers_carry_accounts_for_the_owner_never_for_support(
+    support_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refresh or install reports accounts back; support sees readiness only."""
+    world = support_world
+    host_id = _signed_in_laptop(world, "alice")
+
+    async def answer(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "configured_harnesses": {"codex-native": True},
+            "harness_accounts": _ACCOUNTS,
+            "gateway_inference": None,
+        }
+
+    monkeypatch.setattr(hosts_routes, "_proxy_install_harness", answer)
+    monkeypatch.setattr(hosts_routes, "_proxy_refresh_harnesses", answer)
+    for path in (
+        f"/v1/hosts/{host_id}/harnesses/refresh",
+        f"/v1/hosts/{host_id}/harnesses/claude/install",
+    ):
+        supported = world.people["carol"].post(path)
+        assert supported.status_code == 200, supported.text
+        assert "harness_accounts" not in supported.json()
+        assert _ADDRESS not in supported.text
+        own = world.people["alice"].post(path)
+        assert own.status_code == 200, own.text
+        assert own.json()["harness_accounts"] == _ACCOUNTS
+
+
+def test_no_log_line_prints_a_hosts_account(
+    support_world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The host's reported address, organisation and plan stay out of the logs."""
+    world = support_world
+    host_id = _signed_in_laptop(world, "alice")
+
+    async def answer(**_kwargs: Any) -> dict[str, Any]:
+        return {"status": "ok", "configured_harnesses": {}, "harness_accounts": _ACCOUNTS}
+
+    monkeypatch.setattr(hosts_routes, "_proxy_refresh_harnesses", answer)
+    with caplog.at_level(logging.DEBUG):
+        for person in ("alice", "carol"):
+            client = world.people[person]
+            assert client.get(f"/v1/hosts/{host_id}").status_code == 200
+            assert client.post(f"/v1/hosts/{host_id}/harnesses/refresh").status_code == 200
+    assert _ADDRESS not in caplog.text
+    assert "Alice Ltd" not in caplog.text
 
 
 def _setup_actions(host_id: str) -> list[tuple[str, str]]:
