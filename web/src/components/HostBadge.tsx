@@ -157,6 +157,9 @@ export function HostBadge({
   // The server wakes a computer itself, so it is not disconnected and
   // `omnigent host` (the reconnect instruction) does not apply.
   const computer = host !== undefined && isPersistentHost(host);
+  // Someone else's host isn't in this viewer's list, so a resumable one may be
+  // a computer: it wakes on the next message there too.
+  const wakesItself = computer || (host === undefined && !!session?.hostResumable);
   const computerState = host ? persistentHostStateText(host) : null;
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
   const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
@@ -179,7 +182,7 @@ export function HostBadge({
       !launchStatus &&
       !localWakeRunning &&
       badge?.status === "offline" &&
-      !computer &&
+      !wakesItself &&
       !!onReconnect;
     const statusWord = hostStarting ? startingWord : STATUS_WORD[badge?.status ?? "unknown"];
     let label = badge ? `Host ${badge.label}, ${statusWord}` : "No host bound";
@@ -276,7 +279,7 @@ export function HostBadge({
   // An offline resumable managed host is idle-stopped; reconnecting asks the
   // server to resume it rather than handing out `omnigent host`. A computer
   // shows its state instead: the server wakes it for the next message.
-  const reconnectable = badge.status === "offline" && !computer && !!onReconnect;
+  const reconnectable = badge.status === "offline" && !wakesItself && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
   const title = `Host ${badge.label}, ${statusWord}`;
   // The dot is decorative (aria-hidden), so the status would otherwise be

@@ -612,6 +612,21 @@ describe("HostBadge", () => {
     );
   });
 
+  it("offers no Reconnect on someone else's resumable host, which may be a computer", () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_of_a_member", hostResumable: true },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({ data: [] });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
+
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByTestId("composer-host-menu")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).toBeNull();
+  });
+
   it.each([
     [{ state: "asleep" as const }, "Asleep"],
     [{ state: "waking" as const, wake_stage: "starting" as const }, "Waking… Starting Omnigent"],
