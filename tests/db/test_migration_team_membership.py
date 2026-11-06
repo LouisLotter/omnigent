@@ -285,7 +285,12 @@ def test_upgrade_keeps_an_existing_membership(db_uri, engine) -> None:
             )
         )
         # A resumed upgrade re-runs the data step over tables that already hold members.
-        connection.execute(sa.text(f"UPDATE alembic_version SET version_num = '{_PREVIOUS}'"))
+        connection.execute(
+            sa.text(
+                f"UPDATE alembic_version SET version_num = '{_PREVIOUS}' "
+                f"WHERE version_num = '{_REVISION}'"
+            )
+        )
 
     _migrate(engine, _REVISION)
 

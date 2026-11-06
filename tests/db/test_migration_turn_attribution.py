@@ -169,7 +169,10 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
         ("ALTER TABLE approval_verdicts DROP COLUMN attribution", {}),
         ("DROP TABLE session_turns", {}),
         # The item column stays: the retry must not add it twice.
-        ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
+        (
+            "UPDATE alembic_version SET version_num = :rev WHERE version_num = :current",
+            {"rev": _PREVIOUS, "current": _REVISION},
+        ),
     ):
         with engine.begin() as connection:
             connection.execute(sa.text(statement), parameters)

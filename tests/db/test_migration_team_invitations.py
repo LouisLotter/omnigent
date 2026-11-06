@@ -122,7 +122,10 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
     for statement, parameters in (
         ("DROP INDEX ix_team_invitations_email" + suffix, {}),
         # The two columns stay: the retry must not add them twice.
-        ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
+        (
+            "UPDATE alembic_version SET version_num = :rev WHERE version_num = :current",
+            {"rev": _PREVIOUS, "current": _REVISION},
+        ),
     ):
         with engine.begin() as connection:
             connection.execute(sa.text(statement), parameters)

@@ -101,7 +101,10 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
     for statement, parameters in (
         ("DROP TABLE team_member_removal_items", {}),
         ("DROP INDEX ix_team_member_removals_removed_at" + suffix, {}),
-        ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
+        (
+            "UPDATE alembic_version SET version_num = :rev WHERE version_num = :current",
+            {"rev": _PREVIOUS, "current": _REVISION},
+        ),
     ):
         with engine.begin() as connection:
             connection.execute(sa.text(statement), parameters)
