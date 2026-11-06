@@ -109,6 +109,7 @@ from omnigent.harnesses.claude_native.forwarder import (
 )
 from omnigent.harnesses.claude_native.resume_replay import (
     TranscriptReplayResult,
+    UndeliveredItem,
     external_item_id,
     replay_transcript_items,
     undelivered_transcript_items,
@@ -6022,16 +6023,11 @@ async def _replay_undelivered_claude_transcript(
         return TranscriptReplayResult()
     try:
         undelivered = await asyncio.to_thread(
-            undelivered_transcript_items,
+            _undelivered_saved_items,
             transcript,
             session_id=session_id,
+            external_session_id=external_session_id,
             server_items=server_items,
-            server_record_positions=_claude_resume_record_positions(
-                server_items,
-                session_id=session_id,
-                external_session_id=external_session_id,
-            ),
-            agent_name=_AGENT_NAME,
         )
     except Exception:
         _logger.warning(
@@ -6053,6 +6049,37 @@ async def _replay_undelivered_claude_transcript(
             resume_offset=undelivered[0].record_offset,
             undelivered_source_ids=frozenset(pending.item.source_id for pending in undelivered),
         )
+
+
+def _undelivered_saved_items(
+    transcript: Path,
+    *,
+    session_id: str,
+    external_session_id: str,
+    server_items: list[_JsonObject],
+) -> list[UndeliveredItem] | None:
+    """
+    Place *transcript* against *server_items*; reads the file, so runs off the loop.
+
+    :param transcript: Saved Claude transcript.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param external_session_id: Claude-native session id of *transcript*.
+    :param server_items: Committed session items in chronological order.
+    :returns: See :func:`undelivered_transcript_items`.
+    :raises OSError: If the transcript cannot be read.
+    """
+    return undelivered_transcript_items(
+        transcript,
+        session_id=session_id,
+        server_items=server_items,
+        server_record_positions=_claude_resume_record_positions(
+            server_items,
+            session_id=session_id,
+            external_session_id=external_session_id,
+            transcript=transcript,
+        ),
+        agent_name=_AGENT_NAME,
+    )
 
 
 class _ResumeHistoryUnavailableError(click.ClickException):
@@ -6511,6 +6538,7 @@ def _claude_resume_record_positions(
     *,
     session_id: str,
     external_session_id: str,
+    transcript: Path | None = None,
 ) -> dict[str, int]:
     """
     Map each record uuid a rebuild from *items* writes to the last item it represents.
@@ -6519,50 +6547,125 @@ def _claude_resume_record_positions(
     the server already has their content. A compacted message also stands for
     the rows its snapshot lists as forwarded, which the rebuild leaves out.
 
+    Rebuilds have numbered a compaction's records two ways, and an index-derived
+    uuid can name a different entry in each. *transcript* settles which applies.
+
     :param items: Committed session items in chronological order.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param external_session_id: Claude-native session id of the transcript.
+    :param transcript: The saved transcript, or ``None`` for the current numbering.
     :returns: Record uuid to index in *items*.
+    :raises OSError: If *transcript* cannot be read.
     """
+
+    def record_uuid(entry: _JsonObject, entry_index: int) -> str:
+        return _synthetic_claude_transcript_uuid(
+            session_id=session_id,
+            external_session_id=external_session_id,
+            item=entry,
+            index=entry_index,
+        )
+
     index_by_id = {
         item_id: index
         for index, item in enumerate(items)
         if isinstance(item_id := item.get("id"), str)
     }
+    saved_shapes: dict[str, _MessageShape] | None = None
+
+    def saved_records_matching(layout: list[tuple[int, _JsonObject]]) -> int:
+        assert saved_shapes is not None
+        return sum(
+            saved_shapes.get(record_uuid(entry, entry_index))
+            == _message_shape(entry.get("role"), entry.get("content"))
+            for entry_index, entry in layout
+        )
+
     positions: dict[str, int] = {}
     for index, item in enumerate(items):
-        positions[
-            _synthetic_claude_transcript_uuid(
-                session_id=session_id,
-                external_session_id=external_session_id,
-                item=item,
-                index=index,
-            )
-        ] = index
+        positions[record_uuid(item, index)] = index
         compacted_messages = item.get("compacted_messages")
         if item.get("type") != "compaction" or not isinstance(compacted_messages, list):
             continue
-        # The rebuild numbers the entries after rejoining them; so must this.
-        rejoined, _dropped = _rejoin_split_server_tool_results(compacted_messages)
-        for compacted_index, compacted_message in enumerate(rejoined):
+        layout = list(enumerate(_rejoin_split_server_tool_results(compacted_messages)[0]))
+        stored_layout = _stored_snapshot_layout(compacted_messages)
+        if transcript is not None and stored_layout != layout:
+            if saved_shapes is None:
+                saved_shapes = _transcript_message_shapes(transcript)
+            if saved_records_matching(stored_layout) > saved_records_matching(layout):
+                layout = stored_layout
+        for compacted_index, compacted_message in layout:
             forwarded = compacted_message.get("forwarded_source_ids")
             represented = [
                 index_by_id.get(external_item_id(session_id, source_id), index)
                 for source_id in (forwarded if isinstance(forwarded, list) else [])
                 if isinstance(source_id, str)
             ]
-            positions[
-                _synthetic_claude_transcript_uuid(
-                    session_id=session_id,
-                    external_session_id=external_session_id,
-                    item=compacted_message,
-                    index=compacted_index,
-                )
-            ] = max([index, *represented])
+            positions[record_uuid(compacted_message, compacted_index)] = max([index, *represented])
     return positions
 
 
+def _stored_snapshot_layout(compacted_messages: list[object]) -> list[tuple[int, _JsonObject]]:
+    """
+    Number snapshot entries as 0.20's rebuild did, before any rejoining.
+
+    Transcripts it wrote are still on disk, so the numbering has to stay readable.
+
+    :param compacted_messages: Snapshot entries of a compaction item.
+    :returns: ``(record index, entry)`` pairs.
+    """
+    return [
+        (index, entry)
+        for index, value in enumerate(compacted_messages)
+        if (entry := _json_object(value)) is not None
+    ]
+
+
+def _message_shape(role: object, content: object) -> _MessageShape:
+    """
+    Reduce a message to what survives the step from snapshot entry to record.
+
+    Text changes form on the way. Roles and the ids of other blocks don't, and
+    those tell a call, its result and the turn after it apart.
+
+    :param role: Message role, e.g. ``"assistant"``.
+    :param content: Message content, a string or a list of blocks.
+    :returns: The role and each non-text block's type and id.
+    """
+    blocks = content if isinstance(content, list) else []
+    return role, tuple(
+        (block.get("type"), block.get("id") or block.get("tool_use_id"))
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") not in _TEXT_BLOCK_TYPES
+    )
+
+
+def _transcript_message_shapes(transcript: Path) -> dict[str, _MessageShape]:
+    """
+    Map each record uuid in *transcript* to the shape of its message.
+
+    :param transcript: Saved Claude transcript; corrupt lines are skipped.
+    :returns: Record uuid to :func:`_message_shape`.
+    :raises OSError: If the transcript cannot be read.
+    """
+    shapes: dict[str, _MessageShape] = {}
+    with transcript.open("rb") as lines:
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            uuid_value, message = record.get("uuid"), record.get("message")
+            if isinstance(uuid_value, str) and isinstance(message, dict):
+                shapes[uuid_value] = _message_shape(message.get("role"), message.get("content"))
+    return shapes
+
+
 _SERVER_TOOL_CALL_TYPES = frozenset({"server_tool_use", "mcp_tool_use"})
+_TEXT_BLOCK_TYPES = frozenset({"text", "input_text", "output_text"})
+_MessageShape: TypeAlias = tuple[object, tuple[tuple[object, object], ...]]
 
 
 def _server_tool_result_call_id(block: object) -> str | None:
