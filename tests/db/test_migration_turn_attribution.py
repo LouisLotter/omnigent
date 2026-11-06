@@ -17,7 +17,6 @@ from alembic import command
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.utils import (
     _build_alembic_config,
-    _get_current_db_heads,
     _initialize_or_verify_schema,
     get_or_create_engine,
 )
@@ -26,6 +25,7 @@ from omnigent.entities.attribution import InitiatorAttribution, OwnerAttribution
 from omnigent.stores.approval_store import SqlAlchemyApprovalStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.turn_store import InputKind, SqlAlchemyTurnStore
+from tests.db.team_chain import team_chain_heads
 
 _PREVIOUS = "ap1a2b3c4d5e"
 _REVISION = "at1a2b3c4d5e"
@@ -145,7 +145,7 @@ def test_upgrade_adds_the_columns_and_index_and_changes_nothing_else(db_uri, eng
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert _added(engine) == (True, True, True, True)
     # The item saved before the revision is unchanged and reads as unknown.
     [old] = SqlAlchemyConversationStore(db_uri).list_items(thread_id).data
@@ -177,7 +177,7 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert _added(engine) == (True, True, True, True)
     _use_both_columns(db_uri)
 

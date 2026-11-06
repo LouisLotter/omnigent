@@ -23,6 +23,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _run_migrations,
 )
+from tests.db.team_chain import RELEASE_BRANCH_HEAD
 
 _FORK = "lt1b2c3d4e5f"
 _RELEASE = "b2e4f6a8c013"
@@ -267,14 +268,14 @@ def test_merge_preserves_deployed_data_and_joins_heads(
             _assert_canaries(engine, starting_revision)
 
         # Undoing the merge (and what follows it) must preserve the schemas and expose
-        # both parents.
+        # both parents. The release's own branch keeps the revision it reached.
         _migrate(engine, _FORK, downgrade=True)
         with engine.connect() as connection:
             assert set(
                 connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()
             ) == {
                 _FORK,
-                _RELEASE,
+                RELEASE_BRANCH_HEAD,
             }
         _migrate(engine, "head")
     finally:
