@@ -573,6 +573,76 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "ApprovalSettingsRequest": {
+        "additionalProperties": false,
+        "description": "Whether the person who started an action may approve it.\n\nAllowed by default for a thread, a service and the team (D59); `null`\nrestores the default. Turned off, it excludes the people attribution\nrecorded as taking part in the turn that asked, as best effort.\n\nOmnigent's approvals record a person's consent. They are not a\nseparation-of-duties control. Where an action needs several people's eyes,\nthe external system enforces it, for example GitHub's required\npull-request reviews and branch protection.",
+        "properties": {
+          "allow_initiator": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allow Initiator"
+          },
+          "kind": {
+            "enum": [
+              "session",
+              "service",
+              "team"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "resource_id": {
+            "default": "",
+            "maxLength": 256,
+            "title": "Resource Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ApprovalSettingsRequest",
+        "type": "object"
+      },
+      "ApproverRequest": {
+        "additionalProperties": false,
+        "description": "Name an approver for a resource.",
+        "properties": {
+          "kind": {
+            "enum": [
+              "session",
+              "service",
+              "team"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "resource_id": {
+            "default": "",
+            "maxLength": 256,
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "user_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "user_id"
+        ],
+        "title": "ApproverRequest",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Proposed title for a framework or agent-initiated rename.",
@@ -1633,6 +1703,17 @@
       "ConversationItem": {
         "description": "A persisted item with a store-assigned ID.",
         "properties": {
+          "attribution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnAttribution"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Who started the turn this item starts, on whose thread, computer and harness login, or `None` for other items and when it is unknown."
+          },
           "created_at": {
             "description": "Unix epoch timestamp of creation.",
             "format": "int64",
@@ -3259,6 +3340,63 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "HostAttribution": {
+        "description": "The computer that ran the turn and the person it belongs to.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "personal",
+              "cloud_computer",
+              "sandbox"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Id"
+          }
+        },
+        "required": [
+          "id",
+          "kind"
+        ],
+        "title": "HostAttribution",
+        "type": "object"
+      },
       "HostModelOptionsResponse": {
         "description": "Pre-launch model choices resolved by a host harness.\n\n`error` carries the host's reason for an empty catalog \u2014 a probe that\nfailed on the host is not a transport failure, so the request still\nsucceeds and the picker can say WHY it is empty instead of a generic\n\"Models unavailable\".",
         "properties": {
@@ -3587,6 +3725,117 @@
           "response"
         ],
         "title": "IncompleteEvent",
+        "type": "object"
+      },
+      "InitiatorAttribution": {
+        "description": "Who started a turn.",
+        "properties": {
+          "from_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The thread whose agent sent it, for `agent`; `None` when an agent returned a result into its own thread.",
+            "title": "From Session Id"
+          },
+          "kind": {
+            "description": "See `InitiatorKind`.",
+            "enum": [
+              "person",
+              "schedule",
+              "agent",
+              "terminal"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "on_behalf_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The person an agent acted for, for `agent`.",
+            "title": "On Behalf Of"
+          },
+          "possible": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Everyone who may have typed it, when authorship of terminal typing is not certain; each counts as having taken part.",
+            "title": "Possible"
+          },
+          "registration": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "That person's account registration, when known; a username registered again gets a new one, so the two never merge.",
+            "title": "Registration"
+          },
+          "schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The scheduled task, for `schedule`.",
+            "title": "Schedule Id"
+          },
+          "source": {
+            "description": "See `InitiatorSource`.",
+            "enum": [
+              "signed_in",
+              "schedule",
+              "thread_record",
+              "pending_input",
+              "terminal_input",
+              "terminal_ambiguous",
+              "owner_assumed"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The person (`person`/`terminal`) or the schedule's owner.",
+            "title": "User"
+          }
+        },
+        "required": [
+          "kind",
+          "source"
+        ],
+        "title": "InitiatorAttribution",
         "type": "object"
       },
       "LaunchRunnerRequest": {
@@ -4716,6 +4965,35 @@
         "title": "OutputTextDeltaEvent",
         "type": "object"
       },
+      "OwnerAttribution": {
+        "description": "The thread's actual owner (a sub-agent's is its top-level thread's).",
+        "properties": {
+          "registration": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registration"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User"
+          }
+        },
+        "title": "OwnerAttribution",
+        "type": "object"
+      },
       "PaginatedList": {
         "description": "A paginated list response following cursor-based pagination.",
         "properties": {
@@ -4791,6 +5069,49 @@
           "level"
         ],
         "title": "PermissionObject",
+        "type": "object"
+      },
+      "PersistentHostCreate": {
+        "description": "Body of `POST /v1/hosts`.",
+        "properties": {
+          "name": {
+            "description": "Display name shown in host pickers, e.g. `\"Work computer\"`.",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_user_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whose computer it is, when a team owner or admin creates one for an active member, e.g. `\"alice\"`; `None` for the caller.",
+            "title": "Owner User Id"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A configured persistent provider, or `None` for the first.",
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PersistentHostCreate",
         "type": "object"
       },
       "PickerInfo": {
@@ -5165,6 +5486,110 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "ProtectedPolicyRequest": {
+        "additionalProperties": false,
+        "description": "Create a protected rule.",
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/_Resource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "domain": {
+            "enum": [
+              "team",
+              "personal"
+            ],
+            "title": "Domain",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "factory_params": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Params"
+          },
+          "handler": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Handler",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "name",
+          "handler"
+        ],
+        "title": "ProtectedPolicyRequest",
+        "type": "object"
+      },
+      "ProtectedPolicyUpdate": {
+        "additionalProperties": false,
+        "description": "Change a protected rule.",
+        "properties": {
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "factory_params": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Params"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "ProtectedPolicyUpdate",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -5375,6 +5800,35 @@
           "delta"
         ],
         "title": "ReasoningTextDeltaEvent",
+        "type": "object"
+      },
+      "RequestedReported": {
+        "description": "A setting as requested for the session and as the harness last reported it.",
+        "properties": {
+          "reported": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reported"
+          },
+          "requested": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested"
+          }
+        },
+        "title": "RequestedReported",
         "type": "object"
       },
       "ResetSessionModelOverrideRequest": {
@@ -6117,6 +6571,22 @@
             "title": "Needs Setup",
             "type": "boolean"
           },
+          "persistent_host_overview_urls": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Persistent Host Overview Urls",
+            "type": "object"
+          },
+          "persistent_host_providers": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Persistent Host Providers",
+            "type": "array"
+          },
           "picker": {
             "$ref": "#/components/schemas/PickerInfo",
             "default": {
@@ -6297,6 +6767,7 @@
             "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
+            "session.reported_reasoning_effort": "#/components/schemas/SessionReportedReasoningEffortEvent",
             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
@@ -6330,6 +6801,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReportedReasoningEffortEvent"
           },
           {
             "$ref": "#/components/schemas/SessionCollaborationModeEvent"
@@ -7124,6 +7598,20 @@
       "SessionInputConsumedPayload": {
         "description": "Inner payload of a `SessionInputConsumedEvent`.\n\nEmitted by the sessions route handler at the moment a client\ninput is persisted into `conversation_items`. Carries the\npersisted-item shape so clients can render the input (e.g.\nthe user's message bubble) at the moment of acceptance.",
         "properties": {
+          "attribution": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Who started the turn this item starts, on whose thread, computer and harness login (see `omnigent.entities.attribution.TurnAttribution`); `None` for other items and when unknown.",
+            "title": "Attribution"
+          },
           "cleared_pending_id": {
             "anyOf": [
               {
@@ -8181,6 +8669,54 @@
         "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
+      "SessionReportedReasoningEffortEvent": {
+        "description": "Effort a harness reports the session actually runs at.\n\nEmitted after an `external_reasoning_effort_report` POST, e.g. from the\nclaude-native forwarder reading Claude Code's statusLine. Unlike\n`session.reasoning_effort` it never changes the requested effort.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "reported_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The reported effort, e.g. `\"xhigh\"`, or `None` when the harness no longer reports one (unknown). Category: **transient** (SSE-only). The server also writes `reported_reasoning_effort` on the conversation, so on reconnect clients restore it from the session snapshot rather than from a replayed event.",
+            "title": "Reported Reasoning Effort"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.reported_reasoning_effort",
+            "description": "Always `\"session.reported_reasoning_effort\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionReportedReasoningEffortEvent",
+        "type": "object"
+      },
       "SessionRepositoryBranch": {
         "description": "Current branch and remote availability for one managed repository.\n\n`pushed` is true when the branch exists at the original clone URL,\nfalse when confirmed absent, and null when availability is unknown.\nIt does not indicate whether local commits or working-tree changes are pushed.",
         "properties": {
@@ -8784,6 +9320,18 @@
             "description": "Per-session reasoning-effort hint. Accepted metadata values are `\"none\"`, `\"minimal\"`, `\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, and `\"max\"`. Provider-specific support is validated when a turn executes. `None` means use the agent default.",
             "title": "Reasoning Effort"
           },
+          "reported_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The effort the harness last reported the session runs at, e.g. `\"xhigh\"` from Claude Code's statusLine. `reasoning_effort` is the request; this is the observation. `None` means Omnigent does not know (no report yet).",
+            "title": "Reported Reasoning Effort"
+          },
           "root_conversation_id": {
             "anyOf": [
               {
@@ -8807,6 +9355,23 @@
             ],
             "description": "Runner currently bound to this session, e.g. `\"runner_abc123\"`. `None` until a client binds one via `PATCH /v1/sessions/{id}`.",
             "title": "Runner Id"
+          },
+          "runner_launch": {
+            "anyOf": [
+              {
+                "enum": [
+                  "started",
+                  "failed",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Outcome of the runner launch a `POST /v1/sessions` started on a host: `\"started\"`, `\"failed\"` (nothing runs; the first message launches again), or `\"unknown\"` (the launch's answer was lost and its outcome could not be established). The session is created and keeps its runner binding either way. `None` on every other response, and when the create launched nothing.",
+            "title": "Runner Launch"
           },
           "runner_online": {
             "anyOf": [
@@ -9900,6 +10465,30 @@
             ],
             "title": "Model Override"
           },
+          "scheduled_task_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner registration the fire ran under, re-checked with the task.",
+            "title": "Scheduled Task Generation"
+          },
+          "scheduled_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation whose fire saved this input, re-checked at delivery; `None` for a person's own message.",
+            "title": "Scheduled Task Id"
+          },
           "tools": {
             "anyOf": [
               {
@@ -9992,6 +10581,91 @@
           "kind"
         ],
         "title": "StoreHarnessCredentialRequest",
+        "type": "object"
+      },
+      "SubscriptionAttribution": {
+        "description": "Whose configured harness login the turn used.",
+        "properties": {
+          "account": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A non-secret provider account id. Omnigent does not verify provider accounts, so this is `None`.",
+            "title": "Account"
+          },
+          "login_state": {
+            "default": "unknown",
+            "description": "The computer's own report of its harness login.",
+            "enum": [
+              "ready",
+              "needs_auth",
+              "unavailable",
+              "unknown"
+            ],
+            "title": "Login State",
+            "type": "string"
+          },
+          "login_state_reported_by": {
+            "anyOf": [
+              {
+                "const": "computer",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"computer\"` when `login_state` came from the computer's report rather than the server.",
+            "title": "Login State Reported By"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The harness's provider family, e.g. `\"anthropic\"`.",
+            "title": "Provider"
+          },
+          "source": {
+            "default": "unknown",
+            "description": "`computer_login` for the login configured on that computer; `configured_provider` for a provider the installation configured for the session; `unknown` without a computer.",
+            "enum": [
+              "computer_login",
+              "configured_provider",
+              "unknown"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The person whose login it is: the computer's owner.",
+            "title": "Subject"
+          },
+          "verified": {
+            "default": false,
+            "description": "Always `False`: the provider account is not verified.",
+            "title": "Verified",
+            "type": "boolean"
+          }
+        },
+        "title": "SubscriptionAttribution",
         "type": "object"
       },
       "TerminalCommandData": {
@@ -10088,6 +10762,72 @@
           "delta"
         ],
         "title": "ToolOutputDeltaEvent",
+        "type": "object"
+      },
+      "TurnAttribution": {
+        "description": "The attribution of one turn, recorded with the item that starts it.",
+        "properties": {
+          "effort": {
+            "$ref": "#/components/schemas/RequestedReported",
+            "default": {}
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "host": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostAttribution"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "initiator": {
+            "$ref": "#/components/schemas/InitiatorAttribution"
+          },
+          "model": {
+            "$ref": "#/components/schemas/RequestedReported",
+            "default": {}
+          },
+          "owner": {
+            "$ref": "#/components/schemas/OwnerAttribution"
+          },
+          "recorded_at": {
+            "format": "int64",
+            "title": "Recorded At",
+            "type": "integer"
+          },
+          "subscription": {
+            "$ref": "#/components/schemas/SubscriptionAttribution",
+            "default": {
+              "login_state": "unknown",
+              "source": "unknown",
+              "verified": false
+            }
+          },
+          "v": {
+            "default": 1,
+            "format": "int64",
+            "title": "V",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "initiator",
+          "owner",
+          "recorded_at"
+        ],
+        "title": "TurnAttribution",
         "type": "object"
       },
       "TurnCancelledEvent": {
@@ -10928,6 +11668,31 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "_Resource": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "session",
+              "service",
+              "team"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "resource_id": {
+            "default": "",
+            "maxLength": 256,
+            "title": "Resource Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "_Resource",
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -11491,6 +12256,243 @@
         ]
       }
     },
+    "/v1/approval-settings": {
+      "put": {
+        "description": "Save whether the person who started an action may approve it.\n\nAllowed by default (D59). Turned off, it excludes the people\nattribution recorded as taking part in the turn that asked, as best\neffort. Omnigent's approvals record a person's consent. They are not a\nseparation-of-duties control. Where an action needs several people's\neyes, the external system enforces it, for example GitHub's required\npull-request reviews and branch protection.",
+        "operationId": "save_approval_settings_v1_approval_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Save Approval Settings V1 Approval Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Approval Settings",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/v1/approvals": {
+      "get": {
+        "description": "Pending protected approvals the caller may answer, newest first.",
+        "operationId": "list_pending_approvals_v1_approvals_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Pending Approvals V1 Approvals Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Pending Approvals",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/v1/approvers": {
+      "delete": {
+        "description": "Stop someone approving for a resource; pending approvals bound to it lapse.",
+        "operationId": "remove_approver_v1_approvers_delete",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "session",
+                "service",
+                "team"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Resource Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Remove Approver V1 Approvers Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Approver",
+        "tags": [
+          "approvals"
+        ]
+      },
+      "get": {
+        "description": "A resource's named approvers and initiator setting (allowed by default).",
+        "operationId": "list_approvers_v1_approvers_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "session",
+                "service",
+                "team"
+              ],
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Resource Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Approvers V1 Approvers Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Approvers",
+        "tags": [
+          "approvals"
+        ]
+      },
+      "post": {
+        "description": "Name an approver for a thread, a service or the team.",
+        "operationId": "add_approver_v1_approvers_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproverRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Approver V1 Approvers Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Approver",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/v1/branding/logo/{variant}": {
       "get": {
         "description": "Serve a validated public branding asset, or 404 when unset.",
@@ -11771,9 +12773,94 @@
         "tags": [
           "hosts"
         ]
+      },
+      "post": {
+        "description": "Create a persistent host; its first start runs in the background.\n\nThe host is the caller's, or with `owner_user_id` and support access,\nthe named active member's: a team owner or admin adds it for them.\n\n**Returns:** The new host, `waking` while it starts.\n\n**Raises**\n\n- `OmnigentError` \u2014 400 when no such persistent provider is configured; 409 when the owner already has a host with the name.\n- `HTTPException` \u2014 403 when the caller may not add a computer for someone else; 404 when `owner_user_id` names no active member.",
+        "operationId": "create_persistent_host_v1_hosts_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersistentHostCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Persistent Host V1 Hosts Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Persistent Host",
+        "tags": [
+          "hosts"
+        ]
       }
     },
     "/v1/hosts/{host_id}": {
+      "delete": {
+        "description": "Delete a persistent host and ask its provider to remove the sandbox.\n\nThe host is removed from Omnigent first; a provider removal that fails\nis retried by the managed-sandbox reaper. An owner's or admin's delete\nis checked again in the removal's own write.",
+        "operationId": "delete_persistent_host_v1_hosts__host_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Persistent Host V1 Hosts  Host Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Persistent Host",
+        "tags": [
+          "hosts"
+        ]
+      },
       "get": {
         "description": "Get details for a single host.\n\n**Returns:** Host details dict \u2014 the `list_hosts` fields (including `gateway_inference`, `None` when unreported) plus `runners`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
@@ -11837,7 +12924,7 @@
     },
     "/v1/hosts/{host_id}/credentials/detected": {
       "get": {
-        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline or the host daemon is too old to detect credentials, 502/504 on host failure/timeout.",
+        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Flag-gated like the credential-write\nroute (404 when disabled). The host owner may read it, or a team owner or\nadmin giving support access, to see whether the member is signed in\n(`may_manage_host`); writing a credential stays the owner's. Never\nreturns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline or the host daemon is too old to detect credentials, 502/504 on host failure/timeout.",
         "operationId": "detect_host_credentials_v1_hosts__host_id__credentials_detected_get",
         "parameters": [
           {
@@ -12361,7 +13448,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"version\": str | None, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Only the host owner may install onto it, or a team owner or\nadmin giving support access (`may_manage_host`). Scoped to the\nUI-installable allowlist (claude, codex, pi, opencode, qwen) \u2014\ncurl/brew and interactive-auth harnesses are refused. The whole route\nis gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"version\": str | None, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {
@@ -13017,6 +14104,51 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/start": {
+      "post": {
+        "description": "Start a persistent host again, e.g. after its first start failed.\n\n**Returns:** The host, `waking` while it starts.",
+        "operationId": "start_persistent_host_v1_hosts__host_id__start_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Persistent Host V1 Hosts  Host Id  Start Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Persistent Host",
         "tags": [
           "hosts"
         ]
@@ -13802,6 +14934,196 @@
         ]
       }
     },
+    "/v1/protected-policies": {
+      "get": {
+        "description": "The team's rules (administrators) or the caller's own personal rules.",
+        "operationId": "list_protected_policies_v1_protected_policies_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "domain",
+            "required": false,
+            "schema": {
+              "default": "personal",
+              "enum": [
+                "team",
+                "personal"
+              ],
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Protected Policies V1 Protected Policies Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Protected Policies",
+        "tags": [
+          "approvals"
+        ]
+      },
+      "post": {
+        "description": "Create a team rule (administrators) or a personal rule for the caller.",
+        "operationId": "create_protected_policy_v1_protected_policies_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProtectedPolicyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Protected Policy V1 Protected Policies Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Protected Policy",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/v1/protected-policies/{policy_id}": {
+      "delete": {
+        "description": "Delete a protected rule.",
+        "operationId": "delete_protected_policy_v1_protected_policies__policy_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "policy_id",
+            "required": true,
+            "schema": {
+              "title": "Policy Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Protected Policy V1 Protected Policies  Policy Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Protected Policy",
+        "tags": [
+          "approvals"
+        ]
+      },
+      "patch": {
+        "description": "Rename, re-parameterise, enable or disable a protected rule.",
+        "operationId": "update_protected_policy_v1_protected_policies__policy_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "policy_id",
+            "required": true,
+            "schema": {
+              "title": "Policy Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProtectedPolicyUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Protected Policy V1 Protected Policies  Policy Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Protected Policy",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/v1/runners": {
       "get": {
         "description": "Return currently online runners owned by the requesting user.\n\nWhen auth is active, only runners whose tunnel was\nestablished by the same user are returned. Without auth,\nall online runners are listed (single-user / dev mode).\n\n**Returns:** A `{\"data\": [...]}` list with runner ids and advertised harnesses.",
@@ -13889,7 +15211,7 @@
     },
     "/v1/runners/{runner_id}/token": {
       "post": {
-        "description": "Mint a short-lived owner bearer for a delegated runner.\n\nA host-launched or managed-sandbox runner does not inherit the host\nuser's credential; it presents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and delegated runners are token-bound.\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
+        "description": "Mint or refresh a short-lived runner token.\n\nA host-launched or managed-sandbox runner does not inherit the host\nuser's credential; it presents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a runner\ntoken for its HTTP callbacks and tunnel. The token names the runner,\nits thread, its host and the owner's registration, all read from the\nserver's records; it is never an administrator and never a session\ncookie. Refresh is the same call.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\ncredential and delegated runners are token-bound.\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or the runner has no valid binding; 400 `runner_tokens_unsupported` when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
         "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",
         "parameters": [
           {
@@ -14673,7 +15995,7 @@
         ]
       },
       "put": {
-        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
+        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match; 403 for a delegated credential such as a runner's token.",
         "operationId": "update_session_agent_v1_sessions__session_id__agent_put",
         "parameters": [
           {
@@ -15019,6 +16341,105 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/approvals": {
+      "get": {
+        "description": "A thread's approvals, newest first: who asked and who answered as what.",
+        "operationId": "list_session_approvals_v1_sessions__session_id__approvals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Session Approvals V1 Sessions  Session Id  Approvals Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Approvals",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/approvals/{elicitation_id}": {
+      "get": {
+        "description": "One approval of a thread (or its sub-agents): for readers and its approvers.",
+        "operationId": "get_session_approval_v1_sessions__session_id__approvals__elicitation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "elicitation_id",
+            "required": true,
+            "schema": {
+              "title": "Elicitation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Session Approval V1 Sessions  Session Id  Approvals  Elicitation Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Approval",
+        "tags": [
+          "approvals"
         ]
       }
     },
