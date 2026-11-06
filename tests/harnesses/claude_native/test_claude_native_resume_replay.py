@@ -907,7 +907,13 @@ def test_record_positions_number_compacted_records_as_the_rebuild_does() -> None
                 {"type": "message", "role": "user", "content": "after the advice"},
             ],
         },
-        {"id": forwarded_id, "type": "message", "role": "user", "response_id": "r", "content": "x"},
+        {
+            "id": forwarded_id,
+            "type": "message",
+            "role": "user",
+            "response_id": "r",
+            "content": "x",
+        },
     ]
 
     positions = claude_native._claude_resume_record_positions(

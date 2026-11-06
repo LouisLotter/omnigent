@@ -982,7 +982,11 @@ def test_no_policy_allow_lets_installed_command_answer_in_shell(
 def _guard_answers_in_shell(bridge_dir: Path, payload: dict[str, object]) -> bool:
     """Whether the installed guard answers *payload* itself, never reaching the hook."""
     result = subprocess.run(
-        ["/bin/sh", "-c", policy_allow_cache.guarded_hook_command(bridge_dir, "echo asked-server")],
+        [
+            "/bin/sh",
+            "-c",
+            policy_allow_cache.guarded_hook_command(bridge_dir, "echo asked-server"),
+        ],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
