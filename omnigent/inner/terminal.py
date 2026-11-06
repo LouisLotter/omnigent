@@ -1846,8 +1846,12 @@ class TerminalInstance:
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                 )
-            except _EXEC_REFUSED_ERRORS:
-                self._process_may_exist = False
+            except _EXEC_REFUSED_ERRORS as exc:
+                # Popen names the program it could not execute. The same error
+                # type without that name came from later setup, such as the
+                # child watcher's pidfd_open, when the process already exists.
+                if exc.filename == cmd[0]:
+                    self._process_may_exist = False
                 raise
             _, stderr = await proc.communicate()
             if proc.returncode != 0:

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1115,15 +1116,19 @@ def _unlaunched_instance(tmp_path: Path) -> TerminalInstance:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error_type", "error_number", "proves"),
+    ("error_type", "error_number", "names_the_program", "proves"),
     [
-        (FileNotFoundError, errno.ENOENT, True),
-        (NotADirectoryError, errno.ENOTDIR, True),
-        (PermissionError, errno.EACCES, True),
+        (FileNotFoundError, errno.ENOENT, True, True),
+        (NotADirectoryError, errno.ENOTDIR, True, True),
+        (PermissionError, errno.EACCES, True, True),
         # Connecting the pipes of a process that already exists raises these too.
-        (OSError, errno.ENOSPC, False),
-        (OSError, errno.ENOMEM, False),
-        (BlockingIOError, errno.EAGAIN, False),
+        (OSError, errno.ENOSPC, False, False),
+        (OSError, errno.ENOMEM, False, False),
+        (BlockingIOError, errno.EAGAIN, False, False),
+        # The child watcher's pidfd_open refused: tmux exists by then, and the
+        # error has exec's type but not its program.
+        (PermissionError, errno.EPERM, False, False),
+        (FileNotFoundError, errno.ENOENT, False, False),
     ],
 )
 async def test_launch_proves_no_process_only_when_tmux_could_not_be_executed(
@@ -1131,12 +1136,15 @@ async def test_launch_proves_no_process_only_when_tmux_could_not_be_executed(
     monkeypatch: pytest.MonkeyPatch,
     error_type: type[OSError],
     error_number: int,
+    names_the_program: bool,
     proves: bool,
 ) -> None:
     """The spawn call's error proves nothing unless exec itself was refused."""
 
     async def _spawn(*args: object, **kwargs: object) -> NoReturn:
-        del args, kwargs
+        del kwargs
+        if names_the_program:
+            raise error_type(error_number, "synthetic spawn failure", args[0])
         raise error_type(error_number, "synthetic spawn failure")
 
     monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _spawn)
@@ -1145,6 +1153,35 @@ async def test_launch_proves_no_process_only_when_tmux_could_not_be_executed(
         await _unlaunched_instance(tmp_path).launch()
 
     assert proves_no_terminal_process(raised.value) is proves
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("make_program", "error_type"),
+    [
+        (lambda folder: folder / "no-such-program", FileNotFoundError),
+        (lambda folder: _not_executable(folder), PermissionError),
+    ],
+)
+async def test_a_real_exec_refusal_names_the_program(
+    tmp_path: Path,
+    make_program: Callable[[Path], Path],
+    error_type: type[OSError],
+) -> None:
+    """``launch`` relies on this: only an exec refusal carries the program's name."""
+    program = str(make_program(tmp_path))
+
+    with pytest.raises(error_type) as raised:
+        await asyncio.create_subprocess_exec(program)
+
+    assert raised.value.filename == program
+
+
+def _not_executable(folder: Path) -> Path:
+    program = folder / "not-executable"
+    program.write_text("#!/bin/sh\n")
+    program.chmod(0o644)
+    return program
 
 
 @pytest.mark.asyncio
