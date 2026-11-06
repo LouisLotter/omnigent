@@ -24,10 +24,14 @@ from tests.server.scheduled.test_fire import (
     FakeHostStore,
     FakePermissionStore,
     FakeScheduledTaskStore,
+    _continued_session,
+    _continuing_task,
     _deps,
     _drain,
+    _ExistingConversationStore,
     _FakeConversation,
     _FakeHost,
+    _FakeTeamStore,
     _task,
 )
 
@@ -533,7 +537,9 @@ async def test_a_deleted_tasks_saved_prompt_is_never_delivered(
 
     monkeypatch.setattr(sessions, "_run_managed_launch", provision)
     await fire_mod._make_managed_sandbox_dispatch(fire.deps)(fire.conv, fire.task)
-    fire_mod._make_managed_sandbox_start(fire.deps)(fire.conv, fire.task)
+    fire_mod._make_managed_sandbox_start(fire.deps)(
+        fire.conv, fire.task, None, fire_mod._LEGACY_LAUNCH_ERRORS
+    )
     await asyncio.wait_for(provisioning.wait(), timeout=5)
     [saved] = fire.conversations.list_pending_inputs(fire.conv.id)
     assert saved.data.startup_options.scheduled_task_id == fire.task.id
@@ -566,7 +572,9 @@ async def test_a_task_deleted_before_provisioning_starts_provisions_nothing(
     await fire_mod._make_managed_sandbox_dispatch(fire.deps)(fire.conv, fire.task)
     assert fire.schedules.delete(fire.task.id)
 
-    fire_mod._make_managed_sandbox_start(fire.deps)(fire.conv, fire.task)
+    fire_mod._make_managed_sandbox_start(fire.deps)(
+        fire.conv, fire.task, None, fire_mod._LEGACY_LAUNCH_ERRORS
+    )
     await asyncio.gather(*list(sessions._managed_launch_tasks), return_exceptions=True)
 
     provision.assert_not_awaited()
@@ -992,3 +1000,236 @@ async def test_an_upgrade_format_scheduled_prompt_is_reconciled_on_recovery(
         # The person's own message is still delivered as theirs.
         assert human.id not in statuses
         assert len(world.posts) == 1
+
+
+# ── A continued session runs on its task owner's authority, at every firing ──
+
+
+@dataclasses.dataclass
+class _ContinuedFire:
+    """A real firing into a continued session, with the runner's helpers faked."""
+
+    store: FakeScheduledTaskStore
+    permissions: FakePermissionStore
+    host: _FakeHost
+    conversations: _ExistingConversationStore
+    deps: Any
+    prompts: list[dict[str, Any]]
+    # What happens while the runner is reached, and while it initializes.
+    during_wake: Any = None
+    during_initialization: Any = None
+
+    async def fire(self) -> None:
+        fire_dispatch = fire_mod._FireDispatch(
+            connected=AsyncMock(),
+            connected_preflight=None,
+            managed=AsyncMock(),
+            reuse=fire_mod._make_reuse_dispatch(self.deps),
+        )
+        await fire_mod._run_fire(self.deps, 0, "task_1", fire_dispatch)
+
+    @property
+    def run(self) -> tuple[str, str | None]:
+        (run,) = self.store.runs
+        return run["status"], run["error_code"]
+
+
+@pytest.fixture
+def continued(monkeypatch: pytest.MonkeyPatch) -> _ContinuedFire:
+    import omnigent.server.routes.sessions as sessions_routes
+
+    host = _FakeHost("host_1", _OWNER)
+    permissions = FakePermissionStore(users={_OWNER})
+    permissions.grant(_OWNER, "conv_prev", 4)
+    conversations = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task(user_id=_OWNER)})
+    deps = _deps(
+        store,
+        conversation_store=conversations,
+        permission_store=permissions,
+        host_store=FakeHostStore({host.host_id: host}),
+        host_registry=FakeHostRegistry(online={host.host_id}),
+    )
+    world = _ContinuedFire(store, permissions, host, conversations, deps, [])
+
+    async def reach_runner(*, conv: Any, **_kwargs: Any) -> tuple[object, Any]:
+        if world.during_wake is not None:
+            world.during_wake(world)
+        return object(), conv
+
+    async def initialize(*_args: Any, **_kwargs: Any) -> None:
+        if world.during_initialization is not None:
+            world.during_initialization(world)
+
+    async def submit(*_args: Any, **kwargs: Any) -> None:
+        # The real helper calls this right before it forwards.
+        await kwargs["authorize_submission"]()
+        world.prompts.append(kwargs)
+
+    monkeypatch.setattr(sessions_routes, "ensure_runner_connected", reach_runner)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(sessions_routes, "_dispatch_session_event_to_runner", submit)
+    return world
+
+
+def _suspended(world: _ContinuedFire) -> None:
+    world.deps.team_store = _FakeTeamStore({_OWNER: "suspended"})
+
+
+def _removed(world: _ContinuedFire) -> None:
+    assert world.permissions.users is not None
+    world.permissions.users.discard(_OWNER)
+
+
+def _session_passed_to_bob(world: _ContinuedFire) -> None:
+    world.permissions.grants = [("bob@example.com", "conv_prev", 4)]
+
+
+def _second_owner(world: _ContinuedFire) -> None:
+    world.permissions.grants.append(("bob@example.com", "conv_prev", 4))
+
+
+def _computer_passed_to_bob(world: _ContinuedFire) -> None:
+    world.host.user_id = "bob@example.com"
+
+
+def _computer_re_registered(world: _ContinuedFire) -> None:
+    world.host.account_generation = "a-later-registration"
+
+
+def _continued_task_deleted(world: _ContinuedFire) -> None:
+    world.store._rows["task_1"] = replace(world.store._rows["task_1"], state="deleted")
+
+
+@pytest.mark.asyncio
+async def test_a_continued_firing_sends_the_prompt_as_the_task_owner(
+    continued: _ContinuedFire,
+) -> None:
+    await continued.fire()
+
+    assert continued.run == ("succeeded", None)
+    (prompt,) = continued.prompts
+    assert prompt["created_by"] == _OWNER
+    assert prompt["initiator"].kind == "schedule"
+    assert prompt["initiator"].user == _OWNER
+    assert continued.conversations.created == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("loss", "expected"),
+    [
+        (_session_passed_to_bob, ("failed", "session_authority_revoked")),
+        (_second_owner, ("failed", "session_authority_revoked")),
+        (_computer_passed_to_bob, ("failed", "host_authority_revoked")),
+        (_computer_re_registered, ("failed", "host_authority_revoked")),
+    ],
+    ids=["session-to-bob", "second-owner", "computer-to-bob", "computer-re-registered"],
+)
+async def test_a_continued_session_never_crosses_to_another_member(
+    continued: _ContinuedFire, loss: Any, expected: tuple[str, str]
+) -> None:
+    """The owner grant alone is not enough: the session and its computer must be the owner's."""
+    loss(continued)
+
+    await continued.fire()
+
+    assert continued.run == expected
+    assert continued.prompts == []
+    # Nothing falls back to a new session either.
+    assert continued.conversations.created == []
+
+
+@pytest.mark.asyncio
+async def test_a_continued_session_the_owner_cannot_reach_tells_nothing_more(
+    continued: _ContinuedFire,
+) -> None:
+    continued.permissions.unowned.add("conv_prev")
+
+    await continued.fire()
+
+    assert continued.run == ("failed", "continued_session_forbidden")
+    assert continued.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_a_suspended_owners_continued_task_skips_and_stays(
+    continued: _ContinuedFire,
+) -> None:
+    _suspended(continued)
+
+    await continued.fire()
+
+    assert continued.run == ("skipped", "owner_suspended")
+    assert continued.prompts == []
+    assert {"id": "task_1", "state": "deleted"} not in continued.store.updates
+
+
+@pytest.mark.asyncio
+async def test_a_removed_owners_continued_task_is_disabled(continued: _ContinuedFire) -> None:
+    _removed(continued)
+
+    await continued.fire()
+
+    assert continued.run == ("failed", "owner_deleted")
+    assert continued.prompts == []
+    assert {"id": "task_1", "state": "deleted"} in continued.store.updates
+
+
+_LOST_WHILE_FIRING = [
+    (_suspended, "owner_suspended"),
+    (_removed, "owner_deleted"),
+    (_session_passed_to_bob, "session_authority_revoked"),
+    (_computer_passed_to_bob, "host_authority_revoked"),
+    (_continued_task_deleted, "task_authority_revoked"),
+]
+_LOST_IDS = ["suspended", "removed", "session-to-bob", "computer-to-bob", "task-deleted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("loss", "error_code"), _LOST_WHILE_FIRING, ids=_LOST_IDS)
+async def test_authority_lost_during_a_wake_sends_no_prompt_to_a_continued_session(
+    continued: _ContinuedFire, loss: Any, error_code: str
+) -> None:
+    """Waking the computer can take minutes; nothing held before it carries over."""
+    continued.during_wake = loss
+
+    await continued.fire()
+
+    assert continued.run == ("failed", error_code)
+    assert continued.prompts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("loss", "error_code"), _LOST_WHILE_FIRING, ids=_LOST_IDS)
+async def test_authority_lost_during_initialization_sends_no_prompt_to_a_continued_session(
+    continued: _ContinuedFire, loss: Any, error_code: str
+) -> None:
+    continued.during_initialization = loss
+
+    await continued.fire()
+
+    assert continued.run == ("failed", error_code)
+    assert continued.prompts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lifecycle", "problem"),
+    [("persistent", None), (None, "continued_session_incompatible")],
+    ids=["computer", "one-session-sandbox"],
+)
+async def test_a_task_continues_a_session_on_a_computer_but_not_in_a_sandbox(
+    lifecycle: str | None, problem: str | None
+) -> None:
+    """A computer is pinned like a connected host, though a provider runs it (D38)."""
+    host = _FakeHost("host_1", _OWNER, sandbox_provider="cloud", lifecycle=lifecycle)
+
+    found = await fire_mod.continued_session_problem(
+        _continuing_task(user_id=_OWNER),
+        _continued_session(),
+        host_store=FakeHostStore({host.host_id: host}),
+        permission_store=FakePermissionStore(users={_OWNER}),
+    )
+
+    assert (found[1] if found is not None else None) == problem

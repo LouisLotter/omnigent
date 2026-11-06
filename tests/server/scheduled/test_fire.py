@@ -1386,6 +1386,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         _FakeConversation(id="conv_1", agent_id="ag_1"),
         object(),
         task,
+        host_id=None,
     )
 
     assert [event.data["content"] for event in sent] == [
