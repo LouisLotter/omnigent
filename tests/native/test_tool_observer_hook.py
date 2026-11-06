@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import _POLICY_HOOK_MODULE, _our_hooks_from_list
+from omnigent.native import tool_observer_hook
 from omnigent.native.tool_observer_hook import hook_settings, main
 
 _TOKEN = "relay-token"
@@ -297,3 +298,17 @@ def test_codex_still_trusts_the_hook(tmp_path: Path) -> None:
     assert _our_hooks_from_list(listed, "/w", _POLICY_HOOK_MODULE) == [
         {"key": "k", "command": hook["command"]}
     ]
+
+
+def test_the_harness_waits_for_python_to_start_on_a_busy_machine(tmp_path: Path) -> None:
+    """
+    The relay wait stays short, and the harness timeout covers a slow interpreter.
+
+    Codex shows a failed hook when the Python fallback outlives this timeout,
+    which took seconds at 0.1 CPU (UC-111). The curl path bounds its own wait.
+    """
+    settings = tool_observer_hook.hook_settings(tmp_path, "/usr/bin/python3", "observer.module")
+
+    assert settings["timeout"] == tool_observer_hook.HOOK_TIMEOUT_S
+    assert tool_observer_hook.HOOK_TIMEOUT_S >= 10
+    assert f"--max-time {tool_observer_hook._RELAY_TIMEOUT_S} " in str(settings["command"])
