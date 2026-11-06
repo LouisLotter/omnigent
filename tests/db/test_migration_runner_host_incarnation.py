@@ -19,7 +19,6 @@ from alembic import command
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.utils import (
     _build_alembic_config,
-    _get_current_db_heads,
     _initialize_or_verify_schema,
     get_or_create_engine,
 )
@@ -29,6 +28,7 @@ from omnigent.server.auth import LEVEL_OWNER
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import RETIRED_RUNNER_INCARNATION, HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.db.team_chain import team_chain_heads
 
 _PREVIOUS = "tm1a2b3c4d5e"
 _REVISION = "ri1a2b3c4d5e"
@@ -173,7 +173,7 @@ def test_upgrade_requires_a_rebind_on_an_unchanged_managed_host(db_uri, engine) 
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert not _issues(db_uri, seeded.managed_runner)
     assert _issues(db_uri, _rebind(db_uri, seeded.managed_thread))
 
@@ -199,7 +199,7 @@ def test_upgrade_resumes_after_the_column_was_committed(db_uri, engine) -> None:
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert not _issues(db_uri, seeded.managed_runner)
     assert _issues(db_uri, seeded.personal_runner)
     assert _issues(db_uri, _rebind(db_uri, seeded.managed_thread))

@@ -1,4 +1,5 @@
 import type { TurnAttribution } from "./attribution";
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
@@ -334,6 +335,8 @@ export interface MessageDone {
   responseId: string;
   /** Native live-preview stream finalized by this item. */
   messageId?: string;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
 }
 
 /**

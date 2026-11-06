@@ -1,0 +1,106 @@
+[
+  {
+    "id": "3490708609535f889b75bafe10fdc4e1",
+    "type": "message",
+    "role": "user",
+    "response_id": "resp_0123456789abcdef0123456789abcdef",
+    "content": [
+      {
+        "type": "input_text",
+        "text": "first question"
+      }
+    ]
+  },
+  {
+    "id": "cmp_1",
+    "type": "compaction",
+    "response_id": "compact_1",
+    "token_count": 42,
+    "compacted_messages": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": "summary so far"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "advisor",
+            "input": {}
+          }
+        ],
+        "forwarded_source_ids": [
+          "a-1:0:message"
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "advisor_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+              "type": "advisor_result",
+              "text": "advice"
+            }
+          }
+        ],
+        "forwarded_source_ids": [
+          "a-2:0:message"
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "advisor_tool_result",
+            "tool_use_id": "srvtoolu_gone",
+            "content": {
+              "type": "advisor_result",
+              "text": "late advice"
+            }
+          }
+        ],
+        "forwarded_source_ids": [
+          "a-3:0:message"
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": "after the advice"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "noted"
+          }
+        ],
+        "forwarded_source_ids": [
+          "a-4:0:message"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "1647d640f3d25b428c75142c3f78266c",
+    "type": "message",
+    "role": "assistant",
+    "response_id": "resp_0123456789abcdef0123456789abcdef",
+    "content": [
+      {
+        "type": "output_text",
+        "text": "noted"
+      }
+    ]
+  }
+]

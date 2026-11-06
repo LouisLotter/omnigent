@@ -27,7 +27,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar, cast
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
@@ -79,6 +79,7 @@ from .terminal_lifecycle import (
 TerminalResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 logger = logging.getLogger(__name__)
+_ExceptionT = TypeVar("_ExceptionT", bound=BaseException)
 
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
@@ -366,6 +367,38 @@ class _TmuxCommandError(RuntimeError):
         )
 
 
+# ``tmux`` itself could not be executed: nothing ran. Other ``OSError`` values
+# can also come from connecting a process that does exist.
+_EXEC_REFUSED_ERRORS = (FileNotFoundError, NotADirectoryError, PermissionError)
+_NO_TERMINAL_PROCESS_ATTR = "omnigent_no_terminal_process"
+
+
+def note_no_terminal_process(exc: _ExceptionT) -> _ExceptionT:
+    """
+    Mark *exc* as proof that a launch created no terminal process.
+
+    Only the launch layer, which knows how far it got, may say this.
+
+    :param exc: The launch's failure, e.g. ``FileNotFoundError("tmux")``.
+    :returns: *exc*, so a caller can ``raise`` it.
+    """
+    setattr(exc, _NO_TERMINAL_PROCESS_ATTR, True)
+    return exc
+
+
+def proves_no_terminal_process(exc: BaseException) -> bool:
+    """
+    Whether *exc* proves that its launch created no terminal process.
+
+    Any other failure proves nothing: the process may exist or have run. That
+    includes a cancellation, and an error that merely wraps a marked one.
+
+    :param exc: The failure the launch raised.
+    :returns: ``True`` only for a failure :func:`note_no_terminal_process` marked.
+    """
+    return getattr(exc, _NO_TERMINAL_PROCESS_ATTR, False) is True
+
+
 class _TmuxProcessStartError(RuntimeError):
     """A tmux subprocess transiently could not start, so liveness is unknown."""
 
@@ -382,6 +415,16 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
         return _TmuxProcessStartError(detail)
     return RuntimeError(detail)
 
+
+# has-session stderr when tmux answered but the session no longer exists, or when
+# the socket is still there but its server is gone (``kill-server``, ``killall tmux``).
+_TMUX_SESSION_KILLED_MARKERS = (
+    "no current target",
+    "can't find session",
+    "session not found",
+    "no such session",
+    "no server running on",
+)
 
 # Unrecognized failures leave liveness unknown and are retried.
 _TMUX_TARGET_GONE_STDERR_MARKERS = (
@@ -1124,6 +1167,8 @@ class TerminalInstance:
     keep_alive_after_exit: bool = False
     running: bool = False
     launch_cwd: str | None = None
+    # Set once a launch reaches the call that can create the tmux process.
+    _process_may_exist: bool = field(default=False, init=False, repr=False)
     # Runtime-owned observation; never part of the portable terminal spec.
     program_status_app: str | None = None
     program_status: ProgramStatusReader | None = field(default=None, init=False, repr=False)
@@ -1500,6 +1545,17 @@ class TerminalInstance:
         """Return tmux's observed signal, without attributing who sent it."""
         return self._last_exit_signal
 
+    def session_killed_by_tmux(self) -> bool:
+        """Whether tmux reported this terminal's session, or its whole server, gone.
+
+        With ``keep_alive_after_exit`` an inner-CLI exit leaves a dead pane, so a
+        missing session or server means a tmux kill command (or a killed tmux) ended it.
+        """
+        error = (self._last_session_probe_error or "").lower()
+        return self.keep_alive_after_exit and any(
+            marker in error for marker in _TMUX_SESSION_KILLED_MARKERS
+        )
+
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
 
@@ -1623,9 +1679,19 @@ class TerminalInstance:
         )
 
     async def launch(self, *, cwd: Path | None = None) -> None:
-        """Start the tmux session."""
+        """Start the tmux session.
+
+        A failure before any process could exist is marked for
+        :func:`proves_no_terminal_process`. A cancellation never is.
+        """
+        self._process_may_exist = False
         try:
             await self._launch_impl(cwd=cwd)
+        except Exception as exc:
+            self._stop_network_brokers()
+            if not self._process_may_exist:
+                note_no_terminal_process(exc)
+            raise
         except BaseException:
             self._stop_network_brokers()
             raise
@@ -1772,12 +1838,21 @@ class TerminalInstance:
         try:
             if self._clipboard_bridge is not None:
                 self._clipboard_bridge.start()
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
+            self._process_may_exist = True
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+            except _EXEC_REFUSED_ERRORS as exc:
+                # Popen names the program it could not execute. The same error
+                # type without that name came from later setup, such as the
+                # child watcher's pidfd_open, when the process already exists.
+                if exc.filename == cmd[0]:
+                    self._process_may_exist = False
+                raise
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
                 raise RuntimeError(

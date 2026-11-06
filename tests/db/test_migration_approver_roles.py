@@ -17,7 +17,6 @@ from alembic import command
 from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.utils import (
     _build_alembic_config,
-    _get_current_db_heads,
     _initialize_or_verify_schema,
     get_or_create_engine,
 )
@@ -28,6 +27,7 @@ from omnigent.stores.approval_store import (
     ResourceKind,
     SqlAlchemyApprovalStore,
 )
+from tests.db.team_chain import team_chain_heads
 
 _PREVIOUS = "ri1a2b3c4d5e"
 _REVISION = "ap1a2b3c4d5e"
@@ -115,7 +115,7 @@ def test_upgrade_adds_the_tables_and_changes_nothing_else(db_uri, engine) -> Non
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert _tables(engine) >= set(_TABLES)
     assert _has_login_id(engine)
     with engine.connect() as connection:
@@ -134,7 +134,10 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
         ("DROP TABLE protected_policies", {}),
         ("DROP INDEX ix_approver_grants_approver" + suffix, {}),
         # The login id column stays: the retry must not add it twice.
-        ("UPDATE alembic_version SET version_num = :rev", {"rev": _PREVIOUS}),
+        (
+            "UPDATE alembic_version SET version_num = :rev WHERE version_num = :current",
+            {"rev": _PREVIOUS, "current": _REVISION},
+        ),
     ):
         with engine.begin() as connection:
             connection.execute(sa.text(statement), parameters)
@@ -142,7 +145,7 @@ def test_upgrade_resumes_after_a_committed_part(db_uri, engine) -> None:
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert _tables(engine) >= set(_TABLES)
     assert "ix_approver_grants_approver" in {
         index["name"] for index in sa.inspect(engine).get_indexes("approver_grants")

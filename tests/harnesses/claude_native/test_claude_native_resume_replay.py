@@ -33,6 +33,10 @@ from omnigent.native import native_terminal
 _SESSION_ID = "conv_replay"
 _CLAUDE_SESSION_ID = "4b0f2a52-2b5e-4d8e-9a39-6f0f1c1d2e3f"
 _WORKSPACE = Path("/work/replay-repo")
+# A history with a split server tool pair and an orphaned result, and the transcript
+# 0.20's reconstruction (``b39cfba8c``) wrote for it. That code numbered snapshot
+# entries before any rejoining, so this can't be regenerated from the current one.
+_REBUILT_BY_0_20 = Path(__file__).parents[2] / "fixtures" / "claude_native_020_compaction"
 
 
 def _user(uuid: str, text: str, **extra: Any) -> dict[str, Any]:
@@ -878,6 +882,183 @@ def test_record_positions_cover_rebuilt_and_compacted_records() -> None:
         index=0,
     )
     assert positions[compacted] == 2
+
+
+def test_record_positions_number_compacted_records_as_the_rebuild_does() -> None:
+    """A server tool result rejoined with its call moves every record after it up one."""
+    call = {"type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}}
+    result = {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_1", "content": "advice"}
+    forwarded_id = external_item_id(_SESSION_ID, "a-2:0:message")
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "response_id": "compact_1",
+            "compacted_messages": [
+                {"type": "message", "role": "user", "content": "summary"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [call],
+                    "forwarded_source_ids": ["a-1:0:message"],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [result],
+                    "forwarded_source_ids": ["a-2:0:message"],
+                },
+                {"type": "message", "role": "user", "content": "after the advice"},
+            ],
+        },
+        {
+            "id": forwarded_id,
+            "type": "message",
+            "role": "user",
+            "response_id": "r",
+            "content": "x",
+        },
+    ]
+
+    positions = claude_native._claude_resume_record_positions(
+        items, session_id=_SESSION_ID, external_session_id=_CLAUDE_SESSION_ID
+    )
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id=_SESSION_ID,
+        external_session_id=_CLAUDE_SESSION_ID,
+        cwd=_WORKSPACE,
+        bridge_dir=Path("/nonexistent-bridge"),
+    )
+
+    assert {record["uuid"] for record in records} <= positions.keys()
+    rejoined = next(
+        record
+        for record in records
+        if record.get("type") == "assistant"
+        and any(block.get("type") == "server_tool_use" for block in record["message"]["content"])
+    )
+    # The rejoined record stands for the server rows of both halves.
+    assert positions[rejoined["uuid"]] == 1
+
+
+def _history_rebuilt_by_0_20() -> list[dict[str, Any]]:
+    return json.loads((_REBUILT_BY_0_20 / "server_items.json").read_text(encoding="utf-8"))
+
+
+def _transcript_rebuilt_by_0_20() -> bytes:
+    return (_REBUILT_BY_0_20 / "transcript.jsonl").read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_transcript_rebuilt_by_0_20_is_not_replayed(saved_transcript: Path) -> None:
+    """Every record of that transcript came from the server, under the old numbering."""
+    saved_transcript.write_bytes(_transcript_rebuilt_by_0_20() + b"{not json\n")
+    server = _FakeServer(_history_rebuilt_by_0_20())
+
+    resume = await _cold_resume(server)
+
+    assert resume is not None
+    assert server.posts == []
+
+
+@pytest.mark.asyncio
+async def test_new_records_after_a_0_20_rebuild_are_delivered(saved_transcript: Path) -> None:
+    """Recognising the old numbering must not swallow what Claude wrote since."""
+    saved_transcript.write_bytes(
+        _transcript_rebuilt_by_0_20()
+        + _line(_user("n-1", "question after the upgrade"))
+        + _line(_assistant("n-2", "answer after the upgrade"))
+    )
+    server = _FakeServer(_history_rebuilt_by_0_20())
+
+    await _cold_resume(server)
+
+    assert server.posts == ["n-1:0:message", "n-2:0:message"]
+
+
+@pytest.mark.asyncio
+async def test_new_records_after_a_current_rebuild_of_that_history_are_delivered(
+    saved_transcript: Path,
+) -> None:
+    """The same history, written with rejoined numbering, reconciles as before."""
+    server = _FakeServer(_history_rebuilt_by_0_20())
+    rebuilt = await _cold_resume(server)
+    assert rebuilt is not None
+    assert rebuilt.path.read_bytes() != _transcript_rebuilt_by_0_20()
+    with rebuilt.path.open("ab") as handle:
+        handle.write(_line(_user("n-1", "question after the upgrade")))
+
+    await _cold_resume(server)
+
+    assert server.posts == ["n-1:0:message"]
+
+
+@pytest.mark.parametrize(
+    ("kept_lines", "expected_position"),
+    [
+        # In 0.20's numbering entry 3 is the orphaned result, whose row is gone.
+        (None, 1),
+        # A transcript without the last records is told apart by their content.
+        (5, 1),
+    ],
+)
+def test_overlapping_record_uuid_means_what_the_saved_transcript_wrote(
+    tmp_path: Path, kept_lines: int | None, expected_position: int
+) -> None:
+    """One index-derived uuid names different entries in the two numberings."""
+    items = _history_rebuilt_by_0_20()
+    overlapping = claude_native._synthetic_claude_transcript_uuid(
+        session_id=_SESSION_ID, external_session_id=_CLAUDE_SESSION_ID, item={}, index=3
+    )
+    current = tmp_path / "current.jsonl"
+    current.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in claude_native._claude_transcript_records_from_session_items(
+                items,
+                session_id=_SESSION_ID,
+                external_session_id=_CLAUDE_SESSION_ID,
+                cwd=_WORKSPACE,
+                bridge_dir=Path("/nonexistent-bridge"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    old = tmp_path / "old.jsonl"
+    old.write_bytes(b"".join(_transcript_rebuilt_by_0_20().splitlines(True)[:kept_lines]))
+
+    def _position(transcript: Path | None) -> int:
+        return claude_native._claude_resume_record_positions(
+            items,
+            session_id=_SESSION_ID,
+            external_session_id=_CLAUDE_SESSION_ID,
+            transcript=transcript,
+        )[overlapping]
+
+    assert _position(old) == expected_position
+    # In the rejoined numbering it is the last answer, mirrored in row 2.
+    assert _position(current) == 2
+    assert _position(None) == 2
+
+
+@pytest.mark.asyncio
+async def test_saved_records_that_cannot_be_read_for_their_layout_are_not_placed(
+    saved_transcript: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without knowing the numbering nothing is replayed, and the file is kept aside."""
+    saved_transcript.write_bytes(_transcript_rebuilt_by_0_20())
+
+    def _unreadable(transcript: Path) -> dict[str, Any]:
+        raise OSError(f"cannot read {transcript}")
+
+    monkeypatch.setattr(claude_native, "_transcript_message_shapes", _unreadable)
+    server = _FakeServer(_history_rebuilt_by_0_20())
+
+    await _cold_resume(server)
+
+    assert server.posts == []
+    assert list(saved_transcript.parent.glob(f"{saved_transcript.name}.unreconciled-*"))
 
 
 @pytest.mark.asyncio

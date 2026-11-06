@@ -28,6 +28,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests.db.team_chain import team_chain_heads
 
 _PREVIOUS = "mr1a2b3c4d5e"
 _REVISION = "tm1a2b3c4d5e"
@@ -175,7 +176,7 @@ def test_upgrade_makes_the_sole_admin_owner_and_changes_nothing_else(db_uri, eng
 
     _migrate(engine, _REVISION)
 
-    assert _get_current_db_heads(engine) == (_REVISION,)
+    assert team_chain_heads(engine) == (_REVISION,)
     assert _team_workspaces(engine) == [0]
     # Owner role (1), active state (2), mapped to the existing username.
     assert _members(engine) == [(0, "owner", "owner", 1, 2)]
@@ -284,7 +285,12 @@ def test_upgrade_keeps_an_existing_membership(db_uri, engine) -> None:
             )
         )
         # A resumed upgrade re-runs the data step over tables that already hold members.
-        connection.execute(sa.text(f"UPDATE alembic_version SET version_num = '{_PREVIOUS}'"))
+        connection.execute(
+            sa.text(
+                f"UPDATE alembic_version SET version_num = '{_PREVIOUS}' "
+                f"WHERE version_num = '{_REVISION}'"
+            )
+        )
 
     _migrate(engine, _REVISION)
 
@@ -368,7 +374,7 @@ def test_sqlite_upgrade_interrupted_anywhere_leaves_the_previous_database(tmp_pa
             engine.dispose()
         check = sa.create_engine(uri)
         try:
-            assert _get_current_db_heads(check) == (_PREVIOUS,), writes[-1]
+            assert team_chain_heads(check) == (_PREVIOUS,), writes[-1]
             assert _snapshot(check) == before
         finally:
             check.dispose()
@@ -406,7 +412,7 @@ def test_sqlite_upgrade_killed_mid_way_resumes_on_next_start(tmp_path, killed_af
     assert killed.returncode == -signal.SIGKILL, killed.stderr
     check = sa.create_engine(uri)
     try:
-        assert _get_current_db_heads(check) == (_PREVIOUS,)
+        assert team_chain_heads(check) == (_PREVIOUS,)
         assert not any(_has_team_tables(check).values())
     finally:
         check.dispose()

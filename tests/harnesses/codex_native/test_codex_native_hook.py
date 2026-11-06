@@ -8,12 +8,15 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.harnesses.codex_native import bridge as codex_bridge
 from omnigent.harnesses.codex_native import hook as codex_native_hook
+from omnigent.harnesses.codex_native.app_server import _codex_policy_hook_command
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -21,8 +24,8 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
-from omnigent.native import native_policy_hook
-from tests.native_hook_helpers import make_failing_client
+from omnigent.native import native_policy_hook, policy_allow_cache
+from tests.native_hook_helpers import make_failing_client, make_verdict_client
 
 
 class _DenyHttpxClient:
@@ -938,6 +941,194 @@ def test_observe_tool_runs_without_the_policy_client(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "", result.stdout
+
+
+_NO_POLICY_ALLOW: dict[str, object] = {
+    "result": "POLICY_ACTION_ALLOW",
+    "allow_cache_seconds": 60.0,
+}
+
+
+def test_no_policy_allow_lets_installed_command_answer_in_shell(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The hook records the server's allow window for the command's shell guard.
+
+    The installed command then answers the next tool call itself. The server
+    is unreachable, so a call that got past the guard would fail closed with
+    deny output instead of exiting silently.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", _codex_policy_hook_command(bridge_dir, sys.executable)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def _guard_answers_in_shell(bridge_dir: Path, payload: dict[str, object]) -> bool:
+    """Whether the installed guard answers *payload* itself, never reaching the hook."""
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            policy_allow_cache.guarded_hook_command(bridge_dir, "echo asked-server"),
+        ],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return "asked-server" not in result.stdout
+
+
+def test_a_policy_added_mid_session_reaches_the_next_hook(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Unless the operator turns the allow cache on, no answer opens a window.
+
+    The server's plain no-policy ALLOW leaves the guard asking, so the next
+    tool call meets the rule a person added in between.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        make_verdict_client({"result": "POLICY_ACTION_ALLOW"}),
+    )
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+    assert not _guard_answers_in_shell(bridge_dir, payload)
+
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        make_verdict_client({"result": "POLICY_ACTION_DENY", "reason": "added just now"}),
+    )
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+    assert "added just now" in _assert_codex_enforced_deny(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("mode", ["connect_error", "non_2xx", "malformed_json", "no_verdict"])
+def test_a_failed_check_fails_closed_once_a_window_has_passed(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    """An expired window answers nothing, and the check behind it still fails closed."""
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+    generation = policy_allow_cache.generation(bridge_dir)
+    policy_allow_cache.record(
+        bridge_dir, generation, _NO_POLICY_ALLOW, requested_at=time.time() - 3600
+    )
+    assert not _guard_answers_in_shell(bridge_dir, payload)
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+
+    _assert_codex_enforced_deny(capsys.readouterr().out)
+
+
+def test_answer_for_a_switched_session_opens_no_window(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An answer for the session the hook read cannot open the next session's window.
+
+    The switch lands after the hook reads the bridge state and before its
+    request, so the server answers for the old session.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
+    # The hook imports the bridge lazily, so ``observe-tool`` starts without it.
+    read_state = codex_bridge.read_bridge_state
+
+    def read_then_switch(path: Path) -> CodexNativeBridgeState | None:
+        state = read_state(path)
+        write_bridge_state(
+            path,
+            CodexNativeBridgeState(
+                session_id="conv_rotated",
+                socket_path=str(path / "app-server.sock"),
+                thread_id="thread_new",
+                codex_home=str(path / "codex-home"),
+            ),
+        )
+        return state
+
+    monkeypatch.setattr(codex_bridge, "read_bridge_state", read_then_switch)
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("relay_session_id", "window_opens"),
+    [("conv_active", True), ("conv_previous", False)],
+    ids=["relay_for_this_session", "relay_for_previous_session"],
+)
+def test_relay_answer_opens_window_only_for_the_hooks_session(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relay_session_id: str,
+    window_opens: bool,
+) -> None:
+    """Through the relay the server evaluated the relay's session, which can trail a switch."""
+    from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
+
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps(
+            {"url": "http://127.0.0.1:19999", "token": "tok", "session_id": relay_session_id}
+        )
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+
+    assert (policy_allow_cache._read_state(bridge_dir)[0] > 0) is window_opens
+
+
+def test_bridge_state_write_closes_allow_window(bridge_dir: Path) -> None:
+    """A new or rotated session's policies were never checked, so its hooks must ask."""
+    generation = policy_allow_cache.generation(bridge_dir)
+    policy_allow_cache.record(bridge_dir, generation, _NO_POLICY_ALLOW, requested_at=time.time())
+
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_rotated",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_new",
+            codex_home=str(bridge_dir / "codex-home"),
+        ),
+    )
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
 
 
 # ── route-turn (first-message model routing) ────────────────────────

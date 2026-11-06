@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
+import tempfile
 import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NoReturn, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -36,7 +40,7 @@ from omnigent.harnesses.claude_native.bridge import (
     prepare_bridge_dir,
     read_permission_hook_config,
 )
-from omnigent.harnesses.claude_native.main import ClaudeResumeTranscript
+from omnigent.harnesses.claude_native.main import ClaudeResumeTranscript, claude_tool_env_file
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
     CodexNativeBridgeState,
@@ -50,7 +54,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import TerminalInstance, note_no_terminal_process
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -79,6 +83,7 @@ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.registry import TerminalExitedDuringLaunch
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
@@ -87,7 +92,7 @@ from tests.runner.conftest import (
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 _PI_SESSION_ID = "47f049b9d13df4db397c7f46859b825f"
 
@@ -2583,6 +2588,8 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_ENV_FILE": claude_tool_env_file(),
+        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).
@@ -4557,6 +4564,421 @@ async def test_auto_create_claude_terminal_rebinds_a_moved_bridge(
     else:
         assert label_patches == []
         assert rebinds == []
+
+
+class _FinishedTmux:
+    """A ``tmux new-session`` process that ran to completion."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b"", b"synthetic tmux output"
+
+
+class _ClaudeStartChain:
+    """
+    The real launch chain, with only the ``tmux new-session`` call scripted.
+
+    Each start runs ``_auto_create_claude_terminal``, the resource registry, the
+    terminal registry and the terminal instance. Each step stands in for one
+    spawn call; the mark's state on entry to it is kept in ``marked_at_spawn``.
+    """
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        steps: list[Callable[[], Awaitable[Any]]],
+    ) -> None:
+        monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+        monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+        monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+        monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+        (tmp_path / "workspace").mkdir()
+        monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+            _no_op_forwarder,
+        )
+        self.bridge_dir = bridge_dir_for_bridge_id(self.session_id)
+        self.resources = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+        self.marked_at_spawn: list[bool] = []
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def _spawn(*cmd: str, **kwargs: Any) -> Any:
+            if "new-session" not in cmd:
+                return await real_spawn(*cmd, **kwargs)
+            self.marked_at_spawn.append(claude_native_bridge.claude_never_started(self.bridge_dir))
+            return await steps.pop(0)()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+
+    @property
+    def spawns(self) -> int:
+        """Spawn calls so far; a refused start makes none."""
+        return len(self.marked_at_spawn)
+
+    @property
+    def marked(self) -> bool:
+        """Whether the permission to start fresh stands."""
+        return claude_native_bridge.claude_never_started(self.bridge_dir)
+
+    async def start(self) -> None:
+        await _auto_create_claude_terminal(
+            self.session_id,
+            self.resources,
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+
+    def let_terminals_come_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make a finished ``new-session`` count as a live, observed terminal."""
+        monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            "omnigent.runner.native.orchestration._observe_terminal_interactive", AsyncMock()
+        )
+        monkeypatch.setattr(
+            self.resources,
+            "_observe_terminal_with_lifecycle",
+            AsyncMock(
+                return_value=SessionResourceView(
+                    id="terminal_claude_main",
+                    type="terminal",
+                    session_id=self.session_id,
+                    name="claude:main",
+                    metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+                )
+            ),
+        )
+
+
+_ClaudeStartChainFactory = Callable[[list[Callable[[], Awaitable[Any]]]], _ClaudeStartChain]
+
+
+@pytest.fixture
+async def claude_start_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_ClaudeStartChainFactory]:
+    """Build a chain, and close any terminal it leaves registered."""
+    chains: list[_ClaudeStartChain] = []
+
+    def _build(steps: list[Callable[[], Awaitable[Any]]]) -> _ClaudeStartChain:
+        chains.append(_ClaudeStartChain(tmp_path, monkeypatch, steps))
+        return chains[-1]
+
+    yield _build
+    for chain in chains:
+        await chain.resources.cleanup_session(chain.session_id)
+
+
+async def _tmux_will_not_exec() -> NoReturn:
+    raise FileNotFoundError(errno.ENOENT, "No such file or directory", "tmux")
+
+
+async def _tmux_pipes_failed() -> NoReturn:
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+async def _tmux_failed() -> _FinishedTmux:
+    return _FinishedTmux(returncode=1)
+
+
+async def _tmux_finished() -> _FinishedTmux:
+    return _FinishedTmux(returncode=0)
+
+
+@pytest.mark.asyncio
+async def test_claude_start_proven_never_run_may_retry_fresh_until_one_gets_further(
+    claude_start_chain: _ClaudeStartChainFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each proven failure earns one retry, and every retry gives the proof up first."""
+    chain = claude_start_chain([_tmux_will_not_exec, _tmux_will_not_exec, _tmux_finished])
+    chain.let_terminals_come_up(monkeypatch)
+
+    for _ in range(2):
+        with pytest.raises(FileNotFoundError):
+            await chain.start()
+        assert chain.marked
+
+    await chain.start()
+
+    assert chain.marked_at_spawn == [False, False, False]
+    assert not chain.marked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "failure"),
+    [
+        (_tmux_pipes_failed, OSError),
+        (_tmux_failed, RuntimeError),
+        # tmux finished, but its session is gone: Claude may have run and exited.
+        (_tmux_finished, TerminalExitedDuringLaunch),
+    ],
+)
+async def test_claude_start_that_proves_nothing_refuses_the_retry(
+    claude_start_chain: _ClaudeStartChainFactory,
+    step: Callable[[], Awaitable[Any]],
+    failure: type[Exception],
+) -> None:
+    """Only a positive proof from the launch layer lets a retry start fresh."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    chain = claude_start_chain([step])
+
+    with pytest.raises(failure):
+        await chain.start()
+
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_start_cancelled_after_the_spawn_refuses_the_retry(
+    claude_start_chain: _ClaudeStartChainFactory,
+) -> None:
+    """A cancellation says nothing about the Claude it interrupted."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    spawned = asyncio.Event()
+
+    class _HungTmux:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            spawned.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancellation expected")
+
+    async def _tmux_hangs() -> _HungTmux:
+        return _HungTmux()
+
+    chain = claude_start_chain([_tmux_hangs])
+    task = asyncio.create_task(chain.start())
+    await asyncio.wait_for(spawned.wait(), timeout=5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_start_failing_during_terminal_observation_refuses_the_retry(
+    claude_start_chain: _ClaudeStartChainFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """By the time the terminal is observed, Claude is running in it."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    chain = claude_start_chain([_tmux_finished])
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        chain.resources,
+        "_observe_terminal_with_lifecycle",
+        AsyncMock(side_effect=RuntimeError("synthetic observation failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic observation failure"):
+        await chain.start()
+
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_during_a_second_claude_start_refuses_the_third(
+    claude_start_chain: _ClaudeStartChainFactory,
+) -> None:
+    """A runner that dies mid-launch runs no handler, so the mark must already be gone."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    class _RunnerDied(BaseException):
+        """Escapes every handler, as dying at this point would."""
+
+    async def _runner_dies() -> NoReturn:
+        raise _RunnerDied
+
+    chain = claude_start_chain([_tmux_will_not_exec, _runner_dies])
+
+    with pytest.raises(FileNotFoundError):
+        await chain.start()
+    assert chain.marked
+
+    with pytest.raises(_RunnerDied):
+        await chain.start()
+
+    assert chain.marked_at_spawn == [False, False]
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_start_launches_nothing_if_the_mark_cannot_be_taken_back(
+    claude_start_chain: _ClaudeStartChainFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the mark still standing, a crash in the launch would permit a fresh start."""
+    chain = claude_start_chain([_tmux_will_not_exec, _tmux_finished])
+    chain.let_terminals_come_up(monkeypatch)
+
+    with pytest.raises(FileNotFoundError):
+        await chain.start()
+
+    with monkeypatch.context() as stuck:
+
+        def _cannot_consume(bridge_dir: Path) -> NoReturn:
+            del bridge_dir
+            raise OSError(errno.EIO, "Input/output error")
+
+        stuck.setattr(claude_native_bridge, "consume_claude_never_started", _cannot_consume)
+        with pytest.raises(OSError, match="Input/output error"):
+            await chain.start()
+
+    assert chain.spawns == 1
+    # Nothing was launched, so the proof still holds once the disk recovers.
+    assert chain.marked
+    await chain.start()
+    assert chain.spawns == 2
+    assert not chain.marked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("materialized_bundle", [False, True])
+async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    materialized_bundle: bool,
+) -> None:
+    """Generated skills share the bridge lifetime; supplied bundles remain caller-owned."""
+    isolate_provider_resolution(monkeypatch, tmp_path / "config-home")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    user_file = workspace / "notes.txt"
+    user_file.write_text("Keep this workspace data.")
+    supplied_bundle = tmp_path / "agent-bundle"
+    supplied_bundle.mkdir()
+    supplied_skill = supplied_bundle / "skills" / "example" / "SKILL.md"
+    supplied_skill.parent.mkdir(parents=True)
+    supplied_skill.write_text("---\nname: example\ndescription: Example\n---\nExample skill.")
+    spec = AgentSpec(
+        spec_version=1,
+        name="example",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        skills_filter="none",
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=supplied_bundle if materialized_bundle else None)
+
+    terminal_registry = TerminalRegistry()
+    resource_registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    bundles: list[Path] = []
+
+    async def _launch(**kwargs: Any) -> SessionResourceView:
+        args = kwargs["spec"].args
+        bundle = Path(args[args.index("--plugin-dir") + 1])
+        bundles.append(bundle)
+        assert (bundle / "skills" / "build-omnigent" / "SKILL.md").is_file()
+        assert args[args.index("--setting-sources") + 1] == ""
+        assert "PermissionRequest" in _load_claude_invocation_settings(args)["hooks"]
+        if len(bundles) == 1:
+            # The launch layer's own word that no process came of it. This fake
+            # stands in for that layer, and a bare error proves nothing.
+            raise note_no_terminal_process(
+                OSError(errno.ENOSPC, "Synthetic terminal startup failure")
+            )
+        # A Claude that started reports its session. Without the id the next
+        # launch is refused rather than started over its history (AIR2-008).
+        claude_native_bridge.remember_claude_session_id(
+            bridge_dir_for_bridge_id(kwargs["session_id"]),
+            "a1b2c3d4-1234-5678-9abc-def012345678",
+        )
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=kwargs["session_id"],
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(resource_registry, "launch_required_terminal", _launch)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=resource_registry,
+        auth_token_factory=lambda: None,
+    )
+    session_id = "skill-lifetime-source"
+    async with _runner_client(app) as client:
+        for attempt in range(3):
+            response = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "example-agent",
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "test",
+                        "session_id": session_id,
+                        "agent_id": "example-agent",
+                        "snapshot": {
+                            "created_at": 0,
+                            "updated_at": 0,
+                            "workspace": str(workspace),
+                            "labels": {},
+                        },
+                    },
+                },
+            )
+            assert response.status_code == 201, response.text
+            assert response.json()["terminal_ready"] is (attempt > 0)
+
+    assert len(bundles) == 3
+    assert len(set(bundles)) == 1, "launch retries must not leave unowned skill bundles"
+    bundle = bundles[0]
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    assert bundle == supplied_bundle if materialized_bundle else bundle.is_relative_to(bridge_dir)
+
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation[session_id] = {("claude", "main"): instance}
+    moved = await resource_registry.transfer_terminal(
+        session_id, "skill-lifetime-target", "terminal_claude_main"
+    )
+    assert moved is not None
+    await resource_registry.cleanup_session(session_id)
+    assert claude_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert (bundle / "skills" / "build-omnigent" / "SKILL.md").is_file()
+
+    instance.running = False
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert claude_native_bridge.prune_orphaned_bridge_dirs() == 1
+    assert not bridge_dir.exists()
+    assert bundle.exists() is materialized_bundle
+    assert supplied_skill.is_file()
+    assert user_file.read_text() == "Keep this workspace data."
 
 
 @pytest.mark.asyncio
