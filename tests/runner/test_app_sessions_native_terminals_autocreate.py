@@ -10,10 +10,12 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NoReturn, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -52,7 +54,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.inner.terminal import TerminalInstance, note_no_terminal_process
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -81,6 +83,7 @@ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.registry import TerminalExitedDuringLaunch
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
@@ -4563,6 +4566,295 @@ async def test_auto_create_claude_terminal_rebinds_a_moved_bridge(
         assert rebinds == []
 
 
+class _FinishedTmux:
+    """A ``tmux new-session`` process that ran to completion."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b"", b"synthetic tmux output"
+
+
+class _ClaudeStartChain:
+    """
+    The real launch chain, with only the ``tmux new-session`` call scripted.
+
+    Each start runs ``_auto_create_claude_terminal``, the resource registry, the
+    terminal registry and the terminal instance. Each step stands in for one
+    spawn call; the mark's state on entry to it is kept in ``marked_at_spawn``.
+    """
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        steps: list[Callable[[], Awaitable[Any]]],
+    ) -> None:
+        monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+        monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+        monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+        monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+        (tmp_path / "workspace").mkdir()
+        monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+            _no_op_forwarder,
+        )
+        self.bridge_dir = bridge_dir_for_bridge_id(self.session_id)
+        self.resources = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+        self.marked_at_spawn: list[bool] = []
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def _spawn(*cmd: str, **kwargs: Any) -> Any:
+            if "new-session" not in cmd:
+                return await real_spawn(*cmd, **kwargs)
+            self.marked_at_spawn.append(claude_native_bridge.claude_never_started(self.bridge_dir))
+            return await steps.pop(0)()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+
+    @property
+    def spawns(self) -> int:
+        """Spawn calls so far; a refused start makes none."""
+        return len(self.marked_at_spawn)
+
+    @property
+    def marked(self) -> bool:
+        """Whether the permission to start fresh stands."""
+        return claude_native_bridge.claude_never_started(self.bridge_dir)
+
+    async def start(self) -> None:
+        await _auto_create_claude_terminal(
+            self.session_id,
+            self.resources,
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+
+    def let_terminals_come_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make a finished ``new-session`` count as a live, observed terminal."""
+        monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            "omnigent.runner.native.orchestration._observe_terminal_interactive", AsyncMock()
+        )
+        monkeypatch.setattr(
+            self.resources,
+            "_observe_terminal_with_lifecycle",
+            AsyncMock(
+                return_value=SessionResourceView(
+                    id="terminal_claude_main",
+                    type="terminal",
+                    session_id=self.session_id,
+                    name="claude:main",
+                    metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+                )
+            ),
+        )
+
+
+_ClaudeStartChainFactory = Callable[[list[Callable[[], Awaitable[Any]]]], _ClaudeStartChain]
+
+
+@pytest.fixture
+async def claude_start_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_ClaudeStartChainFactory]:
+    """Build a chain, and close any terminal it leaves registered."""
+    chains: list[_ClaudeStartChain] = []
+
+    def _build(steps: list[Callable[[], Awaitable[Any]]]) -> _ClaudeStartChain:
+        chains.append(_ClaudeStartChain(tmp_path, monkeypatch, steps))
+        return chains[-1]
+
+    yield _build
+    for chain in chains:
+        await chain.resources.cleanup_session(chain.session_id)
+
+
+async def _tmux_will_not_exec() -> NoReturn:
+    raise FileNotFoundError(errno.ENOENT, "No such file or directory", "tmux")
+
+
+async def _tmux_pipes_failed() -> NoReturn:
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+async def _tmux_failed() -> _FinishedTmux:
+    return _FinishedTmux(returncode=1)
+
+
+async def _tmux_finished() -> _FinishedTmux:
+    return _FinishedTmux(returncode=0)
+
+
+@pytest.mark.asyncio
+async def test_claude_start_proven_never_run_may_retry_fresh_until_one_gets_further(
+    claude_start_chain: _ClaudeStartChainFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each proven failure earns one retry, and every retry gives the proof up first."""
+    chain = claude_start_chain([_tmux_will_not_exec, _tmux_will_not_exec, _tmux_finished])
+    chain.let_terminals_come_up(monkeypatch)
+
+    for _ in range(2):
+        with pytest.raises(FileNotFoundError):
+            await chain.start()
+        assert chain.marked
+
+    await chain.start()
+
+    assert chain.marked_at_spawn == [False, False, False]
+    assert not chain.marked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "failure"),
+    [
+        (_tmux_pipes_failed, OSError),
+        (_tmux_failed, RuntimeError),
+        # tmux finished, but its session is gone: Claude may have run and exited.
+        (_tmux_finished, TerminalExitedDuringLaunch),
+    ],
+)
+async def test_claude_start_that_proves_nothing_refuses_the_retry(
+    claude_start_chain: _ClaudeStartChainFactory,
+    step: Callable[[], Awaitable[Any]],
+    failure: type[Exception],
+) -> None:
+    """Only a positive proof from the launch layer lets a retry start fresh."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    chain = claude_start_chain([step])
+
+    with pytest.raises(failure):
+        await chain.start()
+
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_start_cancelled_after_the_spawn_refuses_the_retry(
+    claude_start_chain: _ClaudeStartChainFactory,
+) -> None:
+    """A cancellation says nothing about the Claude it interrupted."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    spawned = asyncio.Event()
+
+    class _HungTmux:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            spawned.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancellation expected")
+
+    async def _tmux_hangs() -> _HungTmux:
+        return _HungTmux()
+
+    chain = claude_start_chain([_tmux_hangs])
+    task = asyncio.create_task(chain.start())
+    await asyncio.wait_for(spawned.wait(), timeout=5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 1
+
+
+@pytest.mark.asyncio
+async def test_claude_start_failing_during_terminal_observation_refuses_the_retry(
+    claude_start_chain: _ClaudeStartChainFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """By the time the terminal is observed, Claude is running in it."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    chain = claude_start_chain([_tmux_finished])
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        chain.resources,
+        "_observe_terminal_with_lifecycle",
+        AsyncMock(side_effect=RuntimeError("synthetic observation failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic observation failure"):
+        await chain.start()
+
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_during_a_second_claude_start_refuses_the_third(
+    claude_start_chain: _ClaudeStartChainFactory,
+) -> None:
+    """A runner that dies mid-launch runs no handler, so the mark must already be gone."""
+    from omnigent.harnesses.claude_native.main import ClaudeTranscriptUnreconciledError
+
+    class _RunnerDied(BaseException):
+        """Escapes every handler, as dying at this point would."""
+
+    async def _runner_dies() -> NoReturn:
+        raise _RunnerDied
+
+    chain = claude_start_chain([_tmux_will_not_exec, _runner_dies])
+
+    with pytest.raises(FileNotFoundError):
+        await chain.start()
+    assert chain.marked
+
+    with pytest.raises(_RunnerDied):
+        await chain.start()
+
+    assert chain.marked_at_spawn == [False, False]
+    assert not chain.marked
+    with pytest.raises(ClaudeTranscriptUnreconciledError):
+        await chain.start()
+    assert chain.spawns == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_start_launches_nothing_if_the_mark_cannot_be_taken_back(
+    claude_start_chain: _ClaudeStartChainFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the mark still standing, a crash in the launch would permit a fresh start."""
+    chain = claude_start_chain([_tmux_will_not_exec, _tmux_finished])
+    chain.let_terminals_come_up(monkeypatch)
+
+    with pytest.raises(FileNotFoundError):
+        await chain.start()
+
+    with monkeypatch.context() as stuck:
+
+        def _cannot_consume(bridge_dir: Path) -> NoReturn:
+            del bridge_dir
+            raise OSError(errno.EIO, "Input/output error")
+
+        stuck.setattr(claude_native_bridge, "consume_claude_never_started", _cannot_consume)
+        with pytest.raises(OSError, match="Input/output error"):
+            await chain.start()
+
+    assert chain.spawns == 1
+    # Nothing was launched, so the proof still holds once the disk recovers.
+    assert chain.marked
+    await chain.start()
+    assert chain.spawns == 2
+    assert not chain.marked
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("materialized_bundle", [False, True])
 async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cleanup(
@@ -4612,7 +4904,11 @@ async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cl
         assert args[args.index("--setting-sources") + 1] == ""
         assert "PermissionRequest" in _load_claude_invocation_settings(args)["hooks"]
         if len(bundles) == 1:
-            raise OSError(errno.ENOSPC, "Synthetic terminal startup failure")
+            # The launch layer's own word that no process came of it. This fake
+            # stands in for that layer, and a bare error proves nothing.
+            raise note_no_terminal_process(
+                OSError(errno.ENOSPC, "Synthetic terminal startup failure")
+            )
         # A Claude that started reports its session. Without the id the next
         # launch is refused rather than started over its history (AIR2-008).
         claude_native_bridge.remember_claude_session_id(

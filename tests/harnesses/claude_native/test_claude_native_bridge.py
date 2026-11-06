@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import io
 import itertools
 import json
@@ -16646,3 +16647,61 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
         with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
             pytest.fail("delivery continued after a failed resize")
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
+
+
+def test_consume_claude_never_started_takes_the_mark_back_durably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The removal reaches the disk before the launch that follows it."""
+    from omnigent.harnesses.claude_native import bridge
+
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def _fsync(descriptor: int) -> None:
+        synced.append(os.fstat(descriptor).st_ino)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(bridge.os, "fsync", _fsync)
+    bridge.mark_claude_never_started(tmp_path)
+    assert bridge.claude_never_started(tmp_path)
+
+    bridge.consume_claude_never_started(tmp_path)
+
+    assert not bridge.claude_never_started(tmp_path)
+    assert synced == [tmp_path.stat().st_ino]
+
+
+def test_consume_claude_never_started_without_a_mark_does_nothing(tmp_path: Path) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    bridge.consume_claude_never_started(tmp_path)
+
+    assert not bridge.claude_never_started(tmp_path)
+
+
+def test_consume_claude_never_started_raises_when_the_mark_will_not_go(tmp_path: Path) -> None:
+    """A mark that stands must stop the launch, not be skipped over."""
+    from omnigent.harnesses.claude_native import bridge
+
+    (tmp_path / bridge._NEVER_STARTED_FILE).mkdir()
+
+    with pytest.raises(OSError):
+        bridge.consume_claude_never_started(tmp_path)
+
+
+def test_consume_claude_never_started_raises_when_the_removal_is_not_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash could bring back a removal the disk never saw."""
+    from omnigent.harnesses.claude_native import bridge
+
+    def _fsync(descriptor: int) -> None:
+        del descriptor
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(bridge.os, "fsync", _fsync)
+    bridge.mark_claude_never_started(tmp_path)
+
+    with pytest.raises(OSError, match="Input/output error"):
+        bridge.consume_claude_never_started(tmp_path)

@@ -17,7 +17,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
+from omnigent.inner.terminal import (
+    TerminalCreateResult,
+    TerminalInstance,
+    note_no_terminal_process,
+    proves_no_terminal_process,
+)
 from omnigent.terminals import TerminalRegistry, registry
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(20)]
@@ -79,6 +84,7 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
                 "owned-session", "shell", "main", _spec(tmp_path, env={"PATH": str(empty_bin)})
             )
         assert raised.value.filename == "tmux"
+        assert proves_no_terminal_process(raised.value)
         assert len(created) == 1
         assert not created[0].private_dir.exists()
         assert terminal_registry.list_for_conversation("owned-session") == []
@@ -201,7 +207,9 @@ async def test_caller_cancellation_during_cleanup_finishes_close_then_propagates
     cancel_requests: int,
 ) -> None:
     instance = _stub_instance(tmp_path)
-    original = FileNotFoundError(errno.ENOENT, "synthetic-private-error", "tmux")
+    original = note_no_terminal_process(
+        FileNotFoundError(errno.ENOENT, "synthetic-private-error", "tmux")
+    )
     monkeypatch.setattr(instance, "launch", AsyncMock(side_effect=original))
     close_started = asyncio.Event()
     release_close = asyncio.Event()
@@ -238,10 +246,26 @@ async def test_caller_cancellation_during_cleanup_finishes_close_then_propagates
 
     assert closed
     assert raised.value.__cause__ is original
+    # What the caller receives is the cancellation, which proves nothing.
+    assert not proves_no_terminal_process(raised.value)
     record = _launch_failed_event(caplog)
     assert record.attributes["exception_type"] == "FileNotFoundError"
     assert record.attributes["launch_cleanup_outcome"] == "closed"
     assert record.attributes["cancelled_during_cleanup"] is True
+
+
+async def test_failure_creating_the_instance_proves_no_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def cannot_create(*_args: Any, **_kwargs: Any) -> TerminalCreateResult:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(registry, "create_terminal_instance", cannot_create)
+
+    with pytest.raises(OSError) as raised:
+        await TerminalRegistry().launch("owned-session", "shell", "main", _spec(tmp_path))
+
+    assert proves_no_terminal_process(raised.value)
 
 
 async def test_immediate_exit_closes_once_and_keeps_exit_evidence(
@@ -264,6 +288,7 @@ async def test_immediate_exit_closes_once_and_keeps_exit_evidence(
         await terminal_registry.launch("owned-session", "shell", "main", _spec(tmp_path))
 
     assert raised.value.instance is instance
+    assert not proves_no_terminal_process(raised.value)
     close.assert_awaited_once()
     assert terminal_registry.get("owned-session", "shell", "main") is None
     record = _launch_failed_event(caplog)

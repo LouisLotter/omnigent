@@ -69,7 +69,11 @@ from omnigent.errors import (
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
-from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
+from omnigent.inner.terminal import (
+    build_terminal_os_env_spec,
+    proves_no_terminal_process,
+    terminal_pane_environment,
+)
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -9193,7 +9197,7 @@ async def _auto_create_claude_terminal(
     )
     from omnigent.harnesses.claude_native.bridge import (
         claude_never_started,
-        clear_claude_never_started,
+        consume_claude_never_started,
         mark_claude_never_started,
     )
     from omnigent.harnesses.claude_native.bridge import (
@@ -9949,6 +9953,9 @@ async def _auto_create_claude_terminal(
         extra={"session_id": session_id},
     )
     try:
+        # This launch may start Claude, so whatever an earlier one proved ends
+        # here. If it can't be ended for certain, nothing is launched.
+        await asyncio.to_thread(consume_claude_never_started, bridge_dir)
         terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
             terminal_name="claude",
@@ -9972,11 +9979,10 @@ async def _auto_create_claude_terminal(
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
-        if not _launched_here_before:
-            # Claude never started here, so a retry has no history to protect.
+        if not _launched_here_before and proves_no_terminal_process(launch_error):
+            # Nothing here has ever started Claude, so a retry has no history to protect.
             mark_claude_never_started(bridge_dir)
         raise
-    clear_claude_never_started(bridge_dir)
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected

@@ -3170,11 +3170,13 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
 
 def mark_claude_never_started(bridge_dir: Path) -> None:
     """
-    Record that this bridge's only launches failed before Claude started.
+    Record that this bridge's launches provably stopped before Claude could start.
 
-    A retry then has no Claude history to protect and may launch fresh. Without
-    the mark a bridge directory counts as an earlier launch. A failed write
-    leaves it that way, which only refuses the retry.
+    A retry then has no Claude history to protect and may launch fresh. Write
+    it only for a failure the launch layer proved came before any process (see
+    :func:`~omnigent.inner.terminal.proves_no_terminal_process`). Without the
+    mark a bridge directory counts as an earlier launch, so a failed write only
+    refuses the retry.
 
     :param bridge_dir: Bridge directory path.
     :returns: None.
@@ -3188,20 +3190,34 @@ def claude_never_started(bridge_dir: Path) -> bool:
     Return whether :func:`mark_claude_never_started` holds for this bridge.
 
     :param bridge_dir: Bridge directory path.
-    :returns: ``True`` while no launch here has started Claude.
+    :returns: ``True`` while the mark stands.
     """
     return (bridge_dir / _NEVER_STARTED_FILE).exists()
 
 
-def clear_claude_never_started(bridge_dir: Path) -> None:
+def consume_claude_never_started(bridge_dir: Path) -> None:
     """
-    Forget the mark once a launch has started Claude.
+    Durably take the mark back, before anything that could start Claude.
+
+    The launch that follows may start Claude and then die with no chance to say
+    so. With the mark gone, a retry refuses to start fresh over what it left.
 
     :param bridge_dir: Bridge directory path.
     :returns: None.
+    :raises OSError: If the mark could not be removed for certain; the caller
+        must not launch.
     """
-    with contextlib.suppress(OSError):
-        (bridge_dir / _NEVER_STARTED_FILE).unlink(missing_ok=True)
+    try:
+        (bridge_dir / _NEVER_STARTED_FILE).unlink()
+    except FileNotFoundError:
+        return
+    if os.name == "nt":  # A directory cannot be opened for fsync there.
+        return
+    directory = os.open(bridge_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def remember_claude_session_id(bridge_dir: Path, claude_session_id: str) -> None:

@@ -29,6 +29,7 @@ from omnigent.inner.terminal import (
     _has_utf8_locale,
     _is_utf8_locale_value,
     create_terminal_instance,
+    proves_no_terminal_process,
 )
 from omnigent.inner.terminal_lifecycle import (
     TERMINAL_INSTANCE_ID_ENV,
@@ -1101,6 +1102,127 @@ class _ProcessWithStdout:
 
     async def communicate(self) -> tuple[bytes, bytes]:
         return self.stdout, self.stderr
+
+
+def _unlaunched_instance(tmp_path: Path) -> TerminalInstance:
+    return TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "error_number", "proves"),
+    [
+        (FileNotFoundError, errno.ENOENT, True),
+        (NotADirectoryError, errno.ENOTDIR, True),
+        (PermissionError, errno.EACCES, True),
+        # Connecting the pipes of a process that already exists raises these too.
+        (OSError, errno.ENOSPC, False),
+        (OSError, errno.ENOMEM, False),
+        (BlockingIOError, errno.EAGAIN, False),
+    ],
+)
+async def test_launch_proves_no_process_only_when_tmux_could_not_be_executed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError],
+    error_number: int,
+    proves: bool,
+) -> None:
+    """The spawn call's error proves nothing unless exec itself was refused."""
+
+    async def _spawn(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        raise error_type(error_number, "synthetic spawn failure")
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    with pytest.raises(error_type) as raised:
+        await _unlaunched_instance(tmp_path).launch()
+
+    assert proves_no_terminal_process(raised.value) is proves
+
+
+@pytest.mark.asyncio
+async def test_launch_failing_before_the_spawn_call_proves_no_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing can exist when the launch never reached the spawn call."""
+    spawn = AsyncMock()
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+
+    def _no_environment(**kwargs: object) -> NoReturn:
+        del kwargs
+        raise ValueError("synthetic environment failure")
+
+    monkeypatch.setattr(terminal_mod, "terminal_pane_environment", _no_environment)
+
+    with pytest.raises(ValueError, match="synthetic environment failure") as raised:
+        await _unlaunched_instance(tmp_path).launch()
+
+    spawn.assert_not_awaited()
+    assert proves_no_terminal_process(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_launch_failed_by_tmux_itself_proves_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tmux ran. Its command sequence may have started the pane before failing."""
+    monkeypatch.setattr(
+        terminal_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_ProcessWithStdout(returncode=1, stderr=b"set-hook failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="tmux launch failed") as raised:
+        await _unlaunched_instance(tmp_path).launch()
+
+    assert not proves_no_terminal_process(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled_in", ["spawn_call", "wait_for_tmux"])
+async def test_cancelled_launch_proves_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled_in: str,
+) -> None:
+    """A cancellation cannot say how far the launch got."""
+    reached = asyncio.Event()
+
+    async def _hang() -> NoReturn:
+        reached.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancellation expected")
+
+    class _HungProcess:
+        returncode = None
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            await _hang()
+
+    async def _spawn(*args: object, **kwargs: object) -> _HungProcess:
+        del args, kwargs
+        if cancelled_in == "spawn_call":
+            await _hang()
+        return _HungProcess()
+
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _spawn)
+    task = asyncio.create_task(_unlaunched_instance(tmp_path).launch())
+    await asyncio.wait_for(reached.wait(), timeout=5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert not proves_no_terminal_process(raised.value)
 
 
 @pytest.mark.parametrize(

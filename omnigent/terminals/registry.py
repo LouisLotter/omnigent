@@ -48,7 +48,11 @@ from urllib.parse import quote
 from omnigent.debug_logging import debug_event
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
+from omnigent.inner.terminal import (
+    TerminalInstance,
+    create_terminal_instance,
+    note_no_terminal_process,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,16 +327,20 @@ class TerminalRegistry:
         shared_environment_args = (
             {"parent_environment": parent_environment} if parent_environment else {}
         )
-        created = create_terminal_instance(
-            terminal_name,
-            session_key,
-            spec,
-            parent_os_env_spec=parent_os_env,
-            **shared_environment_args,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-            conversation_link=self.conversation_link_for_id(conversation_id),
-        )
+        try:
+            created = create_terminal_instance(
+                terminal_name,
+                session_key,
+                spec,
+                parent_os_env_spec=parent_os_env,
+                **shared_environment_args,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+                conversation_link=self.conversation_link_for_id(conversation_id),
+            )
+        except Exception as exc:
+            note_no_terminal_process(exc)
+            raise
         stage = "terminal_spawn"
         try:
             created.instance.program_status_app = program_status_app
