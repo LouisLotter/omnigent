@@ -239,6 +239,7 @@ _SERVER_FILE = "server.json"
 _MCP_SOCKET_PREFIX = "mcp-"
 _MCP_SOCKET_SUFFIX = ".sock"
 _STATE_FILE = "state.json"
+_NEVER_STARTED_FILE = "claude_never_started"
 # The Claude session a launch resumes. Unlike the state, bridge preparation keeps it.
 _RESUME_SESSION_FILE = "resume_session.json"
 _HOOKS_FILE = "hooks.jsonl"
@@ -3165,6 +3166,42 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     return raw
+
+
+def mark_claude_never_started(bridge_dir: Path) -> None:
+    """
+    Record that this bridge's only launches failed before Claude started.
+
+    A retry then has no Claude history to protect and may launch fresh. Without
+    the mark a bridge directory counts as an earlier launch. A failed write
+    leaves it that way, which only refuses the retry.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _NEVER_STARTED_FILE).touch()
+
+
+def claude_never_started(bridge_dir: Path) -> bool:
+    """
+    Return whether :func:`mark_claude_never_started` holds for this bridge.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``True`` while no launch here has started Claude.
+    """
+    return (bridge_dir / _NEVER_STARTED_FILE).exists()
+
+
+def clear_claude_never_started(bridge_dir: Path) -> None:
+    """
+    Forget the mark once a launch has started Claude.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _NEVER_STARTED_FILE).unlink(missing_ok=True)
 
 
 def remember_claude_session_id(bridge_dir: Path, claude_session_id: str) -> None:

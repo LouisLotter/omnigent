@@ -32,6 +32,7 @@ from fastapi import FastAPI
 from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_PLAN_AT_LAUNCH,
+    CAP_RUNNER_REPLACEMENT_TARGETS,
     HOST_CAPABILITIES,
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -343,7 +344,10 @@ async def test_codex_plan_create_checks_host_before_persisting(
 ) -> None:
     cap = register_host()
     conn = app.state.host_registry.get(_HOST_ID)
-    conn.hello.capabilities = [CAP_CODEX_PLAN_AT_LAUNCH] if capable else []
+    conn.hello.capabilities = [
+        CAP_RUNNER_REPLACEMENT_TARGETS,
+        *([CAP_CODEX_PLAN_AT_LAUNCH] if capable else []),
+    ]
     HostStore(db_uri).upsert_on_connect(
         _HOST_ID, "bundle-host", RESERVED_USER_LOCAL, configured_harnesses=readiness
     )

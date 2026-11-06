@@ -58,8 +58,6 @@ with (
     patch("omnigent.host.identity.export_configured_slice_key"),
     patch("omnigent.runtime.telemetry.init"),
     patch("omnigent.git_credential_github.configure_host_git"),
-    patch("omnigent.git_credential_github.configure_host_gh"),
-    patch("omnigent.git_credential_github.start_host_gh_refresh"),
     patch("omnigent.host.databricks_credential.configure_host_databricks"),
     patch.object(hc.HostProcess, "run",
                  new=AsyncMock(side_effect=hc.HostConnectError("HTTP 403: refused"))),

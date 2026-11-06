@@ -14,7 +14,7 @@ import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient, Response
 
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import CAP_RUNNER_REPLACEMENT_TARGETS, HostHelloFrame
 from omnigent.onboarding.sandboxes.profiles import (
     SandboxProfileAccessDenied,
     SandboxProfileContext,
@@ -44,6 +44,16 @@ from tests.server.integration._sandbox_profile_support import (
 from tests.server.integration._sandbox_profile_support import env as env
 
 pytestmark = pytest.mark.asyncio
+
+
+def _hello(name: str) -> HostHelloFrame:
+    """A host's hello; every current host names the runners it replaces."""
+    return HostHelloFrame(
+        version="0.1.0-test",
+        frame_protocol_version=1,
+        name=name,
+        capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
+    )
 
 
 @pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off"])
@@ -76,7 +86,7 @@ async def test_daemon_clear_then_launch_recovers_offline_runner(
         host_id=host_id,
         ws=AsyncMock(),
         owner=_OWNER,
-        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="host"),
+        hello=_hello("host"),
     )
 
     async def valid_workspace(**kwargs):
@@ -131,7 +141,7 @@ async def test_profile_runner_replacement_rejects_live_or_changed_binding(env, m
         host_id=before.host_id,
         ws=AsyncMock(),
         owner=_OWNER,
-        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="host"),
+        hello=_hello("host"),
     )
     if race == "local-live":
         env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
@@ -345,7 +355,7 @@ async def test_caller_host_create_clears_runner_when_post_bind_profile_check_fai
         host_id=host_id,
         ws=AsyncMock(),
         owner=_OWNER,
-        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="profile-host"),
+        hello=_hello("profile-host"),
     )
 
     async def valid_workspace(**kwargs):
@@ -433,7 +443,7 @@ async def test_implicit_fork_can_launch_locally_without_provider_access(
         host_id=host_id,
         ws=AsyncMock(),
         owner=caller,
-        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="local-host"),
+        hello=_hello("local-host"),
     )
 
     async def valid_workspace(**kwargs):
@@ -474,7 +484,7 @@ async def test_failed_host_launch_restores_profile_binding(
     env.app.state.profile_test_hosts.register(
         host_id=host_id,
         ws=AsyncMock(),
-        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="profile-host"),
+        hello=_hello("profile-host"),
         owner=_OWNER,
     )
     response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
@@ -547,7 +557,7 @@ async def test_failed_host_launch_restores_profile_binding(
     registry.register(
         host_id=replacement.host_id,
         ws=AsyncMock(),
-        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="retry"),
+        hello=_hello("retry"),
         owner=_OWNER,
     )
 
@@ -829,9 +839,7 @@ async def test_profile_disabled_during_provisioning_settles_shared_admission_fai
         registry.register(
             host_id=invocation.host_id,
             ws=AsyncMock(),
-            hello=HostHelloFrame(
-                version="0.1.0-test", frame_protocol_version=1, name=invocation.host_name
-            ),
+            hello=_hello(invocation.host_name),
             owner=_OWNER,
             registered_with_managed_token=True,
         )
@@ -987,6 +995,15 @@ class TestProviderManagedProfiles:
         schedules = Mock()
         schedules.get_running_run_by_conversation.return_value = SimpleNamespace(id="profile-run")
         schedules.update_run.side_effect = lambda *a, **kw: loop.call_soon_threadsafe(failed.set)
+        task = SimpleNamespace(
+            id="profile-task",
+            user_id=_OWNER,
+            agent_id=env.agent_id,
+            account_generation=None,
+            state="active",
+        )
+        # The launch re-reads its task before it provisions anything.
+        schedules.get.return_value = task
         deps = FireDeps(
             scheduled_task_store=schedules,
             agent_store=env.app.state.agent_store,
@@ -1000,7 +1017,7 @@ class TestProviderManagedProfiles:
         )
         _make_managed_sandbox_start(deps)(
             conversation,
-            SimpleNamespace(user_id=_OWNER, agent_id=env.agent_id),
+            task,
             uuid.uuid4().hex,
             _STAGED_LAUNCH_ERRORS,
         )

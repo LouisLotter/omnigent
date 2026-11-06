@@ -4613,6 +4613,12 @@ async def test_claude_skill_bundle_survives_retries_and_transfer_until_bridge_cl
         assert "PermissionRequest" in _load_claude_invocation_settings(args)["hooks"]
         if len(bundles) == 1:
             raise OSError(errno.ENOSPC, "Synthetic terminal startup failure")
+        # A Claude that started reports its session. Without the id the next
+        # launch is refused rather than started over its history (AIR2-008).
+        claude_native_bridge.remember_claude_session_id(
+            bridge_dir_for_bridge_id(kwargs["session_id"]),
+            "a1b2c3d4-1234-5678-9abc-def012345678",
+        )
         return SessionResourceView(
             id="terminal_claude_main",
             type="terminal",

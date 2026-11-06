@@ -40,6 +40,10 @@ _SOURCE_IDS = {
 
 
 class _ShellPermissionStore(_StubPermissionStore):
+    def get_user(self, user_id: str) -> None:
+        """Turn attribution reads the sender's registration; these people have none."""
+        return None
+
     def list_for_session(
         self, session_id: str, *, limit: int = 100, after_user_id: str | None = None
     ) -> tuple[list[SessionPermission], str | None]:

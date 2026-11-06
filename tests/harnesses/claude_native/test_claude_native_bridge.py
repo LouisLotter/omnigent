@@ -14824,12 +14824,17 @@ class _HeldPolicyClient(_ScriptedPolicyClient):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
+    async def post(
+        self,
+        url: str,
+        json: dict[str, object] | None = None,
+        timeout: httpx.Timeout | None = None,
+    ) -> SimpleNamespace:
         """Hold the first POST until :attr:`release` is set, then answer it."""
         if self.calls == 0:
             self.entered.set()
             await asyncio.to_thread(self.release.wait, 30)
-        return await super().post(url, json=json)
+        return await super().post(url, json=json, timeout=timeout)
 
 
 @pytest.mark.asyncio

@@ -9192,11 +9192,18 @@ async def _auto_create_claude_terminal(
         bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
     )
     from omnigent.harnesses.claude_native.bridge import (
+        claude_never_started,
+        clear_claude_never_started,
+        mark_claude_never_started,
+    )
+    from omnigent.harnesses.claude_native.bridge import (
         read_resumable_claude_session_id as _read_csid_pre_wipe,
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
-    _launched_here_before = _bridge_dir_for_bridge_id(bridge_id).is_dir()
+    _launched_here_before = _bridge_dir_for_bridge_id(
+        bridge_id
+    ).is_dir() and not claude_never_started(_bridge_dir_for_bridge_id(bridge_id))
     if _pre_wipe_claude_sid is not None:
         # Keep it past the wipe, for a retry after a launch that stops before Claude starts.
         remember_claude_session_id(_bridge_dir_for_bridge_id(bridge_id), _pre_wipe_claude_sid)
@@ -9965,7 +9972,11 @@ async def _auto_create_claude_terminal(
 
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
+        if not _launched_here_before:
+            # Claude never started here, so a retry has no history to protect.
+            mark_claude_never_started(bridge_dir)
         raise
+    clear_claude_never_started(bridge_dir)
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected

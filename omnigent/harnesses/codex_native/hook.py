@@ -232,7 +232,7 @@ def _evaluate_policy_hook_output(
     bridge_dir: Path,
     session_id: str,
     payload: dict[str, object],
-    cache_generation: str | None,
+    cache_generation: str | None = None,
 ) -> dict[str, object] | None:
     """
     Evaluate one governed-session hook payload and shape Codex's answer.

@@ -2481,6 +2481,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     """
     from omnigent.entities import MessageData, NewConversationItem
     from omnigent.host.frames import (
+        CAP_RUNNER_REPLACEMENT_TARGETS,
         HostHelloFrame,
         HostLaunchRunnerFrame,
         HostStopRunnerFrame,
@@ -2670,7 +2671,10 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                     host_id,
                     AsyncMock(),
                     HostHelloFrame(
-                        version="0.1.0-test", frame_protocol_version=1, name="returned-host"
+                        version="0.1.0-test",
+                        frame_protocol_version=1,
+                        name="returned-host",
+                        capabilities=[CAP_RUNNER_REPLACEMENT_TARGETS],
                     ),
                     owner=None,
                 )
