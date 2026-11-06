@@ -78,7 +78,7 @@ from typing import Final
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import OmnigentError
 from omnigent.runtime import (
     get_runner_ws_factory,
@@ -171,6 +171,11 @@ def create_terminal_attach_router(
             auth_provider=auth_provider,
             permission_store=permission_store,
             conversation_store=conversation_store,
+        )
+        # WebSockets bypass the HTTP middleware that attributes debug-log rows
+        # to the request's user; this handler task is per-connection.
+        set_current_user_id(
+            auth_provider.get_user_id(websocket) if auth_provider is not None else None
         )
         await websocket.accept()
         _logger.info(

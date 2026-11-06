@@ -52,6 +52,7 @@ import yaml
 from omnigent.host import credential_broker
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.identity_env import in_managed_sandbox
 
 _logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ def _in_sandbox() -> bool:
     be a no-op there. ``IS_SANDBOX=1`` is baked into the managed host image and
     the k8s pod spec; it is absent on a local host.
     """
-    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+    return in_managed_sandbox()
 
 
 def _read_git_request() -> dict[str, str]:

@@ -265,6 +265,7 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     REFRESH_UNSUPPORTED = "refresh_unsupported"
+    LOGIN_UNSUPPORTED = "login_unsupported"
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
@@ -318,6 +319,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.REFRESH_UNSUPPORTED: 409,
     ErrorCode.RUNNER_TOKENS_UNSUPPORTED: 400,
+    ErrorCode.LOGIN_UNSUPPORTED: 409,
     ErrorCode.WORKSPACE_MISSING: 410,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
@@ -367,6 +369,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorCategory.CONFIG,
     ErrorCode.RUNNER_TOKENS_UNSUPPORTED: ErrorCategory.CONFIG,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
     # The session's agent was deleted or rebound; the caller must recreate the
@@ -429,6 +432,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.RUNNER_TOKENS_UNSUPPORTED: ErrorImpact.BENIGN,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
 }
 
@@ -464,6 +468,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.RUNNER_TOKENS_UNSUPPORTED: ErrorPhase.REQUEST,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,

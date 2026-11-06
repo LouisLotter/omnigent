@@ -69,6 +69,11 @@ _CODECS = [
         ec.encode_team_removal_item_kind,
         ec.decode_team_removal_item_kind,
     ),
+    (
+        ec.SCHEDULED_TASK_SESSION_MODE,
+        ec.encode_scheduled_task_session_mode,
+        ec.decode_scheduled_task_session_mode,
+    ),
 ]
 
 
@@ -157,6 +162,7 @@ def test_shipped_codes_are_stable() -> None:
         "client_secret_post": 2,
         "client_secret_basic": 3,
     }
+    assert ec.SCHEDULED_TASK_SESSION_MODE == {"new": 1, "continue": 2}
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,
         "running": 2,

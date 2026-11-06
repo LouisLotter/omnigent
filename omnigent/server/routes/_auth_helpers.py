@@ -54,6 +54,12 @@ CONNECTION_AUTHORITY_RECHECK_S = 15.0
 """How often a long-lived session stream or terminal re-checks its caller."""
 
 
+def _require_persisted_session_id(conversation_id: str) -> None:
+    """Keep client-only new-chat route IDs out of backing stores."""
+    if conversation_id.startswith("temp:"):
+        raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
+
+
 def get_user_id(
     request: Request,
     auth_provider: AuthProvider | None,
@@ -157,6 +163,7 @@ def _require_access_sync(
     :raises OmnigentError: 403 if insufficient level, 404 if no
         access at all.
     """
+    _require_persisted_session_id(conversation_id)
     if permission_store is None:
         return
     if user_id is None:
@@ -322,6 +329,7 @@ def _require_access_and_level_sync(
     :raises OmnigentError: 401 unauthenticated, 403 insufficient level,
         404 no access at all / conversation not found.
     """
+    _require_persisted_session_id(conversation_id)
     if permission_store is None:
         return SessionAccess(level=None, conversation=None)
     if user_id is None:

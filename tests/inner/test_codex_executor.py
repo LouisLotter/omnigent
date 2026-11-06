@@ -4730,8 +4730,11 @@ def test_materialize_codex_provider_config_failed_config_write_removes_new_key(
     assert list(codex_home.iterdir()) == []
 
 
+@pytest.mark.parametrize("ci", [False, True])
 def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
 ) -> None:
     """Unity Gateway providers name Codex and Omnigent (plus ug for its own table)."""
     import tomllib
@@ -4740,6 +4743,11 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
         _databricks_codex_config_overrides,
         materialize_codex_provider_config,
     )
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
 
     gateway_url = "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1"
     codex_home = tmp_path / "codex-home"
@@ -4759,12 +4767,17 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     )
 
     providers = tomllib.loads((codex_home / "config.toml").read_text())["model_providers"]
+    tags = {}
+    if ci:
+        tags = {"Databricks-Ai-Gateway-Request-Tags": '{"pipeline":"polly-review","run_id":"123"}'}
     assert providers["Databricks"]["http_headers"] == {
+        **tags,
         "User-Agent": "ucode/0.1.0 codex/0.145.0",
         "Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
     assert providers["omnigent_databricks"]["http_headers"] == {
+        **tags,
         "Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent",
     }

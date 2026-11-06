@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -121,6 +122,11 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         return 0
 
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.native import policy_allow_cache
+
+    # Read before the session identity: a session switch picks a new
+    # generation, so an answer for the previous session opens no window.
+    cache_generation = policy_allow_cache.generation(bridge_dir)
     state = read_bridge_state(bridge_dir)
     if state is None:
         return 0
@@ -131,7 +137,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         fail_closed_hook_output(hook_event, "no policy answer before the hook's deadline"),
     )
     try:
-        hook_output = _evaluate_policy_hook_output(bridge_dir, state.session_id, payload)
+        hook_output = _evaluate_policy_hook_output(
+            bridge_dir, state.session_id, payload, cache_generation
+        )
     except Exception as exc:  # noqa: BLE001 - a crashed hook is a failed hook, and Codex runs the tool
         print(
             f"omnigent codex evaluate-policy hook: failed: {type(exc).__name__}: {exc}",
@@ -221,7 +229,10 @@ def _exit_process(code: int) -> None:
 
 
 def _evaluate_policy_hook_output(
-    bridge_dir: Path, session_id: str, payload: dict[str, object]
+    bridge_dir: Path,
+    session_id: str,
+    payload: dict[str, object],
+    cache_generation: str | None,
 ) -> dict[str, object] | None:
     """
     Evaluate one governed-session hook payload and shape Codex's answer.
@@ -230,6 +241,8 @@ def _evaluate_policy_hook_output(
     :param session_id: Omnigent session id from the bridge state, e.g.
         ``"conv_abc"``.
     :param payload: Decoded Codex hook payload.
+    :param cache_generation: Allow-cache generation read before the session
+        identity, e.g. ``"9f86d081884c7d65"``; ``None`` opens no window.
     :returns: Hook output for stdout, or ``None`` for "no opinion": the
         session is not governed, the event carries no policy meaning, the
         verdict does not constrain the call, or a ``PostToolUse`` verdict
@@ -239,6 +252,7 @@ def _evaluate_policy_hook_output(
         read_codex_config_model,
         read_policy_hook_config,
     )
+    from omnigent.native import policy_allow_cache
     from omnigent.native.native_policy_hook import (
         evaluation_response_to_hook_output,
         fail_closed_hook_output,
@@ -292,6 +306,7 @@ def _evaluate_policy_hook_output(
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)
 
+    requested_at = time.time()
     resp, api_error = post_evaluate_with_retry(
         url,
         headers,
@@ -308,6 +323,10 @@ def _evaluate_policy_hook_output(
     if eval_response is None:
         print(f"omnigent codex evaluate-policy hook: {problem}", file=sys.stderr)
         return fail_closed_hook_output(hook_event, problem)
+    # Through the relay the server evaluated the relay's session, which can
+    # trail a session switch.
+    if relay is None or relay[2] == session_id:
+        policy_allow_cache.record(bridge_dir, cache_generation, eval_response, requested_at)
     return evaluation_response_to_hook_output(hook_event, eval_response)
 
 

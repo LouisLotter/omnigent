@@ -31,6 +31,7 @@
  *   Unarchive opens the restored session.
  */
 
+import { toast } from "sonner";
 import {
   type ComponentType,
   lazy,
@@ -215,6 +216,10 @@ import {
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
+  readOpenSubagentsInPanel,
+  writeOpenSubagentsInPanel,
+} from "@/lib/subagentPanelPreferences";
+import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
 } from "@/lib/composerSendShortcutPreferences";
@@ -234,6 +239,10 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "@/lib/pickerEntryVisibility";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -251,7 +260,7 @@ import {
   type CustomTheme,
   writeCustomTheme,
 } from "@/lib/customTheme";
-import { useIsEmbedded } from "@/lib/embedded";
+import { useHostTheme } from "@/lib/embedded";
 import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   applyImportedSettings,
@@ -277,6 +286,7 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { SettingsComputersSection } from "./settings/SettingsComputersSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
@@ -310,16 +320,6 @@ export function SettingsPage() {
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
 
-  const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses" || section === "custom-agents") {
-      return {
-        maxWidthClassName: "max-w-4xl",
-        contentClassName: "px-4 md:px-8",
-      };
-    }
-    return undefined;
-  }, [section]);
-
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
   // NOT inside the shared section PageScroll below, which would nest two
@@ -343,12 +343,12 @@ export function SettingsPage() {
 
   return (
     <PageScroll
+      maxWidthClassName="max-w-4xl"
       contentClassName="px-4 md:px-8"
       extraBottom="2.5rem"
       // Reserve the scrollbar's width so the centered column doesn't shift when
       // switching between a page or tab that scrolls and one that doesn't.
       className="[scrollbar-gutter:stable]"
-      {...pageWrapperSettings}
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
@@ -405,7 +405,7 @@ function Section({
 }) {
   return (
     <section>
-      <h1 className="settings-page-title text-2xl font-semibold">{title}</h1>
+      <h1 className="settings-page-title text-2xl font-medium">{title}</h1>
       {description && (
         <p
           className={cn(
@@ -496,15 +496,32 @@ function ThemeSubsection({
 function ModeControl() {
   const { theme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
+  const followsHost = useHostTheme() !== undefined;
+  const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
   const labelId = useId();
   return (
     <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Mode"
-        labelId={labelId}
-        description="Follow your system, or force light or dark."
-        className="flex-1"
-      />
+      <div className="flex-1">
+        <SettingsLabel
+          label="Mode"
+          labelId={labelId}
+          description={
+            followsHost
+              ? "Follow Databricks, or force light or dark."
+              : "Follow your system, or force light or dark."
+          }
+        />
+        {themeSettingsUrl && (
+          <a
+            href={themeSettingsUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+          >
+            Databricks appearance settings
+          </a>
+        )}
+      </div>
       <IconSegmentedControl<ThemeMode>
         labelledBy={labelId}
         value={mode}
@@ -513,7 +530,7 @@ function ModeControl() {
         items={themeCards.map((card) => ({
           value: card.mode,
           testId: `theme-${card.mode}`,
-          label: card.label,
+          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
           icon: card.icon,
         }))}
       />
@@ -802,7 +819,10 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55">
+      <div
+        data-testid="color-theme-editor"
+        className="overflow-hidden rounded-xl border bg-transparent"
+      >
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -854,15 +874,15 @@ function ColorThemeControl() {
         <div className="px-4">
           <ThemeColorPicker
             label="Accent"
-            value={editableTheme.accent}
+            value={isDark ? editableTheme.darkAccent : editableTheme.accent}
             testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme({ accent, darkAccent: accent })}
+            onChange={(accent) => updateCustomTheme(isDark ? { darkAccent: accent } : { accent })}
           />
           <ThemeColorPicker
             label="Background tint"
-            value={editableTheme.tint}
+            value={isDark ? editableTheme.darkTint : editableTheme.tint}
             testId="custom-theme-tint"
-            onChange={(tint) => updateCustomTheme({ tint })}
+            onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
           />
           <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
             <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
@@ -939,7 +959,7 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
-/** Opt-in: fold a finished turn's earlier messages so only the last shows. */
+/** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
   const labelId = useId();
@@ -948,7 +968,7 @@ function FoldAssistantNarrationControl() {
       <SettingsLabel
         label="Show only the final answer"
         labelId={labelId}
-        description="Once a turn finishes, fold its progress messages into the Worked row. The last message stays visible as the answer."
+        description="Codex marks its final answer, so a finished Codex turn folds its progress messages into the Worked row. Turn this on to fold other agents' progress messages too, keeping each turn's last message visible."
       />
       <Switch
         aria-labelledby={labelId}
@@ -963,14 +983,6 @@ function FoldAssistantNarrationControl() {
 }
 
 function AppearanceSection() {
-  // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
-  // replace it with a note (plus a link to the host's own theme settings when
-  // one is provided). The color palette, terminal theme, and font controls are
-  // per-device prefs that don't conflict with host light/dark, so they stay.
-  // The link opens a new tab: in place, it would replace the app with the
-  // host page, and desktop windows have no Back control.
-  const isEmbedded = useIsEmbedded();
-  const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
@@ -1026,12 +1038,15 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
       } catch {
         // localStorage access errors are non-fatal.
       }
+      // As with import: a same-tab write fires no storage event.
+      notifyHiddenPickerAgentsChanged();
     }
     applyStoredUiFontSize();
 
@@ -1081,45 +1096,7 @@ function AppearanceSection() {
       <div className="flex flex-col gap-6">
         <div key={resetKey} className="flex flex-col gap-6">
           <SettingsGroup title="Theme" testId="settings-group-theme">
-            {isEmbedded ? (
-              <div className="flex flex-col gap-3">
-                <SettingsLabel
-                  label="Theme"
-                  tooltipDescription="Light and dark mode are configured in Databricks preferences."
-                  description={
-                    <>
-                      Light and dark mode are configured in Databricks preferences.
-                      {themeSettingsUrl ? (
-                        <>
-                          {" "}
-                          <a
-                            href={themeSettingsUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
-                          >
-                            Click to open Databricks user preferences page.
-                          </a>
-                          .
-                        </>
-                      ) : null}
-                    </>
-                  }
-                />
-                {themeSettingsUrl && (
-                  <a
-                    href={themeSettingsUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
-                  >
-                    Open Databricks preferences
-                  </a>
-                )}
-              </div>
-            ) : (
-              <ModeControl />
-            )}
+            <ModeControl />
             <div className="mt-4 border-t border-border pt-4">
               <TerminalThemeControl />
             </div>
@@ -1132,6 +1109,7 @@ function AppearanceSection() {
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+              <PickerVisibilitySetting />
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <FoldAssistantNarrationControl />
@@ -1659,7 +1637,7 @@ function DatabricksIntegrationControl() {
 }
 
 /**
- * Opt-in dispatch for messages sent while the agent is working.
+ * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
@@ -1730,7 +1708,7 @@ function ComposerSendShortcutControl() {
  * Where a plain click on a web link in chat content opens — desktop shells
  * with the embedded browser only. Off keeps the current behavior (the
  * default external browser); on routes the link into the conversation's
- * in-app Browser tab. Modified clicks always stay external.
+ * in-app browser tabs. Shift-click always stays external.
  */
 function OpenLinksInAppControl() {
   const [enabled, setEnabled] = useState(readOpenLinksInApp);
@@ -1748,7 +1726,7 @@ function OpenLinksInAppControl() {
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
-        description={`Open web links from chat in this conversation's Browser tab instead of your default browser. ${MOD_KEY}+click always opens the external browser.`}
+        description={`Open web links from chat in in-app browser tabs, reusing a tab already showing the same URL. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
         descriptionClassName="text-ui"
       />
       <Switch
@@ -1792,6 +1770,40 @@ function BackgroundSessionTitlesControl() {
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.background_session_titles"
+      />
+    </div>
+  );
+}
+
+function OpenSubagentsInPanelControl() {
+  const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    // Sub-agent clicks read the stored value, so only show what was saved.
+    if (writeOpenSubagentsInPanel(next)) setEnabled(next);
+    else toast.error("Couldn't save this setting. Check that your browser allows site storage.");
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Open sub-agents in the Workspace panel"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Show a sub-agent's chat as a tab beside the main chat instead of replacing it. On phones, sub-agents still open full screen."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-subagents-in-panel-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_subagents_in_panel"
       />
     </div>
   );
@@ -1881,6 +1893,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <OpenSubagentsInPanelControl />
+          </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
@@ -2006,7 +2021,7 @@ function UiFontSizeControl() {
         role="group"
         aria-label="Interface font size"
         className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
@@ -2170,7 +2185,7 @@ function UiCodeFontSizeControl() {
         role="group"
         aria-label="Code font size"
         className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >

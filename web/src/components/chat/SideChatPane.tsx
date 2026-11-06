@@ -1,4 +1,5 @@
 import { SelectionPopup } from "./SelectionPopup";
+import { SideChatSettings } from "./SideChatSettings";
 import {
   useCallback,
   useEffect,
@@ -11,7 +12,7 @@ import {
 } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
 import {
   type Bubble,
@@ -68,6 +69,7 @@ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -79,7 +81,7 @@ import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
-import { usesNativeSideChatFork } from "@/lib/sideChat";
+import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   appendReplyQuote,
@@ -162,6 +164,7 @@ export function SideChatPane({
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
   const { session } = useSession(pending ? null : childId);
+  const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
     if (!selectionParentId || readOnly || starting) return;
@@ -413,6 +416,7 @@ export function SideChatPane({
                 childId={childId}
                 harness={sessionHarness}
                 session={session}
+                settingsSession={pending ? draftSource : session}
                 agentId={boundAgentId}
                 responseId={activeResponse?.responseId}
                 interruptReady={interruptReady}
@@ -433,14 +437,15 @@ export function SideChatPane({
  * The side chat's composer. On a live tab it sends to the child via
  * `pinnedConversationId` (so turns land on the side thread, not the main one)
  * with the main composer's affordances (attach, dictation). On a pending tab it
- * has just text + send: the first message creates the fork via `onStart`, and
- * the text is kept if creation fails so it isn't lost.
+ * lets the user draft text and choose settings before `onStart` creates the fork.
+ * The draft is kept if creation fails.
  */
 function SideChatComposer({
   fullSession,
   childId,
   harness,
   session,
+  settingsSession,
   agentId,
   responseId,
   interruptReady,
@@ -453,6 +458,7 @@ function SideChatComposer({
   childId: string;
   harness: string | null | undefined;
   session: Session | null | undefined;
+  settingsSession: Session | null | undefined;
   agentId: string | null;
   responseId: string | undefined;
   interruptReady: boolean;
@@ -464,6 +470,9 @@ function SideChatComposer({
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
   const queryClient = useQueryClient();
+  const settingsSaving = useIsMutating({ mutationKey: sideChatSettingsMutationKey(childId) }) > 0;
+  const settingsSavePending = () =>
+    queryClient.isMutating({ mutationKey: sideChatSettingsMutationKey(childId) }) > 0;
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   // Unsent text + attachments live in the store, keyed by child id, NOT in
   // component state: this pane mounts in the desktop rail or the mobile
@@ -487,8 +496,8 @@ function SideChatComposer({
   // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
   const queues = !pending && !fullSession;
   useEffect(() => {
-    if (queues && queuedMessages.length > 0) maybeFlushQueuedHead(childId);
-  }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead]);
+    if (queues && queuedMessages.length > 0 && !settingsSaving) maybeFlushQueuedHead(childId);
+  }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead, settingsSaving]);
   const info = useServerInfo();
   const attachmentPolicy = info === "loading" ? null : (info.filesystem_attachments ?? null);
   useEffect(() => {
@@ -644,7 +653,7 @@ function SideChatComposer({
   // state first — so unmounting in the meantime (closing the mobile drawer,
   // switching tabs) defers the send instead of discarding the only copy.
   useEffect(() => {
-    if (autoSend === undefined || agentId === null) return;
+    if (autoSend === undefined || agentId === null || settingsSaving) return;
     // Re-read and consume the LIVE draft rather than the one captured at
     // render: a replayed mount effect (React StrictMode in development) would
     // otherwise send the captured question a second time.
@@ -654,9 +663,9 @@ function SideChatComposer({
     void send(question, agentId, undefined, { pinnedConversationId: childId }).finally(
       refreshLabels,
     );
-  }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
+  }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels, settingsSaving]);
 
-  const ready = pending ? !starting : agentId !== null;
+  const ready = (pending ? !starting : agentId !== null) && !settingsSaving;
   const canSend =
     serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
   const addFiles = (incoming: File[]) => {
@@ -666,7 +675,10 @@ function SideChatComposer({
   };
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const pasted = clipboardFiles(event.clipboardData);
-    if (!pasted.length) return;
+    if (!pasted.length) {
+      insertPastedText(event);
+      return;
+    }
     event.preventDefault();
     if (!ready) return;
     if (pending) {
@@ -796,6 +808,7 @@ function SideChatComposer({
   };
 
   const submit = () => {
+    if (settingsSavePending()) return;
     stopRequestRef.current += 1;
     setStopNotice(null);
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
@@ -871,6 +884,7 @@ function SideChatComposer({
     // Mod+Enter submits any draft, then steers the whole queue into the running turn.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
+      if (settingsSavePending()) return;
       submit();
       steerAllQueuedMessages(childId);
       return;
@@ -933,7 +947,13 @@ function SideChatComposer({
               dequeueMessage(queueId);
               tailTextareaRef.current?.focus();
             }}
-            onSteer={steerMessage}
+            onSteer={
+              settingsSaving
+                ? undefined
+                : (queueId) => {
+                    if (!settingsSavePending()) steerMessage(queueId);
+                  }
+            }
             onReorder={reorderQueuedMessage}
             widthClassName="mx-3 w-auto"
           />
@@ -1020,6 +1040,25 @@ function SideChatComposer({
           ),
           trailing: (
             <>
+              {!fullSession && settingsSession?.id && (
+                <SideChatSettings
+                  key={childId}
+                  session={settingsSession}
+                  draft={
+                    pending
+                      ? {
+                          settings: composer?.settings,
+                          disabled: starting,
+                          onChange: (updates) =>
+                            updateComposer(childId, (current) => ({
+                              ...current,
+                              settings: { ...current.settings, ...updates },
+                            })),
+                        }
+                      : undefined
+                  }
+                />
+              )}
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}

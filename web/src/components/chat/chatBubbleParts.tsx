@@ -1128,6 +1128,8 @@ function AssistantBubble({
   const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
+  // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
+  const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
 
   return (
     <>
@@ -1142,7 +1144,7 @@ function AssistantBubble({
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly || hasSubagentNotice) && "w-full",
+            (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
@@ -2113,7 +2115,7 @@ export function JumpToTopButton({
       <Button
         type="button"
         variant="outline"
-        size="sm"
+        size="icon-sm"
         disabled={jumping}
         onClick={() => void jumpToTop()}
         aria-label="Jump to the first message"
@@ -2122,7 +2124,7 @@ export function JumpToTopButton({
         tabIndex={visible ? 0 : -1}
         aria-hidden={!visible}
         className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-sm shadow-sm",
+          "size-7 rounded-full p-0 shadow-sm",
           // Force an OPAQUE background in both themes and on hover, so the faded
           // chat text behind the pill doesn't bleed through.
           "bg-background hover:bg-background hover:brightness-95",
@@ -2135,7 +2137,6 @@ export function JumpToTopButton({
         ) : (
           <ArrowUpIcon className="size-3.5" aria-hidden />
         )}
-        {jumping ? "Loading history…" : "Jump to top"}
       </Button>
     </div>
   );

@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
     from omnigent.server.auth import AuthProvider
     from omnigent.server.principals import Principal
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
     from omnigent.server.support_access import SupportAccess, SupportedMember
 
 _logger = logging.getLogger(__name__)
@@ -387,6 +388,7 @@ def resolve_host_launch(
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
     conversation: Conversation | None = None,
+    sandbox_profiles: SandboxProfileCatalog | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -445,6 +447,15 @@ def resolve_host_launch(
         owner = conversation_store.get_actual_session_owner(session_id)
         if owner is None or owner.user_id != user_id:
             raise HTTPException(status_code=404, detail="session not found")
+
+    if sandbox_profiles is not None:
+        sandbox_profiles.require_session_host(
+            session_id,
+            host_id,
+            bind=False,
+            sandbox_provider=host.sandbox_provider,
+            user_id=host.user_id,
+        )
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)
 
