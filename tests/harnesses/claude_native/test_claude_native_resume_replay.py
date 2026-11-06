@@ -880,6 +880,58 @@ def test_record_positions_cover_rebuilt_and_compacted_records() -> None:
     assert positions[compacted] == 2
 
 
+def test_record_positions_number_compacted_records_as_the_rebuild_does() -> None:
+    """A server tool result rejoined with its call moves every record after it up one."""
+    call = {"type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {}}
+    result = {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_1", "content": "advice"}
+    forwarded_id = external_item_id(_SESSION_ID, "a-2:0:message")
+    items: list[dict[str, Any]] = [
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "response_id": "compact_1",
+            "compacted_messages": [
+                {"type": "message", "role": "user", "content": "summary"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [call],
+                    "forwarded_source_ids": ["a-1:0:message"],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [result],
+                    "forwarded_source_ids": ["a-2:0:message"],
+                },
+                {"type": "message", "role": "user", "content": "after the advice"},
+            ],
+        },
+        {"id": forwarded_id, "type": "message", "role": "user", "response_id": "r", "content": "x"},
+    ]
+
+    positions = claude_native._claude_resume_record_positions(
+        items, session_id=_SESSION_ID, external_session_id=_CLAUDE_SESSION_ID
+    )
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id=_SESSION_ID,
+        external_session_id=_CLAUDE_SESSION_ID,
+        cwd=_WORKSPACE,
+        bridge_dir=Path("/nonexistent-bridge"),
+    )
+
+    assert {record["uuid"] for record in records} <= positions.keys()
+    rejoined = next(
+        record
+        for record in records
+        if record.get("type") == "assistant"
+        and any(block.get("type") == "server_tool_use" for block in record["message"]["content"])
+    )
+    # The rejoined record stands for the server rows of both halves.
+    assert positions[rejoined["uuid"]] == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("post_unavailable", [False, True])
 async def test_background_resume_copy_reconciles_original_without_rewriting_it(

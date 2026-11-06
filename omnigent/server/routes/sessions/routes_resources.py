@@ -1266,7 +1266,7 @@ def register_resources_routes(
                     else None
                 )
                 member_id = member.id if member is not None else None
-            except Exception:  # noqa: BLE001 — the record never stops the action
+            except Exception:
                 _logger.debug("Could not read the acting member", exc_info=True)
         _logger.info(
             "github action op=%s session=%s actor_member=%s",

@@ -6542,10 +6542,9 @@ def _claude_resume_record_positions(
         compacted_messages = item.get("compacted_messages")
         if item.get("type") != "compaction" or not isinstance(compacted_messages, list):
             continue
-        for compacted_index, compacted_value in enumerate(compacted_messages):
-            compacted_message = _json_object(compacted_value)
-            if compacted_message is None:
-                continue
+        # The rebuild numbers the entries after rejoining them; so must this.
+        rejoined, _dropped = _rejoin_split_server_tool_results(compacted_messages)
+        for compacted_index, compacted_message in enumerate(rejoined):
             forwarded = compacted_message.get("forwarded_source_ids")
             represented = [
                 index_by_id.get(external_item_id(session_id, source_id), index)
